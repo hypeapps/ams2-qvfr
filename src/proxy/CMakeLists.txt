@@ -11,7 +11,10 @@ add_library(qvfr_proxy SHARED
 )
 target_link_libraries(qvfr_proxy PRIVATE openvr_0912 bcrypt version psapi shell32 ole32)
 target_compile_definitions(qvfr_proxy PRIVATE VR_API_EXPORT)
-target_compile_options(qvfr_proxy PRIVATE /W4)
+# /EHa instead of the default /EHsc: an SEH fault caught by Guarded/Safe then unwinds C++ objects (lock_guard),
+# so no mutex stays locked after a fault in our code. Directory scope: only this target is built here.
+string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
+target_compile_options(qvfr_proxy PRIVATE /W4 /EHa)
 set_target_properties(qvfr_proxy PROPERTIES
   OUTPUT_NAME openvr_api
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/$<CONFIG>/proxy

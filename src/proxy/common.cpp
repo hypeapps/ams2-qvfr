@@ -228,6 +228,8 @@ void LoadConfig() {
     c.expCenterX = IniFloat(ini, L"experiment", L"center_x", 0.0f);
     c.expCenterY = IniFloat(ini, L"experiment", L"center_y", 0.0f);
     c.expPad = IniInt(ini, L"experiment", L"pad", 1) != 0;
+    c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
+    if (c.testFaultFrames > 0) Log("Settings: [test] fault_frames=%d (deliberate fault for testing)", c.testFaultFrames);
     g_cfg = c;
     Log("Settings %s: wrap=%d first_calls=%d stats_interval_s=%d csv_always=%d | benchmark: modifier=0x%X key=0x%X "
         "delay_s=%.1f duration_s=%.1f freeze_pose=%d beep=%d auto_start_s=%.1f | gaze read=%d | experiment: mode=%s "
@@ -249,7 +251,7 @@ void ReportGuardFault(const char* where, unsigned long code) {
     bool was = g_diagDisabled.exchange(true);
     if (!was) {
         Log("ERROR: exception 0x%08lX in diagnostic code (%s). Diagnostics disabled for the rest of the session, "
-            "the game keeps running through the real OpenVR.", code, where);
+            "the game keeps running (an active [experiment] keeps its size, projection and pad).", code, where);
     }
 }
 

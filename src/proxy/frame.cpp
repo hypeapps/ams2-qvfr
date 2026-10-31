@@ -207,6 +207,7 @@ void StartRun(uint32_t newestIndex) {
     g_runCsv = _wfopen((g_runDir / L"timing.csv").c_str(), L"wb");
     if (g_runCsv) fputs(kCsvHeader, g_runCsv);
     g_run = RunStats{};
+    experiment::MarkRunStart();
     g_runFirstIndex = newestIndex + 1;
     g_runSysT0 = -1;
     modern::GetCumulative(g_cumStart);
@@ -477,6 +478,12 @@ void OnWaitGetPosesEnd(vr::IVRCompositor* real, vr::TrackedDevicePose_t* render,
             g_prevGaze = g;
         }
 
+        // Test of the kill-switch path (qvfr_proxy_smoke --fault N): a real access violation inside Guarded.
+        if (Cfg().testFaultFrames > 0 && g_proxyFrames == (uint64_t)Cfg().testFaultFrames) {
+            Log("Test: deliberate access violation at frame %llu", (unsigned long long)g_proxyFrames);
+            *static_cast<volatile int*>(nullptr) = 0;
+        }
+
         HandleHotkey(newest);
         PeriodicStats();
 
@@ -620,7 +627,7 @@ void OnShutdown() {
         g_frozen = false;
         g_frozenPose.bPoseIsValid = false;
     });
-    Guarded("experiment::Shutdown", [] { experiment::Shutdown(); });
+    experiment::Shutdown();  // guards itself; runs even after a diagnostics fault
 }
 
 }  // namespace qvfr::frame

@@ -7,8 +7,10 @@
 //                                     (does not take the HMD from other applications; needs SteamVR running)
 //   qvfr_proxy_smoke.exe --scene 12   Scene application: 12 s of D3D11 frames (grey background) with Submit,
 //                                     the benchmark starts by itself (auto_start_s=2, delay_s=1, duration_s=5)
-//   --experiment focus|outer          with --scene: sets [experiment] mode (size and projection replaced by the proxy)
+//   --experiment focus|outer          sets [experiment] mode (size and projection replaced by the proxy)
 //   --center X Y                      with --experiment: focus center tangents (center_x, center_y)
+//   --fault N                         [test] fault_frames=N: a deliberate exception in the proxy diagnostics at frame N
+// smoke_home\qvfr.ini is rewritten on every run, so options never leak from one run into the next.
 
 #include <windows.h>
 #include <d3d11.h>
@@ -42,6 +44,7 @@ fs::path ExeDir() {
 const char kSceneIni[] =
     "[proxy]\nwrap=1\n[log]\nfirst_calls=2\nstats_interval_s=5\n[timing]\ncsv_always=1\n"
     "[benchmark]\nmodifier=0xA3\nkey=0x78\ndelay_s=1\nduration_s=5\nfreeze_pose=1\nbeep=0\nauto_start_s=2\n[gaze]\nread=1\n";
+const char kBackgroundIni[] = "[proxy]\nwrap=1\n";
 
 int RunScene(vr::IVRSystem* sys, vr::IVRCompositor* comp, vr::IVROverlay* ov, double seconds) {
     ID3D11Device* dev = nullptr;
@@ -119,24 +122,29 @@ int main(int argc, char** argv) {
     double scene = 0;
     std::string experiment;
     std::string center;
+    int fault = 0;
+    auto hasValue = [&](int i) { return i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0; };
     for (int i = 1; i < argc; ++i) {
-        if (!strcmp(argv[i], "--scene")) scene = i + 1 < argc ? atof(argv[++i]) : 12.0;
-        if (!strcmp(argv[i], "--experiment") && i + 1 < argc) experiment = argv[++i];
-        if (!strcmp(argv[i], "--center") && i + 2 < argc) {
+        if (!strcmp(argv[i], "--scene")) scene = hasValue(i) ? atof(argv[++i]) : 12.0;
+        else if (!strcmp(argv[i], "--experiment") && hasValue(i)) experiment = argv[++i];
+        else if (!strcmp(argv[i], "--fault") && hasValue(i)) fault = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--center") && i + 2 < argc) {
             center = std::string("center_x=") + argv[i + 1] + "\ncenter_y=" + argv[i + 2] + "\n";
             i += 2;
+        } else {
+            printf("Unknown or incomplete option: %s\n", argv[i]);
+            return 2;
         }
     }
     fs::path home = ExeDir() / L"smoke_home";
     std::error_code ec;
     fs::create_directories(home, ec);
     SetEnvironmentVariableW(L"QVFR_HOME", home.c_str());
-    if (scene > 0) {
-        if (FILE* f = _wfopen((home / L"qvfr.ini").c_str(), L"wb")) {
-            fputs(kSceneIni, f);
-            if (!experiment.empty()) fprintf(f, "[experiment]\nmode=%s\n%s", experiment.c_str(), center.c_str());
-            fclose(f);
-        }
+    if (FILE* f = _wfopen((home / L"qvfr.ini").c_str(), L"wb")) {
+        fputs(scene > 0 ? kSceneIni : kBackgroundIni, f);
+        if (!experiment.empty()) fprintf(f, "[experiment]\nmode=%s\n%s", experiment.c_str(), center.c_str());
+        if (fault > 0) fprintf(f, "[test]\nfault_frames=%d\n", fault);
+        fclose(f);
     }
 
     fs::path dll = ExeDir() / L"proxy" / L"openvr_api.dll";

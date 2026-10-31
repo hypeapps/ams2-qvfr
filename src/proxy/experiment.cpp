@@ -36,12 +36,35 @@ struct State {
     ID3D11Texture2D* pad[2] = {};
     DXGI_FORMAT padFormat = DXGI_FORMAT_UNKNOWN;
     bool padFailed = false;
-    bool mismatchLogged = false;
+    bool skipLogged = false;
     bool padLogged[2] = {};
+    // Submit counters in focus mode with pad=1, so a summary cannot claim "pad on" for frames that went out stretched.
+    uint64_t padded = 0, skipped = 0;
+    uint64_t runPadded = 0, runSkipped = 0;  // values at MarkRunStart
+    const char* skipReason = "";
 };
 
 std::mutex g_m;
 State g_s;
+
+// The experiment changes what the game renders, so it must keep working when the diagnostics kill-switch
+// (g_diagDisabled) trips; it has its own guard and its own fault flag. The proxy is built with /EHa, so a fault
+// unwinds the lock_guard inside f and g_m is released.
+std::atomic<bool> g_fault{false};
+std::atomic<bool> g_engaged{false};  // the game got a replaced size in this VR session
+
+template <class F>
+void Safe(const char* where, F&& f) {
+    if (g_fault.load(std::memory_order_relaxed)) return;
+    unsigned long code = 0;
+    __try {
+        f();
+    } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+        g_fault = true;
+        Log("ERROR: exception 0x%08lX in the experiment (%s). Experiment stopped for this session; the game keeps what it "
+            "already got (size, projection), Submit goes out without pad.", code, where);
+    }
+}
 
 int Idx(vr::EVREye e) { return e == vr::Eye_Right ? 1 : 0; }
 
@@ -99,6 +122,7 @@ void Setup(vr::IVRSystem* real) {
         e.ft = (float)(e.b - (y0 + g_s.focusH) / densY);
     }
     g_s.active = true;
+    g_engaged = true;
     Log("Experiment: mode %s, SteamVR size (1:1 grid) %u x %u, size returned to the game %u x %u (focus_size %.3f)",
         ExpModeName(g_s.mode), g_s.gridW, g_s.gridH, g_s.focusW, g_s.focusH, size);
     for (int i = 0; i < 2; ++i) {
@@ -172,111 +196,184 @@ bool EnsurePad(int e, ID3D11Device* dev, const D3D11_TEXTURE2D_DESC& src) {
     return true;
 }
 
-}  // namespace
-
-void AdjustSize(vr::IVRSystem* real, uint32_t* w, uint32_t* h) {
-    std::lock_guard lock(g_m);
-    Setup(real);
-    if (!g_s.active || !w || !h) return;
-    *w = g_s.focusW;
-    *h = g_s.focusH;
+void Skip(const char* reason) {
+    ++g_s.skipped;
+    g_s.skipReason = reason;
+    if (!g_s.skipLogged) {
+        g_s.skipLogged = true;
+        Log("Experiment: Submit without pad (%s); the compositor stretches the focus image over the full view", reason);
+    }
 }
 
-void AdjustProjectionRaw(vr::IVRSystem* real, vr::EVREye eye, float* l, float* r, float* t, float* b) {
-    std::lock_guard lock(g_m);
-    Setup(real);
-    if (!g_s.active || g_s.mode != ExpMode::Focus || !l || !r || !t || !b) return;
-    const Eye& e = g_s.eye[Idx(eye)];
-    *l = e.fl;
-    *r = e.fr;
-    *t = e.ft;
-    *b = e.fb;
+bool FullBounds(const vr::VRTextureBounds_t* b) {
+    return !b || (b->uMin == 0.0f && b->vMin == 0.0f && b->uMax == 1.0f && b->vMax == 1.0f);
 }
 
-void AdjustProjectionMatrix(vr::IVRSystem* real, vr::EVREye eye, vr::HmdMatrix44_t& m) {
-    std::lock_guard lock(g_m);
-    Setup(real);
-    if (!g_s.active || g_s.mode != ExpMode::Focus) return;
-    const Eye& e = g_s.eye[Idx(eye)];
-    // Only the x/y terms change; the depth rows stay as the runtime built them for the game's near/far and convention.
-    m.m[0][0] = 2 / (e.fr - e.fl);
-    m.m[0][2] = (e.fr + e.fl) / (e.fr - e.fl);
-    m.m[1][1] = 2 / (e.fb - e.ft);
-    m.m[1][2] = (e.fb + e.ft) / (e.fb - e.ft);
-}
-
-const vr::Texture_t* PrepareSubmit(vr::EVREye eye, const vr::Texture_t* tex, vr::Texture_t& storage) {
-    std::lock_guard lock(g_m);
-    if (!g_s.active || g_s.mode != ExpMode::Focus || !Cfg().expPad || g_s.padFailed) return tex;
-    if (!tex || tex->eType != vr::API_DirectX || !tex->handle) return tex;
+void PadLocked(vr::EVREye eye, const vr::Texture_t* tex, const vr::VRTextureBounds_t* bounds, vr::Texture_t& storage,
+               const vr::Texture_t*& out) {
+    if (!g_s.active || g_s.mode != ExpMode::Focus || !Cfg().expPad) return;
+    if (g_s.padFailed) return Skip("pad texture could not be created");
+    if (!tex || tex->eType != vr::API_DirectX || !tex->handle) return Skip("not a D3D11 texture");
+    if (!FullBounds(bounds)) return Skip("Submit with texture bounds");
     ID3D11Texture2D* src = nullptr;
     if (FAILED(static_cast<IUnknown*>(tex->handle)->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&src)) || !src)
-        return tex;
-    const vr::Texture_t* out = tex;
+        return Skip("not an ID3D11Texture2D");
     D3D11_TEXTURE2D_DESC d{};
     src->GetDesc(&d);
     if (d.Width != g_s.focusW || d.Height != g_s.focusH || d.SampleDesc.Count != 1 || d.ArraySize != 1) {
-        if (!g_s.mismatchLogged) {
-            g_s.mismatchLogged = true;
-            Log("Experiment: game texture %u x %u (samples %u, array %u) is not the returned focus size %u x %u; "
-                "submitting it as is", d.Width, d.Height, d.SampleDesc.Count, d.ArraySize, g_s.focusW, g_s.focusH);
+        if (!g_s.skipLogged)
+            Log("Experiment: game texture %u x %u (samples %u, array %u) is not the returned focus size %u x %u",
+                d.Width, d.Height, d.SampleDesc.Count, d.ArraySize, g_s.focusW, g_s.focusH);
+        src->Release();
+        return Skip("game texture size differs from the returned size");
+    }
+    int e = Idx(eye);
+    ID3D11Device* dev = nullptr;
+    src->GetDevice(&dev);
+    if (dev && EnsurePad(e, dev, d)) {
+        ID3D11DeviceContext* ctx = nullptr;
+        dev->GetImmediateContext(&ctx);
+        D3D11_BOX box{0, 0, 0, g_s.focusW, g_s.focusH, 1};
+        ctx->CopySubresourceRegion(g_s.pad[e], 0, g_s.eye[e].x0, g_s.eye[e].y0, 0, src, 0, &box);
+        ctx->Release();
+        storage = *tex;
+        storage.handle = g_s.pad[e];
+        out = &storage;
+        ++g_s.padded;
+        if (!g_s.padLogged[e]) {
+            g_s.padLogged[e] = true;
+            Log("Experiment: %s eye goes to the compositor as pad texture %p (%u x %u), game image at pixel (%u, %u)",
+                e ? "right" : "left", (void*)g_s.pad[e], g_s.gridW, g_s.gridH, g_s.eye[e].x0, g_s.eye[e].y0);
         }
     } else {
-        int e = Idx(eye);
-        ID3D11Device* dev = nullptr;
-        src->GetDevice(&dev);
-        if (dev) {
-            if (EnsurePad(e, dev, d)) {
-                ID3D11DeviceContext* ctx = nullptr;
-                dev->GetImmediateContext(&ctx);
-                D3D11_BOX box{0, 0, 0, g_s.focusW, g_s.focusH, 1};
-                ctx->CopySubresourceRegion(g_s.pad[e], 0, g_s.eye[e].x0, g_s.eye[e].y0, 0, src, 0, &box);
-                ctx->Release();
-                storage = *tex;
-                storage.handle = g_s.pad[e];
-                out = &storage;
-                if (!g_s.padLogged[e]) {
-                    g_s.padLogged[e] = true;
-                    Log("Experiment: %s eye goes to the compositor as pad texture %p (%u x %u), game image at pixel (%u, %u)",
-                        e ? "right" : "left", (void*)g_s.pad[e], g_s.gridW, g_s.gridH, g_s.eye[e].x0, g_s.eye[e].y0);
-                }
-            } else {
-                g_s.padFailed = true;
-            }
-            dev->Release();
-        }
+        g_s.padFailed = true;
+        Skip("pad texture could not be created");
     }
+    if (dev) dev->Release();
     src->Release();
+}
+
+void ShutdownLocked() {
+    std::lock_guard lock(g_m);
+    if (g_s.active && g_s.mode == ExpMode::Focus && Cfg().expPad)
+        Log("Experiment: session end, %llu Submit padded, %llu without pad%s%s%s", (unsigned long long)g_s.padded,
+            (unsigned long long)g_s.skipped, g_s.skipped ? " (last reason: " : "", g_s.skipped ? g_s.skipReason : "",
+            g_s.skipped ? ")" : "");
+    ReleasePads();
+    g_s = State{};
+}
+
+}  // namespace
+
+void AdjustSize(vr::IVRSystem* real, uint32_t* w, uint32_t* h) {
+    Safe("AdjustSize", [&] {
+        std::lock_guard lock(g_m);
+        Setup(real);
+        if (!g_s.active || !w || !h) return;
+        *w = g_s.focusW;
+        *h = g_s.focusH;
+    });
+}
+
+void AdjustProjectionRaw(vr::IVRSystem* real, vr::EVREye eye, float* l, float* r, float* t, float* b) {
+    Safe("AdjustProjectionRaw", [&] {
+        std::lock_guard lock(g_m);
+        Setup(real);
+        if (!g_s.active || g_s.mode != ExpMode::Focus || !l || !r || !t || !b) return;
+        const Eye& e = g_s.eye[Idx(eye)];
+        *l = e.fl;
+        *r = e.fr;
+        *t = e.ft;
+        *b = e.fb;
+    });
+}
+
+void AdjustProjectionMatrix(vr::IVRSystem* real, vr::EVREye eye, vr::HmdMatrix44_t& m) {
+    Safe("AdjustProjectionMatrix", [&] {
+        std::lock_guard lock(g_m);
+        Setup(real);
+        if (!g_s.active || g_s.mode != ExpMode::Focus) return;
+        const Eye& e = g_s.eye[Idx(eye)];
+        // Only the x/y terms change; the depth rows stay as the runtime built them for the game's near/far and convention.
+        m.m[0][0] = 2 / (e.fr - e.fl);
+        m.m[0][2] = (e.fr + e.fl) / (e.fr - e.fl);
+        m.m[1][1] = 2 / (e.fb - e.ft);
+        m.m[1][2] = (e.fb + e.ft) / (e.fb - e.ft);
+    });
+}
+
+const vr::Texture_t* PrepareSubmit(vr::EVREye eye, const vr::Texture_t* tex, const vr::VRTextureBounds_t* bounds,
+                                   vr::Texture_t& storage) {
+    const vr::Texture_t* out = tex;
+    Safe("PrepareSubmit", [&] {
+        std::lock_guard lock(g_m);
+        PadLocked(eye, tex, bounds, storage, out);
+    });
     return out;
 }
 
+bool Engaged() { return g_engaged.load(std::memory_order_relaxed); }
+
+void MarkRunStart() {
+    Safe("MarkRunStart", [&] {
+        std::lock_guard lock(g_m);
+        g_s.runPadded = g_s.padded;
+        g_s.runSkipped = g_s.skipped;
+    });
+}
+
 std::string Describe() {
-    std::lock_guard lock(g_m);
-    char buf[512];
-    if (!g_s.active) {
-        snprintf(buf, sizeof(buf), "Experiment: %s", g_s.mode == ExpMode::Off ? "off" : "inactive (see log)");
-        return buf;
-    }
-    const Eye& e = g_s.eye[0];
-    snprintf(buf, sizeof(buf),
-             "Experiment: mode %s, SteamVR size %u x %u, returned to the game %u x %u, focus_size %.3f; "
-             "left eye focus l %.4f r %.4f t %.4f b %.4f%s",
-             ExpModeName(g_s.mode), g_s.gridW, g_s.gridH, g_s.focusW, g_s.focusH, Cfg().expFocusSize, e.fl, e.fr, e.ft, e.fb,
-             g_s.mode == ExpMode::Focus ? (Cfg().expPad && !g_s.padFailed ? ", pad on" : ", pad off")
-                                        : " (not used: outer keeps the full projection)");
+    char buf[640] = "Experiment: (error)";
+    Safe("Describe", [&] {
+        std::lock_guard lock(g_m);
+        if (!g_s.active) {
+            snprintf(buf, sizeof(buf), "Experiment: %s", g_s.mode == ExpMode::Off ? "off" : "inactive (see log)");
+            return;
+        }
+        char pad[200] = "";
+        if (g_s.mode == ExpMode::Outer) {
+            snprintf(pad, sizeof(pad), " (not used: outer keeps the full projection)");
+        } else if (!Cfg().expPad) {
+            snprintf(pad, sizeof(pad), ", pad off (pad=0)");
+        } else {
+            uint64_t p = g_s.padded - g_s.runPadded, s = g_s.skipped - g_s.runSkipped;
+            snprintf(pad, sizeof(pad), ", pad: %llu Submit padded, %llu without pad%s%s%s since the run start",
+                     (unsigned long long)p, (unsigned long long)s, s ? " (" : "", s ? g_s.skipReason : "", s ? ")" : "");
+        }
+        const Eye& e = g_s.eye[0];
+        snprintf(buf, sizeof(buf),
+                 "Experiment: mode %s, SteamVR size %u x %u, returned to the game %u x %u, focus_size %.3f; "
+                 "left eye focus l %.4f r %.4f t %.4f b %.4f%s",
+                 ExpModeName(g_s.mode), g_s.gridW, g_s.gridH, g_s.focusW, g_s.focusH, Cfg().expFocusSize, e.fl, e.fr, e.ft,
+                 e.fb, pad);
+    });
+    if (g_fault) return std::string(buf) + " [experiment stopped after an exception, see log]";
     return buf;
 }
 
 const char* RunSuffix() {
-    std::lock_guard lock(g_m);
-    if (!g_s.active) return "";
-    return g_s.mode == ExpMode::Focus ? "_focus" : "_outer";
+    const char* s = "";
+    Safe("RunSuffix", [&] {
+        std::lock_guard lock(g_m);
+        if (!g_s.active) return;
+        if (g_s.mode == ExpMode::Outer)
+            s = "_outer";
+        else
+            s = Cfg().expPad ? "_focus" : "_focus_nopad";
+    });
+    return s;
 }
 
 void Shutdown() {
-    std::lock_guard lock(g_m);
-    ReleasePads();
-    g_s = State{};
+    // Not gated by g_fault: the textures must be released and the next VR session starts clean.
+    unsigned long code = 0;
+    __try {
+        ShutdownLocked();
+    } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+        Log("ERROR: exception 0x%08lX in experiment::Shutdown", code);
+    }
+    g_fault = false;
+    g_engaged = false;
 }
 
 }  // namespace qvfr::experiment

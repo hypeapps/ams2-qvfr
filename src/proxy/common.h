@@ -52,6 +52,8 @@ struct Config {
     float expCenterX = 0.0f;          // focus center as a view direction tangent (right = +), same for both eyes
     float expCenterY = 0.0f;          // up = +
     bool expPad = true;               // focus: copy the game texture 1:1 into a black full-FOV texture before Submit
+    // [test] (not in the default ini; used by qvfr_proxy_smoke --fault)
+    int testFaultFrames = 0;          // > 0: deliberate access violation in the diagnostics at this proxy frame
 };
 
 const Config& Cfg();

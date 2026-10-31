@@ -119,10 +119,10 @@ public:
     // Size and projection: the experiment ([experiment] in qvfr.ini) may replace them; the log shows what the game gets.
     void GetRecommendedRenderTargetSize(uint32_t* w, uint32_t* h) override {
         SystemWrapBase::GetRecommendedRenderTargetSize(w, h);
+        uint32_t realW = w ? *w : 0, realH = h ? *h : 0;
+        experiment::AdjustSize(real_, w, h);  // outside Guarded: must not depend on the diagnostics kill-switch
         Guarded("GetRecommendedRenderTargetSize", [&] {
             if (!w || !h) return;
-            uint32_t realW = *w, realH = *h;
-            experiment::AdjustSize(real_, w, h);
             frame::NoteRecommendedSize(realW, realH, *w, *h);
             if (realW != *w || realH != *h)
                 LogValue(size_, "IVRSystem::GetRecommendedRenderTargetSize = %u x %u (experiment; SteamVR %u x %u)", *w, *h,
@@ -134,8 +134,8 @@ public:
 
     vr::HmdMatrix44_t GetProjectionMatrix(vr::EVREye eye, float zn, float zf, vr::EGraphicsAPIConvention conv) override {
         vr::HmdMatrix44_t m = SystemWrapBase::GetProjectionMatrix(eye, zn, zf, conv);
+        experiment::AdjustProjectionMatrix(real_, eye, m);
         Guarded("GetProjectionMatrix", [&] {
-            experiment::AdjustProjectionMatrix(real_, eye, m);
             const auto& a = m.m;
             LogValue(projMat_[EyeIdx(eye)][conv == vr::API_OpenGL ? 1 : 0],
                      "IVRSystem::GetProjectionMatrix(%s, near %.4f, far %.1f, %s) = [%.5f %.5f %.5f %.5f | %.5f %.5f %.5f "
@@ -149,9 +149,9 @@ public:
 
     void GetProjectionRaw(vr::EVREye eye, float* l, float* r, float* t, float* b) override {
         SystemWrapBase::GetProjectionRaw(eye, l, r, t, b);
+        experiment::AdjustProjectionRaw(real_, eye, l, r, t, b);
         Guarded("GetProjectionRaw", [&] {
             if (!l || !r || !t || !b) return;
-            experiment::AdjustProjectionRaw(real_, eye, l, r, t, b);
             LogValue(projRaw_[EyeIdx(eye)], "IVRSystem::GetProjectionRaw(%s) = left %.5f right %.5f top %.5f bottom %.5f",
                      EyeName(eye), *l, *r, *t, *b);
         });
@@ -220,8 +220,7 @@ public:
                                   vr::EVRSubmitFlags flags) override {
         // Focus experiment: the compositor gets the game image placed into a full-FOV texture.
         vr::Texture_t padded{};
-        const vr::Texture_t* out = tex;
-        Guarded("experiment Submit", [&] { out = experiment::PrepareSubmit(eye, tex, padded); });
+        const vr::Texture_t* out = experiment::PrepareSubmit(eye, tex, bounds, padded);
         double t0 = NowMs();
         vr::EVRCompositorError err = CompositorWrapBase::Submit(eye, out, bounds, flags);
         frame::OnSubmit(eye, tex, bounds, flags, err, NowMs() - t0);
