@@ -22,6 +22,7 @@ Analyzed binaries are data: run the scripts with `-I` and never execute anything
 - `disasm.py <pe> <symbols.txt> <name-fragment>...`: disassembles selected functions with annotations
   (symbol names, imports, strings at RIP-relative addresses).
 - `dwarf_pe.py <pe> <out-dir>`: dumps DWARF (compile units, functions, types, variables) from a MinGW-built PE.
+- `ghidra/`: headless Ghidra export scripts (string xrefs, references to RVAs, decompilation); see [ghidra/README.md](ghidra/README.md).
 
 Example:
 

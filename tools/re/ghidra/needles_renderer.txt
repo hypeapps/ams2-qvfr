@@ -1,0 +1,51 @@
+# Renderer survey needles (AMS2, Madness engine). Substring match.
+# eye loop and render task graph
+CBeginEye
+CEndFrame
+CMain3dSceneEnd
+CHDRProcessing
+CPostProcessingFilter
+CRenderFullScreenBlur
+CRenderDOF
+CCustomFuncTask
+AdditionEyeTasks
+mainSceneRenderTasks
+preMainSceneRenderTasks
+postmainSceneRenderTasks
+BuildRenderTasksOculusRift
+BuildRenderTasksTripleScreen
+mRenderTaskManager
+BTaskManager
+CRenderThreadProcessor
+CreateRenderThreadMsg
+DeferredContextSW
+# eye render targets and VR backend
+EyeRenderTargets
+QuadRenderTargets
+HeadTrackingRenderTargets
+MWL::Base::_BVROpen
+BVROpen:
+BVROculus
+ResScale
+exposureFOV
+# once-per-frame passes and per-view state
+CCaptureBonnetReflection
+CPlanerReflectionTasks
+CDynamicEnvMap
+EnvMapUpdatesPerFrame
+dynamicPlayerCarEmap
+finishStaticEmap
+CHUDMirrorRender
+COcclusionSystem
+CMainScenePredicateResults
+PredicateRenderables
+COcclusionQuery
+DynamicLightAdaptation
+CGodRay
+CSunLensFlare
+CalcSSAOWithNormals
+Do Helmet Dof
+ApplyFXAA
+ResolveMSAA
+HDR_CombinePass
+Bloom_Threshold
