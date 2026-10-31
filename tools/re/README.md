@@ -22,6 +22,10 @@ Analyzed binaries are data: run the scripts with `-I` and never execute anything
 - `disasm.py <pe> <symbols.txt> <name-fragment>...`: disassembles selected functions with annotations
   (symbol names, imports, strings at RIP-relative addresses).
 - `dwarf_pe.py <pe> <out-dir>`: dumps DWARF (compile units, functions, types, variables) from a MinGW-built PE.
+- `anchors.py <reference-pe> <rva-file> <pe>...`: builds byte patterns at RVAs of the reference PE (whole instructions,
+  RIP-relative displacements and rel32 targets wildcarded) and lists their matches in other PEs. `anchors_m3.txt` holds the
+  renderer anchors for `AMS2AVX.exe`. Twin functions with identical code (for example two task builders) match twice;
+  tell them apart by order or by a unique anchor inside one of them.
 - `ghidra/`: headless Ghidra export scripts (string xrefs, references to RVAs, decompilation); see [ghidra/README.md](ghidra/README.md).
 
 Example:

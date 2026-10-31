@@ -1,0 +1,25 @@
+# M3 anchors in AMS2AVX.exe (reference). Format: <hex-rva> <name>
+7ae6a0 BuildRenderTasksOculusRift
+7b2033 BuildRenderTasksOculusRift eye loop end (cmp esi,3 at +0xe)
+7b2400 BuildRenderTasksTripleScreen
+7ac4b0 CInGameSection build render tasks
+7bdb90 CInGameSection view camera setup functor
+7d96f0 render context init
+9d74c0 CBeginEye ctor
+9d7670 CBeginEye Execute
+9d7750 CEndEye ctor
+9d7900 CEndEye Execute
+9d4030 CCaptureBonnetReflection ctor
+9d43d0 CCaptureBonnetReflection Execute
+9d4900 CHDRProcessing Execute
+9d6e80 CEndFrame ctor
+9d7030 CEndFrame Execute
+cd06a0 task group ctor
+cd0cd0 task group add task
+cddee0 task add dependency
+d6af00 BVROpen Create
+d6bf30 BVROpen BeginFrame
+d6ba70 BVROpen EndFrame (Submit)
+d6d360 BVROpen GetProjectionMatrix helper
+d6d470 BVROpen eye projection per frame
+1b7ab30 projection matrix builder

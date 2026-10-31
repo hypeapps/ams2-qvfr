@@ -8,6 +8,7 @@ Headless export scripts for the AMS2 executable. They only read the analyzed pro
 | `ExportRefsTo.java` | `<out-file> <rva-file>` | references to each RVA (for example delay-load IAT slots) |
 | `DecompileFunctions.java` | `<out-dir> <rva-file>` | one `.c` file per function containing each RVA, with callers and callees |
 | `ExportVtables.java` | `<out-file> <rva-file>` | vtable recovered from one known slot: start, slots, constructors that reference it |
+| `ExportScalarUses.java` | `<out-file> <scalar-file>` | instructions using each scalar (for example a struct field offset), grouped by function |
 | `ExportTaskNames.java` | `<out-file> <rva-file>` | render task class name (slot 6 `GetName`) and `Execute` (slot 9) from a constructor |
 
 Input files take one entry per line; `#` starts a comment. RVA files take a hex RVA and an optional label.

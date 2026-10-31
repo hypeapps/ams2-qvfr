@@ -1,0 +1,7 @@
+# M3 anchors that differ between the builds (SSE in AMS2.exe, VEX in AMS2AVX.exe). Reference: AMS2.exe
+7c1610 CInGameSection view camera setup functor
+d72e30 BVROpen BeginFrame
+d72930 BVROpen EndFrame (Submit)
+d74310 BVROpen GetProjectionMatrix helper
+d74420 BVROpen eye projection per frame
+d74510 BVROpen eye-to-head per frame
