@@ -17,6 +17,7 @@
 #include "common.h"
 #include "experiment.h"
 #include "modern_vr.h"
+#include "quad.h"
 #include "sysinfo.h"
 
 namespace qvfr::frame {
@@ -201,7 +202,7 @@ void StartCountdown(const char* why) {
 }
 
 void StartRun(uint32_t newestIndex) {
-    g_runDir = BenchDir() / Widen(LocalTimeStamp() + experiment::RunSuffix());
+    g_runDir = BenchDir() / Widen(LocalTimeStamp() + experiment::RunSuffix() + quad::RunSuffix());
     std::error_code ec;
     fs::create_directories(g_runDir, ec);
     g_runCsv = _wfopen((g_runDir / L"timing.csv").c_str(), L"wb");
@@ -254,6 +255,7 @@ void FinishRun(bool aborted) {
              g_recH, g_gameW, g_gameH, g_texDesc.c_str());
     lines.push_back(buf);
     lines.push_back(experiment::Describe());
+    lines.push_back(quad::Describe());
     lines.push_back(StatLine("GPU total (total_gpu)", r.totalGpu, budget));
     lines.push_back(StatLine("Game GPU before Submit", r.preGpu, budget));
     lines.push_back(StatLine("Game GPU after Submit", r.postGpu));

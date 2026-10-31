@@ -99,12 +99,19 @@ const char kDefaultIni[] =
     "; Quad views through extra eye groups in the game engine (hooks in AMS2AVX.exe, only for the known exe build).\n"
     ";   off   = no engine hooks\n"
     ";   probe = logging hooks only (task order, render context fields, D3D11 calls per eye); the image does not change\n"
+    ";   quad  = two extra eye groups render the focus views (for now with the eye cameras: the image does not change)\n"
     "mode=off\n"
     "; probe: how many frames to log in full after the first in-game frame (one more every stats_interval_s).\n"
     "probe_frames=3\n"
     "; probe: 1 = hooks in the game engine (eye tasks, builder); 1 = hooks in the D3D11 immediate context (counters).\n"
     "probe_engine=1\n"
-    "probe_d3d=1\n";
+    "probe_d3d=1\n"
+    "; quad: hotkey for a shot of the four views (outer L/R, focus L/R): PNG files in Documents\\ams2-qvfr\\shots\\\n"
+    "; and pixel differences in the log. 0xA3 = right Ctrl, 0x79 = F10; shot_key=0 turns the hotkey off.\n"
+    "shot_modifier=0xA3\n"
+    "shot_key=0x79\n"
+    "; quad: > 0 = one shot by itself this many seconds after the first frame with focus groups.\n"
+    "shot_auto_s=0\n";
 
 std::string IniString(const fs::path& ini, const wchar_t* sec, const wchar_t* key, const wchar_t* def) {
     wchar_t buf[64];
@@ -256,6 +263,8 @@ void LoadConfig() {
     std::string quad = IniString(ini, L"quad", L"mode", L"off");
     if (quad == "probe") {
         c.quadMode = QuadMode::Probe;
+    } else if (quad == "quad") {
+        c.quadMode = QuadMode::Quad;
     } else if (quad != "off") {
         Log("Settings: unknown [quad] mode=\"%s\", using off", quad.c_str());
     }
@@ -266,9 +275,13 @@ void LoadConfig() {
     }
     c.probeEngine = IniInt(ini, L"quad", L"probe_engine", 1) != 0;
     c.probeD3D = IniInt(ini, L"quad", L"probe_d3d", 1) != 0;
+    c.shotKeyMod = IniInt(ini, L"quad", L"shot_modifier", c.shotKeyMod);
+    c.shotKey = IniInt(ini, L"quad", L"shot_key", c.shotKey);
+    c.shotAutoS = IniFloat(ini, L"quad", L"shot_auto_s", 0.0f);
     if (c.quadMode != QuadMode::Off)
-        Log("Settings: [quad] mode=%s probe_frames=%d probe_engine=%d probe_d3d=%d", QuadModeName(c.quadMode),
-            c.probeFrames, c.probeEngine, c.probeD3D);
+        Log("Settings: [quad] mode=%s probe_frames=%d probe_engine=%d probe_d3d=%d shot_modifier=0x%X shot_key=0x%X "
+            "shot_auto_s=%.1f",
+            QuadModeName(c.quadMode), c.probeFrames, c.probeEngine, c.probeD3D, c.shotKeyMod, c.shotKey, c.shotAutoS);
     c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
     if (c.testFaultFrames > 0) Log("Settings: [test] fault_frames=%d (deliberate fault for testing)", c.testFaultFrames);
     g_cfg = c;
@@ -288,7 +301,13 @@ const char* ExpModeName(ExpMode m) {
     }
 }
 
-const char* QuadModeName(QuadMode m) { return m == QuadMode::Probe ? "probe" : "off"; }
+const char* QuadModeName(QuadMode m) {
+    switch (m) {
+        case QuadMode::Probe: return "probe";
+        case QuadMode::Quad: return "quad";
+        default: return "off";
+    }
+}
 
 void ReportGuardFault(const char* where, unsigned long code) {
     bool was = g_diagDisabled.exchange(true);

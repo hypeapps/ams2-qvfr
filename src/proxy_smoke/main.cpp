@@ -16,6 +16,10 @@
 //                                     the Submit texture, like AMS2; after VR_Shutdown checks the probe lines in the log
 //                                     (engine hooks off on this exe, D3D11 hooks on, the copy into Submit found, clears
 //                                     counted). No Draw: an empty Draw costs several ms in the NVIDIA driver.
+//   --quad                            [quad] mode=quad; after VR_Shutdown checks that nothing was hooked or patched
+//                                     (this exe is not the supported AMS2AVX.exe)
+//   --shots                           without SteamVR and without the proxy DLL: the proxy's shot module on synthetic
+//                                     textures (staging copies, PNG files, pixel differences)
 // smoke_home\qvfr.ini is rewritten on every run, so options never leak from one run into the next.
 
 #include <windows.h>
@@ -31,6 +35,10 @@
 #include <fstream>
 #include <set>
 #include <string>
+#include <vector>
+
+#include "common.h"
+#include "shots.h"
 
 namespace fs = std::filesystem;
 
@@ -216,6 +224,126 @@ int CheckProbe(const fs::path& logDir) {
     return ok ? 0 : 4;
 }
 
+// Quad mode on a foreign exe: the supported-build check fails, so no engine hook and no builder patch.
+int CheckQuad(const fs::path& logDir) {
+    fs::path log = NewestLog(logDir);
+    std::ifstream in(log);
+    if (!in) {
+        printf("Quad check FAILED: no proxy log in %ls\n", logDir.c_str());
+        return 5;
+    }
+    bool settings = false, notSupported = false, hooked = false, faults = false;
+    std::string line;
+    while (std::getline(in, line)) {
+        settings |= line.find("Settings: [quad] mode=quad") != std::string::npos;
+        notSupported |= line.find("Quad: exe not supported") != std::string::npos;
+        hooked |= line.find("Quad: engine hooks installed") != std::string::npos ||
+                  line.find("builder patch applied") != std::string::npos;
+        faults |= line.find("in quad mode") != std::string::npos;
+    }
+    bool ok = settings && notSupported && !hooked && !faults;
+    printf("Quad check %s: settings %d, exe not supported %d, hooks or patch %d, faults %d (%ls)\n", ok ? "OK" : "FAILED",
+           settings, notSupported, hooked, faults, log.filename().c_str());
+    return ok ? 0 : 5;
+}
+
+// PNG width and height from the IHDR chunk.
+bool PngSize(const fs::path& p, uint32_t& w, uint32_t& h) {
+    std::ifstream f(p, std::ios::binary);
+    unsigned char b[24] = {};
+    if (!f.read((char*)b, sizeof(b)) || memcmp(b + 12, "IHDR", 4) != 0) return false;
+    w = (uint32_t)b[16] << 24 | (uint32_t)b[17] << 16 | (uint32_t)b[18] << 8 | b[19];
+    h = (uint32_t)b[20] << 24 | (uint32_t)b[21] << 16 | (uint32_t)b[22] << 8 | b[23];
+    return true;
+}
+
+// The shot module on its own: four textures like the four views (outer_l == focus_l, focus_r differs from outer_r
+// in a 16 x 16 block, one image in R10G10B10A2), then the log lines and the PNG files it writes.
+int RunShots(const fs::path& home) {
+    ID3D11Device* dev = nullptr;
+    ID3D11DeviceContext* ctx = nullptr;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev,
+                                 nullptr, &ctx))) {
+        printf("D3D11CreateDevice failed\n");
+        return 1;
+    }
+    const UINT w = 1024, h = 768;
+    static const char* const names[] = {"outer_l", "outer_r", "focus_l", "focus_r", "tonemap"};
+    static const qvfr::shots::Pair pairs[] = {
+        {2, 0, "focus L vs outer L"}, {3, 1, "focus R vs outer R"}, {0, 1, "outer L vs outer R"}};
+    std::vector<uint32_t> px((size_t)w * h);
+    ID3D11Texture2D* tex[5] = {};
+    for (int i = 0; i < 5; ++i) {
+        for (UINT y = 0; y < h; ++y)
+            for (UINT x = 0; x < w; ++x) {
+                uint32_t r = x * 255 / w, g = y * 255 / h, b = (i == 1 || i == 3) ? 200 : 40;
+                if (i == 3 && x >= 500 && x < 516 && y >= 300 && y < 316) r = (r + 128) % 256;
+                px[(size_t)y * w + x] = i == 4 ? (r << 2) | (g << 12) | (b << 22) | (3u << 30)
+                                               : r | g << 8 | b << 16 | 0xFF000000u;
+            }
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = w;
+        d.Height = h;
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.Format = i == 4 ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        d.SampleDesc.Count = 1;
+        d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        D3D11_SUBRESOURCE_DATA init{px.data(), w * 4, 0};
+        if (FAILED(dev->CreateTexture2D(&d, &init, &tex[i]))) {
+            printf("Cannot create the shot textures\n");
+            return 1;
+        }
+    }
+    double t0 = qvfr::NowMs();
+    bool begun = qvfr::shots::Begin(names, 5, pairs, 3);
+    bool again = qvfr::shots::Begin(names, 5, pairs, 3);  // refused while the first shot is active
+    int grabbed = 0;
+    for (int i = 0; i < 5; ++i) grabbed += qvfr::shots::Grab(ctx, tex[i], i);
+    qvfr::shots::End(ctx);
+    // The worker writes the files; Begin succeeds again once it is done.
+    bool done = false;
+    while (!done && qvfr::NowMs() - t0 < 30000) {
+        Sleep(100);
+        if (qvfr::shots::Begin(names, 0, nullptr, 0)) {
+            qvfr::shots::Cancel();
+            done = true;
+        }
+    }
+    for (ID3D11Texture2D* t : tex) t->Release();
+    ctx->Release();
+    dev->Release();
+
+    fs::path newest;
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(home / L"shots", ec))
+        if (e.is_directory() && (newest.empty() || e.path().filename() > newest.filename())) newest = e.path();
+    int pngs = 0, halfSize = 0;
+    for (const char* n : names) {
+        uint32_t pw = 0, ph = 0;
+        if (PngSize(newest / (std::string(n) + ".png"), pw, ph)) {
+            ++pngs;
+            halfSize += pw == w / 2 && ph == h / 2;
+        }
+    }
+    std::ifstream in(NewestLog(home / L"logs"));
+    std::string line;
+    bool same = false, differs = false, parallax = false;
+    while (std::getline(in, line)) {
+        same |= line.find("focus L vs outer L: mean abs difference 0.000 (0..255), max 0,") != std::string::npos;
+        differs |= line.find("focus R vs outer R:") != std::string::npos &&
+                   line.find("> 32: 0.033%") != std::string::npos;  // 256 of 786432 pixels
+        parallax |= line.find("outer L vs outer R:") != std::string::npos &&
+                    line.find("max 0,") == std::string::npos;
+    }
+    bool ok = begun && !again && grabbed == 5 && done && pngs == 5 && halfSize == 5 && same && differs && parallax;
+    printf("Shots check %s: begin %d, second begin refused %d, grabbed %d, writer done %d (%.1f s), PNG %d (half size %d) in "
+           "%ls, diffs: identical %d, block %d, different %d\n",
+           ok ? "OK" : "FAILED", begun, !again, grabbed, done, (qvfr::NowMs() - t0) / 1000.0, pngs, halfSize,
+           newest.c_str(), same, differs, parallax);
+    return ok ? 0 : 6;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -225,6 +353,8 @@ int main(int argc, char** argv) {
     int fault = 0;
     bool trace = false;
     bool probe = false;
+    bool quad = false;
+    bool shotsTest = false;
     auto hasValue = [&](int i) { return i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0; };
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--scene")) scene = hasValue(i) ? atof(argv[++i]) : 12.0;
@@ -232,6 +362,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--fault") && hasValue(i)) fault = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--trace")) trace = true;
         else if (!strcmp(argv[i], "--probe")) probe = true;
+        else if (!strcmp(argv[i], "--quad")) quad = true;
+        else if (!strcmp(argv[i], "--shots")) shotsTest = true;
         else if (!strcmp(argv[i], "--center") && i + 2 < argc) {
             center = std::string("center_x=") + argv[i + 1] + "\ncenter_y=" + argv[i + 2] + "\n";
             i += 2;
@@ -244,12 +376,14 @@ int main(int argc, char** argv) {
     std::error_code ec;
     fs::create_directories(home, ec);
     SetEnvironmentVariableW(L"QVFR_HOME", home.c_str());
+    if (shotsTest) return RunShots(home);
     if (FILE* f = _wfopen((home / L"qvfr.ini").c_str(), L"wb")) {
         fputs(scene > 0 ? kSceneIni : kBackgroundIni, f);
         if (!experiment.empty()) fprintf(f, "[experiment]\nmode=%s\n%s", experiment.c_str(), center.c_str());
         if (fault > 0) fprintf(f, "[test]\nfault_frames=%d\n", fault);
         if (trace) fputs("[trace]\ncallers=1\ndepth=12\n", f);
         if (probe) fputs("[quad]\nmode=probe\nprobe_frames=2\n", f);
+        if (quad) fputs("[quad]\nmode=quad\n", f);
         fclose(f);
     }
 
@@ -299,6 +433,7 @@ int main(int argc, char** argv) {
         shutdown();
         if (trace && rc == 0) rc = CheckTrace(home / L"logs");
         if (probe && rc == 0) rc = CheckProbe(home / L"logs");
+        if (quad && rc == 0) rc = CheckQuad(home / L"logs");
     }
     printf("Proxy log: %ls\n", (home / L"logs").c_str());
     return rc;

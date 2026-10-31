@@ -14,6 +14,7 @@
 #include "frame.h"
 #include "generated/wrappers_0912.h"
 #include "probe.h"
+#include "quad.h"
 
 namespace qvfr {
 
@@ -77,6 +78,7 @@ void LogCallStats(bool totals) {
     LogOverlayStats();
     callers::LogStats(totals);
     probe::LogStats(totals);
+    quad::LogStats(totals);
 }
 
 namespace {
@@ -215,6 +217,7 @@ public:
         callers::Note(site);
         frame::OnWaitGetPosesBegin();
         probe::OnFrameStart();
+        quad::OnFrameStart();
         double t0 = NowMs();
         vr::EVRCompositorError err = CompositorWrapBase::WaitGetPoses(render, nRender, game, nGame);
         double t1 = NowMs();
@@ -243,6 +246,7 @@ public:
         vr::Texture_t padded{};
         const vr::Texture_t* out = experiment::PrepareSubmit(eye, tex, bounds, padded);
         probe::OnSubmitBegin(eye, tex);
+        quad::OnSubmitBegin(eye, tex);
         double t0 = NowMs();
         vr::EVRCompositorError err = CompositorWrapBase::Submit(eye, out, bounds, flags);
         probe::OnSubmitEnd(eye);
