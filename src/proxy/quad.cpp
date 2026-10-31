@@ -27,6 +27,10 @@ constexpr size_t kCtxCamBlock = 0x190;   // per view camera data; the camera fun
 constexpr size_t kCamBlockSize = 0x1a0;
 constexpr size_t kCtxQuery = 0x70c;      // per view scene query (visibility list) index, stride 4
 constexpr int kFocusView = 2;            // the view number the focus groups run as
+constexpr size_t kAppType = 0x8;         // app singleton: type (5 or 7..9 with a VR device)
+constexpr size_t kAppVr = 0xe0;          // app singleton: engine VR device (_BVROpen)
+constexpr size_t kVrEyeData = 0xa0;      // VR device: per eye data (tangents, eye to head, projection), eye 0 first
+constexpr size_t kVrEyeSize = 0x110;
 
 // Eye groups in build order. CBeginEye/CEndEye::Execute pick the tonemap target and the Submit texture by view - 1,
 // so every group after outer L writes into the right eye's Submit texture and outer L's stays untouched.
@@ -60,6 +64,7 @@ std::atomic<bool> g_on{false};
 std::atomic<bool> g_fault{false};
 bool g_installed = false;
 bool g_patched = false;
+uint8_t* g_app = nullptr;  // the engine's app singleton (static object, address taken from its getter)
 
 // Runs f under SEH. A fault stops the focus swaps for the session (Safe skips its work from then on); the detours keep
 // calling the originals, so the focus groups render the right eye like outer R.
@@ -96,16 +101,19 @@ struct Swap {
     uint8_t slot[kSlotSize];
     uint8_t block[kCamBlockSize];
     int32_t query = 0;
+    uint8_t* vr = nullptr;  // VR device whose view 2 eye data is swapped (null = not swapped)
+    uint8_t eye[kVrEyeSize];
 };
 
 struct Run {
     double t0 = 0, t1 = 0;
     void* out = nullptr;  // texture the group's CEndEye wrote (only compared)
     bool swapped = false;
+    bool eyeSwapped = false;
 };
 
 struct Stats {
-    uint64_t frames = 0, full = 0, partial = 0, swaps = 0, lateRestores = 0, outNotSubmit = 0;
+    uint64_t frames = 0, full = 0, partial = 0, swaps = 0, eyeSwaps = 0, lateRestores = 0, outNotSubmit = 0;
     double cpuMs[kGroups] = {};
 };
 
@@ -185,6 +193,14 @@ bool WritePatch(bool apply) {
 
 // ---------------------------------------------------------------- view 2 swap
 
+// The engine's VR device (app+0xe0), or null outside VR. The app type check is the one the engine does before it.
+uint8_t* VrDevice() {
+    if (!g_app) return nullptr;
+    int type = *(int*)(g_app + kAppType);
+    if (type != 5 && (unsigned)(type - 7) >= 3) return nullptr;
+    return *(uint8_t**)(g_app + kAppVr);
+}
+
 void SwapInLocked(uint8_t* ctx, int group, int src) {
     Swap& s = g_swap;
     memcpy(s.slot, ctx + kCtxSlots + kFocusView * kSlotSize, kSlotSize);
@@ -193,6 +209,14 @@ void SwapInLocked(uint8_t* ctx, int group, int src) {
     memcpy(ctx + kCtxSlots + kFocusView * kSlotSize, ctx + kCtxSlots + src * kSlotSize, kSlotSize);
     memcpy(ctx + kCtxCamBlock + kFocusView * kCamBlockSize, ctx + kCtxCamBlock + src * kCamBlockSize, kCamBlockSize);
     memcpy(ctx + kCtxQuery + kFocusView * 4, ctx + kCtxQuery + src * 4, 4);
+    // The deferred lighting reads the eye frustum tangents straight from the VR device by view - 1 (0x9ce0e8),
+    // so the view 2 eye data must be the source eye's too.
+    s.vr = VrDevice();
+    if (s.vr) {
+        uint8_t* eye = s.vr + kVrEyeData + (kFocusView - 1) * kVrEyeSize;
+        memcpy(s.eye, eye, kVrEyeSize);
+        memcpy(eye, s.vr + kVrEyeData + (src - 1) * kVrEyeSize, kVrEyeSize);
+    }
     s.ctx = ctx;
     s.group = group;
 }
@@ -206,6 +230,8 @@ void RestoreLocked() {
     memcpy(ctx + kCtxSlots + kFocusView * kSlotSize, s.slot, kSlotSize);
     memcpy(ctx + kCtxCamBlock + kFocusView * kCamBlockSize, s.block, kCamBlockSize);
     memcpy(ctx + kCtxQuery + kFocusView * 4, &s.query, 4);
+    if (s.vr) memcpy(s.vr + kVrEyeData + (kFocusView - 1) * kVrEyeSize, s.eye, kVrEyeSize);
+    s.vr = nullptr;
 }
 
 // ---------------------------------------------------------------- frame bookkeeping
@@ -221,6 +247,7 @@ void FinishFrameLocked() {
         for (int g = 0; g < kGroups; ++g) g_st.cpuMs[g] += g_run[g].t1 - g_run[g].t0;
     }
     if (g_run[FocusL].swapped) ++g_st.swaps;
+    if (g_run[FocusL].eyeSwapped) ++g_st.eyeSwaps;
     // Expected: outer L writes into the left Submit texture, the other three groups into the right one. Only frames
     // after the first Submit count (track loading runs the eye groups without Submit and without the D3D11 hook).
     bool submitting = g_lastSubmit[0] && g_lastSubmit[1];
@@ -236,7 +263,9 @@ void FinishFrameLocked() {
             char line[256];
             snprintf(line, sizeof(line), "  %-8s CBeginEye +%7.3f ms  CEndEye +%7.3f ms (%.3f ms)  output %p%s", kGroupNames[g],
                      r.t0 - g_frameT0, r.t1 - g_frameT0, r.t1 - r.t0, r.out,
-                     r.swapped ? "  (view 2 fields swapped for view 1)" : "");
+                     r.swapped ? (r.eyeSwapped ? "  (view 2 fields and VR eye data swapped for view 1)"
+                                               : "  (view 2 fields swapped for view 1, VR eye data NOT swapped)")
+                               : "");
             LogRaw(line);
         }
     }
@@ -380,6 +409,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         if (src == kFocusView || !ctx || view != kFocusView) return;
         SwapInLocked(ctx, g, src);
         r.swapped = true;
+        r.eyeSwapped = g_swap.vr != nullptr;
     });
     return o_beginExec(task, b, c, d);
 }
@@ -432,12 +462,12 @@ void STDMETHODCALLTYPE D_OMSetRenderTargets(ID3D11DeviceContext* c, UINT n, ID3D
 
 void LogStatsLocked(const Stats& s, const char* what) {
     double f = s.full ? (double)s.full : 1;
-    Log("Quad stats%s: %llu in-game frames, %llu with all four eye groups, %llu partial; focus L swaps %llu, late restores "
-        "%llu, frames with outputs other than the Submit textures %llu; CPU per group (CBeginEye to CEndEye): outer L "
-        "%.2f ms, outer R %.2f ms, focus L %.2f ms, focus R %.2f ms",
+    Log("Quad stats%s: %llu in-game frames, %llu with all four eye groups, %llu partial; focus L swaps %llu (with VR eye "
+        "data %llu), late restores %llu, frames with outputs other than the Submit textures %llu; CPU per group "
+        "(CBeginEye to CEndEye): outer L %.2f ms, outer R %.2f ms, focus L %.2f ms, focus R %.2f ms",
         what, (unsigned long long)s.frames, (unsigned long long)s.full, (unsigned long long)s.partial,
-        (unsigned long long)s.swaps, (unsigned long long)s.lateRestores, (unsigned long long)s.outNotSubmit,
-        s.cpuMs[0] / f, s.cpuMs[1] / f, s.cpuMs[2] / f, s.cpuMs[3] / f);
+        (unsigned long long)s.swaps, (unsigned long long)s.eyeSwaps, (unsigned long long)s.lateRestores,
+        (unsigned long long)s.outNotSubmit, s.cpuMs[0] / f, s.cpuMs[1] / f, s.cpuMs[2] / f, s.cpuMs[3] / f);
 }
 
 void AddStats(Stats& a, const Stats& b) {
@@ -445,6 +475,7 @@ void AddStats(Stats& a, const Stats& b) {
     a.full += b.full;
     a.partial += b.partial;
     a.swaps += b.swaps;
+    a.eyeSwaps += b.eyeSwaps;
     a.lateRestores += b.lateRestores;
     a.outNotSubmit += b.outNotSubmit;
     for (int g = 0; g < kGroups; ++g) a.cpuMs[g] += b.cpuMs[g];
@@ -484,6 +515,15 @@ void Install() {
         }
         g_installed = true;
         Log("Quad: engine hooks installed (builder, eye task ctors, CBeginEye/CEndEye Execute)");
+        // The getter returns the static app object through lea rax, [rip+disp32] at +0x20.
+        const uint8_t* lea = (const uint8_t*)hooks::Address(Anchor::AppGetter) + 0x20;
+        if (lea[0] == 0x48 && lea[1] == 0x8D && lea[2] == 0x05) {
+            g_app = const_cast<uint8_t*>(lea) + 7 + *(const int32_t*)(lea + 3);
+            Log("Quad: app object at AMS2AVX.exe+0x%llX (VR device eye data swapped with the view 2 fields)",
+                (unsigned long long)((uintptr_t)g_app - hooks::ExeBase()));
+        } else {
+            Log("Quad: app getter does not match; eye data not swapped (focus L lighting uses the right eye)");
+        }
         g_patched = WritePatch(true);
     });
     g_on = g_installed;

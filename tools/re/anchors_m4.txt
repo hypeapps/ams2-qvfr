@@ -19,3 +19,5 @@ cd06a0 TaskGroupCtor task group ctor
 cd0cd0 TaskGroupAddTask task group add task
 cddee0 TaskAddDependency task add dependency
 1b7ab30 ProjectionBuilder projection matrix builder
+9ce0e8 EyeDataRead deferred light constants: lea eax, [rbx-1]; imul rax, rcx, 0x110; add rax, 0xa0 (eye data of the VR device by view - 1)
+c8beb0 AppGetter app singleton getter (lea rax, [rip+disp] at +0x20 -> app; app+0xe0 = VR device)
