@@ -182,6 +182,8 @@ struct Stats {
     uint64_t imm = 0, other = 0, offThread = 0, ecl = 0, copies = 0, clears = 0;  // all frames
     uint64_t eyeImm[kViews] = {}, eyeN[kViews] = {}, outsideImm = 0;   // in-game frames
     double eyeMs[kViews] = {};
+    double beginMs[kViews] = {};      // CBeginEye::Execute (the game's own code inside the detour)
+    double frameMs = 0, endFrameMs = 0;  // in-game frames: WaitGetPoses entry to the next one; CEndFrame::Execute
 };
 
 std::mutex g_m;
@@ -393,6 +395,14 @@ void FinishFrameLocked() {
             }
         }
         g_st.outsideImm += imm > inEyes ? imm - inEyes : 0;
+        g_st.frameMs += NowMs() - g_frameT0;
+        for (int i = 0; i + 1 < g_evCount; ++i) {
+            const Event& b = g_ev[i];
+            const Event& n = g_ev[i + 1];
+            if (b.kind == EvBeginEye && n.kind == EvBeginEyeDone && b.view >= 0 && b.view < kViews && b.thread == n.thread)
+                g_st.beginMs[b.view] += n.t - b.t;
+            if (b.kind == EvEndFrame && n.kind == EvEndFrameDone) g_st.endFrameMs += n.t - b.t;
+        }
     }
     if (!g_detail) return;
     Log("Probe frame %llu (%s, %d events%s, %.2f ms, immediate context draws %llu, other contexts %llu):",
@@ -741,6 +751,11 @@ void LogStatsLocked(const Stats& s, const char* what) {
             "%.0f (%.2f ms); outside the eyes %.0f",
             what, avg(s.eyeImm[1], s.eyeN[1]), s.eyeN[1] ? s.eyeMs[1] / s.eyeN[1] : 0.0, avg(s.eyeImm[2], s.eyeN[2]),
             s.eyeN[2] ? s.eyeMs[2] / s.eyeN[2] : 0.0, s.outsideImm / g);
+    if (s.inGame)
+        Log("Probe stats%s: per in-game frame: %.2f ms (%.1f/s); CBeginEye::Execute view 1 %.2f ms, view 2 %.2f ms; "
+            "CEndFrame::Execute %.2f ms",
+            what, s.frameMs / g, s.frameMs > 0 ? 1000.0 * s.inGame / s.frameMs : 0.0,
+            s.eyeN[1] ? s.beginMs[1] / s.eyeN[1] : 0.0, s.eyeN[2] ? s.beginMs[2] / s.eyeN[2] : 0.0, s.endFrameMs / g);
 }
 
 void AddStats(Stats& a, const Stats& b) {
@@ -757,7 +772,10 @@ void AddStats(Stats& a, const Stats& b) {
         a.eyeImm[v] += b.eyeImm[v];
         a.eyeN[v] += b.eyeN[v];
         a.eyeMs[v] += b.eyeMs[v];
+        a.beginMs[v] += b.beginMs[v];
     }
+    a.frameMs += b.frameMs;
+    a.endFrameMs += b.endFrameMs;
 }
 
 }  // namespace
@@ -773,7 +791,9 @@ void Install() {
     }
     first = false;
     Safe("Install", [&] {
-        if (hooks::EngineAvailable()) {
+        if (!Cfg().probeEngine) {
+            Log("Probe: engine hooks off (probe_engine=0)");
+        } else if (hooks::EngineAvailable()) {
             bool ok = true;
             ok &= hooks::Create(Anchor::BuilderOculusRift, (void*)D_Builder, (void**)&o_builder);
             ok &= hooks::Create(Anchor::BeginEyeCtor, (void*)D_BeginCtor, (void**)&o_beginCtor);
@@ -822,7 +842,16 @@ void OnSubmitBegin(vr::EVREye eye, const vr::Texture_t* tex) {
                     g_dev = dev;
                     g_imm = imm;  // no reference kept: the game owns the device for the whole session
                     if (imm) {
-                        if (!g_d3dHooked) HookD3D11(imm);
+                        if (!g_d3dHooked) {
+                            if (Cfg().probeD3D)
+                                HookD3D11(imm);
+                            else
+                                Log("Probe: D3D11 hooks off (probe_d3d=0)");
+                            // Frames before the first Submit (track loading) have no D3D11 data: log the next
+                            // probe_frames in full again.
+                            std::lock_guard lock(g_m);
+                            g_detailLeft = Cfg().probeFrames;
+                        }
                         g_d3dHooked = true;
                         imm->Release();
                     }

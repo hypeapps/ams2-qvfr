@@ -62,6 +62,8 @@ struct Config {
     // [quad] (M4: focus views through extra eye groups in the engine)
     QuadMode quadMode = QuadMode::Off;
     int probeFrames = 3;              // probe: frames logged in full after the first in-game frame
+    bool probeEngine = true;          // probe: hooks in the game engine (eye tasks, builder)
+    bool probeD3D = true;             // probe: hooks in the D3D11 immediate context (draw and copy counters)
     // [test] (not in the default ini; used by qvfr_proxy_smoke --fault)
     int testFaultFrames = 0;          // > 0: deliberate access violation in the diagnostics at this proxy frame
 };

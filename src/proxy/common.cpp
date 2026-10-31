@@ -101,7 +101,10 @@ const char kDefaultIni[] =
     ";   probe = logging hooks only (task order, render context fields, D3D11 calls per eye); the image does not change\n"
     "mode=off\n"
     "; probe: how many frames to log in full after the first in-game frame (one more every stats_interval_s).\n"
-    "probe_frames=3\n";
+    "probe_frames=3\n"
+    "; probe: 1 = hooks in the game engine (eye tasks, builder); 1 = hooks in the D3D11 immediate context (counters).\n"
+    "probe_engine=1\n"
+    "probe_d3d=1\n";
 
 std::string IniString(const fs::path& ini, const wchar_t* sec, const wchar_t* key, const wchar_t* def) {
     wchar_t buf[64];
@@ -261,7 +264,11 @@ void LoadConfig() {
         Log("Settings: [quad] probe_frames=%d outside 0..100, using 3", c.probeFrames);
         c.probeFrames = 3;
     }
-    if (c.quadMode != QuadMode::Off) Log("Settings: [quad] mode=%s probe_frames=%d", QuadModeName(c.quadMode), c.probeFrames);
+    c.probeEngine = IniInt(ini, L"quad", L"probe_engine", 1) != 0;
+    c.probeD3D = IniInt(ini, L"quad", L"probe_d3d", 1) != 0;
+    if (c.quadMode != QuadMode::Off)
+        Log("Settings: [quad] mode=%s probe_frames=%d probe_engine=%d probe_d3d=%d", QuadModeName(c.quadMode),
+            c.probeFrames, c.probeEngine, c.probeD3D);
     c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
     if (c.testFaultFrames > 0) Log("Settings: [test] fault_frames=%d (deliberate fault for testing)", c.testFaultFrames);
     g_cfg = c;
