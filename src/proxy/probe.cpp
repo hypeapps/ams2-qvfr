@@ -154,10 +154,10 @@ std::string DescribeD3D11Object(uintptr_t p) {
 
 enum Ev : uint8_t {
     EvBeginEye, EvBeginEyeDone, EvEndEye, EvEndFrame, EvEndFrameDone, EvFunctor, EvFunctorDone, EvSubmit, EvSubmitDone,
-    EvCopy
+    EvCopy, EvRtSubmit
 };
 const char* const kEvNames[] = {"BeginEye", "BeginEye done", "EndEye", "EndFrame", "EndFrame done", "CameraFunctor",
-                                "CameraFunctor done", "Submit", "Submit done", "Copy"};
+                                "CameraFunctor done", "Submit", "Submit done", "Copy", "RT = Submit tex"};
 
 struct Event {
     Ev kind;
@@ -219,6 +219,10 @@ std::atomic<DWORD> g_renderThread{0}, g_drawThread{0};
 std::atomic<void*> g_submitTex[8] = {};  // recent Submit textures: [eye * 4 + i]
 int g_submitTexNext[2] = {};
 thread_local int t_inSubmit = -1;
+// Full frames only (the render thread): the last render target 0 bound on the immediate context (one reference held)
+// and whether a Submit texture was already bound as a render target in this frame.
+ID3D11RenderTargetView* g_lastRtv = nullptr;
+bool g_submitRtNoted[2] = {};
 thread_local bool t_inBuilder = false;
 
 bool IsSubmitTex(void* p, int* eye) {
@@ -436,6 +440,11 @@ void StartFrameLocked() {
     g_frameCopies0 = g_copies.load();
     g_frameClears0 = g_immClears.load();
     g_detail = false;
+    g_submitRtNoted[0] = g_submitRtNoted[1] = false;
+    if (g_lastRtv) {
+        g_lastRtv->Release();
+        g_lastRtv = nullptr;
+    }
     g_dumpPending = false;
     if (g_inGameFrames > 0 && (g_detailLeft > 0 || g_periodicDetail)) {
         g_detail = true;
@@ -540,29 +549,15 @@ void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
     Safe("CEndEye", [&] {
         std::lock_guard lock(g_m);
         char note[200] = "";
-        ID3D11DeviceContext* imm = g_imm.load();
-        // The immediate context is not thread-safe: read its bindings only on the thread that draws on it.
-        if (g_detail && imm && GetCurrentThreadId() == g_drawThread.load()) {
-            ID3D11RenderTargetView* rtv[8] = {};
-            ID3D11DepthStencilView* dsv = nullptr;
-            imm->OMGetRenderTargets(8, rtv, &dsv);
-            int n = 0;
-            for (auto* v : rtv) n += v != nullptr;
-            std::string s = "no render target";
-            if (rtv[0]) {
-                ID3D11Resource* res = nullptr;
-                rtv[0]->GetResource(&res);
-                if (res) {
-                    s = "RT0 " + DescribeResource(res);
-                    res->Release();
-                }
-            }
-            snprintf(note, sizeof(note), "%d RTV, %s%s", n, s.c_str(), dsv ? ", DSV bound" : "");
-            for (auto* v : rtv)
-                if (v) v->Release();
-            if (dsv) dsv->Release();
-        } else if (g_detail) {
-            snprintf(note, sizeof(note), "(bindings not read: not the drawing thread %lu)", g_drawThread.load());
+        // The last render target 0 of the view (the post-processing unbinds everything before CEndEye).
+        if (g_detail && g_lastRtv) {
+            ID3D11Resource* res = nullptr;
+            g_lastRtv->GetResource(&res);
+            int e = -1;
+            bool sub = res && IsSubmitTex(res, &e);
+            snprintf(note, sizeof(note), "last RT0 %s%s", res ? DescribeResource(res).c_str() : "?",
+                     sub ? (e ? " (Submit tex right)" : " (Submit tex left)") : "");
+            if (res) res->Release();
         }
         AddEventLocked(EvEndEye, TaskView(task), note);
     });
@@ -697,6 +692,38 @@ void STDMETHODCALLTYPE D_CopyResource(ID3D11DeviceContext* c, ID3D11Resource* ds
     NoteCopy(c, dst, src, false);
     o_copyResource(c, dst, src);
 }
+using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*,
+                                                      ID3D11DepthStencilView*);
+OMSetRenderTargetsFn o_omSetRt = nullptr;
+
+// Only in full frames: remembers render target 0 and notes the first bind of each Submit texture as a render target.
+void STDMETHODCALLTYPE D_OMSetRenderTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv,
+                                            ID3D11DepthStencilView* dsv) {
+    if (g_detail.load(std::memory_order_relaxed) && c == g_imm.load(std::memory_order_relaxed) && n && rtv && rtv[0]) {
+        ID3D11RenderTargetView* v = rtv[0];
+        Safe("OMSetRenderTargets", [&] {
+            std::lock_guard lock(g_m);
+            if (v != g_lastRtv) {
+                v->AddRef();
+                if (g_lastRtv) g_lastRtv->Release();
+                g_lastRtv = v;
+            }
+            ID3D11Resource* res = nullptr;
+            v->GetResource(&res);
+            int e = -1;
+            if (res && IsSubmitTex(res, &e) && !g_submitRtNoted[e]) {
+                g_submitRtNoted[e] = true;
+                char note[200];
+                snprintf(note, sizeof(note), "%s eye, first bind in this frame: %s", e ? "right" : "left",
+                         DescribeResource(res).c_str());
+                AddEventLocked(EvRtSubmit, e, note);
+            }
+            if (res) res->Release();
+        });
+    }
+    o_omSetRt(c, n, rtv, dsv);
+}
+
 void STDMETHODCALLTYPE D_ClearRtv(ID3D11DeviceContext* c, ID3D11RenderTargetView* v, const FLOAT* color) {
     if (c == g_imm.load(std::memory_order_relaxed)) g_immClears.fetch_add(1, std::memory_order_relaxed);
     o_clearRtv(c, v, color);
@@ -712,7 +739,7 @@ void STDMETHODCALLTYPE D_ExecuteCommandList(ID3D11DeviceContext* c, ID3D11Comman
 
 // ID3D11DeviceContext vtable slots (d3d11.h order).
 constexpr int kSlotDrawIndexed = 12, kSlotDraw = 13, kSlotDrawIndexedInstanced = 20, kSlotDrawInstanced = 21,
-              kSlotDispatch = 41, kSlotCopySubresourceRegion = 46, kSlotCopyResource = 47, kSlotClearRtv = 50,
+              kSlotOMSetRenderTargets = 33, kSlotDispatch = 41, kSlotCopySubresourceRegion = 46, kSlotCopyResource = 47, kSlotClearRtv = 50,
               kSlotClearDsv = 53, kSlotExecuteCommandList = 58;
 
 void HookD3D11(ID3D11DeviceContext* imm) {
@@ -727,6 +754,8 @@ void HookD3D11(ID3D11DeviceContext* imm) {
     ok &= hooks::CreateAt(vt[kSlotCopySubresourceRegion], (void*)D_CopySubresourceRegion, (void**)&o_copyRegion,
                           "CopySubresourceRegion");
     ok &= hooks::CreateAt(vt[kSlotCopyResource], (void*)D_CopyResource, (void**)&o_copyResource, "CopyResource");
+    ok &= hooks::CreateAt(vt[kSlotOMSetRenderTargets], (void*)D_OMSetRenderTargets, (void**)&o_omSetRt,
+                          "OMSetRenderTargets");
     ok &= hooks::CreateAt(vt[kSlotClearRtv], (void*)D_ClearRtv, (void**)&o_clearRtv, "ClearRenderTargetView");
     ok &= hooks::CreateAt(vt[kSlotClearDsv], (void*)D_ClearDsv, (void**)&o_clearDsv, "ClearDepthStencilView");
     ok &= hooks::CreateAt(vt[kSlotExecuteCommandList], (void*)D_ExecuteCommandList, (void**)&o_ecl, "ExecuteCommandList");
@@ -902,6 +931,8 @@ void Shutdown() {
     hooks::DisableAll();
     Safe("Shutdown", [&] {
         std::lock_guard lock(g_m);
+        if (g_lastRtv) g_lastRtv->Release();
+        g_lastRtv = nullptr;
         g_imm = nullptr;
         g_dev = nullptr;
         for (auto& t : g_submitTex) t = nullptr;
