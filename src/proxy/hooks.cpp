@@ -145,6 +145,18 @@ bool Readable(const void* p, size_t n) {
     return true;
 }
 
+bool TryRead(const void* p, void* out, size_t n) {
+    if (!p || !out || n == 0) return false;
+    __try {
+        memcpy(out, p, n);
+        return true;
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION || GetExceptionCode() == STATUS_GUARD_PAGE_VIOLATION
+                    ? EXCEPTION_EXECUTE_HANDLER
+                    : EXCEPTION_CONTINUE_SEARCH) {
+        return false;
+    }
+}
+
 bool Init() {
     std::call_once(g_once, [] {
         g_base = (uintptr_t)GetModuleHandleW(nullptr);

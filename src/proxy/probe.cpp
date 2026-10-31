@@ -49,12 +49,11 @@ void Safe(const char* where, F&& f) {
     }
 }
 
+// Game memory is read through hooks::TryRead (SEH), never through VirtualQuery: the engine's objects live in an arena
+// of several GB, and VirtualQuery there costs about 1 ms per GB (it was 15 ms per CBeginEye in the first probe run).
 template <class T>
 bool ReadAt(const void* base, size_t off, T& out) {
-    const uint8_t* p = static_cast<const uint8_t*>(base) + off;
-    if (!hooks::Readable(p, sizeof(T))) return false;
-    memcpy(&out, p, sizeof(T));
-    return true;
+    return base && hooks::TryRead(static_cast<const uint8_t*>(base) + off, &out, sizeof(T));
 }
 
 bool LooksLikePointer(uintptr_t v) { return v >= 0x10000 && v < 0x7FFFFFFF0000ull && (v & 7) == 0; }
@@ -111,9 +110,8 @@ HMODULE D3D11Module() {
 
 // A D3D11 object is recognized by its vtable inside d3d11.dll; only then QueryInterface is called on it.
 bool IsD3D11Object(uintptr_t p) {
-    if (!LooksLikePointer(p) || !hooks::Readable((void*)p, 8)) return false;
-    uintptr_t vt = *(uintptr_t*)p;
-    if (!LooksLikePointer(vt)) return false;
+    uintptr_t vt = 0;
+    if (!LooksLikePointer(p) || !hooks::TryRead((void*)p, &vt, 8) || !LooksLikePointer(vt)) return false;
     HMODULE m = nullptr;
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                             (LPCWSTR)vt, &m))
@@ -271,12 +269,13 @@ void* TaskCtx(void* task) {
 // ---------------------------------------------------------------- render context dump
 
 void DumpFloats(const char* label, const void* p, size_t bytes) {
-    if (!hooks::Readable(p, bytes)) {
+    float f[256];
+    bytes = std::min(bytes, sizeof(f));
+    if (!hooks::TryRead(p, f, bytes)) {
         Log("  %s %p: not readable", label, p);
         return;
     }
     Log("  %s %p (0x%zX B, floats):", label, p, bytes);
-    const float* f = static_cast<const float*>(p);
     for (size_t i = 0; i < bytes / 4; i += 8) {
         char line[256];
         int n = snprintf(line, sizeof(line), "    +0x%03zX:", i * 4);
@@ -287,21 +286,23 @@ void DumpFloats(const char* label, const void* p, size_t bytes) {
 
 // D3D11 objects referenced from a render target set: directly (+off) or one pointer deeper (+off -> +off2).
 void ScanForD3D11(const char* label, void* obj) {
-    if (!LooksLikePointer((uintptr_t)obj) || !hooks::Readable(obj, 0x200)) {
+    uintptr_t top[0x200 / 8];
+    if (!LooksLikePointer((uintptr_t)obj) || !hooks::TryRead(obj, top, sizeof(top))) {
         Log("  %s %p: not readable", label, obj);
         return;
     }
     int lines = 0;
     for (size_t off = 0; off < 0x200 && lines < 32; off += 8) {
-        uintptr_t q = *(uintptr_t*)((uint8_t*)obj + off);
+        uintptr_t q = top[off / 8];
         if (IsD3D11Object(q)) {
             Log("  %s +0x%03zX: %s", label, off, DescribeD3D11Object(q).c_str());
             ++lines;
             continue;
         }
-        if (!LooksLikePointer(q) || !hooks::Readable((void*)q, 0x100)) continue;
+        uintptr_t sub[0x100 / 8];
+        if (!LooksLikePointer(q) || !hooks::TryRead((void*)q, sub, sizeof(sub))) continue;
         for (size_t off2 = 0; off2 < 0x100 && lines < 32; off2 += 8) {
-            uintptr_t r = *(uintptr_t*)(q + off2);
+            uintptr_t r = sub[off2 / 8];
             if (IsD3D11Object(r)) {
                 Log("  %s +0x%03zX -> +0x%02zX: %s", label, off, off2, DescribeD3D11Object(r).c_str());
                 ++lines;

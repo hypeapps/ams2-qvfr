@@ -31,7 +31,11 @@ bool CreateAt(void* target, void* detour, void** original, const char* name);
 void DisableAll();  // VR_Shutdown: detours stop; trampolines stay, a thread may still be inside one
 void EnableAll();   // a later VR_Init
 
-// Pointer and memory range checks before reading game memory (VirtualQuery, committed and readable).
+// Memory range check with VirtualQuery (committed and readable). Its cost grows with the size of the region that
+// holds p, about 1 ms per GB, so it is only for small regions (the exe image), never for game heap objects.
 bool Readable(const void* p, size_t n);
+// Copies n bytes from game memory under SEH; false on an access violation (or a guard page). Cheap: use this for
+// game objects.
+bool TryRead(const void* p, void* out, size_t n);
 
 }  // namespace qvfr::hooks
