@@ -221,11 +221,13 @@ void FinishFrameLocked() {
         for (int g = 0; g < kGroups; ++g) g_st.cpuMs[g] += g_run[g].t1 - g_run[g].t0;
     }
     if (g_run[FocusL].swapped) ++g_st.swaps;
-    // Expected: outer L writes into the left Submit texture, the other three groups into the right one.
-    bool outOk = g_run[OuterL].out == g_lastSubmit[0];
-    for (int g = OuterR; g < kGroups; ++g) outOk &= g_run[g].out == g_lastSubmit[1];
-    if (full && !outOk) ++g_st.outNotSubmit;
-    if (full && g_detailLeft > 0) {
+    // Expected: outer L writes into the left Submit texture, the other three groups into the right one. Only frames
+    // after the first Submit count (track loading runs the eye groups without Submit and without the D3D11 hook).
+    bool submitting = g_lastSubmit[0] && g_lastSubmit[1];
+    bool outOk = g_run[OuterL].out && g_run[OuterL].out == g_lastSubmit[0];
+    for (int g = OuterR; g < kGroups; ++g) outOk &= g_run[g].out && g_run[g].out == g_lastSubmit[1];
+    if (full && submitting && !outOk) ++g_st.outNotSubmit;
+    if (full && submitting && g_detailLeft > 0) {
         --g_detailLeft;
         Log("Quad frame %llu (all four eye groups%s):", (unsigned long long)g_frameNo,
             outOk ? ", outputs are the Submit textures as expected" : ", OUTPUTS DIFFER from the Submit textures");
@@ -420,10 +422,11 @@ using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT
 OMSetRenderTargetsFn o_omSetRt = nullptr;
 constexpr int kSlotOMSetRenderTargets = 33;  // ID3D11DeviceContext vtable (d3d11.h order)
 
-// Inside CEndEye::Execute the game binds the eye's Submit texture and copies the view's final image into it.
+// Inside CEndEye::Execute the game first binds the eye's Submit texture and copies the view's final image into it
+// (0xdb7ab0), then draws the desktop mirror (3440 x 1440 in the first M4.2 run), so only the first bind counts.
 void STDMETHODCALLTYPE D_OMSetRenderTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv,
                                             ID3D11DepthStencilView* dsv) {
-    if (t_inEndEye && n && rtv && rtv[0] && c == g_imm.load(std::memory_order_relaxed)) t_endRtv = rtv[0];
+    if (t_inEndEye && !t_endRtv && n && rtv && rtv[0] && c == g_imm.load(std::memory_order_relaxed)) t_endRtv = rtv[0];
     o_omSetRt(c, n, rtv, dsv);
 }
 
