@@ -10,6 +10,8 @@
 //   --experiment focus|outer          sets [experiment] mode (size and projection replaced by the proxy)
 //   --center X Y                      with --experiment: focus center tangents (center_x, center_y)
 //   --fault N                         [test] fault_frames=N: a deliberate exception in the proxy diagnostics at frame N
+//   --trace                           [trace] callers=1; after VR_Shutdown checks the caller stacks in the proxy log
+//                                     (they start in this exe, no proxy frames, each unique stack once, hits counted)
 // smoke_home\qvfr.ini is rewritten on every run, so options never leak from one run into the next.
 
 #include <windows.h>
@@ -22,6 +24,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <set>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -116,6 +120,62 @@ int RunScene(vr::IVRSystem* sys, vr::IVRCompositor* comp, vr::IVROverlay* ov, do
     return 0;
 }
 
+// Newest proxy log in smoke_home\logs.
+fs::path NewestLog(const fs::path& dir) {
+    fs::path best;
+    fs::file_time_type bestTime{};
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+        if (e.path().extension() != L".log") continue;
+        auto t = e.last_write_time(ec);
+        if (best.empty() || t > bestTime) {
+            best = e.path();
+            bestTime = t;
+        }
+    }
+    return best;
+}
+
+// Reads "Caller stack <method> #<n> (...): <frames>" and "Caller stacks <method> (session total): #1 <hits>, ..." lines.
+int CheckTrace(const fs::path& logDir) {
+    fs::path log = NewestLog(logDir);
+    std::ifstream in(log);
+    if (!in) {
+        printf("Trace check FAILED: no proxy log in %ls\n", logDir.c_str());
+        return 3;
+    }
+    const std::string kStack = "Caller stack ", kTotal = "Caller stacks ", kSelf = "qvfr_proxy_smoke.exe+";
+    std::set<std::string> seen;
+    int stacks = 0, fromSmoke = 0, withProxy = 0, duplicates = 0, totals = 0, counted = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        size_t p = line.find(kStack);
+        size_t colon = line.find("): ", p);
+        if (p != std::string::npos && colon != std::string::npos) {
+            std::string method = line.substr(p + kStack.size(), line.find(" #", p) - p - kStack.size());
+            std::string frames = line.substr(colon + 3);
+            ++stacks;
+            if (frames.compare(0, kSelf.size(), kSelf) == 0) ++fromSmoke;
+            if (frames.find("openvr_api.dll+") != std::string::npos) ++withProxy;
+            if (!seen.insert(method + "|" + frames).second) ++duplicates;
+        }
+        p = line.find(kTotal);
+        if (p != std::string::npos && line.find("(session total)", p) != std::string::npos) {
+            ++totals;
+            // A stack hit more than once was counted, not logged again.
+            for (size_t h = line.find('#', p); h != std::string::npos; h = line.find('#', h + 1)) {
+                size_t sp = line.find(' ', h);
+                if (sp != std::string::npos && atoi(line.c_str() + sp + 1) > 1) ++counted;
+            }
+        }
+    }
+    bool ok = stacks > 0 && fromSmoke > 0 && !withProxy && !duplicates && totals > 0 && counted > 0;
+    printf("Trace check %s: %d caller stacks (%d starting in qvfr_proxy_smoke.exe), %d with proxy frames, %d duplicates, "
+           "%d session totals, %d stacks hit more than once (%ls)\n",
+           ok ? "OK" : "FAILED", stacks, fromSmoke, withProxy, duplicates, totals, counted, log.filename().c_str());
+    return ok ? 0 : 3;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -123,11 +183,13 @@ int main(int argc, char** argv) {
     std::string experiment;
     std::string center;
     int fault = 0;
+    bool trace = false;
     auto hasValue = [&](int i) { return i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0; };
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--scene")) scene = hasValue(i) ? atof(argv[++i]) : 12.0;
         else if (!strcmp(argv[i], "--experiment") && hasValue(i)) experiment = argv[++i];
         else if (!strcmp(argv[i], "--fault") && hasValue(i)) fault = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--trace")) trace = true;
         else if (!strcmp(argv[i], "--center") && i + 2 < argc) {
             center = std::string("center_x=") + argv[i + 1] + "\ncenter_y=" + argv[i + 2] + "\n";
             i += 2;
@@ -144,6 +206,7 @@ int main(int argc, char** argv) {
         fputs(scene > 0 ? kSceneIni : kBackgroundIni, f);
         if (!experiment.empty()) fprintf(f, "[experiment]\nmode=%s\n%s", experiment.c_str(), center.c_str());
         if (fault > 0) fprintf(f, "[test]\nfault_frames=%d\n", fault);
+        if (trace) fputs("[trace]\ncallers=1\ndepth=12\n", f);
         fclose(f);
     }
 
@@ -177,6 +240,9 @@ int main(int argc, char** argv) {
         sys->GetProjectionRaw(vr::Eye_Left, &l, &r, &t, &b);
         sys->GetProjectionMatrix(vr::Eye_Left, 0.05f, 1000.0f, vr::API_DirectX);
         sys->GetEyeToHeadTransform(vr::Eye_Right);
+        // A second call site hit several times: with --trace one more stack of this method, counted, not logged again.
+        // The volatile counter keeps the compiler from unrolling the loop into separate call sites.
+        for (volatile int i = 0; i < 4; ++i) sys->GetEyeToHeadTransform((vr::EVREye)(i & 1));
         printf("Size %u x %u, left eye: left %.4f right %.4f top %.4f bottom %.4f\n", w, h, l, r, t, b);
         vr::IVRCompositor* comp = compositor();
         vr::IVROverlay* ov = overlay();
@@ -188,6 +254,7 @@ int main(int argc, char** argv) {
                (void*)GetProcAddress(m, "VR_IVRSystem_GetRecommendedRenderTargetSize"));
         if (scene > 0 && comp) rc = RunScene(sys, comp, ov, scene);
         shutdown();
+        if (trace && rc == 0) rc = CheckTrace(home / L"logs");
     }
     printf("Proxy log: %ls\n", (home / L"logs").c_str());
     return rc;

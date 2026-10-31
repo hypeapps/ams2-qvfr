@@ -5,6 +5,7 @@ add_library(qvfr_proxy SHARED
   wrappers.cpp
   frame.cpp
   experiment.cpp
+  callers.cpp
   modern_vr.cpp
   sysinfo.cpp
   common.cpp

@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "callers.h"
 #include "common.h"
 #include "experiment.h"
 #include "frame.h"
@@ -73,6 +74,7 @@ void LogCallStats(bool totals) {
     }
     g_lastStatsMs = now;
     LogOverlayStats();
+    callers::LogStats(totals);
 }
 
 namespace {
@@ -118,6 +120,8 @@ public:
 
     // Size and projection: the experiment ([experiment] in qvfr.ini) may replace them; the log shows what the game gets.
     void GetRecommendedRenderTargetSize(uint32_t* w, uint32_t* h) override {
+        static callers::Site site{"IVRSystem::GetRecommendedRenderTargetSize"};
+        callers::Note(site);
         SystemWrapBase::GetRecommendedRenderTargetSize(w, h);
         uint32_t realW = w ? *w : 0, realH = h ? *h : 0;
         experiment::AdjustSize(real_, w, h);  // outside Guarded: must not depend on the diagnostics kill-switch
@@ -133,6 +137,8 @@ public:
     }
 
     vr::HmdMatrix44_t GetProjectionMatrix(vr::EVREye eye, float zn, float zf, vr::EGraphicsAPIConvention conv) override {
+        static callers::Site site{"IVRSystem::GetProjectionMatrix"};
+        callers::Note(site);
         vr::HmdMatrix44_t m = SystemWrapBase::GetProjectionMatrix(eye, zn, zf, conv);
         experiment::AdjustProjectionMatrix(real_, eye, m);
         Guarded("GetProjectionMatrix", [&] {
@@ -148,6 +154,8 @@ public:
     }
 
     void GetProjectionRaw(vr::EVREye eye, float* l, float* r, float* t, float* b) override {
+        static callers::Site site{"IVRSystem::GetProjectionRaw"};
+        callers::Note(site);
         SystemWrapBase::GetProjectionRaw(eye, l, r, t, b);
         experiment::AdjustProjectionRaw(real_, eye, l, r, t, b);
         Guarded("GetProjectionRaw", [&] {
@@ -158,6 +166,8 @@ public:
     }
 
     vr::HmdMatrix34_t GetEyeToHeadTransform(vr::EVREye eye) override {
+        static callers::Site site{"IVRSystem::GetEyeToHeadTransform"};
+        callers::Note(site);
         vr::HmdMatrix34_t m = SystemWrapBase::GetEyeToHeadTransform(eye);
         Guarded("GetEyeToHeadTransform", [&] {
             const auto& a = m.m;
@@ -178,6 +188,8 @@ public:
 
     void GetDeviceToAbsoluteTrackingPose(vr::ETrackingUniverseOrigin origin, float predict, vr::TrackedDevicePose_t* poses,
                                          uint32_t count) override {
+        static callers::Site site{"IVRSystem::GetDeviceToAbsoluteTrackingPose"};
+        callers::Note(site);
         SystemWrapBase::GetDeviceToAbsoluteTrackingPose(origin, predict, poses, count);
         Guarded("GetDeviceToAbsoluteTrackingPose", [&] {
             LogValue(devicePose_, "IVRSystem::GetDeviceToAbsoluteTrackingPose(origin %d, %u devices)", (int)origin, count);
@@ -197,6 +209,8 @@ public:
 
     vr::EVRCompositorError WaitGetPoses(vr::TrackedDevicePose_t* render, uint32_t nRender, vr::TrackedDevicePose_t* game,
                                         uint32_t nGame) override {
+        static callers::Site site{"IVRCompositor::WaitGetPoses"};
+        callers::Note(site);
         frame::OnWaitGetPosesBegin();
         double t0 = NowMs();
         vr::EVRCompositorError err = CompositorWrapBase::WaitGetPoses(render, nRender, game, nGame);
@@ -211,6 +225,8 @@ public:
 
     vr::EVRCompositorError GetLastPoses(vr::TrackedDevicePose_t* render, uint32_t nRender, vr::TrackedDevicePose_t* game,
                                         uint32_t nGame) override {
+        static callers::Site site{"IVRCompositor::GetLastPoses"};
+        callers::Note(site);
         vr::EVRCompositorError err = CompositorWrapBase::GetLastPoses(render, nRender, game, nGame);
         frame::FilterLastPoses(render, nRender, game, nGame);
         return err;
@@ -218,6 +234,8 @@ public:
 
     vr::EVRCompositorError Submit(vr::EVREye eye, const vr::Texture_t* tex, const vr::VRTextureBounds_t* bounds,
                                   vr::EVRSubmitFlags flags) override {
+        static callers::Site site{"IVRCompositor::Submit"};
+        callers::Note(site);
         // Focus experiment: the compositor gets the game image placed into a full-FOV texture.
         vr::Texture_t padded{};
         const vr::Texture_t* out = experiment::PrepareSubmit(eye, tex, bounds, padded);
@@ -243,6 +261,8 @@ public:
     using OverlayWrapBase::OverlayWrapBase;
 
     vr::EVROverlayError CreateOverlay(const char* key, const char* name, vr::VROverlayHandle_t* handle) override {
+        static callers::Site site{"IVROverlay::CreateOverlay"};
+        callers::Note(site);
         vr::EVROverlayError err = OverlayWrapBase::CreateOverlay(key, name, handle);
         Guarded("CreateOverlay", [&] {
             Log("IVROverlay::CreateOverlay(\"%s\", \"%s\") = handle 0x%llX, error %d", key ? key : "", name ? name : "",
@@ -256,24 +276,32 @@ public:
     }
 
     vr::EVROverlayError DestroyOverlay(vr::VROverlayHandle_t h) override {
+        static callers::Site site{"IVROverlay::DestroyOverlay"};
+        callers::Note(site);
         Guarded("DestroyOverlay", [&] { Log("IVROverlay::DestroyOverlay(%s)", Name(h).c_str()); });
         return OverlayWrapBase::DestroyOverlay(h);
     }
 
     // Visibility, width and alpha: logged only on change (at most kLimit times per overlay and property).
     vr::EVROverlayError ShowOverlay(vr::VROverlayHandle_t h) override {
+        static callers::Site site{"IVROverlay::ShowOverlay"};
+        callers::Note(site);
         vr::EVROverlayError err = OverlayWrapBase::ShowOverlay(h);
         Guarded("ShowOverlay", [&] { Visible(h, 1, err); });
         return err;
     }
 
     vr::EVROverlayError HideOverlay(vr::VROverlayHandle_t h) override {
+        static callers::Site site{"IVROverlay::HideOverlay"};
+        callers::Note(site);
         vr::EVROverlayError err = OverlayWrapBase::HideOverlay(h);
         Guarded("HideOverlay", [&] { Visible(h, 0, err); });
         return err;
     }
 
     vr::EVROverlayError SetOverlayWidthInMeters(vr::VROverlayHandle_t h, float w) override {
+        static callers::Site site{"IVROverlay::SetOverlayWidthInMeters"};
+        callers::Note(site);
         vr::EVROverlayError err = OverlayWrapBase::SetOverlayWidthInMeters(h, w);
         Guarded("SetOverlayWidthInMeters", [&] {
             std::lock_guard lock(m_);
@@ -286,6 +314,8 @@ public:
     }
 
     vr::EVROverlayError SetOverlayAlpha(vr::VROverlayHandle_t h, float a) override {
+        static callers::Site site{"IVROverlay::SetOverlayAlpha"};
+        callers::Note(site);
         vr::EVROverlayError err = OverlayWrapBase::SetOverlayAlpha(h, a);
         Guarded("SetOverlayAlpha", [&] {
             std::lock_guard lock(m_);
@@ -301,6 +331,8 @@ public:
 
     vr::EVROverlayError SetOverlayTransformAbsolute(vr::VROverlayHandle_t h, vr::ETrackingUniverseOrigin origin,
                                                     const vr::HmdMatrix34_t* m) override {
+        static callers::Site site{"IVROverlay::SetOverlayTransformAbsolute"};
+        callers::Note(site);
         vr::EVROverlayError err = OverlayWrapBase::SetOverlayTransformAbsolute(h, origin, m);
         Guarded("SetOverlayTransformAbsolute", [&] {
             std::lock_guard lock(m_);
@@ -322,6 +354,8 @@ public:
     }
 
     vr::EVROverlayError SetOverlayTexture(vr::VROverlayHandle_t h, const vr::Texture_t* tex) override {
+        static callers::Site site{"IVROverlay::SetOverlayTexture"};
+        callers::Note(site);
         vr::EVROverlayError err = OverlayWrapBase::SetOverlayTexture(h, tex);
         Guarded("SetOverlayTexture", [&] {
             if (!tex) return;

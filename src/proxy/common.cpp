@@ -86,7 +86,14 @@ const char kDefaultIni[] =
     "center_y=0\n"
     "; focus only: 1 = copy the game image 1:1 into a black full-FOV texture, so it shows in its real place and scale.\n"
     "; 0 = submit the game texture as is (the compositor stretches it over the whole field of view).\n"
-    "pad=1\n";
+    "pad=1\n"
+    "\n"
+    "[trace]\n"
+    "; 1 = log where in the game the key OpenVR calls come from (size, projection, eye transforms, poses, Submit, overlays):\n"
+    "; every unique call stack once as module+RVA, hit counts in the stats. For reverse engineering, normally 0.\n"
+    "callers=0\n"
+    "; Game frames per stack (1..48).\n"
+    "depth=12\n";
 
 std::string IniString(const fs::path& ini, const wchar_t* sec, const wchar_t* key, const wchar_t* def) {
     wchar_t buf[64];
@@ -228,6 +235,13 @@ void LoadConfig() {
     c.expCenterX = IniFloat(ini, L"experiment", L"center_x", 0.0f);
     c.expCenterY = IniFloat(ini, L"experiment", L"center_y", 0.0f);
     c.expPad = IniInt(ini, L"experiment", L"pad", 1) != 0;
+    c.traceCallers = IniInt(ini, L"trace", L"callers", 0) != 0;
+    c.traceDepth = IniInt(ini, L"trace", L"depth", c.traceDepth);
+    if (c.traceDepth < 1 || c.traceDepth > 48) {
+        Log("Settings: [trace] depth=%d outside 1..48, using 12", c.traceDepth);
+        c.traceDepth = 12;
+    }
+    if (c.traceCallers) Log("Settings: [trace] callers=1 depth=%d (unique caller stacks of key methods)", c.traceDepth);
     c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
     if (c.testFaultFrames > 0) Log("Settings: [test] fault_frames=%d (deliberate fault for testing)", c.testFaultFrames);
     g_cfg = c;

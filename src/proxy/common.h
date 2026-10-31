@@ -52,6 +52,9 @@ struct Config {
     float expCenterX = 0.0f;          // focus center as a view direction tangent (right = +), same for both eyes
     float expCenterY = 0.0f;          // up = +
     bool expPad = true;               // focus: copy the game texture 1:1 into a black full-FOV texture before Submit
+    // [trace] (M3: where in the game the key OpenVR calls come from)
+    bool traceCallers = false;        // log every unique call stack of the key methods once (module+RVA)
+    int traceDepth = 12;              // game frames per stack (proxy frames are not counted)
     // [test] (not in the default ini; used by qvfr_proxy_smoke --fault)
     int testFaultFrames = 0;          // > 0: deliberate access violation in the diagnostics at this proxy frame
 };
