@@ -22,6 +22,10 @@ Analyzed binaries are data: run the scripts with `-I` and never execute anything
 - `disasm.py <pe> <symbols.txt> <name-fragment>...`: disassembles selected functions with annotations
   (symbol names, imports, strings at RIP-relative addresses).
 - `dwarf_pe.py <pe> <out-dir>`: dumps DWARF (compile units, functions, types, variables) from a MinGW-built PE.
+- `anchors.py <reference-pe> <rva-file> [--emit-cpp <out.inc>] <pe>...`: with `--emit-cpp` it also writes the anchors
+  as an X-macro list for the proxy; `anchors_m4.txt` (first word of each name = C++ identifier) generates
+  `src/proxy/generated/anchors_ams2avx.inc`. Regenerate after changing the list or after a game update:
+  `python -I tools/re/anchors.py <AMS2AVX.exe> tools/re/anchors_m4.txt --emit-cpp src/proxy/generated/anchors_ams2avx.inc <AMS2AVX.exe>`.
 - `anchors.py <reference-pe> <rva-file> <pe>...`: builds byte patterns at RVAs of the reference PE (whole instructions,
   RIP-relative displacements and rel32 targets wildcarded) and lists their matches in other PEs. `anchors_m3.txt` holds the
   renderer anchors for `AMS2AVX.exe`. Twin functions with identical code (for example two task builders) match twice;

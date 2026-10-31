@@ -19,6 +19,7 @@
 #include "experiment.h"
 #include "frame.h"
 #include "modern_vr.h"
+#include "probe.h"
 #include "sysinfo.h"
 #include "wrappers.h"
 
@@ -158,6 +159,7 @@ IVRSystem* VR_CALLTYPE VR_Init(EVRInitError* peError, EVRApplicationType eApplic
     }
     if (g_fn.getGeneric) modern::Init(reinterpret_cast<modern::GetGenericFn>(g_fn.getGeneric));
     Guarded("LogModules", [] { sysinfo::LogModules("after VR_Init"); });
+    probe::Install();  // [quad] mode=probe; guards itself
     return Wrap() ? wrap::System(real) : real;
 }
 
@@ -166,6 +168,7 @@ void VR_CALLTYPE VR_Shutdown() {
     if (!Ready()) return;
     frame::OnShutdown();
     Guarded("LogCallStats", [] { LogCallStats(true); });
+    probe::Shutdown();
     modern::Shutdown();
     if (g_fn.shutdown) g_fn.shutdown();
 }

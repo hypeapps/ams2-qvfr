@@ -1,0 +1,21 @@
+# M4 anchors in AMS2AVX.exe (reference). Format: <hex-rva> <Id> <description>
+# The Id is the C++ name in src/proxy/generated/anchors_ams2avx.inc (anchors.py --emit-cpp).
+7ae6a0 BuilderOculusRift BuildRenderTasksOculusRift (VR task graph builder)
+7b0ce0 BuilderGroupStore eye loop: mov [rsp+rax*8+0x50], r13 (group array store, disp8 at +4)
+7b0cfe BuilderGroupLoad eye loop: mov rdx, [rsp+rax*8+0x50] (previous group, disp8 at +4)
+7b2041 BuilderLoopCmp eye loop end: cmp esi, 3 (imm8 at +2)
+7b20bd BuilderPostmainArray postmain dependencies: lea rbx, [rsp+0x50] (disp8 at +4)
+7bdb90 ViewCameraFunctor CInGameSection view camera setup functor
+9d74c0 BeginEyeCtor CBeginEye ctor
+9d7670 BeginEyeExecute CBeginEye Execute
+9d7750 EndEyeCtor CEndEye ctor
+9d7900 EndEyeExecute CEndEye Execute
+9d4030 BonnetReflectionCtor CCaptureBonnetReflection ctor
+9d43d0 BonnetReflectionExecute CCaptureBonnetReflection Execute
+9d4900 HdrExecute CHDRProcessing Execute
+9d6e80 EndFrameCtor CEndFrame ctor
+9d7030 EndFrameExecute CEndFrame Execute
+cd06a0 TaskGroupCtor task group ctor
+cd0cd0 TaskGroupAddTask task group add task
+cddee0 TaskAddDependency task add dependency
+1b7ab30 ProjectionBuilder projection matrix builder

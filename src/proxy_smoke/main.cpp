@@ -12,6 +12,10 @@
 //   --fault N                         [test] fault_frames=N: a deliberate exception in the proxy diagnostics at frame N
 //   --trace                           [trace] callers=1; after VR_Shutdown checks the caller stacks in the proxy log
 //                                     (they start in this exe, no proxy frames, each unique stack once, hits counted)
+//   --probe                           [quad] mode=probe; the scene clears a "final" texture per eye and copies it into
+//                                     the Submit texture, like AMS2; after VR_Shutdown checks the probe lines in the log
+//                                     (engine hooks off on this exe, D3D11 hooks on, the copy into Submit found, clears
+//                                     counted). No Draw: an empty Draw costs several ms in the NVIDIA driver.
 // smoke_home\qvfr.ini is rewritten on every run, so options never leak from one run into the next.
 
 #include <windows.h>
@@ -50,7 +54,7 @@ const char kSceneIni[] =
     "[benchmark]\nmodifier=0xA3\nkey=0x78\ndelay_s=1\nduration_s=5\nfreeze_pose=1\nbeep=0\nauto_start_s=2\n[gaze]\nread=1\n";
 const char kBackgroundIni[] = "[proxy]\nwrap=1\n";
 
-int RunScene(vr::IVRSystem* sys, vr::IVRCompositor* comp, vr::IVROverlay* ov, double seconds) {
+int RunScene(vr::IVRSystem* sys, vr::IVRCompositor* comp, vr::IVROverlay* ov, double seconds, bool probe) {
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
     if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev,
@@ -74,10 +78,12 @@ int RunScene(vr::IVRSystem* sys, vr::IVRCompositor* comp, vr::IVROverlay* ov, do
     rv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
     ID3D11Texture2D* tex[2] = {};
+    ID3D11Texture2D* final[2] = {};  // --probe: the eye image is drawn here and copied into the Submit texture
     ID3D11RenderTargetView* rtv[2] = {};
     for (int e = 0; e < 2; ++e) {
-        if (FAILED(dev->CreateTexture2D(&d, nullptr, &tex[e])) ||
-            FAILED(dev->CreateRenderTargetView(tex[e], &rv, &rtv[e]))) {
+        ID3D11Texture2D*& target = probe ? final[e] : tex[e];
+        if ((probe && FAILED(dev->CreateTexture2D(&d, nullptr, &tex[e]))) ||
+            FAILED(dev->CreateTexture2D(&d, nullptr, &target)) || FAILED(dev->CreateRenderTargetView(target, &rv, &rtv[e]))) {
             printf("Cannot create the eye textures\n");
             return 1;
         }
@@ -94,6 +100,7 @@ int RunScene(vr::IVRSystem* sys, vr::IVRCompositor* comp, vr::IVROverlay* ov, do
         for (int e = 0; e < 2; ++e) {
             const float c[4] = {0.25f, 0.25f, 0.28f, 1.0f};
             ctx->ClearRenderTargetView(rtv[e], c);
+            if (probe) ctx->CopyResource(tex[e], final[e]);
             vr::Texture_t t{tex[e], vr::API_DirectX, vr::ColorSpace_Gamma};
             comp->Submit((vr::EVREye)e, &t, nullptr, vr::Submit_Default);
         }
@@ -114,6 +121,7 @@ int RunScene(vr::IVRSystem* sys, vr::IVRCompositor* comp, vr::IVROverlay* ov, do
     for (int e = 0; e < 2; ++e) {
         rtv[e]->Release();
         tex[e]->Release();
+        if (final[e]) final[e]->Release();
     }
     ctx->Release();
     dev->Release();
@@ -176,6 +184,38 @@ int CheckTrace(const fs::path& logDir) {
     return ok ? 0 : 3;
 }
 
+// Probe lines: engine hooks off on this exe, D3D11 hooks installed, a copy into each eye's Submit texture,
+// stats with immediate context clears (one ClearRenderTargetView per eye and frame in the scene).
+int CheckProbe(const fs::path& logDir) {
+    fs::path log = NewestLog(logDir);
+    std::ifstream in(log);
+    if (!in) {
+        printf("Probe check FAILED: no proxy log in %ls\n", logDir.c_str());
+        return 4;
+    }
+    bool engineOff = false, d3d = false, intoLeft = false, intoRight = false, total = false, faults = false;
+    double clears = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        engineOff |= line.find("Probe: engine hooks off") != std::string::npos;
+        d3d |= line.find("Probe: D3D11 hooks installed") != std::string::npos;
+        intoLeft |= line.find("into Submit texture of the left eye") != std::string::npos;
+        intoRight |= line.find("into Submit texture of the right eye") != std::string::npos;
+        faults |= line.find("exception") != std::string::npos && line.find("probe") != std::string::npos;
+        size_t p = line.find("Probe stats (session total)");
+        size_t q = line.find("clears ", p);
+        if (p != std::string::npos && q != std::string::npos) {
+            total = true;
+            clears = atof(line.c_str() + q + strlen("clears "));
+        }
+    }
+    bool ok = engineOff && d3d && intoLeft && intoRight && total && clears >= 1.5 && !faults;
+    printf("Probe check %s: engine hooks off %d, D3D11 hooks %d, copy into Submit left %d right %d, session stats %d "
+           "(%.2f immediate clears per frame, expected about 2), probe faults %d (%ls)\n",
+           ok ? "OK" : "FAILED", engineOff, d3d, intoLeft, intoRight, total, clears, faults, log.filename().c_str());
+    return ok ? 0 : 4;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -184,12 +224,14 @@ int main(int argc, char** argv) {
     std::string center;
     int fault = 0;
     bool trace = false;
+    bool probe = false;
     auto hasValue = [&](int i) { return i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0; };
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--scene")) scene = hasValue(i) ? atof(argv[++i]) : 12.0;
         else if (!strcmp(argv[i], "--experiment") && hasValue(i)) experiment = argv[++i];
         else if (!strcmp(argv[i], "--fault") && hasValue(i)) fault = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--trace")) trace = true;
+        else if (!strcmp(argv[i], "--probe")) probe = true;
         else if (!strcmp(argv[i], "--center") && i + 2 < argc) {
             center = std::string("center_x=") + argv[i + 1] + "\ncenter_y=" + argv[i + 2] + "\n";
             i += 2;
@@ -207,6 +249,7 @@ int main(int argc, char** argv) {
         if (!experiment.empty()) fprintf(f, "[experiment]\nmode=%s\n%s", experiment.c_str(), center.c_str());
         if (fault > 0) fprintf(f, "[test]\nfault_frames=%d\n", fault);
         if (trace) fputs("[trace]\ncallers=1\ndepth=12\n", f);
+        if (probe) fputs("[quad]\nmode=probe\nprobe_frames=2\n", f);
         fclose(f);
     }
 
@@ -252,9 +295,10 @@ int main(int argc, char** argv) {
         // Forwarded exports work once the original is loaded (after the first call into the proxy).
         printf("Forwarded VR_IVRSystem_GetRecommendedRenderTargetSize after VR_Init: %p\n",
                (void*)GetProcAddress(m, "VR_IVRSystem_GetRecommendedRenderTargetSize"));
-        if (scene > 0 && comp) rc = RunScene(sys, comp, ov, scene);
+        if (scene > 0 && comp) rc = RunScene(sys, comp, ov, scene, probe);
         shutdown();
         if (trace && rc == 0) rc = CheckTrace(home / L"logs");
+        if (probe && rc == 0) rc = CheckProbe(home / L"logs");
     }
     printf("Proxy log: %ls\n", (home / L"logs").c_str());
     return rc;

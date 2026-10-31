@@ -93,7 +93,15 @@ const char kDefaultIni[] =
     "; every unique call stack once as module+RVA, hit counts in the stats. For reverse engineering, normally 0.\n"
     "callers=0\n"
     "; Game frames per stack (1..48).\n"
-    "depth=12\n";
+    "depth=12\n"
+    "\n"
+    "[quad]\n"
+    "; Quad views through extra eye groups in the game engine (hooks in AMS2AVX.exe, only for the known exe build).\n"
+    ";   off   = no engine hooks\n"
+    ";   probe = logging hooks only (task order, render context fields, D3D11 calls per eye); the image does not change\n"
+    "mode=off\n"
+    "; probe: how many frames to log in full after the first in-game frame (one more every stats_interval_s).\n"
+    "probe_frames=3\n";
 
 std::string IniString(const fs::path& ini, const wchar_t* sec, const wchar_t* key, const wchar_t* def) {
     wchar_t buf[64];
@@ -242,6 +250,18 @@ void LoadConfig() {
         c.traceDepth = 12;
     }
     if (c.traceCallers) Log("Settings: [trace] callers=1 depth=%d (unique caller stacks of key methods)", c.traceDepth);
+    std::string quad = IniString(ini, L"quad", L"mode", L"off");
+    if (quad == "probe") {
+        c.quadMode = QuadMode::Probe;
+    } else if (quad != "off") {
+        Log("Settings: unknown [quad] mode=\"%s\", using off", quad.c_str());
+    }
+    c.probeFrames = IniInt(ini, L"quad", L"probe_frames", c.probeFrames);
+    if (c.probeFrames < 0 || c.probeFrames > 100) {
+        Log("Settings: [quad] probe_frames=%d outside 0..100, using 3", c.probeFrames);
+        c.probeFrames = 3;
+    }
+    if (c.quadMode != QuadMode::Off) Log("Settings: [quad] mode=%s probe_frames=%d", QuadModeName(c.quadMode), c.probeFrames);
     c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
     if (c.testFaultFrames > 0) Log("Settings: [test] fault_frames=%d (deliberate fault for testing)", c.testFaultFrames);
     g_cfg = c;
@@ -260,6 +280,8 @@ const char* ExpModeName(ExpMode m) {
         default: return "off";
     }
 }
+
+const char* QuadModeName(QuadMode m) { return m == QuadMode::Probe ? "probe" : "off"; }
 
 void ReportGuardFault(const char* where, unsigned long code) {
     bool was = g_diagDisabled.exchange(true);

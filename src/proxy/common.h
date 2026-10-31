@@ -28,6 +28,10 @@ std::wstring Widen(const std::string& s);
 enum class ExpMode { Off, Focus, Outer };
 const char* ExpModeName(ExpMode m);
 
+// off: no engine hooks; probe: logging hooks in the engine and in D3D11 (M4.1), the image does not change.
+enum class QuadMode { Off, Probe };
+const char* QuadModeName(QuadMode m);
+
 struct Config {
     // [proxy]
     bool wrap = true;                 // 0 = the game gets the real interfaces, the proxy only logs startup
@@ -55,6 +59,9 @@ struct Config {
     // [trace] (M3: where in the game the key OpenVR calls come from)
     bool traceCallers = false;        // log every unique call stack of the key methods once (module+RVA)
     int traceDepth = 12;              // game frames per stack (proxy frames are not counted)
+    // [quad] (M4: focus views through extra eye groups in the engine)
+    QuadMode quadMode = QuadMode::Off;
+    int probeFrames = 3;              // probe: frames logged in full after the first in-game frame
     // [test] (not in the default ini; used by qvfr_proxy_smoke --fault)
     int testFaultFrames = 0;          // > 0: deliberate access violation in the diagnostics at this proxy frame
 };
