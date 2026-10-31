@@ -1,0 +1,40 @@
+# Local-only notes and research material: never pushed
+/docs/
+/.claude/
+/assets/
+/CLAUDE.md
+CLAUDE.local.md
+
+# Build output
+/build/
+/out/
+CMakeUserPresets.json
+CMakeCache.txt
+CMakeFiles/
+*.obj
+*.ilk
+*.exp
+*.idb
+*.ipch
+
+# Runtime output of the tools (logs, CSV, generated ini)
+*.log
+smoke_home/
+
+# IDEs
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store

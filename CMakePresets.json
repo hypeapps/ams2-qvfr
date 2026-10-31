@@ -1,0 +1,17 @@
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "Ninja Multi-Config, MSVC x64 (run from a vcvars64 environment, see build.ps1)",
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/build",
+      "environment": { "CC": "cl", "CXX": "cl" },
+      "cacheVariables": { "CMAKE_CONFIGURATION_TYPES": "Debug;Release" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "debug", "configurePreset": "default", "configuration": "Debug" },
+    { "name": "release", "configurePreset": "default", "configuration": "Release" }
+  ]
+}

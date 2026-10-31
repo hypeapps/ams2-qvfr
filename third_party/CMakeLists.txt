@@ -1,0 +1,20 @@
+# OpenVR SDK 2.15.6: headers for the tools (gaze test) and for newer interfaces (IVRSystem_026, IVRInput_011).
+add_library(openvr_sdk INTERFACE)
+target_include_directories(openvr_sdk INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/openvr-2.15.6/headers)
+set(OPENVR_SDK_DLL ${CMAKE_CURRENT_SOURCE_DIR}/openvr-2.15.6/bin/win64/openvr_api.dll CACHE INTERNAL "")
+
+# OpenVR 0.9.12: the version AMS2 talks to (IVRSystem_009, IVRCompositor_009, IVROverlay_007).
+# The DLL is byte-identical to the game's x64\openvr_api.dll (MD5 864be5a92276ce2b902b6f3a0f850703).
+add_library(openvr_0912 INTERFACE)
+target_include_directories(openvr_0912 INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/openvr-0.9.12/headers)
+set(OPENVR_0912_DLL ${CMAKE_CURRENT_SOURCE_DIR}/openvr-0.9.12/bin/win64/openvr_api.dll CACHE INTERNAL "")
+
+# MinHook 1.3.4 (BSD-2-Clause), built from source as a static library.
+add_library(minhook STATIC
+  minhook/src/buffer.c
+  minhook/src/hook.c
+  minhook/src/trampoline.c
+  minhook/src/hde/hde64.c
+)
+target_include_directories(minhook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/minhook/include)
+target_compile_options(minhook PRIVATE /W3)
