@@ -70,7 +70,29 @@ const char kDefaultIni[] =
     "\n"
     "[gaze]\n"
     "; 1 = read gaze through IVRSystem_026::GetEyeTrackedFoveationCenter every frame (log and CSV).\n"
-    "read=1\n";
+    "read=1\n"
+    "\n"
+    "[experiment]\n"
+    "; Size and projection test without engine hooks. The game reads both once per VR session, so restart the game\n"
+    "; after a change. The size reported by SteamVR is treated as the 1:1 grid.\n"
+    ";   off   = no change (reference)\n"
+    ";   focus = the game renders only the focus window (focus_size of the tangent span) at 1:1 density\n"
+    ";   outer = the game renders the full FOV into a texture of the focus size\n"
+    "mode=off\n"
+    "; Focus window as a fraction of the eye's tangent span, both axes (0.5 = 50% x 50%).\n"
+    "focus_size=0.5\n"
+    "; Focus center as view direction tangents, the same for both eyes (0,0 = optical axis; right and up are +).\n"
+    "center_x=0\n"
+    "center_y=0\n"
+    "; focus only: 1 = copy the game image 1:1 into a black full-FOV texture, so it shows in its real place and scale.\n"
+    "; 0 = submit the game texture as is (the compositor stretches it over the whole field of view).\n"
+    "pad=1\n";
+
+std::string IniString(const fs::path& ini, const wchar_t* sec, const wchar_t* key, const wchar_t* def) {
+    wchar_t buf[64];
+    GetPrivateProfileStringW(sec, key, def, buf, 64, ini.c_str());
+    return Narrow(buf);
+}
 
 int IniInt(const fs::path& ini, const wchar_t* sec, const wchar_t* key, int def) {
     wchar_t buf[64];
@@ -190,11 +212,37 @@ void LoadConfig() {
     c.benchBeep = IniInt(ini, L"benchmark", L"beep", 1) != 0;
     c.benchAutoStartS = IniFloat(ini, L"benchmark", L"auto_start_s", 0.0f);
     c.gazeRead = IniInt(ini, L"gaze", L"read", 1) != 0;
+    std::string mode = IniString(ini, L"experiment", L"mode", L"off");
+    if (mode == "focus") {
+        c.expMode = ExpMode::Focus;
+    } else if (mode == "outer") {
+        c.expMode = ExpMode::Outer;
+    } else if (mode != "off") {
+        Log("Settings: unknown [experiment] mode=\"%s\", using off", mode.c_str());
+    }
+    c.expFocusSize = IniFloat(ini, L"experiment", L"focus_size", c.expFocusSize);
+    if (!(c.expFocusSize >= 0.1f && c.expFocusSize <= 1.0f)) {
+        Log("Settings: focus_size=%.3f outside 0.1..1, using 0.5", c.expFocusSize);
+        c.expFocusSize = 0.5f;
+    }
+    c.expCenterX = IniFloat(ini, L"experiment", L"center_x", 0.0f);
+    c.expCenterY = IniFloat(ini, L"experiment", L"center_y", 0.0f);
+    c.expPad = IniInt(ini, L"experiment", L"pad", 1) != 0;
     g_cfg = c;
     Log("Settings %s: wrap=%d first_calls=%d stats_interval_s=%d csv_always=%d | benchmark: modifier=0x%X key=0x%X "
-        "delay_s=%.1f duration_s=%.1f freeze_pose=%d beep=%d auto_start_s=%.1f | gaze read=%d",
+        "delay_s=%.1f duration_s=%.1f freeze_pose=%d beep=%d auto_start_s=%.1f | gaze read=%d | experiment: mode=%s "
+        "focus_size=%.3f center=(%.3f, %.3f) pad=%d",
         Narrow(ini.wstring()).c_str(), c.wrap, c.firstCalls, c.statsIntervalS, c.csvAlways, c.benchKeyMod, c.benchKey,
-        c.benchDelayS, c.benchDurationS, c.benchFreezePose, c.benchBeep, c.benchAutoStartS, c.gazeRead);
+        c.benchDelayS, c.benchDurationS, c.benchFreezePose, c.benchBeep, c.benchAutoStartS, c.gazeRead,
+        ExpModeName(c.expMode), c.expFocusSize, c.expCenterX, c.expCenterY, c.expPad);
+}
+
+const char* ExpModeName(ExpMode m) {
+    switch (m) {
+        case ExpMode::Focus: return "focus";
+        case ExpMode::Outer: return "outer";
+        default: return "off";
+    }
 }
 
 void ReportGuardFault(const char* where, unsigned long code) {

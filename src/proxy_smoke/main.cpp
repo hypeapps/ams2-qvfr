@@ -7,6 +7,8 @@
 //                                     (does not take the HMD from other applications; needs SteamVR running)
 //   qvfr_proxy_smoke.exe --scene 12   Scene application: 12 s of D3D11 frames (grey background) with Submit,
 //                                     the benchmark starts by itself (auto_start_s=2, delay_s=1, duration_s=5)
+//   --experiment focus|outer          with --scene: sets [experiment] mode (size and projection replaced by the proxy)
+//   --center X Y                      with --experiment: focus center tangents (center_x, center_y)
 
 #include <windows.h>
 #include <d3d11.h>
@@ -49,23 +51,26 @@ int RunScene(vr::IVRSystem* sys, vr::IVRCompositor* comp, vr::IVROverlay* ov, do
         printf("D3D11CreateDevice failed\n");
         return 1;
     }
+    // Like AMS2: textures of exactly the size the proxy returns, R8G8B8A8_TYPELESS with GENERATE_MIPS, typed RTV.
     uint32_t w = 0, h = 0;
     sys->GetRecommendedRenderTargetSize(&w, &h);
-    w /= 4;
-    h /= 4;  // size does not matter for the test, smaller = faster
     D3D11_TEXTURE2D_DESC d{};
     d.Width = w;
     d.Height = h;
     d.MipLevels = 1;
     d.ArraySize = 1;
-    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+    d.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
     d.SampleDesc.Count = 1;
     d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    d.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+    D3D11_RENDER_TARGET_VIEW_DESC rv{};
+    rv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
     ID3D11Texture2D* tex[2] = {};
     ID3D11RenderTargetView* rtv[2] = {};
     for (int e = 0; e < 2; ++e) {
         if (FAILED(dev->CreateTexture2D(&d, nullptr, &tex[e])) ||
-            FAILED(dev->CreateRenderTargetView(tex[e], nullptr, &rtv[e]))) {
+            FAILED(dev->CreateRenderTargetView(tex[e], &rv, &rtv[e]))) {
             printf("Cannot create the eye textures\n");
             return 1;
         }
@@ -112,8 +117,15 @@ int RunScene(vr::IVRSystem* sys, vr::IVRCompositor* comp, vr::IVROverlay* ov, do
 
 int main(int argc, char** argv) {
     double scene = 0;
+    std::string experiment;
+    std::string center;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--scene")) scene = i + 1 < argc ? atof(argv[++i]) : 12.0;
+        if (!strcmp(argv[i], "--experiment") && i + 1 < argc) experiment = argv[++i];
+        if (!strcmp(argv[i], "--center") && i + 2 < argc) {
+            center = std::string("center_x=") + argv[i + 1] + "\ncenter_y=" + argv[i + 2] + "\n";
+            i += 2;
+        }
     }
     fs::path home = ExeDir() / L"smoke_home";
     std::error_code ec;
@@ -122,6 +134,7 @@ int main(int argc, char** argv) {
     if (scene > 0) {
         if (FILE* f = _wfopen((home / L"qvfr.ini").c_str(), L"wb")) {
             fputs(kSceneIni, f);
+            if (!experiment.empty()) fprintf(f, "[experiment]\nmode=%s\n%s", experiment.c_str(), center.c_str());
             fclose(f);
         }
     }

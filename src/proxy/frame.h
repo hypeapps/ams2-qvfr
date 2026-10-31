@@ -19,7 +19,7 @@ void OnSetTrackingSpace(vr::ETrackingUniverseOrigin origin);
 void OnSubmit(vr::EVREye eye, const vr::Texture_t* tex, const vr::VRTextureBounds_t* bounds, vr::EVRSubmitFlags flags,
               vr::EVRCompositorError err, double durMs);
 
-void NoteRecommendedSize(uint32_t w, uint32_t h);
+void NoteRecommendedSize(uint32_t realW, uint32_t realH, uint32_t returnedW, uint32_t returnedH);
 std::string TextureInfo(void* handle, int type);  // D3D11 texture description for the log (size, format, samples)
 void OnShutdown();
 

@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "common.h"
+#include "experiment.h"
 #include "modern_vr.h"
 #include "sysinfo.h"
 
@@ -59,7 +60,8 @@ bool g_sharedLogged = false;
 bool g_deviceLogged = false;
 void* g_frameHandle[2] = {};
 std::string g_texDesc;        // the last texture description, for the benchmark summary
-uint32_t g_recW = 0, g_recH = 0;
+uint32_t g_recW = 0, g_recH = 0;    // size from SteamVR
+uint32_t g_gameW = 0, g_gameH = 0;  // size returned to the game (differs in the experiment)
 double g_firstSubmitMs = -1;
 
 // ---------------------------------------------------------------- gaze and periodic stats
@@ -199,7 +201,7 @@ void StartCountdown(const char* why) {
 }
 
 void StartRun(uint32_t newestIndex) {
-    g_runDir = BenchDir() / Widen(LocalTimeStamp());
+    g_runDir = BenchDir() / Widen(LocalTimeStamp() + experiment::RunSuffix());
     std::error_code ec;
     fs::create_directories(g_runDir, ec);
     g_runCsv = _wfopen((g_runDir / L"timing.csv").c_str(), L"wb");
@@ -247,9 +249,10 @@ void FinishRun(bool aborted) {
     snprintf(buf, sizeof(buf), "Frames %llu in %.2f s (%.2f fps), budget %.2f ms (%.1f Hz)", (unsigned long long)r.frames,
              dur, dur > 0 ? (r.frames - 1) / dur : 0.0, budget, 1000.0 / budget);
     lines.push_back(buf);
-    snprintf(buf, sizeof(buf), "Size recommended by SteamVR (returned to the game) %u x %u; Submit texture: %s", g_recW, g_recH,
-             g_texDesc.c_str());
+    snprintf(buf, sizeof(buf), "Size recommended by SteamVR %u x %u, returned to the game %u x %u; Submit texture: %s", g_recW,
+             g_recH, g_gameW, g_gameH, g_texDesc.c_str());
     lines.push_back(buf);
+    lines.push_back(experiment::Describe());
     lines.push_back(StatLine("GPU total (total_gpu)", r.totalGpu, budget));
     lines.push_back(StatLine("Game GPU before Submit", r.preGpu, budget));
     lines.push_back(StatLine("Game GPU after Submit", r.postGpu));
@@ -589,9 +592,11 @@ std::string TextureInfo(void* handle, int type) {
     return s;
 }
 
-void NoteRecommendedSize(uint32_t w, uint32_t h) {
-    g_recW = w;
-    g_recH = h;
+void NoteRecommendedSize(uint32_t realW, uint32_t realH, uint32_t returnedW, uint32_t returnedH) {
+    g_recW = realW;
+    g_recH = realH;
+    g_gameW = returnedW;
+    g_gameH = returnedH;
 }
 
 void OnShutdown() {
@@ -615,6 +620,7 @@ void OnShutdown() {
         g_frozen = false;
         g_frozenPose.bPoseIsValid = false;
     });
+    Guarded("experiment::Shutdown", [] { experiment::Shutdown(); });
 }
 
 }  // namespace qvfr::frame

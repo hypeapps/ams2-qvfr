@@ -24,6 +24,10 @@ std::wstring Widen(const std::string& s);
 
 // ---------------------------------------------------------------- settings (qvfr.ini)
 
+// off: no change; focus: narrow FOV at 1:1 density; outer: full FOV in a texture of the focus size.
+enum class ExpMode { Off, Focus, Outer };
+const char* ExpModeName(ExpMode m);
+
 struct Config {
     // [proxy]
     bool wrap = true;                 // 0 = the game gets the real interfaces, the proxy only logs startup
@@ -42,6 +46,12 @@ struct Config {
     float benchAutoStartS = 0.0f;     // > 0: the benchmark starts by itself this many seconds after the first Submit
     // [gaze]
     bool gazeRead = true;             // read gaze through IVRSystem_026 every frame
+    // [experiment] (M2.5: the proxy alone changes the size and projection the game gets)
+    ExpMode expMode = ExpMode::Off;
+    float expFocusSize = 0.5f;        // focus window as a fraction of the eye's tangent span (both axes)
+    float expCenterX = 0.0f;          // focus center as a view direction tangent (right = +), same for both eyes
+    float expCenterY = 0.0f;          // up = +
+    bool expPad = true;               // focus: copy the game texture 1:1 into a black full-FOV texture before Submit
 };
 
 const Config& Cfg();
