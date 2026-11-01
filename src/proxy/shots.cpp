@@ -167,8 +167,10 @@ Span Footprint(double s, double e, int size) {
 // a shows the rectangle r of b: average a over the footprint of each b pixel fully inside r, compare with that pixel.
 void DiffRegion(const Image& a, const Image& b, const Pair& r, DiffStats& st) {
     const double kx = a.w / (double)r.rw, ky = a.h / (double)r.rh;  // a pixels per b pixel
-    const int u0 = std::max(0, (int)std::ceil(r.rx)), u1 = std::min((int)b.w, (int)std::floor(r.rx + r.rw));
-    const int v0 = std::max(0, (int)std::ceil(r.ry)), v1 = std::min((int)b.h, (int)std::floor(r.ry + r.rh));
+    const int u0 = std::max(0, (int)std::ceil(r.rx + r.inset));
+    const int u1 = std::min((int)b.w, (int)std::floor(r.rx + r.rw - r.inset));
+    const int v0 = std::max(0, (int)std::ceil(r.ry + r.inset));
+    const int v1 = std::min((int)b.h, (int)std::floor(r.ry + r.rh - r.inset));
     if (u0 >= u1 || v0 >= v1) return;
     std::vector<Span> cols(u1 - u0);
     for (int u = u0; u < u1; ++u) cols[u - u0] = Footprint((u - r.rx) * kx, (u + 1 - r.rx) * kx, (int)a.w);
@@ -197,8 +199,8 @@ void LogDiff(const Image& a, const Image& b, const Pair& pair) {
     char what[160] = "";
     if (pair.rw > 0 && pair.rh > 0) {
         DiffRegion(a, b, pair, st);
-        snprintf(what, sizeof(what), " (first image averaged into %.1f x %.1f pixels at (%.1f, %.1f) of the second)",
-                 pair.rw, pair.rh, pair.rx, pair.ry);
+        snprintf(what, sizeof(what), " (first image averaged into %.1f x %.1f pixels at (%.1f, %.1f) of the second%s)",
+                 pair.rw, pair.rh, pair.rx, pair.ry, pair.inset > 0 ? ", edge band left out" : "");
     } else if (a.w != b.w || a.h != b.h) {
         Log("Shot: %s: sizes differ (%u x %u and %u x %u)", pair.label, a.w, a.h, b.w, b.h);
         return;

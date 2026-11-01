@@ -20,6 +20,8 @@
 //                                     (this exe is not the supported AMS2AVX.exe)
 //   --shots                           without SteamVR and without the proxy DLL: the proxy's shot module on synthetic
 //                                     textures (staging copies, PNG files, pixel differences)
+//   --quad-compose                    without SteamVR and without the proxy DLL: the proxy's composition module on
+//                                     synthetic textures (pixels by region, pipeline state restored)
 // smoke_home\qvfr.ini is rewritten on every run, so options never leak from one run into the next.
 
 #include <windows.h>
@@ -38,6 +40,7 @@
 #include <vector>
 
 #include "common.h"
+#include "compose.h"
 #include "shots.h"
 
 namespace fs = std::filesystem;
@@ -358,6 +361,162 @@ int RunShots(const fs::path& home) {
     return ok ? 0 : 6;
 }
 
+// The composition module on its own: a constant outer and a patterned focus (without shader resource binding, so the
+// copy path runs) into a 1024 x 768 grid, both eyes, twice. Checks the pixels by region (focus 1:1 inside the blend
+// band, outer in the margin and outside the window, between the two in the feather band) and that the pipeline
+// state set before the draw is back afterwards.
+int RunCompose() {
+    ID3D11Device* dev = nullptr;
+    ID3D11DeviceContext* ctx = nullptr;
+    // With the debug layer (Graphics Tools) when installed: its warnings (binding hazards, state) fail the check.
+    bool debugLayer = SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, D3D11_CREATE_DEVICE_DEBUG,
+                                                  nullptr, 0, D3D11_SDK_VERSION, &dev, nullptr, &ctx));
+    if (!debugLayer && FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+                                                D3D11_SDK_VERSION, &dev, nullptr, &ctx))) {
+        printf("D3D11CreateDevice failed\n");
+        return 1;
+    }
+    ID3D11InfoQueue* info = nullptr;
+    if (debugLayer) dev->QueryInterface(__uuidof(ID3D11InfoQueue), (void**)&info);
+    qvfr::compose::Layout l;
+    l.gridW = 1024;
+    l.gridH = 768;
+    l.focusW = 512;
+    l.focusH = 384;
+    l.x0 = 300;
+    l.y0 = 200;
+    l.marginPx = 8;
+    l.featherPx = 32;
+    const uint32_t outerPx = 0xFF967D32u;  // r 50, g 125, b 150
+    auto focusPx = [](uint32_t x, uint32_t y) {
+        return ((x * 7) & 255) | ((y * 13) & 255) << 8 | (((x ^ y) * 5) & 255) << 16 | 0xFF000000u;
+    };
+    std::vector<uint32_t> px((size_t)l.focusW * l.focusH);
+    auto make = [&](bool focus, UINT bind, ID3D11Texture2D** t) {
+        for (uint32_t y = 0; y < l.focusH; ++y)
+            for (uint32_t x = 0; x < l.focusW; ++x) px[(size_t)y * l.focusW + x] = focus ? focusPx(x, y) : outerPx;
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = l.focusW;
+        d.Height = l.focusH;
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
+        d.SampleDesc.Count = 1;
+        d.BindFlags = bind;
+        D3D11_SUBRESOURCE_DATA init{px.data(), l.focusW * 4, 0};
+        return SUCCEEDED(dev->CreateTexture2D(&d, &init, t));
+    };
+    ID3D11Texture2D *outer = nullptr, *focus = nullptr, *dummy = nullptr;
+    ID3D11RenderTargetView* dummyRtv = nullptr;
+    bool made = make(false, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, &outer) &&
+                make(true, D3D11_BIND_RENDER_TARGET, &focus) && make(false, D3D11_BIND_RENDER_TARGET, &dummy);
+    D3D11_RENDER_TARGET_VIEW_DESC rv{};
+    rv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    made = made && SUCCEEDED(dev->CreateRenderTargetView(dummy, &rv, &dummyRtv));
+    if (!made) {
+        printf("Cannot create the composition test textures\n");
+        return 1;
+    }
+    // The "game" state: one render target, a viewport and a triangle strip.
+    const D3D11_VIEWPORT gameVp = {1, 2, 300, 200, 0, 1};
+    ctx->OMSetRenderTargets(1, &dummyRtv, nullptr);
+    ctx->RSSetViewports(1, &gameVp);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    ID3D11Texture2D* out[2] = {};
+    for (int round = 0; round < 2; ++round)
+        for (int e = 0; e < 2; ++e) out[e] = qvfr::compose::Draw(ctx, e, outer, focus, l);
+    ID3D11RenderTargetView* rtvAfter = nullptr;
+    ctx->OMGetRenderTargets(1, &rtvAfter, nullptr);
+    D3D11_VIEWPORT vpAfter{};
+    UINT nvp = 1;
+    ctx->RSGetViewports(&nvp, &vpAfter);
+    D3D11_PRIMITIVE_TOPOLOGY topoAfter{};
+    ctx->IAGetPrimitiveTopology(&topoAfter);
+    bool stateOk = rtvAfter == dummyRtv && nvp == 1 && !memcmp(&vpAfter, &gameVp, sizeof(gameVp)) &&
+                   topoAfter == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
+    if (rtvAfter) rtvAfter->Release();
+
+    // Read back the left eye and check each pixel by its distance to the focus window edge.
+    uint64_t inner = 0, innerBad = 0, outside = 0, outsideBad = 0, band = 0, bandBad = 0;
+    bool readOk = false;
+    D3D11_TEXTURE2D_DESC od{};
+    if (out[0] && out[1] && out[0] != out[1]) {
+        out[0]->GetDesc(&od);
+        D3D11_TEXTURE2D_DESC s = od;
+        s.Usage = D3D11_USAGE_STAGING;
+        s.BindFlags = 0;
+        s.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ID3D11Texture2D* staging = nullptr;
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (SUCCEEDED(dev->CreateTexture2D(&s, nullptr, &staging))) {
+            ctx->CopyResource(staging, out[0]);
+            if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
+                readOk = true;
+                auto near1 = [](uint32_t a, uint32_t b) {
+                    for (int c = 0; c < 24; c += 8)
+                        if (std::abs((int)((a >> c) & 255) - (int)((b >> c) & 255)) > 1) return false;
+                    return true;
+                };
+                auto between = [](uint32_t v, uint32_t a, uint32_t b) {
+                    for (int c = 0; c < 24; c += 8) {
+                        int x = (v >> c) & 255, p = (a >> c) & 255, q = (b >> c) & 255;
+                        if (x < std::min(p, q) - 1 || x > std::max(p, q) + 1) return false;
+                    }
+                    return true;
+                };
+                for (uint32_t y = 0; y < od.Height; ++y) {
+                    const uint32_t* row = (const uint32_t*)((const uint8_t*)m.pData + (size_t)y * m.RowPitch);
+                    for (uint32_t x = 0; x < od.Width; ++x) {
+                        const uint32_t v = row[x];
+                        const float qx = x + 0.5f - l.x0, qy = y + 0.5f - l.y0;
+                        const float d = std::min(std::min(qx, l.focusW - qx), std::min(qy, l.focusH - qy));
+                        if (d >= l.marginPx + l.featherPx) {
+                            ++inner;
+                            innerBad += v != focusPx(x - l.x0, y - l.y0);
+                        } else if (d <= l.marginPx) {
+                            ++outside;
+                            outsideBad += !near1(v, outerPx);
+                        } else {
+                            ++band;
+                            bandBad += !between(v, outerPx, focusPx(x - l.x0, y - l.y0));
+                        }
+                    }
+                }
+                ctx->Unmap(staging, 0);
+            }
+            staging->Release();
+        }
+    }
+    qvfr::compose::Release();
+    int warnings = 0;
+    if (info) {
+        for (UINT64 i = 0, n = info->GetNumStoredMessages(); i < n; ++i) {
+            SIZE_T size = 0;
+            info->GetMessage(i, nullptr, &size);
+            std::vector<char> buf(size);
+            auto* msg = (D3D11_MESSAGE*)buf.data();
+            if (FAILED(info->GetMessage(i, msg, &size)) || msg->Severity > D3D11_MESSAGE_SEVERITY_WARNING) continue;
+            ++warnings;
+            printf("D3D11 debug layer: %.*s\n", (int)msg->DescriptionByteLength, msg->pDescription);
+        }
+        info->Release();
+    }
+    for (IUnknown* u : {(IUnknown*)outer, (IUnknown*)focus, (IUnknown*)dummy, (IUnknown*)dummyRtv}) u->Release();
+    ctx->Release();
+    dev->Release();
+    bool ok = readOk && stateOk && od.Width == l.gridW && od.Height == l.gridH &&
+              od.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS && inner && outside && band && !innerBad && !outsideBad &&
+              !bandBad && !warnings;
+    printf("Compose check %s: outputs %p/%p (%u x %u fmt %d), state restored %d, pixels wrong: focus %llu of %llu, "
+           "outer %llu of %llu, blend band %llu of %llu; debug layer %s, %d warnings\n",
+           ok ? "OK" : "FAILED", (void*)out[0], (void*)out[1], od.Width, od.Height, (int)od.Format, stateOk,
+           (unsigned long long)innerBad, (unsigned long long)inner, (unsigned long long)outsideBad,
+           (unsigned long long)outside, (unsigned long long)bandBad, (unsigned long long)band,
+           debugLayer ? "on" : "not installed", warnings);
+    return ok ? 0 : 7;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -369,6 +528,7 @@ int main(int argc, char** argv) {
     bool probe = false;
     bool quad = false;
     bool shotsTest = false;
+    bool composeTest = false;
     auto hasValue = [&](int i) { return i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0; };
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--scene")) scene = hasValue(i) ? atof(argv[++i]) : 12.0;
@@ -378,6 +538,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--probe")) probe = true;
         else if (!strcmp(argv[i], "--quad")) quad = true;
         else if (!strcmp(argv[i], "--shots")) shotsTest = true;
+        else if (!strcmp(argv[i], "--quad-compose")) composeTest = true;
         else if (!strcmp(argv[i], "--center") && i + 2 < argc) {
             center = std::string("center_x=") + argv[i + 1] + "\ncenter_y=" + argv[i + 2] + "\n";
             i += 2;
@@ -391,6 +552,7 @@ int main(int argc, char** argv) {
     fs::create_directories(home, ec);
     SetEnvironmentVariableW(L"QVFR_HOME", home.c_str());
     if (shotsTest) return RunShots(home);
+    if (composeTest) return RunCompose();
     if (FILE* f = _wfopen((home / L"qvfr.ini").c_str(), L"wb")) {
         fputs(scene > 0 ? kSceneIni : kBackgroundIni, f);
         if (!experiment.empty()) fprintf(f, "[experiment]\nmode=%s\n%s", experiment.c_str(), center.c_str());

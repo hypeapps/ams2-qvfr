@@ -108,13 +108,20 @@ const char kDefaultIni[] =
     "; quad: focus center as view direction tangents, the same for both eyes (0,0 = optical axis; right and up are +).\n"
     "center_x=0\n"
     "center_y=0\n"
+    "; quad: 1 = the proxy composes each eye from outer (upscaled to the 1:1 grid) and focus (1:1 in its window) and\n"
+    "; sends the grid-size image to SteamVR; 0 = outer only, at the focus size (diagnostics).\n"
+    "compose=1\n"
+    "; quad: the outermost margin_px grid pixels of the focus are not shown (guard band for screen-space effects), the\n"
+    "; next feather_px blend from outer into focus.\n"
+    "margin_px=32\n"
+    "feather_px=128\n"
     "; probe: how many frames to log in full after the first in-game frame (one more every stats_interval_s).\n"
     "probe_frames=3\n"
     "; probe: 1 = hooks in the game engine (eye tasks, builder); 1 = hooks in the D3D11 immediate context (counters).\n"
     "probe_engine=1\n"
     "probe_d3d=1\n"
-    "; quad: hotkey for a shot of the four views (outer L/R, focus L/R): PNG files in Documents\\ams2-qvfr\\shots\\\n"
-    "; and pixel differences in the log. 0xA3 = right Ctrl, 0x79 = F10; shot_key=0 turns the hotkey off.\n"
+    "; quad: hotkey for a shot of the four views (outer L/R, focus L/R) and the composed eyes: PNG files in\n"
+    "; Documents\\ams2-qvfr\\shots\\ and pixel differences in the log. 0xA3 = right Ctrl, 0x79 = F10; shot_key=0 turns the hotkey off.\n"
     "shot_modifier=0xA3\n"
     "shot_key=0x79\n"
     "; quad: > 0 = one shot by itself this many seconds after the first frame with focus groups.\n"
@@ -292,11 +299,22 @@ void LoadConfig() {
     }
     c.quadCenterX = IniFloat(ini, L"quad", L"center_x", 0.0f);
     c.quadCenterY = IniFloat(ini, L"quad", L"center_y", 0.0f);
+    c.quadCompose = IniInt(ini, L"quad", L"compose", 1) != 0;
+    c.quadMarginPx = IniInt(ini, L"quad", L"margin_px", c.quadMarginPx);
+    if (c.quadMarginPx < 0 || c.quadMarginPx > 512) {
+        Log("Settings: [quad] margin_px=%d outside 0..512, using 32", c.quadMarginPx);
+        c.quadMarginPx = 32;
+    }
+    c.quadFeatherPx = IniInt(ini, L"quad", L"feather_px", c.quadFeatherPx);
+    if (c.quadFeatherPx < 0 || c.quadFeatherPx > 1024) {
+        Log("Settings: [quad] feather_px=%d outside 0..1024, using 128", c.quadFeatherPx);
+        c.quadFeatherPx = 128;
+    }
     if (c.quadMode != QuadMode::Off)
-        Log("Settings: [quad] mode=%s focus_size=%.3f center=(%.3f, %.3f) probe_frames=%d probe_engine=%d probe_d3d=%d "
-            "shot_modifier=0x%X shot_key=0x%X shot_auto_s=%.1f",
-            QuadModeName(c.quadMode), c.quadFocusSize, c.quadCenterX, c.quadCenterY, c.probeFrames, c.probeEngine,
-            c.probeD3D, c.shotKeyMod, c.shotKey, c.shotAutoS);
+        Log("Settings: [quad] mode=%s focus_size=%.3f center=(%.3f, %.3f) compose=%d margin_px=%d feather_px=%d "
+            "probe_frames=%d probe_engine=%d probe_d3d=%d shot_modifier=0x%X shot_key=0x%X shot_auto_s=%.1f",
+            QuadModeName(c.quadMode), c.quadFocusSize, c.quadCenterX, c.quadCenterY, c.quadCompose, c.quadMarginPx,
+            c.quadFeatherPx, c.probeFrames, c.probeEngine, c.probeD3D, c.shotKeyMod, c.shotKey, c.shotAutoS);
     if (c.quadMode == QuadMode::Quad && c.expMode != ExpMode::Off) {
         Log("Settings: [experiment] mode=%s ignored: [quad] mode=quad sets the size and projection itself",
             ExpModeName(c.expMode));

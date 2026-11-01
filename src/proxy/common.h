@@ -71,6 +71,9 @@ struct Config {
     float quadFocusSize = 0.5f;       // quad: focus window, fraction of the tangent span; also the game's render size
     float quadCenterX = 0.0f;         // quad: focus center tangents, right = +
     float quadCenterY = 0.0f;         // up = +
+    bool quadCompose = true;          // quad: the proxy composes outer and focus into one grid-size image per eye (M4.4)
+    int quadMarginPx = 32;            // quad: hidden band at the focus edge (guard band), grid pixels
+    int quadFeatherPx = 128;          // quad: blend band from outer to focus inside the margin, grid pixels
     // [test] (not in the default ini; used by qvfr_proxy_smoke --fault)
     int testFaultFrames = 0;          // > 0: deliberate access violation in the diagnostics at this proxy frame
 };

@@ -2,6 +2,7 @@
 
 #include <d3d11.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -9,6 +10,7 @@
 #include <mutex>
 
 #include "common.h"
+#include "compose.h"
 #include "focus_geometry.h"
 #include "hooks.h"
 #include "shots.h"
@@ -44,15 +46,24 @@ constexpr size_t kMatSize = 0x40;
 constexpr int kGroups = 4;
 enum Group { OuterL, OuterR, FocusL, FocusR };
 const char* const kGroupNames[kGroups] = {"outer L", "outer R", "focus L", "focus R"};
-const char* const kShotNames[kGroups] = {"outer_l", "outer_r", "focus_l", "focus_r"};
+// Shot images: the four views at their CEndEye, then the composed eyes at Submit.
+constexpr int kComposed = kGroups;  // + eye
+constexpr int kShotImages = kGroups + 2;
+const char* const kShotNames[kShotImages] = {"outer_l", "outer_r", "focus_l", "focus_r", "composed_l", "composed_r"};
 // The view whose camera, frustum and visibility list each group renders with; the focus groups replace only the
 // projection (camera and VR device eye data) with the focus window of that eye.
 constexpr int kSourceView[kGroups] = {1, 2, 1, 2};
-// Filled in by SetupLocked: with the focus projection the focus views are compared with their window in the outer views.
+// Rectangles filled in by SetupLocked: the focus views against their window in the outer views and in the composed
+// eyes (only inside the blend band, where the composition must be the focus pixel for pixel), and the outer views
+// against the whole composed eye.
 shots::Pair g_shotPairs[] = {
     {FocusL, OuterL, "focus L vs outer L"},
     {FocusR, OuterR, "focus R vs outer R"},
     {OuterL, OuterR, "outer L vs outer R (reference: parallax)"},
+    {FocusL, kComposed + 0, "focus L vs composed L"},
+    {FocusR, kComposed + 1, "focus R vs composed R"},
+    {OuterL, kComposed + 0, "outer L vs composed L"},
+    {OuterR, kComposed + 1, "outer R vs composed R"},
 };
 
 // Builder patch: three eye loop iterations instead of one, and the group array moved to free stack slots
@@ -127,7 +138,9 @@ struct Run {
 struct Stats {
     uint64_t frames = 0, full = 0, partial = 0, swaps = 0, eyeSwaps = 0, lateRestores = 0, outNotSubmit = 0;
     uint64_t projected = 0;   // frames with the focus projection in both focus groups
-    uint64_t rightCopy = 0, rightAsIs = 0;  // right eye Submit: outer R copy, game texture (no copy this frame)
+    uint64_t composed[2] = {};   // Submit per eye with the composed image
+    uint64_t outerOnly[2] = {};  // without the composition: outer at the focus size (left: game texture, right: copy)
+    uint64_t rightAsIs = 0;      // right eye: game texture (focus R), no outer R copy in this frame
     double cpuMs[kGroups] = {};
 };
 
@@ -159,13 +172,19 @@ bool g_autoShotDone = false;
 bool g_keyWasDown = false;
 void* g_lastSubmit[2] = {};  // texture of the latest Submit per eye (only compared)
 Focus g_focus;
-// Until the composition (M4.4) the right Submit texture ends the frame with focus R, so the right eye gets a copy of
-// outer R taken at its CEndEye.
-ID3D11Texture2D* g_outerR = nullptr;
-bool g_outerRFrame = false;     // the copy holds this frame's outer R
-bool g_outerRFailed = false;
+// Outer R, focus L and focus R all end in the right Submit texture, so the first two are copied at their CEndEye.
+// The composition takes outer L from the left Submit texture and focus R from the right one.
+struct Copy {
+    ID3D11Texture2D* tex = nullptr;
+    bool frame = false;  // holds this frame's image
+    bool failed = false;
+    bool sizeLogged = false;
+};
+enum { CopyOuterR, CopyFocusL, kCopies };
+const char* const kCopyNames[kCopies] = {"outer R", "focus L"};
+Copy g_copy[kCopies];
 bool g_rightLogged = false;
-bool g_copySizeLogged = false;
+char g_noCompose[2][160] = {};  // last reason logged per eye
 
 thread_local bool t_inBuilder = false;
 thread_local int t_buildGroup = -1;
@@ -437,7 +456,7 @@ void FinishFrameLocked() {
     }
     g_began = g_ended = 0;
     for (Run& r : g_run) r = Run{};
-    g_outerRFrame = false;
+    for (Copy& c : g_copy) c.frame = false;
 }
 
 void HandleShotLocked() {
@@ -457,7 +476,7 @@ void HandleShotLocked() {
     const char* why = autoShot ? "shot_auto_s" : "hotkey";
     if (!g_imm.load() || !g_graph.ok) {
         Log("Quad: shot (%s) skipped: no focus groups or no D3D11 device yet", why);
-    } else if (!shots::Begin(kShotNames, kGroups, g_shotPairs, (int)std::size(g_shotPairs))) {
+    } else if (!shots::Begin(kShotNames, kShotImages, g_shotPairs, (int)std::size(g_shotPairs))) {
         Log("Quad: shot (%s) skipped: the previous one is still being written", why);
     } else {
         g_shotFrame = true;
@@ -465,37 +484,40 @@ void HandleShotLocked() {
     }
 }
 
-void ReleaseOuterR() {
-    if (g_outerR) g_outerR->Release();
-    g_outerR = nullptr;
-    g_outerRFrame = false;
+void ReleaseCopies() {
+    for (Copy& c : g_copy) {
+        if (c.tex) c.tex->Release();
+        c = Copy{};
+    }
 }
 
-// Right after outer R's CEndEye the right Submit texture holds outer R; the focus groups overwrite it later.
-void CopyOuterRLocked(ID3D11Resource* res) {
+// Right after a group's CEndEye the right Submit texture holds its image; the later groups overwrite it.
+void CopyLocked(int k, ID3D11Resource* res) {
+    Copy& c = g_copy[k];
     ID3D11DeviceContext* imm = g_imm.load();
-    if (!imm || g_outerRFailed) return;
+    if (!imm || c.failed) return;
     ID3D11Texture2D* src = nullptr;
     if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&src)) || !src) return;
     D3D11_TEXTURE2D_DESC d{};
     src->GetDesc(&d);
     if (d.Width != g_focus.geo.focusW || d.Height != g_focus.geo.focusH) {
         // Not an eye texture (the desktop mirror after leaving the race in the first M4.3 run).
-        if (!g_copySizeLogged) {
-            g_copySizeLogged = true;
-            Log("Quad: outer R output %u x %u fmt %d is not the focus size; no copy (the right eye gets the game texture)",
-                d.Width, d.Height, (int)d.Format);
+        if (!c.sizeLogged) {
+            c.sizeLogged = true;
+            Log("Quad: %s output %u x %u fmt %d is not the focus size; no copy", kCopyNames[k], d.Width, d.Height,
+                (int)d.Format);
         }
         src->Release();
         return;
     }
     D3D11_TEXTURE2D_DESC have{};
-    if (g_outerR) g_outerR->GetDesc(&have);
-    if (g_outerR && (have.Width != d.Width || have.Height != d.Height || have.Format != d.Format ||
-                     have.MipLevels != d.MipLevels || have.ArraySize != d.ArraySize)) {
-        ReleaseOuterR();
+    if (c.tex) c.tex->GetDesc(&have);
+    if (c.tex && (have.Width != d.Width || have.Height != d.Height || have.Format != d.Format ||
+                  have.MipLevels != d.MipLevels || have.ArraySize != d.ArraySize)) {
+        c.tex->Release();
+        c.tex = nullptr;
     }
-    if (!g_outerR) {
+    if (!c.tex) {
         D3D11_TEXTURE2D_DESC n = d;
         n.Usage = D3D11_USAGE_DEFAULT;
         n.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
@@ -503,22 +525,74 @@ void CopyOuterRLocked(ID3D11Resource* res) {
         n.MiscFlags = 0;
         ID3D11Device* dev = nullptr;
         imm->GetDevice(&dev);
-        HRESULT hr = dev ? dev->CreateTexture2D(&n, nullptr, &g_outerR) : E_FAIL;
+        HRESULT hr = dev ? dev->CreateTexture2D(&n, nullptr, &c.tex) : E_FAIL;
         if (dev) dev->Release();
-        if (FAILED(hr) || !g_outerR) {
-            g_outerR = nullptr;
-            g_outerRFailed = true;
-            Log("Quad: cannot create the outer R copy %u x %u fmt %d (0x%08lX); the right eye shows focus R",
-                d.Width, d.Height, (int)d.Format, (unsigned long)hr);
+        if (FAILED(hr) || !c.tex) {
+            c.tex = nullptr;
+            c.failed = true;
+            Log("Quad: cannot create the %s copy %u x %u fmt %d (0x%08lX)", kCopyNames[k], d.Width, d.Height,
+                (int)d.Format, (unsigned long)hr);
             src->Release();
             return;
         }
-        Log("Quad: outer R copy %p (%u x %u fmt %d) for the right eye until the composition (M4.4)", (void*)g_outerR,
-            d.Width, d.Height, (int)d.Format);
+        Log("Quad: %s copy %p (%u x %u fmt %d, game texture bind flags 0x%X)", kCopyNames[k], (void*)c.tex, d.Width,
+            d.Height, (int)d.Format, d.BindFlags);
     }
-    imm->CopyResource(g_outerR, src);
-    g_outerRFrame = true;
+    imm->CopyResource(c.tex, src);
+    c.frame = true;
     src->Release();
+}
+
+bool FullBounds(const vr::VRTextureBounds_t* b) {
+    return !b || (b->uMin == 0.0f && b->vMin == 0.0f && b->uMax == 1.0f && b->vMax == 1.0f);
+}
+
+void NoComposeLocked(int e, const char* why) {
+    if (strcmp(g_noCompose[e], why) == 0) return;
+    snprintf(g_noCompose[e], sizeof(g_noCompose[e]), "%s", why);
+    Log("Quad: %s eye without the composition (%s): outer only at the focus size%s", e ? "right" : "left", why,
+        e ? " if this frame's outer R copy exists" : "");
+}
+
+// The composed eye for this Submit, or null (the reason logged once). Outer L is the left Submit texture, outer R the
+// copy from its CEndEye; focus L the copy from its CEndEye, focus R the right Submit texture.
+ID3D11Texture2D* ComposeLocked(int e, const vr::Texture_t* tex, const vr::VRTextureBounds_t* bounds) {
+    ID3D11DeviceContext* imm = g_imm.load();
+    const Copy& copy = g_copy[e ? CopyOuterR : CopyFocusL];
+    const char* why = nullptr;
+    if (!imm)
+        why = "no D3D11 device yet";
+    else if (g_began != 0xF || g_ended != 0xF)
+        why = "not all four eye groups ran in this frame";
+    else if (!FullBounds(bounds))
+        why = "Submit with texture bounds";
+    else if (!g_run[e ? FocusR : FocusL].projected)
+        why = "no focus projection in this frame";
+    else if (!copy.frame || !copy.tex)
+        why = e ? "no outer R copy in this frame" : "no focus L copy in this frame";
+    if (why) {
+        NoComposeLocked(e, why);
+        return nullptr;
+    }
+    ID3D11Texture2D* game = nullptr;
+    if (FAILED(static_cast<IUnknown*>(tex->handle)->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&game)) || !game) {
+        NoComposeLocked(e, "the Submit texture is not an ID3D11Texture2D");
+        return nullptr;
+    }
+    const focus::Geometry& g = g_focus.geo;
+    compose::Layout l;
+    l.gridW = g.gridW;
+    l.gridH = g.gridH;
+    l.focusW = g.focusW;
+    l.focusH = g.focusH;
+    l.x0 = g.eye[e].x0;
+    l.y0 = g.eye[e].y0;
+    l.marginPx = (float)Cfg().quadMarginPx;
+    l.featherPx = (float)Cfg().quadFeatherPx;
+    ID3D11Texture2D* out = compose::Draw(imm, e, e ? copy.tex : game, e ? game : copy.tex, l);
+    game->Release();
+    if (!out) NoComposeLocked(e, "composition failed, see the Compose line");
+    return out;
 }
 
 // ---------------------------------------------------------------- engine detours
@@ -664,7 +738,12 @@ void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
             Log("Quad: %s writes its final image into %s", kGroupNames[g], DescribeTex(res).c_str());
         }
         if (g_shotFrame) shots::Grab(g_imm.load(), res, g);
-        if (g == OuterR && g_focus.on && g_graph.ok && (g_began & 3) == 3) CopyOuterRLocked(res);
+        // Only after this frame's earlier groups (a stale task address otherwise).
+        const unsigned upTo = (2u << g) - 1;
+        if (g_focus.on && g_graph.ok && (g_began & upTo) == upTo) {
+            if (g == OuterR) CopyLocked(CopyOuterR, res);
+            if (g == FocusL && Cfg().quadCompose) CopyLocked(CopyFocusL, res);
+        }
         res->Release();
     });
     return r;
@@ -689,11 +768,12 @@ void LogStatsLocked(const Stats& s, const char* what) {
     double f = s.full ? (double)s.full : 1;
     Log("Quad stats%s: %llu in-game frames, %llu with all four eye groups, %llu partial; focus L swaps %llu (with VR eye "
         "data %llu), frames with the focus projection %llu, late restores %llu, frames with outputs other than the "
-        "Submit textures %llu; right eye Submit: outer R copy %llu, game texture %llu; CPU per group (CBeginEye to "
-        "CEndEye): outer L %.2f ms, outer R %.2f ms, focus L %.2f ms, focus R %.2f ms",
+        "Submit textures %llu; Submit composed L/R %llu/%llu, outer only L/R %llu/%llu, right game texture %llu; CPU "
+        "per group (CBeginEye to CEndEye): outer L %.2f ms, outer R %.2f ms, focus L %.2f ms, focus R %.2f ms",
         what, (unsigned long long)s.frames, (unsigned long long)s.full, (unsigned long long)s.partial,
         (unsigned long long)s.swaps, (unsigned long long)s.eyeSwaps, (unsigned long long)s.projected,
-        (unsigned long long)s.lateRestores, (unsigned long long)s.outNotSubmit, (unsigned long long)s.rightCopy,
+        (unsigned long long)s.lateRestores, (unsigned long long)s.outNotSubmit, (unsigned long long)s.composed[0],
+        (unsigned long long)s.composed[1], (unsigned long long)s.outerOnly[0], (unsigned long long)s.outerOnly[1],
         (unsigned long long)s.rightAsIs, s.cpuMs[0] / f, s.cpuMs[1] / f, s.cpuMs[2] / f, s.cpuMs[3] / f);
 }
 
@@ -706,7 +786,10 @@ void AddStats(Stats& a, const Stats& b) {
     a.lateRestores += b.lateRestores;
     a.outNotSubmit += b.outNotSubmit;
     a.projected += b.projected;
-    a.rightCopy += b.rightCopy;
+    for (int e = 0; e < 2; ++e) {
+        a.composed[e] += b.composed[e];
+        a.outerOnly[e] += b.outerOnly[e];
+    }
     a.rightAsIs += b.rightAsIs;
     for (int g = 0; g < kGroups; ++g) a.cpuMs[g] += b.cpuMs[g];
 }
@@ -718,6 +801,10 @@ void SetupLocked(vr::IVRSystem* real) {
     g_focus.setupDone = true;
     static const char* const plain[2] = {"focus L vs outer L", "focus R vs outer R"};
     for (int i = 0; i < 2; ++i) g_shotPairs[i] = {g_shotPairs[i].a, g_shotPairs[i].b, plain[i]};
+    for (size_t i = 3; i < std::size(g_shotPairs); ++i) {
+        shots::Pair& p = g_shotPairs[i];
+        p = {p.a, p.b, p.label};
+    }
     if (!g_installed || !g_patched || !real) return;
     const Config& c = Cfg();
     focus::Geometry& g = g_focus.geo;
@@ -744,6 +831,28 @@ void SetupLocked(vr::IVRSystem* real) {
         p.ry = (float)(e.y0 * sy);
         p.rw = (float)(g.focusW * sx);
         p.rh = (float)(g.focusH * sy);
+        // The composed eye is the grid: focus 1:1 in its window, outer over the whole grid.
+        shots::Pair& f = g_shotPairs[3 + i];
+        f.rx = (float)e.x0;
+        f.ry = (float)e.y0;
+        f.rw = (float)g.focusW;
+        f.rh = (float)g.focusH;
+        f.inset = (float)(c.quadMarginPx + c.quadFeatherPx);
+        shots::Pair& o = g_shotPairs[5 + i];
+        o.rw = (float)g.gridW;
+        o.rh = (float)g.gridH;
+    }
+    if (c.quadCompose) {
+        const int band = c.quadMarginPx + c.quadFeatherPx;
+        Log("Quad: composition on: each eye goes to SteamVR as a %u x %u image, outer upscaled bilinearly, focus 1:1 "
+            "with margin %d px and feather %d px (%u x %u shown fully sharp)",
+            g.gridW, g.gridH, c.quadMarginPx, c.quadFeatherPx, g.focusW > 2u * band ? g.focusW - 2 * band : 0u,
+            g.focusH > 2u * band ? g.focusH - 2 * band : 0u);
+        if (2u * band >= std::min(g.focusW, g.focusH))
+            Log("Quad: WARNING: margin_px + feather_px = %d is half the focus size or more; the focus never shows fully",
+                band);
+    } else {
+        Log("Quad: composition off (compose=0): SteamVR gets outer at the focus size");
     }
 }
 
@@ -855,24 +964,43 @@ void AdjustSize(vr::IVRSystem* real, uint32_t* w, uint32_t* h) {
 
 bool Engaged() { return g_focus.engaged; }
 
-const vr::Texture_t* PrepareSubmit(vr::EVREye eye, const vr::Texture_t* tex, vr::Texture_t& storage) {
+const vr::Texture_t* PrepareSubmit(vr::EVREye eye, const vr::Texture_t* tex, const vr::VRTextureBounds_t* bounds,
+                                   vr::Texture_t& storage) {
     const vr::Texture_t* out = tex;
-    if (!g_on || eye != vr::Eye_Right) return out;
+    if (!g_on) return out;
     Guard("PrepareSubmit", [&] {
         std::lock_guard lock(g_m);
-        if (!g_focus.on || !g_graph.ok || !tex) return;
-        if (!g_outerRFrame || !g_outerR || g_began != 0xF || g_ended != 0xF) {
+        if (!g_focus.on || !g_graph.ok || !tex || tex->eType != vr::API_DirectX || !tex->handle) return;
+        const int e = eye == vr::Eye_Right ? 1 : 0;
+        if (Cfg().quadCompose) {
+            if (ID3D11Texture2D* composed = ComposeLocked(e, tex, bounds)) {
+                storage = *tex;
+                storage.handle = composed;
+                out = &storage;
+                ++g_st.composed[e];
+                if (g_shotFrame) shots::Grab(g_imm.load(), composed, kComposed + e);
+                return;
+            }
+        }
+        // Without the composition SteamVR gets outer at the focus size: the left Submit texture holds outer L, the
+        // right one ends the frame with focus R, so the right eye gets the outer R copy.
+        if (!e) {
+            ++g_st.outerOnly[0];
+            return;
+        }
+        const Copy& c = g_copy[CopyOuterR];
+        if (!c.frame || !c.tex || g_began != 0xF || g_ended != 0xF) {
             ++g_st.rightAsIs;
             return;
         }
         storage = *tex;
-        storage.handle = g_outerR;
+        storage.handle = c.tex;
         out = &storage;
-        ++g_st.rightCopy;
+        ++g_st.outerOnly[1];
         if (!g_rightLogged) {
             g_rightLogged = true;
             Log("Quad: right eye goes to the compositor as the outer R copy %p (game texture %p ends the frame with "
-                "focus R)", (void*)g_outerR, tex->handle);
+                "focus R)", (void*)c.tex, tex->handle);
         }
     });
     return out;
@@ -898,10 +1026,11 @@ std::string Describe() {
         const focus::Geometry& g = g_focus.geo;
         if (g_focus.on)
             snprintf(focus, sizeof(focus),
-                     "game size %u x %u of %u x %u (focus_size %.3f), focus projection %s, right eye shows outer R "
-                     "until the composition (M4.4)",
+                     "game size %u x %u of %u x %u (focus_size %.3f), focus projection %s, %s",
                      g.focusW, g.focusH, g.gridW, g.gridH, Cfg().quadFocusSize,
-                     g_focus.projFailed ? "OFF after a check (see log)" : "on");
+                     g_focus.projFailed ? "OFF after a check (see log)" : "on",
+                     Cfg().quadCompose ? "composition on (margin and feather in the log)"
+                                       : "composition off (outer only)");
         snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s%s",
                  g_installed ? "engine hooks on" : "engine hooks off", g_patched ? "on" : "off",
                  g_graph.ok ? "running" : "not running", focus, g_fault ? ", stopped after an exception" : "");
@@ -943,10 +1072,10 @@ void Shutdown() {
         g_lastSubmit[0] = g_lastSubmit[1] = nullptr;
         for (bool& b : g_outLogged) b = false;
         g_focus = Focus{};
-        ReleaseOuterR();
-        g_outerRFailed = false;
+        ReleaseCopies();
+        compose::Release();
         g_rightLogged = false;
-        g_copySizeLogged = false;
+        for (auto& s : g_noCompose) s[0] = 0;
     });
 }
 

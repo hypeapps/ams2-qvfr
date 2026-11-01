@@ -249,9 +249,9 @@ public:
         const vr::Texture_t* out = experiment::PrepareSubmit(eye, tex, bounds, padded);
         probe::OnSubmitBegin(eye, tex);
         quad::OnSubmitBegin(eye, tex);
-        // Quad mode: the right eye gets the outer R copy until the composition (M4.4).
-        vr::Texture_t outerR{};
-        out = quad::PrepareSubmit(eye, out, outerR);
+        // Quad mode: the compositor gets the composed eye (outer upscaled to the grid, focus 1:1 in its window).
+        vr::Texture_t composed{};
+        out = quad::PrepareSubmit(eye, out, bounds, composed);
         double t0 = NowMs();
         vr::EVRCompositorError err = CompositorWrapBase::Submit(eye, out, bounds, flags);
         probe::OnSubmitEnd(eye);
