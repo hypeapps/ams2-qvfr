@@ -32,8 +32,8 @@ constexpr size_t kAppType = 0x8;         // app singleton: type (5 or 7..9 with 
 constexpr size_t kAppVr = 0xe0;          // app singleton: engine VR device (_BVROpen)
 constexpr size_t kVrEyeData = 0xa0;      // VR device: per eye data (tangents, eye to head, projection), eye 0 first
 constexpr size_t kVrEyeSize = 0x110;
-constexpr size_t kEyeTangents = 0x0;     // eye data: 4 floats {-t, b, r, -l} computed from the projection (0xd6bf30)
-constexpr size_t kEyeProj = 0x90;        // eye data: projection matrix, row vector convention (transposed OpenVR)
+constexpr size_t kEyeTangents = 0x0;     // eye data: 4 floats {b, -t, -l, r} computed from the projection (0xd6bf30)
+constexpr size_t kEyeProj = 0x90;        // eye data: projection, row vectors, z forward (m20 = -OpenVR m02, m23 = 1)
 constexpr uintptr_t kCamVtable = 0x2115d30;  // camera class vtable (RVA); all view cameras have it
 constexpr size_t kCamProj = 0x110;       // camera: explicit projection (set through vtable +0x210, read by +0x138/+0x150)
 constexpr size_t kCamProjDirty = 0x402;  // camera: 1 = rebuild the projection from FOV and aspect at the next update
@@ -165,6 +165,7 @@ ID3D11Texture2D* g_outerR = nullptr;
 bool g_outerRFrame = false;     // the copy holds this frame's outer R
 bool g_outerRFailed = false;
 bool g_rightLogged = false;
+bool g_copySizeLogged = false;
 
 thread_local bool t_inBuilder = false;
 thread_local int t_buildGroup = -1;
@@ -242,12 +243,13 @@ bool FocusEyeData(const uint8_t* src, const focus::Eye& e, uint8_t* out, char* w
     memcpy(out, src, kVrEyeSize);
     const float* tan = (const float*)(src + kEyeTangents);
     const float* m = (const float*)(src + kEyeProj);  // m[i * 4 + j]: row i, column j
-    if (!NearTan(tan[0], -e.t) || !NearTan(tan[1], e.b) || !NearTan(tan[2], e.r) || !NearTan(tan[3], -e.l)) {
-        snprintf(why, whySize, "engine tangents {%.5f %.5f %.5f %.5f}, expected {-t b r -l} = {%.5f %.5f %.5f %.5f}",
-                 tan[0], tan[1], tan[2], tan[3], -e.t, e.b, e.r, -e.l);
+    if (!NearTan(tan[0], e.b) || !NearTan(tan[1], -e.t) || !NearTan(tan[2], -e.l) || !NearTan(tan[3], e.r)) {
+        snprintf(why, whySize, "engine tangents {%.5f %.5f %.5f %.5f}, expected {b -t -l r} = {%.5f %.5f %.5f %.5f}",
+                 tan[0], tan[1], tan[2], tan[3], e.b, -e.t, -e.l, e.r);
         return false;
     }
-    // Clip space of the focus window: x' = sx * x + ox * w, y' = sy * y + oy * w. Row vectors, so the x and y columns
+    // Clip space of the focus window: x' = sx * x + ox * w, y' = sy * y + oy * w (NDC x = m00 * x/z + m20 for the
+    // engine's z forward, the same function of the view tangent as in OpenVR). Row vectors, so the x and y columns
     // of the matrix change.
     const double sx = (e.r - e.l) / (double)(e.fr - e.fl), ox = ((e.r + e.l) - (e.fr + e.fl)) / (double)(e.fr - e.fl);
     const double sy = (e.b - e.t) / (double)(e.fb - e.ft), oy = ((e.b + e.t) - (e.fb + e.ft)) / (double)(e.fb - e.ft);
@@ -257,10 +259,10 @@ bool FocusEyeData(const uint8_t* src, const focus::Eye& e, uint8_t* out, char* w
         fm[i * 4 + 1] = (float)(sy * m[i * 4 + 1] + oy * m[i * 4 + 3]);
     }
     float* ft = (float*)(out + kEyeTangents);
-    ft[0] = -e.ft;
-    ft[1] = e.fb;
-    ft[2] = e.fr;
-    ft[3] = -e.fl;
+    ft[0] = e.fb;
+    ft[1] = -e.ft;
+    ft[2] = -e.fl;
+    ft[3] = e.fr;
     // The engine's own tangent formula (0xd6bf30) on the new matrix must give the focus window back.
     float chk[4] = {(1 - fm[9]) / fm[5], (1 + fm[9]) / fm[5], (1 + fm[8]) / fm[0], (1 - fm[8]) / fm[0]};
     for (int k = 0; k < 4; ++k) {
@@ -305,7 +307,7 @@ void LogFocusFirst(int group, const uint8_t* src, const uint8_t* foc, const uint
     const float* t1 = (const float*)(foc + kEyeTangents);
     const float* m0 = (const float*)(src + kEyeProj);
     const float* m1 = (const float*)(foc + kEyeProj);
-    Log("Quad: %s projection: eye tangents {-t b r -l} {%.5f %.5f %.5f %.5f} -> {%.5f %.5f %.5f %.5f}; matrix m00 m11 "
+    Log("Quad: %s projection: eye tangents {b -t -l r} {%.5f %.5f %.5f %.5f} -> {%.5f %.5f %.5f %.5f}; matrix m00 m11 "
         "m20 m21 [%.5f %.5f %.5f %.5f] -> [%.5f %.5f %.5f %.5f]; camera %p",
         kGroupNames[group], t0[0], t0[1], t0[2], t0[3], t1[0], t1[1], t1[2], t1[3], m0[0], m0[5], m0[8], m0[9], m1[0],
         m1[5], m1[8], m1[9], (const void*)cam);
@@ -385,11 +387,18 @@ void RestoreLocked() {
 // ---------------------------------------------------------------- frame bookkeeping
 
 void FinishFrameLocked() {
-    if (!g_began) return;  // no eye group of the VR graph ran (menu, loading)
+    if (!g_began && !g_ended) return;  // no eye group of the VR graph ran (menu, loading)
     ++g_st.frames;
     bool full = g_began == 0xF && g_ended == 0xF;
     if (!full) {
         ++g_st.partial;
+        // In the race every frame runs all four groups; a partial frame means the graph is gone and other tasks
+        // reuse the recorded addresses. Off until the next builder call.
+        if (g_graph.ok) {
+            g_graph = Graph{};
+            Log("Quad: frame %llu ran only part of the eye groups (began 0x%X, ended 0x%X): race graph gone, focus "
+                "groups off until the next builder call", (unsigned long long)g_frameNo, g_began, g_ended);
+        }
     } else {
         ++g_st.full;
         for (int g = 0; g < kGroups; ++g) g_st.cpuMs[g] += g_run[g].t1 - g_run[g].t0;
@@ -470,6 +479,16 @@ void CopyOuterRLocked(ID3D11Resource* res) {
     if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&src)) || !src) return;
     D3D11_TEXTURE2D_DESC d{};
     src->GetDesc(&d);
+    if (d.Width != g_focus.geo.focusW || d.Height != g_focus.geo.focusH) {
+        // Not an eye texture (the desktop mirror after leaving the race in the first M4.3 run).
+        if (!g_copySizeLogged) {
+            g_copySizeLogged = true;
+            Log("Quad: outer R output %u x %u fmt %d is not the focus size; no copy (the right eye gets the game texture)",
+                d.Width, d.Height, (int)d.Format);
+        }
+        src->Release();
+        return;
+    }
     D3D11_TEXTURE2D_DESC have{};
     if (g_outerR) g_outerR->GetDesc(&have);
     if (g_outerR && (have.Width != d.Width || have.Height != d.Height || have.Format != d.Format ||
@@ -602,6 +621,10 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         r.t0 = NowMs();
         g_began |= 1u << g;
         if (!g_graph.ok || g < FocusL) return;
+        // The groups run in build order; a focus task without its predecessors in this frame is a stale address
+        // (the race graph is gone and the menu reuses the memory).
+        const unsigned before = (1u << g) - 1;
+        if ((g_ended & before) != before) return;
         if (g_firstFocusMs < 0) {
             g_firstFocusMs = NowMs();
             Log("Quad: first frame with focus groups (frame %llu, thread %lu)", (unsigned long long)g_frameNo,
@@ -641,7 +664,7 @@ void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
             Log("Quad: %s writes its final image into %s", kGroupNames[g], DescribeTex(res).c_str());
         }
         if (g_shotFrame) shots::Grab(g_imm.load(), res, g);
-        if (g == OuterR && g_focus.on && g_graph.ok) CopyOuterRLocked(res);
+        if (g == OuterR && g_focus.on && g_graph.ok && (g_began & 3) == 3) CopyOuterRLocked(res);
         res->Release();
     });
     return r;
@@ -838,7 +861,7 @@ const vr::Texture_t* PrepareSubmit(vr::EVREye eye, const vr::Texture_t* tex, vr:
     Guard("PrepareSubmit", [&] {
         std::lock_guard lock(g_m);
         if (!g_focus.on || !g_graph.ok || !tex) return;
-        if (!g_outerRFrame || !g_outerR) {
+        if (!g_outerRFrame || !g_outerR || g_began != 0xF || g_ended != 0xF) {
             ++g_st.rightAsIs;
             return;
         }
@@ -923,6 +946,7 @@ void Shutdown() {
         ReleaseOuterR();
         g_outerRFailed = false;
         g_rightLogged = false;
+        g_copySizeLogged = false;
     });
 }
 
