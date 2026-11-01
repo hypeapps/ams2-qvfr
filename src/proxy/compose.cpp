@@ -32,6 +32,7 @@ struct Output {
     ID3D11RenderTargetView* rtv = nullptr;
     D3D11_TEXTURE2D_DESC desc{};
     bool logged = false;
+    bool failed = false;  // creation failed for desc: not retried every Submit
 };
 
 // Shader resource views of the source textures. The view holds a reference, so a cached texture address cannot be
@@ -77,8 +78,21 @@ Output g_out[2];
 CachedSrv g_srv[kSrvCache];
 int g_srvNext = 0;
 ID3D11Texture2D* g_scratch[2][2] = {};  // [eye][outer, focus]: copies of sources without shader resource binding
+bool g_scratchFailed[2][2] = {};
 State g_state;
-char g_lastError[256] = "";
+// Failure sites, each logged once per eye until its message changes (the eyes and the sources alternate).
+enum Site {
+    SitePipeline,
+    SiteSize,
+    SiteFormat,
+    SiteWindow,
+    SiteOutput,
+    SiteCopy,
+    SiteView = SiteCopy + 2,
+    SiteMap = SiteView + 2,
+    kSites
+};
+char g_lastError[2][kSites][256] = {};
 
 template <class T>
 void SafeRelease(T*& p) {
@@ -86,15 +100,17 @@ void SafeRelease(T*& p) {
     p = nullptr;
 }
 
-// Logs a failure once until a different one happens (the caller counts the eyes sent without the composition).
-void Fail(const char* fmt, ...) {
+// Logs a failure once per eye and site until a different one happens there (the caller counts the eyes sent without
+// the composition).
+void Fail(int eye, int site, const char* fmt, ...) {
     char buf[256];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    if (strcmp(buf, g_lastError) == 0) return;
-    snprintf(g_lastError, sizeof(g_lastError), "%s", buf);
+    char* last = g_lastError[eye][site];
+    if (strcmp(buf, last) == 0) return;
+    snprintf(last, sizeof(g_lastError[eye][site]), "%s", buf);
     Log("Compose: %s; this eye goes out without the composition", buf);
 }
 
@@ -122,6 +138,8 @@ void ReleaseOutputs() {
     g_srvNext = 0;
     for (auto& eye : g_scratch)
         for (ID3D11Texture2D*& t : eye) SafeRelease(t);
+    for (auto& eye : g_scratchFailed)
+        for (bool& f : eye) f = false;
 }
 
 bool EnsurePipeline(ID3D11Device* dev) {
@@ -156,8 +174,8 @@ bool EnsurePipeline(ID3D11Device* dev) {
         SafeRelease(g_p.sampler);
         SafeRelease(g_p.cb);
         g_p.failed = true;
-        Fail("cannot create the shaders and states (0x%08lX, device feature level 0x%X)", (unsigned long)hr,
-             (unsigned)dev->GetFeatureLevel());
+        Fail(0, SitePipeline, "cannot create the shaders and states (0x%08lX, device feature level 0x%X)",
+             (unsigned long)hr, (unsigned)dev->GetFeatureLevel());
         return false;
     }
     Log("Compose: shaders ready (vs %zu B, ps %zu B, feature level 0x%X)", sizeof(kComposeVS), sizeof(kComposePS),
@@ -173,6 +191,7 @@ bool EnsureOutput(int eye, const Layout& l, DXGI_FORMAT fmt) {
         o = Output{};
     }
     if (o.tex) return true;
+    if (o.failed && o.desc.Width == l.gridW && o.desc.Height == l.gridH && o.desc.Format == fmt) return false;
     D3D11_TEXTURE2D_DESC d{};
     d.Width = l.gridW;
     d.Height = l.gridH;
@@ -191,11 +210,14 @@ bool EnsureOutput(int eye, const Layout& l, DXGI_FORMAT fmt) {
     }
     if (FAILED(hr)) {
         SafeRelease(o.tex);
-        Fail("cannot create the %s eye output %u x %u fmt %d (0x%08lX)", eye ? "right" : "left", d.Width, d.Height,
-             (int)fmt, (unsigned long)hr);
+        o.desc = d;
+        o.failed = true;
+        Fail(eye, SiteOutput, "cannot create the %s eye output %u x %u fmt %d (0x%08lX)", eye ? "right" : "left",
+             d.Width, d.Height, (int)fmt, (unsigned long)hr);
         return false;
     }
     o.desc = d;
+    o.failed = false;
     Log("Compose: %s eye output %p, %u x %u fmt %d (views fmt %d)", eye ? "right" : "left", (void*)o.tex, d.Width,
         d.Height, (int)fmt, (int)ViewFormat(fmt));
     return true;
@@ -212,6 +234,7 @@ ID3D11ShaderResourceView* SourceView(ID3D11DeviceContext* ctx, int eye, int whic
                   have.MipLevels != d.MipLevels)) {
             SafeRelease(s);
         }
+        if (!s && g_scratchFailed[eye][which]) return nullptr;
         if (!s) {
             D3D11_TEXTURE2D_DESC n = d;
             n.Usage = D3D11_USAGE_DEFAULT;
@@ -221,8 +244,9 @@ ID3D11ShaderResourceView* SourceView(ID3D11DeviceContext* ctx, int eye, int whic
             HRESULT hr = g_p.dev->CreateTexture2D(&n, nullptr, &s);
             if (FAILED(hr)) {
                 s = nullptr;
-                Fail("cannot create a copy of the %s source %u x %u fmt %d (0x%08lX)", which ? "focus" : "outer",
-                     d.Width, d.Height, (int)d.Format, (unsigned long)hr);
+                g_scratchFailed[eye][which] = true;
+                Fail(eye, SiteCopy + which, "cannot create a copy of the %s source %u x %u fmt %d (0x%08lX)",
+                     which ? "focus" : "outer", d.Width, d.Height, (int)d.Format, (unsigned long)hr);
                 return nullptr;
             }
             Log("Compose: %s eye %s source %p has no shader resource binding; copied into %p every frame",
@@ -240,8 +264,8 @@ ID3D11ShaderResourceView* SourceView(ID3D11DeviceContext* ctx, int eye, int whic
     ID3D11ShaderResourceView* srv = nullptr;
     HRESULT hr = g_p.dev->CreateShaderResourceView(tex, &v, &srv);
     if (FAILED(hr) || !srv) {
-        Fail("cannot create a view of the %s source fmt %d as fmt %d (0x%08lX)", which ? "focus" : "outer",
-             (int)d.Format, (int)v.Format, (unsigned long)hr);
+        Fail(eye, SiteView + which, "cannot create a view of the %s source fmt %d as fmt %d (0x%08lX)",
+             which ? "focus" : "outer", (int)d.Format, (int)v.Format, (unsigned long)hr);
         return nullptr;
     }
     CachedSrv& c = g_srv[g_srvNext];
@@ -323,18 +347,19 @@ ID3D11Texture2D* Draw(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* outer,
     focus->GetDesc(&fd);
     const char* side = eye ? "right" : "left";
     if (od.Width != l.focusW || od.Height != l.focusH || fd.Width != l.focusW || fd.Height != l.focusH) {
-        Fail("%s eye sources outer %u x %u, focus %u x %u are not the focus size %u x %u", side, od.Width, od.Height,
-             fd.Width, fd.Height, l.focusW, l.focusH);
+        Fail(eye, SiteSize, "%s eye sources outer %u x %u, focus %u x %u are not the focus size %u x %u", side,
+             od.Width, od.Height, fd.Width, fd.Height, l.focusW, l.focusH);
         return nullptr;
     }
     if (od.SampleDesc.Count != 1 || fd.SampleDesc.Count != 1 || od.Format != fd.Format) {
-        Fail("%s eye sources: samples %u and %u, formats %d and %d (expected one sample, the same format)", side,
+        Fail(eye, SiteFormat,
+             "%s eye sources: samples %u and %u, formats %d and %d (expected one sample, the same format)", side,
              od.SampleDesc.Count, fd.SampleDesc.Count, (int)od.Format, (int)fd.Format);
         return nullptr;
     }
     if (!l.gridW || !l.gridH || l.x0 + l.focusW > l.gridW || l.y0 + l.focusH > l.gridH) {
-        Fail("focus window (%u, %u) %u x %u does not fit the grid %u x %u", l.x0, l.y0, l.focusW, l.focusH, l.gridW,
-             l.gridH);
+        Fail(eye, SiteWindow, "focus window (%u, %u) %u x %u does not fit the grid %u x %u", l.x0, l.y0, l.focusW,
+             l.focusH, l.gridW, l.gridH);
         return nullptr;
     }
     ID3D11Device* dev = nullptr;
@@ -348,7 +373,7 @@ ID3D11Texture2D* Draw(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* outer,
     D3D11_MAPPED_SUBRESOURCE m{};
     HRESULT hr = ctx->Map(g_p.cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &m);
     if (FAILED(hr)) {
-        Fail("cannot map the constant buffer (0x%08lX)", (unsigned long)hr);
+        Fail(eye, SiteMap, "cannot map the constant buffer (0x%08lX)", (unsigned long)hr);
         return nullptr;
     }
     const Constants k = {(float)l.gridW,  (float)l.gridH,  (float)l.x0, (float)l.y0,
@@ -396,7 +421,7 @@ void Release() {
     SafeRelease(g_p.cb);
     SafeRelease(g_p.dev);
     g_p = Pipeline{};
-    g_lastError[0] = 0;
+    memset(g_lastError, 0, sizeof(g_lastError));
 }
 
 }  // namespace qvfr::compose

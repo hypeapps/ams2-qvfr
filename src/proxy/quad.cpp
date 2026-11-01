@@ -152,8 +152,14 @@ struct Focus {
     bool engaged = false;     // the size was replaced in this session (the wrappers must stay)
     focus::Geometry geo;
     bool projFailed = false;  // engine data did not match the geometry: focus groups render the eye views
+    int projMisses = 0;       // consecutive focus groups without the projection (projFailed at kProjMissLimit)
+    bool missLogged = false;
+    bool noCopyLogged = false;
     bool logged[kGroups] = {};
 };
+// About one second of frames with both focus groups failing the check; one-off misses (a camera rebuilding its
+// projection right after the builder) only cost that frame's composition.
+constexpr int kProjMissLimit = 144;
 
 std::mutex g_m;
 Graph g_graph;
@@ -189,7 +195,7 @@ char g_noCompose[2][160] = {};  // last reason logged per eye
 thread_local bool t_inBuilder = false;
 thread_local int t_buildGroup = -1;
 thread_local bool t_inEndEye = false;
-thread_local ID3D11RenderTargetView* t_endRtv = nullptr;
+thread_local ID3D11Resource* t_endRes = nullptr;  // referenced: the RTV may be gone once CEndEye returns
 
 // D3D11: the immediate context (no reference held; the game owns the device for the whole session).
 std::atomic<ID3D11DeviceContext*> g_imm{nullptr};
@@ -217,29 +223,49 @@ std::string DescribeTex(void* p) {
 
 // ---------------------------------------------------------------- builder patch
 
+bool WriteByte(uint8_t* a, uint8_t v) {
+    DWORD old = 0;
+    if (!VirtualProtect(a, 1, PAGE_EXECUTE_READWRITE, &old)) return false;
+    *a = v;
+    VirtualProtect(a, 1, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), a, 1);
+    return true;
+}
+
+// Bytes already in the target state count as done, so a second call is harmless. A failed write puts the bytes
+// written so far back: a half patch (the store at 0x60, the load at 0x50) would break the eye loop.
 bool WritePatch(bool apply) {
+    constexpr size_t n = std::size(kPatch);
     for (const PatchByte& p : kPatch) {
         uint8_t* a = (uint8_t*)hooks::Address(p.anchor);
-        uint8_t want = apply ? p.from : p.to;
-        if (!a || a[p.off] != want) {
+        uint8_t from = apply ? p.from : p.to, to = apply ? p.to : p.from;
+        if (!a || (a[p.off] != from && a[p.off] != to)) {
             Log("Quad: builder patch not %s: %s+%zu is 0x%02X, expected 0x%02X", apply ? "applied" : "removed",
-                hooks::Name(p.anchor), p.off, a ? a[p.off] : 0, want);
+                hooks::Name(p.anchor), p.off, a ? a[p.off] : 0, from);
             return false;
         }
     }
-    for (const PatchByte& p : kPatch) {
+    bool written[n] = {};
+    size_t count = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const PatchByte& p = kPatch[i];
         uint8_t* a = (uint8_t*)hooks::Address(p.anchor) + p.off;
-        DWORD old = 0;
-        if (!VirtualProtect(a, 1, PAGE_EXECUTE_READWRITE, &old)) {
-            Log("Quad: VirtualProtect failed at %s (error %lu)", hooks::Name(p.anchor), GetLastError());
+        uint8_t to = apply ? p.to : p.from;
+        if (*a == to) continue;
+        if (!WriteByte(a, to)) {
+            Log("Quad: VirtualProtect failed at %s (error %lu); builder patch left %s", hooks::Name(p.anchor),
+                GetLastError(), apply ? "off" : "on");
+            for (size_t k = 0; k < i; ++k) {
+                const PatchByte& q = kPatch[k];
+                if (written[k]) WriteByte((uint8_t*)hooks::Address(q.anchor) + q.off, apply ? q.from : q.to);
+            }
             return false;
         }
-        *a = apply ? p.to : p.from;
-        VirtualProtect(a, 1, old, &old);
-        FlushInstructionCache(GetCurrentProcess(), a, 1);
+        written[i] = true;
+        ++count;
     }
-    Log("Quad: builder patch %s (4 bytes: eye loop for views 2..4, group array at [rsp+0x60])",
-        apply ? "applied" : "removed");
+    Log("Quad: builder patch %s (4 bytes: eye loop for views 2..4, group array at [rsp+0x60])%s",
+        apply ? "applied" : "removed", count ? "" : ", already in place");
     return true;
 }
 
@@ -361,16 +387,33 @@ void SwapInLocked(uint8_t* ctx, int group, int src, Run& run) {
     s.vr = vr;
     uint8_t data[kVrEyeSize];
     bool proj = false;
-    if (g_focus.on && !g_focus.projFailed) {
+    // Focus R ends in the right Submit texture, which then is the right eye's only image: without this frame's outer
+    // R copy it must stay the plain eye view, not the focus window.
+    const Copy& outerR = g_copy[CopyOuterR];
+    if (g_focus.on && !g_focus.projFailed && group == FocusR && (!outerR.frame || !outerR.tex)) {
+        if (!g_focus.noCopyLogged) {
+            g_focus.noCopyLogged = true;
+            Log("Quad: focus R without the focus projection in frame %llu: no outer R copy (the right eye gets the "
+                "plain eye view at the focus size)", (unsigned long long)g_frameNo);
+        }
+    } else if (g_focus.on && !g_focus.projFailed) {
         char why[256] = "";
         uint8_t* cam = *(uint8_t**)(ctx + kCtxSlots + kFocusView * kSlotSize);
         proj = CameraReady(cam, srcEye, why, sizeof(why)) &&
                FocusEyeData(srcEye, g_focus.geo.eye[src - 1], data, why, sizeof(why));
         if (!proj) {
-            g_focus.projFailed = true;
-            Log("Quad: focus projection OFF for this session (%s: %s); the focus groups render the eye views",
-                kGroupNames[group], why);
+            if (!g_focus.missLogged) {
+                g_focus.missLogged = true;
+                Log("Quad: %s without the focus projection in frame %llu (%s); off after %d misses in a row",
+                    kGroupNames[group], (unsigned long long)g_frameNo, why, kProjMissLimit);
+            }
+            if (++g_focus.projMisses >= kProjMissLimit) {
+                g_focus.projFailed = true;
+                Log("Quad: focus projection OFF until the next builder call (%s: %s); the focus groups render the "
+                    "eye views", kGroupNames[group], why);
+            }
         } else {
+            g_focus.projMisses = 0;
             if (!g_focus.logged[group]) {
                 g_focus.logged[group] = true;
                 LogFocusFirst(group, srcEye, data, cam);
@@ -602,11 +645,15 @@ Fn4 o_builder = nullptr, o_beginCtor = nullptr, o_endCtor = nullptr, o_bonnetCto
 Fn4 o_beginExec = nullptr, o_endExec = nullptr;
 
 void* __fastcall D_Builder(void* a, void* b, void* c, void* d) {
-    Safe("builder", [&] {
+    // Not gated by the fault flag: the restore, and after a fault the graph stays empty (no focus groups).
+    Guard("builder", [&] {
         std::lock_guard lock(g_m);
         ++g_builderCalls;
         RestoreLocked();
         g_graph = Graph{};
+        g_focus.projFailed = false;
+        g_focus.projMisses = 0;
+        g_focus.missLogged = false;
     });
     t_inBuilder = true;
     t_buildGroup = -1;
@@ -714,11 +761,11 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
 
 void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
     t_inEndEye = true;
-    t_endRtv = nullptr;
+    t_endRes = nullptr;
     void* r = o_endExec(task, b, c, d);
     t_inEndEye = false;
-    ID3D11RenderTargetView* rtv = t_endRtv;
-    t_endRtv = nullptr;
+    ID3D11Resource* res = t_endRes;
+    t_endRes = nullptr;
     // Not gated by the fault flag: without the restore focus R would render with the left eye's data.
     Guard("CEndEye", [&] {
         std::lock_guard lock(g_m);
@@ -729,8 +776,6 @@ void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
         Run& run = g_run[g];
         run.t1 = NowMs();
         g_ended |= 1u << g;
-        ID3D11Resource* res = nullptr;
-        if (rtv) rtv->GetResource(&res);
         run.out = res;
         if (!res) return;
         if (!g_outLogged[g]) {
@@ -744,8 +789,8 @@ void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
             if (g == OuterR) CopyLocked(CopyOuterR, res);
             if (g == FocusL && Cfg().quadCompose) CopyLocked(CopyFocusL, res);
         }
-        res->Release();
     });
+    if (res) res->Release();
     return r;
 }
 
@@ -760,7 +805,8 @@ constexpr int kSlotOMSetRenderTargets = 33;  // ID3D11DeviceContext vtable (d3d1
 // (0xdb7ab0), then draws the desktop mirror (3440 x 1440 in the first M4.2 run), so only the first bind counts.
 void STDMETHODCALLTYPE D_OMSetRenderTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv,
                                             ID3D11DepthStencilView* dsv) {
-    if (t_inEndEye && !t_endRtv && n && rtv && rtv[0] && c == g_imm.load(std::memory_order_relaxed)) t_endRtv = rtv[0];
+    if (t_inEndEye && !t_endRes && n && rtv && rtv[0] && c == g_imm.load(std::memory_order_relaxed))
+        rtv[0]->GetResource(&t_endRes);
     o_omSetRt(c, n, rtv, dsv);
 }
 
@@ -865,7 +911,7 @@ void Install() {
     if (!first) {
         if (!g_installed) return;
         hooks::EnableAll();
-        Guard("Install (again)", [&] { g_patched = WritePatch(true); });
+        if (!g_patched) Guard("Install (again)", [&] { g_patched = WritePatch(true); });
         g_on = true;
         return;
     }
@@ -906,12 +952,14 @@ void Install() {
 
 void OnFrameStart() {
     if (!g_on) return;
-    Safe("frame", [&] {
+    // The restore is not gated by the fault flag (a swap left over from the faulting frame).
+    Guard("frame", [&] {
         std::lock_guard lock(g_m);
         if (g_swap.ctx) {
             ++g_st.lateRestores;
             RestoreLocked();
         }
+        if (g_fault.load(std::memory_order_relaxed)) return;
         FinishFrameLocked();
         ++g_frameNo;
         g_frameT0 = NowMs();
@@ -967,7 +1015,8 @@ bool Engaged() { return g_focus.engaged; }
 const vr::Texture_t* PrepareSubmit(vr::EVREye eye, const vr::Texture_t* tex, const vr::VRTextureBounds_t* bounds,
                                    vr::Texture_t& storage) {
     const vr::Texture_t* out = tex;
-    if (!g_on) return out;
+    // After a fault the per-frame state is frozen, but no swap happens any more: both game textures are eye views.
+    if (!g_on || g_fault.load(std::memory_order_relaxed)) return out;
     Guard("PrepareSubmit", [&] {
         std::lock_guard lock(g_m);
         if (!g_focus.on || !g_graph.ok || !tex || tex->eType != vr::API_DirectX || !tex->handle) return;
@@ -1055,7 +1104,11 @@ void Shutdown() {
         std::lock_guard lock(g_m);
         if (g_patched) g_patched = !WritePatch(false);
     });
-    hooks::DisableAll();
+    // A patch still in place keeps the ctor hooks, so views 3 and 4 never reach the engine.
+    if (g_patched)
+        Log("Quad: builder patch still on; engine hooks stay enabled");
+    else
+        hooks::DisableAll();
     Guard("Shutdown (state)", [&] {
         std::lock_guard lock(g_m);
         RestoreLocked();
