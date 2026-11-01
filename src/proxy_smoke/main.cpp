@@ -232,7 +232,7 @@ int CheckQuad(const fs::path& logDir) {
         printf("Quad check FAILED: no proxy log in %ls\n", logDir.c_str());
         return 5;
     }
-    bool settings = false, notSupported = false, hooked = false, faults = false;
+    bool settings = false, notSupported = false, hooked = false, faults = false, size = false, resized = false;
     std::string line;
     while (std::getline(in, line)) {
         settings |= line.find("Settings: [quad] mode=quad") != std::string::npos;
@@ -240,10 +240,15 @@ int CheckQuad(const fs::path& logDir) {
         hooked |= line.find("Quad: engine hooks installed") != std::string::npos ||
                   line.find("builder patch applied") != std::string::npos;
         faults |= line.find("in quad mode") != std::string::npos;
+        // Without the focus groups the game must keep the SteamVR size.
+        size |= line.find("IVRSystem::GetRecommendedRenderTargetSize = ") != std::string::npos;
+        resized |= line.find("quad focus size") != std::string::npos ||
+                   line.find("size returned to the game") != std::string::npos;
     }
-    bool ok = settings && notSupported && !hooked && !faults;
-    printf("Quad check %s: settings %d, exe not supported %d, hooks or patch %d, faults %d (%ls)\n", ok ? "OK" : "FAILED",
-           settings, notSupported, hooked, faults, log.filename().c_str());
+    bool ok = settings && notSupported && !hooked && !faults && size && !resized;
+    printf("Quad check %s: settings %d, exe not supported %d, hooks or patch %d, faults %d, size logged %d, size "
+           "replaced %d (%ls)\n",
+           ok ? "OK" : "FAILED", settings, notSupported, hooked, faults, size, resized, log.filename().c_str());
     return ok ? 0 : 5;
 }
 
@@ -258,7 +263,8 @@ bool PngSize(const fs::path& p, uint32_t& w, uint32_t& h) {
 }
 
 // The shot module on its own: four textures like the four views (outer_l == focus_l, focus_r differs from outer_r
-// in a 16 x 16 block, one image in R10G10B10A2), then the log lines and the PNG files it writes.
+// in a 16 x 16 block, one image in R10G10B10A2), a focus window (outer_l's 256 x 192 rectangle at (200, 150), each
+// pixel repeated 2 x 2), then the log lines and the PNG files it writes.
 int RunShots(const fs::path& home) {
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
@@ -268,38 +274,43 @@ int RunShots(const fs::path& home) {
         return 1;
     }
     const UINT w = 1024, h = 768;
-    static const char* const names[] = {"outer_l", "outer_r", "focus_l", "focus_r", "tonemap"};
-    static const qvfr::shots::Pair pairs[] = {
-        {2, 0, "focus L vs outer L"}, {3, 1, "focus R vs outer R"}, {0, 1, "outer L vs outer R"}};
+    static const char* const names[] = {"outer_l", "outer_r", "focus_l", "focus_r", "tonemap", "focus_window"};
+    static const qvfr::shots::Pair pairs[] = {{2, 0, "focus L vs outer L"},
+                                              {3, 1, "focus R vs outer R"},
+                                              {0, 1, "outer L vs outer R"},
+                                              {5, 0, "window vs outer L", 200, 150, 256, 192}};
+    constexpr int kImages = 6;
     std::vector<uint32_t> px((size_t)w * h);
-    ID3D11Texture2D* tex[5] = {};
-    for (int i = 0; i < 5; ++i) {
-        for (UINT y = 0; y < h; ++y)
-            for (UINT x = 0; x < w; ++x) {
-                uint32_t r = x * 255 / w, g = y * 255 / h, b = (i == 1 || i == 3) ? 200 : 40;
+    ID3D11Texture2D* tex[kImages] = {};
+    for (int i = 0; i < kImages; ++i) {
+        const UINT iw = i == 5 ? w / 2 : w, ih = i == 5 ? h / 2 : h;
+        for (UINT y = 0; y < ih; ++y)
+            for (UINT x = 0; x < iw; ++x) {
+                UINT u = i == 5 ? 200 + x / 2 : x, v = i == 5 ? 150 + y / 2 : y;  // outer_l pixel shown here
+                uint32_t r = u * 255 / w, g = v * 255 / h, b = (i == 1 || i == 3) ? 200 : 40;
                 if (i == 3 && x >= 500 && x < 516 && y >= 300 && y < 316) r = (r + 128) % 256;
-                px[(size_t)y * w + x] = i == 4 ? (r << 2) | (g << 12) | (b << 22) | (3u << 30)
-                                               : r | g << 8 | b << 16 | 0xFF000000u;
+                px[(size_t)y * iw + x] = i == 4 ? (r << 2) | (g << 12) | (b << 22) | (3u << 30)
+                                                : r | g << 8 | b << 16 | 0xFF000000u;
             }
         D3D11_TEXTURE2D_DESC d{};
-        d.Width = w;
-        d.Height = h;
+        d.Width = iw;
+        d.Height = ih;
         d.MipLevels = 1;
         d.ArraySize = 1;
         d.Format = i == 4 ? DXGI_FORMAT_R10G10B10A2_UNORM : DXGI_FORMAT_R8G8B8A8_TYPELESS;
         d.SampleDesc.Count = 1;
         d.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-        D3D11_SUBRESOURCE_DATA init{px.data(), w * 4, 0};
+        D3D11_SUBRESOURCE_DATA init{px.data(), iw * 4, 0};
         if (FAILED(dev->CreateTexture2D(&d, &init, &tex[i]))) {
             printf("Cannot create the shot textures\n");
             return 1;
         }
     }
     double t0 = qvfr::NowMs();
-    bool begun = qvfr::shots::Begin(names, 5, pairs, 3);
-    bool again = qvfr::shots::Begin(names, 5, pairs, 3);  // refused while the first shot is active
+    bool begun = qvfr::shots::Begin(names, kImages, pairs, 4);
+    bool again = qvfr::shots::Begin(names, kImages, pairs, 4);  // refused while the first shot is active
     int grabbed = 0;
-    for (int i = 0; i < 5; ++i) grabbed += qvfr::shots::Grab(ctx, tex[i], i);
+    for (int i = 0; i < kImages; ++i) grabbed += qvfr::shots::Grab(ctx, tex[i], i);
     qvfr::shots::End(ctx);
     // The worker writes the files; Begin succeeds again once it is done.
     bool done = false;
@@ -319,28 +330,31 @@ int RunShots(const fs::path& home) {
     for (const auto& e : fs::directory_iterator(home / L"shots", ec))
         if (e.is_directory() && (newest.empty() || e.path().filename() > newest.filename())) newest = e.path();
     int pngs = 0, halfSize = 0;
-    for (const char* n : names) {
+    for (int i = 0; i < kImages; ++i) {
         uint32_t pw = 0, ph = 0;
-        if (PngSize(newest / (std::string(n) + ".png"), pw, ph)) {
+        if (PngSize(newest / (std::string(names[i]) + ".png"), pw, ph)) {
             ++pngs;
-            halfSize += pw == w / 2 && ph == h / 2;
+            halfSize += i == 5 ? pw == w / 4 && ph == h / 4 : pw == w / 2 && ph == h / 2;
         }
     }
     std::ifstream in(NewestLog(home / L"logs"));
     std::string line;
-    bool same = false, differs = false, parallax = false;
+    bool same = false, differs = false, parallax = false, window = false;
     while (std::getline(in, line)) {
+        window |= line.find("window vs outer L: mean abs difference 0.000 (0..255), max 0,") != std::string::npos &&
+                  line.find("256.0 x 192.0 pixels at (200.0, 150.0)") != std::string::npos;
         same |= line.find("focus L vs outer L: mean abs difference 0.000 (0..255), max 0,") != std::string::npos;
         differs |= line.find("focus R vs outer R:") != std::string::npos &&
                    line.find("> 32: 0.033%") != std::string::npos;  // 256 of 786432 pixels
         parallax |= line.find("outer L vs outer R:") != std::string::npos &&
                     line.find("max 0,") == std::string::npos;
     }
-    bool ok = begun && !again && grabbed == 5 && done && pngs == 5 && halfSize == 5 && same && differs && parallax;
+    bool ok = begun && !again && grabbed == kImages && done && pngs == kImages && halfSize == kImages && same &&
+              differs && parallax && window;
     printf("Shots check %s: begin %d, second begin refused %d, grabbed %d, writer done %d (%.1f s), PNG %d (half size %d) in "
-           "%ls, diffs: identical %d, block %d, different %d\n",
+           "%ls, diffs: identical %d, block %d, different %d, focus window %d\n",
            ok ? "OK" : "FAILED", begun, !again, grabbed, done, (qvfr::NowMs() - t0) / 1000.0, pngs, halfSize,
-           newest.c_str(), same, differs, parallax);
+           newest.c_str(), same, differs, parallax, window);
     return ok ? 0 : 6;
 }
 

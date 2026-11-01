@@ -10,6 +10,9 @@ namespace qvfr::shots {
 struct Pair {
     int a, b;           // image indices
     const char* label;  // for the log line
+    // rw > 0: image a shows the rectangle (rx, ry, rw, rh) of image b, in b's pixels (a focus view inside its outer).
+    // a is then averaged over each b pixel's footprint and compared with the b pixels inside the rectangle.
+    float rx = 0, ry = 0, rw = 0, rh = 0;
 };
 
 // One shot is up to kMaxImages images taken in the same frame. All calls come from the game's render thread.

@@ -5,6 +5,7 @@ add_library(qvfr_proxy SHARED
   wrappers.cpp
   frame.cpp
   experiment.cpp
+  focus_geometry.cpp
   callers.cpp
   hooks.cpp
   probe.cpp

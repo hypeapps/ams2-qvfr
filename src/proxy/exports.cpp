@@ -128,7 +128,7 @@ bool Ready() {
 
 // After a diagnostics fault the game normally gets the real interfaces. Not while the experiment is engaged:
 // the game already renders with a replaced size and projection, and only the wrappers keep Submit consistent.
-bool Wrap() { return Cfg().wrap && (!g_diagDisabled.load() || experiment::Engaged()); }
+bool Wrap() { return Cfg().wrap && (!g_diagDisabled.load() || experiment::Engaged() || quad::Engaged()); }
 
 void LogFirst(const char* what) {
     Guarded("LogFirst", [&] {

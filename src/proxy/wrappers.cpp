@@ -128,13 +128,15 @@ public:
         callers::Note(site);
         SystemWrapBase::GetRecommendedRenderTargetSize(w, h);
         uint32_t realW = w ? *w : 0, realH = h ? *h : 0;
-        experiment::AdjustSize(real_, w, h);  // outside Guarded: must not depend on the diagnostics kill-switch
+        // Outside Guarded: must not depend on the diagnostics kill-switch. At most one of them is on (quad wins).
+        experiment::AdjustSize(real_, w, h);
+        quad::AdjustSize(real_, w, h);
         Guarded("GetRecommendedRenderTargetSize", [&] {
             if (!w || !h) return;
             frame::NoteRecommendedSize(realW, realH, *w, *h);
             if (realW != *w || realH != *h)
-                LogValue(size_, "IVRSystem::GetRecommendedRenderTargetSize = %u x %u (experiment; SteamVR %u x %u)", *w, *h,
-                         realW, realH);
+                LogValue(size_, "IVRSystem::GetRecommendedRenderTargetSize = %u x %u (%s; SteamVR %u x %u)", *w, *h,
+                         quad::Engaged() ? "quad focus size" : "experiment", realW, realH);
             else
                 LogValue(size_, "IVRSystem::GetRecommendedRenderTargetSize = %u x %u", *w, *h);
         });
@@ -247,6 +249,9 @@ public:
         const vr::Texture_t* out = experiment::PrepareSubmit(eye, tex, bounds, padded);
         probe::OnSubmitBegin(eye, tex);
         quad::OnSubmitBegin(eye, tex);
+        // Quad mode: the right eye gets the outer R copy until the composition (M4.4).
+        vr::Texture_t outerR{};
+        out = quad::PrepareSubmit(eye, out, outerR);
         double t0 = NowMs();
         vr::EVRCompositorError err = CompositorWrapBase::Submit(eye, out, bounds, flags);
         probe::OnSubmitEnd(eye);

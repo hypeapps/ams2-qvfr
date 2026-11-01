@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -126,17 +127,10 @@ bool WritePng(const fs::path& path, const Image& img, std::string& err) {
     return true;
 }
 
-void LogDiff(const Image& a, const Image& b, const char* label) {
-    if (a.w != b.w || a.h != b.h) {
-        Log("Shot: %s: sizes differ (%u x %u and %u x %u)", label, a.w, a.h, b.w, b.h);
-        return;
-    }
-    uint64_t sum = 0, over8 = 0, over32 = 0;
+struct DiffStats {
+    uint64_t sum = 0, over8 = 0, over32 = 0, n = 0;
     int maxd = 0;
-    const size_t n = (size_t)a.w * a.h;
-    for (size_t i = 0; i < n; ++i) {
-        const uint8_t* p = a.rgb.data() + i * 3;
-        const uint8_t* q = b.rgb.data() + i * 3;
+    void Add(const uint8_t* p, const uint8_t* q) {
         int d = 0;
         for (int c = 0; c < 3; ++c) {
             int v = std::abs((int)p[c] - (int)q[c]);
@@ -146,9 +140,79 @@ void LogDiff(const Image& a, const Image& b, const char* label) {
         maxd = std::max(maxd, d);
         over8 += d > 8;
         over32 += d > 32;
+        ++n;
     }
-    Log("Shot: %s: mean abs difference %.3f (0..255), max %d, pixels off by > 8: %.3f%%, > 32: %.3f%%", label,
-        (double)sum / (3.0 * n), maxd, 100.0 * over8 / n, 100.0 * over32 / n);
+};
+
+// Weights of the source pixels covering [s, e) along one axis (source pixel i covers [i, i + 1)).
+struct Span {
+    int i0 = 0;
+    std::vector<float> w;
+};
+
+Span Footprint(double s, double e, int size) {
+    Span sp;
+    sp.i0 = std::max(0, (int)std::floor(s));
+    int i1 = std::min(size, (int)std::ceil(e));
+    double total = 0;
+    for (int i = sp.i0; i < i1; ++i) {
+        double w = std::min(e, (double)i + 1) - std::max(s, (double)i);
+        sp.w.push_back((float)std::max(0.0, w));
+        total += std::max(0.0, w);
+    }
+    for (float& w : sp.w) w = total > 0 ? (float)(w / total) : 0.0f;
+    return sp;
+}
+
+// a shows the rectangle r of b: average a over the footprint of each b pixel fully inside r, compare with that pixel.
+void DiffRegion(const Image& a, const Image& b, const Pair& r, DiffStats& st) {
+    const double kx = a.w / (double)r.rw, ky = a.h / (double)r.rh;  // a pixels per b pixel
+    const int u0 = std::max(0, (int)std::ceil(r.rx)), u1 = std::min((int)b.w, (int)std::floor(r.rx + r.rw));
+    const int v0 = std::max(0, (int)std::ceil(r.ry)), v1 = std::min((int)b.h, (int)std::floor(r.ry + r.rh));
+    if (u0 >= u1 || v0 >= v1) return;
+    std::vector<Span> cols(u1 - u0);
+    for (int u = u0; u < u1; ++u) cols[u - u0] = Footprint((u - r.rx) * kx, (u + 1 - r.rx) * kx, (int)a.w);
+    for (int v = v0; v < v1; ++v) {
+        Span row = Footprint((v - r.ry) * ky, (v + 1 - r.ry) * ky, (int)a.h);
+        for (int u = u0; u < u1; ++u) {
+            const Span& col = cols[u - u0];
+            float acc[3] = {};
+            for (size_t j = 0; j < row.w.size(); ++j) {
+                const uint8_t* line = a.rgb.data() + (size_t)(row.i0 + j) * a.w * 3;
+                for (size_t i = 0; i < col.w.size(); ++i) {
+                    const uint8_t* p = line + (size_t)(col.i0 + i) * 3;
+                    float w = row.w[j] * col.w[i];
+                    for (int c = 0; c < 3; ++c) acc[c] += w * p[c];
+                }
+            }
+            uint8_t avg[3];
+            for (int c = 0; c < 3; ++c) avg[c] = (uint8_t)std::clamp((int)std::lround(acc[c]), 0, 255);
+            st.Add(avg, b.rgb.data() + ((size_t)v * b.w + u) * 3);
+        }
+    }
+}
+
+void LogDiff(const Image& a, const Image& b, const Pair& pair) {
+    DiffStats st;
+    char what[160] = "";
+    if (pair.rw > 0 && pair.rh > 0) {
+        DiffRegion(a, b, pair, st);
+        snprintf(what, sizeof(what), " (first image averaged into %.1f x %.1f pixels at (%.1f, %.1f) of the second)",
+                 pair.rw, pair.rh, pair.rx, pair.ry);
+    } else if (a.w != b.w || a.h != b.h) {
+        Log("Shot: %s: sizes differ (%u x %u and %u x %u)", pair.label, a.w, a.h, b.w, b.h);
+        return;
+    } else {
+        const size_t n = (size_t)a.w * a.h;
+        for (size_t i = 0; i < n; ++i) st.Add(a.rgb.data() + i * 3, b.rgb.data() + i * 3);
+    }
+    if (!st.n) {
+        Log("Shot: %s: no pixels to compare%s", pair.label, what);
+        return;
+    }
+    const double n = (double)st.n;
+    Log("Shot: %s: mean abs difference %.3f (0..255), max %d, pixels off by > 8: %.3f%%, > 32: %.3f%%%s", pair.label,
+        (double)st.sum / (3.0 * n), st.maxd, 100.0 * st.over8 / n, 100.0 * st.over32 / n, what);
 }
 
 void RunJob(std::unique_ptr<Job> job) {
@@ -156,7 +220,7 @@ void RunJob(std::unique_ptr<Job> job) {
     double t0 = NowMs();
     for (const Pair& p : job->pairs) {
         int a = job->index[p.a], b = job->index[p.b];
-        if (a >= 0 && b >= 0) LogDiff(job->images[a], job->images[b], p.label);
+        if (a >= 0 && b >= 0) LogDiff(job->images[a], job->images[b], p);
     }
     fs::path dir = BaseDir() / L"shots" / Widen(job->stamp);
     std::error_code ec;

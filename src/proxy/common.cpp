@@ -99,8 +99,15 @@ const char kDefaultIni[] =
     "; Quad views through extra eye groups in the game engine (hooks in AMS2AVX.exe, only for the known exe build).\n"
     ";   off   = no engine hooks\n"
     ";   probe = logging hooks only (task order, render context fields, D3D11 calls per eye); the image does not change\n"
-    ";   quad  = two extra eye groups render the focus views (for now with the eye cameras: the image does not change)\n"
+    ";   quad  = two extra eye groups render the focus views; the game renders at the focus size (outer: full FOV,\n"
+    ";           focus: the focus window at 1:1 density). Replaces [experiment] while on.\n"
     "mode=off\n"
+    "; quad: focus window as a fraction of the eye's tangent span, both axes (0.5 = 50% x 50%); also the size the game\n"
+    "; renders at, so the outer density is focus_size of 1:1. Restart the game after a change.\n"
+    "focus_size=0.5\n"
+    "; quad: focus center as view direction tangents, the same for both eyes (0,0 = optical axis; right and up are +).\n"
+    "center_x=0\n"
+    "center_y=0\n"
     "; probe: how many frames to log in full after the first in-game frame (one more every stats_interval_s).\n"
     "probe_frames=3\n"
     "; probe: 1 = hooks in the game engine (eye tasks, builder); 1 = hooks in the D3D11 immediate context (counters).\n"
@@ -278,10 +285,23 @@ void LoadConfig() {
     c.shotKeyMod = IniInt(ini, L"quad", L"shot_modifier", c.shotKeyMod);
     c.shotKey = IniInt(ini, L"quad", L"shot_key", c.shotKey);
     c.shotAutoS = IniFloat(ini, L"quad", L"shot_auto_s", 0.0f);
+    c.quadFocusSize = IniFloat(ini, L"quad", L"focus_size", c.quadFocusSize);
+    if (!(c.quadFocusSize >= 0.1f && c.quadFocusSize <= 1.0f)) {
+        Log("Settings: [quad] focus_size=%.3f outside 0.1..1, using 0.5", c.quadFocusSize);
+        c.quadFocusSize = 0.5f;
+    }
+    c.quadCenterX = IniFloat(ini, L"quad", L"center_x", 0.0f);
+    c.quadCenterY = IniFloat(ini, L"quad", L"center_y", 0.0f);
     if (c.quadMode != QuadMode::Off)
-        Log("Settings: [quad] mode=%s probe_frames=%d probe_engine=%d probe_d3d=%d shot_modifier=0x%X shot_key=0x%X "
-            "shot_auto_s=%.1f",
-            QuadModeName(c.quadMode), c.probeFrames, c.probeEngine, c.probeD3D, c.shotKeyMod, c.shotKey, c.shotAutoS);
+        Log("Settings: [quad] mode=%s focus_size=%.3f center=(%.3f, %.3f) probe_frames=%d probe_engine=%d probe_d3d=%d "
+            "shot_modifier=0x%X shot_key=0x%X shot_auto_s=%.1f",
+            QuadModeName(c.quadMode), c.quadFocusSize, c.quadCenterX, c.quadCenterY, c.probeFrames, c.probeEngine,
+            c.probeD3D, c.shotKeyMod, c.shotKey, c.shotAutoS);
+    if (c.quadMode == QuadMode::Quad && c.expMode != ExpMode::Off) {
+        Log("Settings: [experiment] mode=%s ignored: [quad] mode=quad sets the size and projection itself",
+            ExpModeName(c.expMode));
+        c.expMode = ExpMode::Off;
+    }
     c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
     if (c.testFaultFrames > 0) Log("Settings: [test] fault_frames=%d (deliberate fault for testing)", c.testFaultFrames);
     g_cfg = c;
