@@ -1,6 +1,7 @@
 #include "quad.h"
 
 #include <d3d11.h>
+#include <intrin.h>
 
 #include <algorithm>
 #include <atomic>
@@ -73,8 +74,12 @@ enum Group { OuterL, OuterR, FocusL, FocusR };
 const char* const kGroupNames[kGroups] = {"outer L", "outer R", "focus L", "focus R"};
 // Shot images: the four views at their CEndEye, then the composed eyes at Submit.
 constexpr int kComposed = kGroups;  // + eye
-constexpr int kShotImages = kGroups + 2;
-const char* const kShotNames[kShotImages] = {"outer_l", "outer_r", "focus_l", "focus_r", "composed_l", "composed_r"};
+constexpr int kShotFixed = kGroups + 2;
+constexpr int kShotImages = shots::kMaxImages;  // the rest: focus's clones at the end of focus L (M7.4 diagnostics)
+char g_dumpNames[kShotImages - kShotFixed][64];
+ID3D11Resource* g_dumpRes[kShotImages - kShotFixed] = {};  // not referenced: released no earlier than the next frame
+const char* g_shotNames[kShotImages] = {"outer_l", "outer_r", "focus_l", "focus_r", "composed_l", "composed_r"};
+int g_shotCount = kShotFixed;
 // The view whose camera, frustum and visibility list each group renders with; the focus groups replace only the
 // projection (camera and VR device eye data) with the focus window of that eye.
 constexpr int kSourceView[kGroups] = {1, 2, 1, 2};
@@ -196,8 +201,8 @@ struct Stats {
 
 // Focus window for this VR session (M4.3, M7.2): the game gets the render size and the full projection (outer), the
 // focus groups get the focus window of their eye. The window (geo.focusW x geo.focusH grid pixels) is the DFR or the FFR
-// section, by follow_gaze at the start of the session. Without smaller targets (M7.2) both sets render at the game
-// size, the larger of the outer and the focus texture sizes per axis.
+// section, by follow_gaze at the start of the session. The game renders at the larger of the outer and the focus texture
+// sizes per axis; a set whose size differs renders into clones in its own size (M7.4), or at the game size without them.
 struct Focus {
     bool setupDone = false;
     bool on = false;          // geometry ready: the game got the render size
@@ -206,7 +211,8 @@ struct Focus {
     focus::Geometry geo;
     uint32_t outerW = 0, outerH = 0;    // outer texture wanted (peripheral_multiplier)
     uint32_t focusTexW = 0, focusTexH = 0;  // focus texture wanted (focus_multiplier x window)
-    uint32_t gameW = 0, gameH = 0;      // size returned to the game = size of all four views
+    uint32_t gameW = 0, gameH = 0;      // size returned to the game = size of all four views without clones
+    uint32_t outerOutW = 0, outerOutH = 0;  // outer L's output in the latest frame (with clones: outer's size)
     bool projFailed = false;  // engine data did not match the geometry: focus groups render the eye views
     int projMisses = 0;       // consecutive focus groups without the projection (projFailed at kProjMissLimit)
     bool missLogged = false;
@@ -246,6 +252,7 @@ enum { CopyOuterR, CopyFocusL, kCopies };
 const char* const kCopyNames[kCopies] = {"outer R", "focus L"};
 Copy g_copy[kCopies];
 bool g_rightLogged = false;
+bool g_cloneSubmitLogged = false;
 char g_noCompose[2][160] = {};  // last reason logged per eye
 uint32_t g_gen = 0;             // gpu::Generation() the D3D11 objects above belong to
 
@@ -892,9 +899,9 @@ void FinishFrameLocked() {
     if (g_run[FocusL].projected && g_run[FocusR].projected) ++g_st.projected;
     // Expected: outer L writes into the left Submit texture, the other groups into the right one. Only frames
     // after the first Submit count (track loading runs the eye groups without Submit and without the D3D11 hook).
-    // With clones (M7.3) the focus groups write the clone of the right Submit texture.
+    // With clones (M7.3, M7.4) a group writes the clone of its Submit texture.
     bool submitting = g_lastSubmit[0] && g_lastSubmit[1];
-    bool outOk = g_run[OuterL].out && g_run[OuterL].out == g_lastSubmit[0];
+    bool outOk = g_run[OuterL].out && clones::Original(g_run[OuterL].out) == g_lastSubmit[0];
     for (int g = OuterR; g < kGroups; ++g)
         if (want & (1u << g)) outOk &= g_run[g].out && clones::Original(g_run[g].out) == g_lastSubmit[1];
     if (full && submitting && !outOk) ++g_st.outNotSubmit;
@@ -1014,9 +1021,14 @@ void HandleShotLocked() {
     const char* why = autoShot ? "shot_auto_s" : "hotkey";
     // The blend band may have changed (live reload).
     for (int i = 0; i < 2; ++i) g_shotPairs[3 + i].inset = SharpInsetLocked();
+    // Diagnostics (M7.4): focus's clones join the shot, grabbed at the end of focus L.
+    const int dumps =
+        c.shotClones ? clones::ListForShot(clones::Focus, g_dumpRes, g_dumpNames, kShotImages - kShotFixed) : 0;
+    for (int i = 0; i < dumps; ++i) g_shotNames[kShotFixed + i] = g_dumpNames[i];
+    g_shotCount = kShotFixed + dumps;
     if (!gpu::Context() || !g_graph.ok) {
         Log("Quad: shot (%s) skipped: no focus groups or no D3D11 device yet", why);
-    } else if (!shots::Begin(kShotNames, kShotImages, g_shotPairs, (int)std::size(g_shotPairs))) {
+    } else if (!shots::Begin(g_shotNames, g_shotCount, g_shotPairs, (int)std::size(g_shotPairs))) {
         Log("Quad: shot (%s) skipped: the previous one is still being written", why);
     } else {
         g_shotFrame = true;
@@ -1040,11 +1052,14 @@ void CopyLocked(int k, ID3D11Resource* res) {
     if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&src)) || !src) return;
     D3D11_TEXTURE2D_DESC d{};
     src->GetDesc(&d);
-    if (d.Width != g_focus.gameW || d.Height != g_focus.gameH) {
+    const bool eyeSize = (d.Width == g_focus.gameW && d.Height == g_focus.gameH) ||
+                         (d.Width == g_focus.outerW && d.Height == g_focus.outerH) ||
+                         (d.Width == g_focus.focusTexW && d.Height == g_focus.focusTexH);
+    if (!eyeSize) {
         // Not an eye texture (the desktop mirror after leaving the race in the first M4.3 run).
         if (!c.sizeLogged) {
             c.sizeLogged = true;
-            Log("Quad: %s output %u x %u fmt %d is not the game's render size; no copy", kCopyNames[k], d.Width,
+            Log("Quad: %s output %u x %u fmt %d is not the game's, outer's or focus's size; no copy", kCopyNames[k], d.Width,
                 d.Height, (int)d.Format);
         }
         src->Release();
@@ -1097,13 +1112,27 @@ void NoComposeLocked(int e, const char* why) {
 // The composed eye for this Submit, or null (the reason logged once). Outer L is the left Submit texture, outer R the
 // copy from its CEndEye; focus L the copy from its CEndEye, focus R what its CEndEye wrote.
 // The sources must be this frame's images: outer L in the left Submit texture; outer R, focus L and focus R one after
-// another in the right one (the copies were taken from it at their CEndEye). Review finding 6 (M4). With clones (M7.3)
-// both focus groups write the clone of the right Submit texture instead.
+// another in the right one (the copies were taken from it at their CEndEye). Review finding 6 (M4). With clones (M7.3,
+// M7.4) a group writes the clone of its Submit texture instead (outer's and focus's are different clones).
 bool OutputsMatchLocked(int e, void* submitTex) {
     void* right = g_run[OuterR].out;
     void* focus = g_run[FocusR].out;
-    if (!right || !focus || g_run[FocusL].out != focus || clones::Original(focus) != right) return false;
-    return e ? right == submitTex : g_run[OuterL].out == submitTex;
+    if (!right || !focus || g_run[FocusL].out != focus || clones::Original(focus) != clones::Original(right))
+        return false;
+    return clones::Original(e ? right : g_run[OuterL].out) == submitTex;
+}
+
+// The size of a 2D texture.
+bool TexSize(void* res, uint32_t& w, uint32_t& h) {
+    ID3D11Texture2D* t = nullptr;
+    if (!res || FAILED(static_cast<IUnknown*>(res)->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&t)) || !t)
+        return false;
+    D3D11_TEXTURE2D_DESC d{};
+    t->GetDesc(&d);
+    t->Release();
+    w = d.Width;
+    h = d.Height;
+    return true;
 }
 
 ID3D11Texture2D* ComposeLocked(int e, const vr::Texture_t* tex, const vr::VRTextureBounds_t* bounds) {
@@ -1126,21 +1155,26 @@ ID3D11Texture2D* ComposeLocked(int e, const vr::Texture_t* tex, const vr::VRText
         NoComposeLocked(e, why);
         return nullptr;
     }
-    // Left eye: outer L is the game texture. Right eye: focus R is what its CEndEye wrote (the right Submit texture, or
-    // its clone).
-    void* src = e ? g_run[FocusR].out : tex->handle;
+    // Left eye: outer L is what its CEndEye wrote (the left Submit texture, or its clone). Right eye: focus R is what its
+    // CEndEye wrote (the right Submit texture, or its clone).
+    void* src = e ? g_run[FocusR].out : g_run[OuterL].out;
     ID3D11Texture2D* game = nullptr;
     if (FAILED(static_cast<IUnknown*>(src)->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&game)) || !game) {
-        NoComposeLocked(e, e ? "the focus R output is not an ID3D11Texture2D" : "the Submit texture is not an ID3D11Texture2D");
+        NoComposeLocked(e, e ? "the focus R output is not an ID3D11Texture2D" : "the outer L output is not an ID3D11Texture2D");
         return nullptr;
     }
+    ID3D11Texture2D* outerTex = e ? copy.tex : game;
+    ID3D11Texture2D* focusTex = e ? game : copy.tex;
     const focus::Geometry& g = g_focus.geo;
     compose::Layout l;
     l.gridW = g.gridW;
     l.gridH = g.gridH;
-    // No smaller targets yet (M7.2): outer and focus both at the game's render size.
-    l.outerW = l.focusTexW = g_focus.gameW;
-    l.outerH = l.focusTexH = g_focus.gameH;
+    // The sizes the groups rendered at: their own with clones (M7.4), else the game's.
+    if (!TexSize(outerTex, l.outerW, l.outerH) || !TexSize(focusTex, l.focusTexW, l.focusTexH)) {
+        game->Release();
+        NoComposeLocked(e, "no size of the outer or focus texture");
+        return nullptr;
+    }
     l.focusW = g.focusW;
     l.focusH = g.focusH;
     // The window the eye's focus group rendered (this frame's, checked above through `projected`).
@@ -1161,7 +1195,7 @@ ID3D11Texture2D* ComposeLocked(int e, const vr::Texture_t* tex, const vr::VRText
     }
     const gpu::Phase phase = e ? gpu::ComposeR : gpu::ComposeL;
     gpu::Begin(phase);
-    ID3D11Texture2D* out = compose::Draw(imm, e, e ? copy.tex : game, e ? game : copy.tex, l);
+    ID3D11Texture2D* out = compose::Draw(imm, e, outerTex, focusTex, l);
     gpu::End(phase);
     game->Release();
     if (!out) NoComposeLocked(e, "composition failed, see the Compose line");
@@ -1299,11 +1333,15 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         r.t0 = NowMs();
         g_began |= 1u << g;
         gpu::Begin((gpu::Phase)g);  // the groups and the GPU phases have the same order
-        if (!g_graph.ok || g < FocusL) return;
-        // The groups run in build order; a focus task without its predecessors in this frame is a stale address
-        // (the race graph is gone and the menu reuses the memory).
+        if (!g_graph.ok) return;
+        // The groups run in build order; a task without its predecessors in this frame is a stale address (the race
+        // graph is gone and the menu reuses the memory).
         const unsigned before = (1u << g) - 1;
         if ((g_ended & before) != before) return;
+        if (g < FocusL) {
+            clones::BeginGroup(gpu::Context(), clones::Outer);
+            return;
+        }
         if (g_firstFocusMs < 0) {
             g_firstFocusMs = NowMs();
             Log("Quad: first frame with focus groups (frame %llu, thread %lu)", (unsigned long long)g_frameNo,
@@ -1313,7 +1351,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         int view = *(int*)((uint8_t*)task + kTaskView);
         if (!ctx || view != kFocusView) return;
         SwapInLocked(ctx, g, kSourceView[g], r);
-        clones::BeginFocus(gpu::Context());
+        clones::BeginGroup(gpu::Context(), clones::Focus);
     });
     return o_beginExec(task, b, c, d);
 }
@@ -1331,7 +1369,7 @@ void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
         int g = Find(g_graph.end, task);
         if (g < 0) return;
         if (g_swap.ctx && g_swap.group == g) RestoreLocked();
-        if (g >= FocusL) clones::EndFocus(gpu::Context());  // no-op without its BeginFocus
+        clones::EndGroup(gpu::Context());  // no-op without its BeginGroup
         if (g_fault.load(std::memory_order_relaxed)) return;
         Run& run = g_run[g];
         run.t1 = NowMs();
@@ -1343,7 +1381,11 @@ void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
             g_outLogged[g] = true;
             Log("Quad: %s writes its final image into %s", kGroupNames[g], DescribeTex(res).c_str());
         }
+        if (g == OuterL) TexSize(res, g_focus.outerOutW, g_focus.outerOutH);
         if (g_shotFrame) shots::Grab(gpu::Context(), res, g);
+        // Diagnostics: every clone of focus as focus L left it.
+        if (g_shotFrame && g == FocusL)
+            for (int i = kShotFixed; i < g_shotCount; ++i) shots::Grab(gpu::Context(), g_dumpRes[i - kShotFixed], i);
         // Only after this frame's earlier groups (a stale task address otherwise); in outer-only mode nothing is composed.
         const unsigned upTo = (2u << g) - 1;
         if (g_focus.on && g_graph.ok && !g_frameSkip && (g_began & upTo) == upTo) {
@@ -1366,10 +1408,18 @@ constexpr int kSlotOMSetRenderTargets = 33;  // ID3D11DeviceContext vtable (d3d1
 // (0xdb7ab0), then draws the desktop mirror (3440 x 1440 in the first M4.2 run), so only the first bind counts.
 void STDMETHODCALLTYPE D_OMSetRenderTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv,
                                             ID3D11DepthStencilView* dsv) {
+    void* caller = _ReturnAddress();
+    // Clones' bind fix: a pass with its own views of a cloned target binds the clone.
+    ID3D11RenderTargetView* trtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    ID3D11DepthStencilView* tdsv = nullptr;
+    if (clones::MapTargets(c, n, rtv, dsv, trtv, &tdsv, caller)) {
+        rtv = trtv;
+        dsv = tdsv;
+    }
     if (t_inEndEye && !t_endRes && n && rtv && rtv[0] && c == gpu::Context())
         rtv[0]->GetResource(&t_endRes);
-    clones::OnOMSetRenderTargets(c, n, rtv, dsv);
     o_omSetRt(c, n, rtv, dsv);
+    clones::OnOMSetRenderTargets(c, n, rtv, dsv, caller);
 }
 
 void LogStatsLocked(const Stats& s, const char* what) {
@@ -1415,11 +1465,14 @@ void AddStats(Stats& a, const Stats& b) {
     for (int g = 0; g < kGroups; ++g) a.cpuMs[g] += b.cpuMs[g];
 }
 
-// Shot rectangles for the focus window of both eyes. Outer views are gameW x gameH over the whole grid, so the window
-// in them is (x0, y0, focusW, focusH) * scale; the composed eye is the grid (focus in its window).
+// Shot rectangles for the focus window of both eyes. Outer views cover the whole grid at the size outer L rendered at in
+// the latest frame (outer's own with clones, else the game's), so the window in them is (x0, y0, focusW, focusH) *
+// scale; the composed eye is the grid (focus in its window).
 void ShotRectsLocked(const focus::Eye* eye) {
     const focus::Geometry& g = g_focus.geo;
-    const double sx = g_focus.gameW / (double)g.gridW, sy = g_focus.gameH / (double)g.gridH;
+    const uint32_t ow = g_focus.outerOutW ? g_focus.outerOutW : g_focus.gameW;
+    const uint32_t oh = g_focus.outerOutH ? g_focus.outerOutH : g_focus.gameH;
+    const double sx = ow / (double)g.gridW, sy = oh / (double)g.gridH;
     for (int i = 0; i < 2; ++i) {
         const focus::Eye& e = eye[i];
         shots::Pair& p = g_shotPairs[i];
@@ -1472,7 +1525,8 @@ void SetupLocked(vr::IVRSystem* real) {
     g_focus.gameW = std::max(g_focus.outerW, g_focus.focusTexW);
     g_focus.gameH = std::max(g_focus.outerH, g_focus.focusTexH);
     g_focus.on = true;
-    clones::SetEyeSize(g_focus.gameW, g_focus.gameH);
+    clones::SetSizes(g_focus.gameW, g_focus.gameH, g_focus.outerW, g_focus.outerH, g_focus.focusTexW,
+                     g_focus.focusTexH);
     g_focus.engaged = true;
     for (int i = 0; i < 2; ++i) {
         float cx = 0, cy = 0;
@@ -1484,11 +1538,17 @@ void SetupLocked(vr::IVRSystem* real) {
         g.gridW, g.gridH, g_focus.outerW, g_focus.outerH, c.peripheralMultiplier, g.focusW, g.focusH,
         g_focus.dfr ? "DFR" : "FFR", secX, secY, g_focus.focusTexW, g_focus.focusTexH, c.focusMultiplier, g_focus.gameW,
         g_focus.gameH);
-    Log("Quad: no smaller targets yet (M7.3: clones at the game size): outer and focus both render at the game size, "
-        "so the density of 1:1 is "
-        "%.0f%% x %.0f%% for outer (wanted %.0f%%) and %.0f%% x %.0f%% for focus (wanted %.0f%%)",
-        100.0 * g_focus.gameW / g.gridW, 100.0 * g_focus.gameH / g.gridH, 100.0 * c.peripheralMultiplier,
-        100.0 * g_focus.gameW / g.focusW, 100.0 * g_focus.gameH / g.focusH, 100.0 * c.focusMultiplier);
+    const bool outerOwn = g_focus.outerW != g_focus.gameW || g_focus.outerH != g_focus.gameH;
+    const bool focusOwn = g_focus.focusTexW != g_focus.gameW || g_focus.focusTexH != g_focus.gameH;
+    Log("Quad: smaller targets (M7.4): %s; with clones the density of 1:1 is %.0f%% x %.0f%% for outer and "
+        "%.0f%% x %.0f%% for focus, without them (clones off or failed) %.0f%% x %.0f%% and %.0f%% x %.0f%%",
+        outerOwn && focusOwn ? "outer and focus render into clones in their own sizes"
+        : outerOwn           ? "outer renders into clones in its own size, focus at the game size"
+        : focusOwn           ? "focus renders into clones in its own size, outer at the game size"
+                             : "not needed, outer and focus both want the game size",
+        100.0 * g_focus.outerW / g.gridW, 100.0 * g_focus.outerH / g.gridH, 100.0 * g_focus.focusTexW / g.focusW,
+        100.0 * g_focus.focusTexH / g.focusH, 100.0 * g_focus.gameW / g.gridW, 100.0 * g_focus.gameH / g.gridH,
+        100.0 * g_focus.gameW / g.focusW, 100.0 * g_focus.gameH / g.focusH);
     static const char* const labels[2] = {"focus L vs its window in outer L", "focus R vs its window in outer R"};
     for (int i = 0; i < 2; ++i) {
         const focus::Eye& e = g.eye[i];
@@ -1505,7 +1565,8 @@ void SetupLocked(vr::IVRSystem* real) {
         g_follow ? "follows the gaze (DFR)" : "fixed at the center (FFR)", c.followGaze, c.gazeHoldS, c.gazeKeyMod,
         c.gazeKey);
     if (c.quadCompose) {
-        const bool exact = g_focus.gameW == g.focusW && g_focus.gameH == g.focusH;
+        // With clones the focus texture has its own size (focus_multiplier x window), else the game size.
+        const bool exact = g_focus.focusTexW == g.focusW && g_focus.focusTexH == g.focusH;
         const char* how = exact ? "pixel for pixel" : "bilinearly";
         if (c.legacyEdge) {
             const int band = c.quadMarginPx + c.quadFeatherPx;
@@ -1754,8 +1815,26 @@ const vr::Texture_t* PrepareSubmit(vr::EVREye eye, const vr::Texture_t* tex, con
         std::lock_guard lock(g_m);
         if (!g_focus.on || !g_graph.ok || !tex || tex->eType != vr::API_DirectX || !tex->handle) return;
         const int e = eye == vr::Eye_Right ? 1 : 0;
-        // Outer only: the focus groups did not run, so both game textures hold outer at the focus size.
-        if (g_frameSkip) return;
+        // Outer's output when it rendered into a clone of this Submit texture (M7.4): the game texture is stale, so
+        // SteamVR gets the clone (it scales a smaller texture itself).
+        auto outerClone = [&](int g) -> bool {
+            void* o = g_run[g].out;
+            if (!o || o == tex->handle || clones::Original(o) != tex->handle) return false;
+            storage = *tex;
+            storage.handle = o;
+            out = &storage;
+            if (!g_cloneSubmitLogged) {
+                g_cloneSubmitLogged = true;
+                Log("Quad: %s eye goes to the compositor as outer's clone %s (no composition)", e ? "right" : "left",
+                    DescribeTex(o).c_str());
+            }
+            return true;
+        };
+        // Outer only: the focus groups did not run, so both game textures (or outer's clones of them) hold outer.
+        if (g_frameSkip) {
+            outerClone(e ? OuterR : OuterL);
+            return;
+        }
         const bool fullFrame = g_began == 0xF && g_ended == 0xF;
         if (Cfg().quadCompose) {
             ID3D11Texture2D* composed = ComposeLocked(e, tex, bounds);
@@ -1778,10 +1857,11 @@ const vr::Texture_t* PrepareSubmit(vr::EVREye eye, const vr::Texture_t* tex, con
                 return;
             }
         }
-        // Without the composition SteamVR gets outer at the focus size: the left Submit texture holds outer L, the
-        // right one ends the frame with focus R, so the right eye gets the outer R copy.
+        // Without the composition SteamVR gets outer alone: the left Submit texture (or outer's clone of it) holds
+        // outer L, the right one ends the frame with focus R, so the right eye gets the outer R copy.
         if (!e) {
             ++g_st.outerOnly[0];
+            outerClone(OuterL);
             return;
         }
         const Copy& c = g_copy[CopyOuterR];
@@ -1899,7 +1979,7 @@ void Shutdown() {
         g_focus = Focus{};
         ReleaseCopies();
         compose::Release();
-        g_rightLogged = false;
+        g_rightLogged = g_cloneSubmitLogged = false;
         for (auto& s : g_noCompose) s[0] = 0;
     });
 }

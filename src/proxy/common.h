@@ -103,10 +103,18 @@ struct Config {
     int outerKey = VK_F11;
     int gazeKeyMod = VK_RCONTROL;     // focus window: follow the gaze (DFR) <-> fixed (FFR)
     int gazeKey = VK_F6;
-    // Clones of the engine's eye-size targets for the focus groups (M7.3): 1 = on at start; the hotkey switches.
+    // Clones of the engine's eye-size targets (M7.3, M7.4): 1 = on at start; the hotkey switches.
     bool clones = true;
     int clonesKeyMod = VK_RCONTROL;
     int clonesKey = VK_F5;
+    // A viewport the engine sets for an original while a smaller clone is bound is scaled to the clone (M7.4).
+    bool clonesViewportFix = true;
+    // In an eye group with clones every bind, clear and copy of a cloned original goes to its clone, and in the other
+    // eye groups a clone goes back to its original (M7.4: engine passes that keep their own D3D11 views).
+    bool clonesBindFix = true;
+    // Each shot also saves every focus clone as focus L left it (M7.4 diagnostics; the read-back stalls the game for
+    // about 3 s).
+    bool shotClones = false;
     // [test] (not in the default ini; used by qvfr_proxy_smoke --fault)
     int testFaultFrames = 0;          // > 0: deliberate access violation in the diagnostics at this proxy frame
 };

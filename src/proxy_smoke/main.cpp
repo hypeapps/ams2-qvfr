@@ -25,7 +25,8 @@
 //                                     pipeline state restored)
 //   --focus-geometry                  without SteamVR: focus window placement for a gaze point (Dream Air frusta)
 //   --clones                          without SteamVR and without the proxy DLL: the proxy's clones module on fake engine
-//                                     objects (learning, swap of fields and bound views, restore, leaks, destroy)
+//                                     objects (learning, clones in the sets' sizes, swap of fields, sizes and bound
+//                                     views, viewports, restore, leaks, destroy; focus or outer smaller)
 // smoke_home\qvfr.ini is rewritten on every run, so options never leak from one run into the next.
 
 #include <windows.h>
@@ -42,6 +43,7 @@
 #include <fstream>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "clones.h"
@@ -285,15 +287,43 @@ int RunShots(const fs::path& home) {
         return 1;
     }
     const UINT w = 1024, h = 768;
-    static const char* const names[] = {"outer_l", "outer_r", "focus_l", "focus_r", "tonemap", "focus_window"};
+    static const char* const names[] = {"outer_l", "outer_r", "focus_l", "focus_r", "tonemap", "focus_window",
+                                        "hdr16",   "hdr11"};
     static const qvfr::shots::Pair pairs[] = {{2, 0, "focus L vs outer L"},
                                               {3, 1, "focus R vs outer R"},
                                               {0, 1, "outer L vs outer R"},
                                               {5, 0, "window vs outer L", 200, 150, 256, 192}};
-    constexpr int kImages = 6;
+    constexpr int kImages = 8;
     std::vector<uint32_t> px((size_t)w * h);
     ID3D11Texture2D* tex[kImages] = {};
-    for (int i = 0; i < kImages; ++i) {
+    // HDR formats (M7.4 dump): RGBA16F (1, 0.5, 0) with one NaN pixel, R11G11B10 all 1.0; 64 x 64.
+    {
+        std::vector<uint16_t> h16(64 * 64 * 4);
+        for (size_t p = 0; p < 64 * 64; ++p) {
+            h16[p * 4 + 0] = p == 0 ? 0x7E00 : 0x3C00;
+            h16[p * 4 + 1] = 0x3800;
+            h16[p * 4 + 2] = 0;
+            h16[p * 4 + 3] = 0x3C00;
+        }
+        std::vector<uint32_t> r11(64 * 64, 0x3C0u | (0x3C0u << 11) | (0x1E0u << 22));
+        const DXGI_FORMAT fmts[2] = {DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R11G11B10_FLOAT};
+        const void* data[2] = {h16.data(), r11.data()};
+        const UINT pitch[2] = {64 * 8, 64 * 4};
+        for (int k = 0; k < 2; ++k) {
+            D3D11_TEXTURE2D_DESC d{};
+            d.Width = d.Height = 64;
+            d.MipLevels = d.ArraySize = 1;
+            d.Format = fmts[k];
+            d.SampleDesc.Count = 1;
+            d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            D3D11_SUBRESOURCE_DATA init{data[k], pitch[k], 0};
+            if (FAILED(dev->CreateTexture2D(&d, &init, &tex[6 + k]))) {
+                printf("Cannot create the HDR shot textures\n");
+                return 1;
+            }
+        }
+    }
+    for (int i = 0; i < 6; ++i) {
         const UINT iw = i == 5 ? w / 2 : w, ih = i == 5 ? h / 2 : h;
         for (UINT y = 0; y < ih; ++y)
             for (UINT x = 0; x < iw; ++x) {
@@ -345,13 +375,15 @@ int RunShots(const fs::path& home) {
         uint32_t pw = 0, ph = 0;
         if (PngSize(newest / (std::string(names[i]) + ".png"), pw, ph)) {
             ++pngs;
-            halfSize += i == 5 ? pw == w / 4 && ph == h / 4 : pw == w / 2 && ph == h / 2;
+            halfSize += i >= 6 ? pw == 32 && ph == 32 : i == 5 ? pw == w / 4 && ph == h / 4 : pw == w / 2 && ph == h / 2;
         }
     }
     std::ifstream in(NewestLog(home / L"logs"));
     std::string line;
-    bool same = false, differs = false, parallax = false, window = false;
+    bool same = false, differs = false, parallax = false, window = false, hdr16 = false, hdr11 = false;
     while (std::getline(in, line)) {
+        hdr16 |= line.find("hdr16 (64 x 64 fmt 10): values 0..1, NaN or infinity in 1 pixels") != std::string::npos;
+        hdr11 |= line.find("hdr11 (64 x 64 fmt 26): values 1..1, NaN or infinity in 0 pixels") != std::string::npos;
         window |= line.find("window vs outer L: mean abs difference 0.000 (0..255), max 0,") != std::string::npos &&
                   line.find("256.0 x 192.0 pixels at (200.0, 150.0)") != std::string::npos;
         same |= line.find("focus L vs outer L: mean abs difference 0.000 (0..255), max 0,") != std::string::npos;
@@ -361,11 +393,11 @@ int RunShots(const fs::path& home) {
                     line.find("max 0,") == std::string::npos;
     }
     bool ok = begun && !again && grabbed == kImages && done && pngs == kImages && halfSize == kImages && same &&
-              differs && parallax && window;
+              differs && parallax && window && hdr16 && hdr11;
     printf("Shots check %s: begin %d, second begin refused %d, grabbed %d, writer done %d (%.1f s), PNG %d (half size %d) in "
-           "%ls, diffs: identical %d, block %d, different %d, focus window %d\n",
+           "%ls, diffs: identical %d, block %d, different %d, focus window %d, HDR values RGBA16F %d R11G11B10 %d\n",
            ok ? "OK" : "FAILED", begun, !again, grabbed, done, (qvfr::NowMs() - t0) / 1000.0, pngs, halfSize,
-           newest.c_str(), same, differs, parallax, window);
+           newest.c_str(), same, differs, parallax, window, hdr16, hdr11);
     return ok ? 0 : 6;
 }
 
@@ -699,11 +731,14 @@ struct FakeObj {
     }
 };
 
-// Clones (M7.3) on fake engine objects with the engine's layout: texture objects (D3D11 texture at +0x58, views after
-// it, name at +0xf0) and a render target object (size at +0x24, view counts at +0x64/+0x66, view arrays at +0x78/+0x88,
-// name at +0xb8). Learning sorts written from read-only textures; a focus group then swaps the fields and the bound
-// views, a clear through the render target's array reaches the clone, everything goes back after the group, a write to
-// an original is counted as a leak, and a destroyed object gets its originals back at once.
+// Clones (M7.3, M7.4) on fake engine objects with the engine's layout: texture objects (D3D11 texture at +0x58, views
+// after it, u16 size at +0x68, name at +0xf0), a render target object (size at +0x24, view counts at +0x64/+0x66, view
+// arrays at +0x78/+0x88, name at +0xb8) and an engine device (render target size per context at +0x9b18, dirty flags
+// at +0xe448). Scenario 1, focus smaller than the game: learning sorts written from read-only textures; a focus group
+// then swaps the fields (textures, views, sizes), the device sizes and the bound views, scales a viewport set for the
+// original, a clear through the render target's array reaches the clone, everything goes back after the group, outer
+// groups stay untouched, a write to an original is counted as a leak, and a destroyed object gets its originals back at
+// once. Scenario 2, outer smaller: outer gets clones of what it writes, except a texture focus reads but does not write.
 int RunClones() {
     namespace cl = qvfr::clones;
     ID3D11Device* dev = nullptr;
@@ -715,7 +750,22 @@ int RunClones() {
     }
     qvfr::hooks::Init();
     cl::InstallD3DHooks(ctx);
-    cl::SetEyeSize(64, 48);
+    // Fake engine device: context k's render target size at +0x9b18 + k * 0xe60, its dirty flag at +0xe448 + k.
+    std::vector<uint8_t> engineDev(0xe448 + 8);
+    auto devSize = [&](int k) { return reinterpret_cast<float*>(engineDev.data() + 0x9b18 + k * 0xe60); };
+    auto devDirty = [&](int k) -> uint8_t& { return engineDev[0xe448 + k]; };
+    const float devInit[4][2] = {{64, 48}, {32, 24}, {100, 100}, {0, 0}};
+    for (int k = 0; k < 4; ++k) {
+        devSize(k)[0] = devInit[k][0];
+        devSize(k)[1] = devInit[k][1];
+    }
+    // Postprocess object at device+0x17b0: the scene size as two ints at +0x100.
+    FakeObj post;
+    post.at<int32_t>(0x100) = 64;
+    post.at<int32_t>(0x104) = 48;
+    *reinterpret_cast<void**>(engineDev.data() + 0x17b0) = &post;
+    cl::TestSetDevice(engineDev.data());
+    cl::SetSizes(64, 48, 64, 48, 32, 24);
     auto tex = [&](UINT w, UINT h) {
         D3D11_TEXTURE2D_DESC d{};
         d.Width = w;
@@ -738,6 +788,21 @@ int RunClones() {
         dev->CreateRenderTargetView(t, nullptr, &v);
         return v;
     };
+    auto size = [](ID3D11Texture2D* t) {
+        D3D11_TEXTURE2D_DESC d{};
+        if (t) t->GetDesc(&d);
+        return std::make_pair(d.Width, d.Height);
+    };
+    auto viewport = [&](float w, float h) {
+        D3D11_VIEWPORT v{0, 0, w, h, 0, 1};
+        ctx->RSSetViewports(1, &v);
+    };
+    auto boundViewport = [&]() {
+        D3D11_VIEWPORT v{};
+        UINT n = 1;
+        ctx->RSGetViewports(&n, &v);
+        return std::make_pair(v.Width, v.Height);
+    };
     // A: eye size, written and read; B: 1/2, written by a copy; C: eye size, only read; D: not eye size, written.
     ID3D11Texture2D *texA = tex(64, 48), *texB = tex(32, 24), *texC = tex(64, 48), *texD = tex(100, 100),
                     *texE = tex(32, 24);
@@ -753,7 +818,12 @@ int RunClones() {
     C.at<void*>(0x70) = srvC;
     D.at<void*>(0x58) = texD;
     FakeObj* objs[] = {&A, &B, &C, &D};
-    for (int i = 0; i < 4; ++i) objs[i]->at<const char*>(0xf0) = names[i];
+    ID3D11Texture2D* objTex[] = {texA, texB, texC, texD};
+    for (int i = 0; i < 4; ++i) {
+        objs[i]->at<const char*>(0xf0) = names[i];
+        objs[i]->at<uint16_t>(0x68) = (uint16_t)size(objTex[i]).first;
+        objs[i]->at<uint16_t>(0x6a) = (uint16_t)size(objTex[i]).second;
+    }
     void* arr78[1] = {rtvA2};
     void* arr88[1] = {rtvA3};
     R.at<uint16_t>(0x24) = 64;
@@ -772,49 +842,92 @@ int RunClones() {
             printf("Clones: WRONG %s\n", what);
         }
     };
-    const float blue[4] = {0, 0, 1, 1}, red[4] = {1, 0, 0, 1};
-    // Learning: 16 focus groups.
+    const float blue[4] = {0, 0, 1, 1}, red[4] = {1, 0, 0, 1}, green[4] = {0, 1, 0, 1};
+    // Learning: 16 outer and 16 focus groups (outer only clears A).
     for (int f = 0; f < 17; ++f) {
         cl::OnFrameStart(ctx, true);
         if (f == 16) break;
-        cl::BeginFocus(ctx);
+        cl::BeginGroup(ctx, cl::Outer);
+        ctx->ClearRenderTargetView(rtvA, green);
+        cl::EndGroup(ctx);
+        cl::BeginGroup(ctx, cl::Focus);
         ctx->ClearRenderTargetView(A.at<ID3D11RenderTargetView*>(0x80), blue);
         ID3D11ShaderResourceView* s[2] = {srvA, srvC};
         ctx->PSSetShaderResources(0, 2, s);
         ctx->CopyResource(texB, texE);
         ctx->ClearRenderTargetView(rtvD, blue);
-        cl::EndFocus(ctx);
+        cl::EndGroup(ctx);
     }
     cl::TestState st = cl::TestGet();
     expect(st.phase == 2, "phase after learning (ready)");
     expect(st.textures == 3 && st.renderTargets == 1, "listed: A, B, C and the render target (not D)");
-    expect(st.clones == 2, "clones for A and B only (C is read only)");
-    expect(st.entries == 6, "entries: A +0x58 +0x70 +0x80, B +0x58, the render target's two arrays");
-    // A focus group with clones: fields and the bound SRV swapped, a clear through the array reaches the clone.
+    expect(st.clones[1] == 2 && st.clones[0] == 0, "focus clones for A and B only (C is read only), none for outer");
+    expect(st.entries == 9, "entries: A +0x58 +0x68 +0x70 +0x80, B +0x58 +0x68, the render target's two arrays and size");
+    // Outer at the game size: its groups keep the originals.
+    cl::OnFrameStart(ctx, true);
+    cl::BeginGroup(ctx, cl::Outer);
+    expect(!cl::TestGet().swapped && A.at<void*>(0x58) == texA, "no swap in an outer group");
+    cl::EndGroup(ctx);
+    // A focus group with clones: fields, sizes and the bound views swapped, the viewport for the original scaled, a
+    // clear through the array reaches the clone.
     ID3D11ShaderResourceView* s0[2] = {srvA, srvC};
     ctx->PSSetShaderResources(0, 2, s0);
-    cl::OnFrameStart(ctx, true);
-    cl::BeginFocus(ctx);
+    ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    viewport(64, 48);
+    cl::BeginGroup(ctx, cl::Focus);
     ID3D11Texture2D* cloneA = A.at<ID3D11Texture2D*>(0x58);
+    ID3D11Texture2D* cloneB = B.at<ID3D11Texture2D*>(0x58);
     expect(cl::TestGet().swapped, "swapped inside the focus group");
     expect(cloneA != texA && A.at<void*>(0x70) != srvA && A.at<void*>(0x80) != rtvA, "A's texture and views swapped");
-    expect(B.at<void*>(0x58) != texB, "B swapped");
-    expect(C.at<void*>(0x58) == texC && C.at<void*>(0x70) == srvC && D.at<void*>(0x58) == texD, "C and D untouched");
+    expect(size(cloneA) == std::make_pair(32u, 24u) && size(cloneB) == std::make_pair(16u, 12u),
+           "clones in focus's size: A 32 x 24, B (1/2) 16 x 12");
+    expect(A.at<uint16_t>(0x68) == 32 && A.at<uint16_t>(0x6a) == 24 && B.at<uint16_t>(0x68) == 16 &&
+               B.at<uint16_t>(0x6a) == 12,
+           "texture size fields swapped");
+    expect(R.at<uint16_t>(0x24) == 32 && R.at<uint16_t>(0x26) == 24, "render target size swapped");
+    expect(C.at<void*>(0x58) == texC && C.at<void*>(0x70) == srvC && D.at<void*>(0x58) == texD &&
+               C.at<uint16_t>(0x68) == 64,
+           "C and D untouched");
     expect(arr78[0] != rtvA2 && arr88[0] != rtvA3, "render target arrays swapped");
+    expect(devSize(0)[0] == 32 && devSize(0)[1] == 24 && devDirty(0) == 1 && devSize(1)[0] == 16 &&
+               devSize(1)[1] == 12 && devDirty(1) == 1 && devSize(2)[0] == 100 && devDirty(2) == 0,
+           "device render target sizes: game size and 1/2 swapped, others untouched");
+    expect(post.at<int32_t>(0x100) == 32 && post.at<int32_t>(0x104) == 24, "postprocess scene size swapped");
     ID3D11ShaderResourceView* bound[2] = {};
     ctx->PSGetShaderResources(0, 2, bound);
     expect(bound[0] == A.at<ID3D11ShaderResourceView*>(0x70) && bound[1] == srvC, "bound SRV translated to the clone");
     for (auto* b : bound)
         if (b) b->Release();
+    expect(boundViewport() == std::make_pair(64.0f, 48.0f), "viewport kept without a clone target bound");
+    // The engine binds the render target's view (D3D11 unbinds A's clone SRV) and sets the original's viewport again.
+    ctx->OMSetRenderTargets(1, (ID3D11RenderTargetView* const*)arr78, nullptr);
+    cl::OnOMSetRenderTargets(ctx, 1, (ID3D11RenderTargetView* const*)arr78, nullptr, nullptr);
+    viewport(64, 48);
+    expect(boundViewport() == std::make_pair(32.0f, 24.0f), "viewport set for the original scaled to the clone");
+    viewport(16, 12);
+    expect(boundViewport() == std::make_pair(16.0f, 12.0f), "viewport that fits the clone kept");
+    viewport(64, 48);
     ctx->ClearRenderTargetView((ID3D11RenderTargetView*)arr78[0], red);
-    cl::EndFocus(ctx);
+    // A bind of targets of different sizes (the clone and D) is logged as a size mismatch.
+    ID3D11RenderTargetView* mixedRtv[2] = {(ID3D11RenderTargetView*)arr78[0], rtvD};
+    ctx->OMSetRenderTargetsAndUnorderedAccessViews(2, mixedRtv, nullptr, 0, D3D11_KEEP_UNORDERED_ACCESS_VIEWS, nullptr,
+                                                   nullptr);
+    ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    cl::EndGroup(ctx);
     expect(!cl::TestGet().swapped && A.at<void*>(0x58) == texA && A.at<void*>(0x70) == srvA && A.at<void*>(0x80) == rtvA &&
                B.at<void*>(0x58) == texB && arr78[0] == rtvA2 && arr88[0] == rtvA3,
            "originals back after the group");
-    ctx->PSGetShaderResources(0, 2, bound);
-    expect(bound[0] == srvA && bound[1] == srvC, "bound SRV translated back");
-    for (auto* b : bound)
-        if (b) b->Release();
+    expect(A.at<uint16_t>(0x68) == 64 && A.at<uint16_t>(0x6a) == 48 && R.at<uint16_t>(0x24) == 64 &&
+               R.at<uint16_t>(0x26) == 48,
+           "sizes back after the group");
+    expect(devSize(0)[0] == 64 && devSize(0)[1] == 48 && devSize(1)[0] == 32 && devSize(1)[1] == 24,
+           "device sizes back after the group");
+    expect(post.at<int32_t>(0x100) == 64 && post.at<int32_t>(0x104) == 48,
+           "postprocess scene size back after the group");
+    expect(boundViewport() == std::make_pair(64.0f, 48.0f), "viewport as the engine asked after the group");
+    st = cl::TestGet();
+    expect(st.viewportsFixed == 3 && st.viewportMismatches == 3,
+           "three viewports for the original scaled (at the bind and two RSSetViewports)");
     expect(cl::Original(cloneA) == texA && cl::Original(texA) == texA, "Original() of a clone");
     // Pixels: the original keeps the learning clear (blue), the clone got red.
     auto pixel = [&](ID3D11Texture2D* t) {
@@ -838,34 +951,143 @@ int RunClones() {
     };
     const uint32_t pxA = pixel(texA), pxClone = pixel(cloneA);
     expect(pxA == 0xFFFF0000u && pxClone == 0xFF0000FFu, "original blue, clone red");
-    // A write to an original inside a focus group is a leak.
+    expect(pixel(cloneB) == 0, "a clone nothing wrote yet is zero");
+    // Bind fix: inside a focus group a write to an original through its field view or through a view the engine keeps
+    // elsewhere (X) goes to the clone, no leak; the bound SRVs go back after the group.
+    ID3D11RenderTargetView* rtvX = rtv(texA);
+    ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    ctx->PSSetShaderResources(0, 2, s0);
     cl::OnFrameStart(ctx, true);
-    cl::BeginFocus(ctx);
+    cl::BeginGroup(ctx, cl::Focus);
+    ID3D11ShaderResourceView* cloneSrvA = A.at<ID3D11ShaderResourceView*>(0x70);
     ctx->ClearRenderTargetView(rtvA, red);
-    cl::EndFocus(ctx);
+    ctx->ClearRenderTargetView(rtvX, green);
+    ID3D11RenderTargetView* mapped[8] = {};
+    ID3D11DepthStencilView* mappedDsv = nullptr;
+    const bool mappedOk = cl::MapTargets(ctx, 1, &rtvX, nullptr, mapped, &mappedDsv, nullptr);
+    ID3D11Resource* mappedRes = nullptr;
+    if (mapped[0]) mapped[0]->GetResource(&mappedRes);
+    expect(mappedOk && mappedRes == cloneA && !mappedDsv, "a bind of a view kept outside the fields goes to the clone");
+    if (mappedRes) mappedRes->Release();
+    cl::EndGroup(ctx);
     st = cl::TestGet();
-    expect(st.leaks == 1 && st.cloneUses >= 1, "one leak counted, clone uses counted");
-    // An object destroyed inside a focus group gets its originals back at once; the set is watched again.
+    expect(st.leaks == 0 && st.cloneUses >= 1, "no leak, clone uses counted");
+    expect(st.bindsToClone == 3 && st.lazyViews == 1, "bind fix: three to the clone, one view made on the clone");
+    expect(pixel(texA) == 0xFFFF0000u && pixel(cloneA) == 0xFF00FF00u, "both clears reached the clone");
+    ctx->PSGetShaderResources(0, 2, bound);
+    expect(bound[0] == srvA && bound[1] == srvC, "bound SRV translated back after the focus group");
+    for (auto* b : bound)
+        if (b) b->Release();
+    // In an outer group (no clones in) a clone view bound by a cached pointer goes back to the original.
+    cl::BeginGroup(ctx, cl::Outer);
+    ctx->PSSetShaderResources(0, 1, &cloneSrvA);
+    ID3D11ShaderResourceView* back = nullptr;
+    ctx->PSGetShaderResources(0, 1, &back);
+    expect(back == srvA && cl::TestGet().bindsToOriginal == 1, "a clone bound in an outer group goes back to the original");
+    if (back) back->Release();
+    cl::EndGroup(ctx);
+    ctx->PSGetShaderResources(0, 2, bound);
+    expect(bound[0] == srvA && bound[1] == srvC, "bound SRV translated back");
+    for (auto* b : bound)
+        if (b) b->Release();
+    // The original's target bound and its viewport set before the group: both go to the clone at the group start.
+    ID3D11ShaderResourceView* none[2] = {};
+    ctx->PSSetShaderResources(0, 2, none);
+    ctx->OMSetRenderTargets(1, &rtvA, nullptr);
+    viewport(64, 48);
     cl::OnFrameStart(ctx, true);
-    cl::BeginFocus(ctx);
+    cl::BeginGroup(ctx, cl::Focus);
+    ID3D11RenderTargetView* boundRtv = nullptr;
+    ctx->OMGetRenderTargets(1, &boundRtv, nullptr);
+    expect(boundRtv && boundRtv == A.at<ID3D11RenderTargetView*>(0x80), "bound RTV translated to the clone");
+    if (boundRtv) boundRtv->Release();
+    expect(boundViewport() == std::make_pair(32.0f, 24.0f), "viewport of the original scaled at the group start");
+    cl::EndGroup(ctx);
+    expect(boundViewport() == std::make_pair(64.0f, 48.0f), "viewport back after the group");
+    ctx->OMGetRenderTargets(1, &boundRtv, nullptr);
+    expect(boundRtv == rtvA, "bound RTV translated back");
+    if (boundRtv) boundRtv->Release();
+    ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    // An object destroyed inside a focus group gets its originals back at once; the list is watched again.
+    cl::OnFrameStart(ctx, true);
+    cl::BeginGroup(ctx, cl::Focus);
     cl::TestDestroy(false, &A);
-    expect(A.at<void*>(0x58) == texA && A.at<void*>(0x70) == srvA && A.at<void*>(0x80) == rtvA, "A restored at destroy");
-    cl::EndFocus(ctx);
-    expect(B.at<void*>(0x58) == texB && arr78[0] == rtvA2, "the rest restored after the group");
+    expect(A.at<void*>(0x58) == texA && A.at<void*>(0x70) == srvA && A.at<void*>(0x80) == rtvA &&
+               A.at<uint16_t>(0x68) == 64,
+           "A restored at destroy");
+    cl::EndGroup(ctx);
+    expect(B.at<void*>(0x58) == texB && arr78[0] == rtvA2 && R.at<uint16_t>(0x24) == 64,
+           "the rest restored after the group");
     cl::OnFrameStart(ctx, true);
     st = cl::TestGet();
-    expect(st.phase == 1 && st.textures == 2 && st.clones == 0, "set watched again without A");
+    expect(st.phase == 1 && st.textures == 2 && st.clones[1] == 0, "list watched again without A");
     // Off: no swap.
     cl::OnFrameStart(ctx, false);
-    cl::BeginFocus(ctx);
+    cl::BeginGroup(ctx, cl::Focus);
     expect(!cl::TestGet().swapped && B.at<void*>(0x58) == texB, "no swap while off");
-    cl::EndFocus(ctx);
+    cl::EndGroup(ctx);
+    const int bad1 = bad;
+    const int translated1 = (int)cl::TestGet().translated;
     cl::Shutdown();
-    printf("Clones check %s: %d wrong; %d translations, original pixel 0x%08X, clone pixel 0x%08X\n",
-           bad ? "FAILED" : "OK", bad, (int)st.translated, pxA, pxClone);
+
+    // Scenario 2: outer smaller (32 x 24), focus at the game size. P: written by outer and focus; Q: written by outer,
+    // read by focus (kept for outer); S: written by outer only.
+    for (int k = 0; k < 4; ++k) {
+        devSize(k)[0] = devInit[k][0];
+        devSize(k)[1] = devInit[k][1];
+        devDirty(k) = 0;
+    }
+    ID3D11Texture2D *texP = tex(64, 48), *texQ = tex(64, 48), *texS = tex(64, 48);
+    ID3D11RenderTargetView *rtvP = rtv(texP), *rtvQ = rtv(texQ), *rtvS = rtv(texS);
+    ID3D11ShaderResourceView* srvQ = srv(texQ);
+    static const char* const names2[] = {"Fake P", "Fake Q", "Fake S"};
+    FakeObj P, Q, S;
+    FakeObj* objs2[] = {&P, &Q, &S};
+    ID3D11Texture2D* objTex2[] = {texP, texQ, texS};
+    void* objView2[] = {rtvP, rtvQ, rtvS};
+    for (int i = 0; i < 3; ++i) {
+        objs2[i]->at<void*>(0x58) = objTex2[i];
+        objs2[i]->at<void*>(0x80) = objView2[i];
+        objs2[i]->at<const char*>(0xf0) = names2[i];
+        objs2[i]->at<uint16_t>(0x68) = 64;
+        objs2[i]->at<uint16_t>(0x6a) = 48;
+    }
+    Q.at<void*>(0x70) = srvQ;
+    cl::SetSizes(64, 48, 32, 24, 64, 48);
+    for (FakeObj* o : objs2) cl::TestRegister(false, o);
+    for (int f = 0; f < 17; ++f) {
+        cl::OnFrameStart(ctx, true);
+        if (f == 16) break;
+        cl::BeginGroup(ctx, cl::Outer);
+        for (ID3D11RenderTargetView* v : {rtvP, rtvQ, rtvS}) ctx->ClearRenderTargetView(v, green);
+        cl::EndGroup(ctx);
+        cl::BeginGroup(ctx, cl::Focus);
+        ctx->ClearRenderTargetView(rtvP, blue);
+        ctx->PSSetShaderResources(0, 1, &srvQ);
+        cl::EndGroup(ctx);
+    }
+    st = cl::TestGet();
+    expect(st.phase == 2 && st.textures == 3, "outer: ready, three textures listed");
+    expect(st.clones[0] == 2 && st.clones[1] == 0, "outer clones for P and S (Q kept: focus reads it), none for focus");
+    cl::OnFrameStart(ctx, true);
+    cl::BeginGroup(ctx, cl::Outer);
+    expect(cl::TestGet().swapped && size(P.at<ID3D11Texture2D*>(0x58)) == std::make_pair(32u, 24u) &&
+               size(S.at<ID3D11Texture2D*>(0x58)) == std::make_pair(32u, 24u) && Q.at<void*>(0x58) == texQ,
+           "outer group: P and S in 32 x 24 clones, Q the original");
+    expect(devSize(0)[0] == 32 && devSize(0)[1] == 24, "outer group: device size swapped");
+    cl::EndGroup(ctx);
+    expect(P.at<void*>(0x58) == texP && S.at<void*>(0x58) == texS && devSize(0)[0] == 64, "outer: originals back");
+    cl::BeginGroup(ctx, cl::Focus);
+    expect(!cl::TestGet().swapped && P.at<void*>(0x58) == texP, "focus group at the game size: no swap");
+    cl::EndGroup(ctx);
+    cl::Shutdown();
+    printf("Clones check %s: %d wrong (focus smaller %d, outer smaller %d); %d translations, original pixel 0x%08X, "
+           "clone pixel 0x%08X\n",
+           bad ? "FAILED" : "OK", bad, bad1, bad - bad1, translated1, pxA, pxClone);
     for (IUnknown* u : {(IUnknown*)srvA, (IUnknown*)srvC, (IUnknown*)rtvA, (IUnknown*)rtvA2, (IUnknown*)rtvA3,
                         (IUnknown*)rtvD, (IUnknown*)texA, (IUnknown*)texB, (IUnknown*)texC, (IUnknown*)texD,
-                        (IUnknown*)texE})
+                        (IUnknown*)texE, (IUnknown*)rtvX, (IUnknown*)rtvP, (IUnknown*)rtvQ, (IUnknown*)rtvS, (IUnknown*)srvQ,
+                        (IUnknown*)texP, (IUnknown*)texQ, (IUnknown*)texS})
         u->Release();
     ctx->Release();
     dev->Release();

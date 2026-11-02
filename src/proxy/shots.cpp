@@ -28,6 +28,29 @@ struct Image {
     std::vector<uint8_t> rgb;  // full resolution, 8 bits per channel
 };
 
+// Value statistics of a float or single-channel image (the 8-bit ones are not counted).
+struct Values {
+    bool counted = false;
+    uint64_t n = 0, bad = 0, zero = 0;  // pixels, pixels with NaN or infinity, all-zero pixels
+    float lo = 0, hi = 0;               // finite channel values
+    void Add(const float* c, int k) {
+        counted = true;
+        ++n;
+        bool z = true;
+        for (int i = 0; i < k; ++i) {
+            if (!std::isfinite(c[i])) {
+                ++bad;
+                return;
+            }
+            if (c[i] != 0) z = false;
+            if (n == 1 && i == 0) lo = hi = c[i];
+            lo = std::min(lo, c[i]);
+            hi = std::max(hi, c[i]);
+        }
+        if (z) ++zero;
+    }
+};
+
 struct Job {
     std::string stamp;
     std::vector<Image> images;
@@ -49,16 +72,109 @@ bool Supported(DXGI_FORMAT f) {
         case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
         case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
         case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM:
+        case DXGI_FORMAT_R11G11B10_FLOAT:
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM:
+        case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R32_FLOAT:
+        case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_R8_UNORM:
             return true;
         default:
             return false;
     }
 }
 
+float Half(uint16_t h) {
+    const uint32_t s = (uint32_t)(h >> 15) << 31, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+    uint32_t f;
+    if (e == 0) {
+        const float v = std::ldexp((float)m, -24);
+        return s ? -v : v;
+    }
+    f = e == 31 ? (s | 0x7f800000u | (m << 13)) : (s | ((e + 112) << 23) | (m << 13));
+    float r;
+    memcpy(&r, &f, 4);
+    return r;
+}
+
+// Unsigned small float of R11G11B10: `mb` mantissa bits, 5 exponent bits.
+float Small(uint32_t v, int mb) {
+    const uint32_t m = v & ((1u << mb) - 1), e = (v >> mb) & 0x1f;
+    if (e == 31) return m ? NAN : INFINITY;
+    if (e == 0) return std::ldexp((float)m, -14 - mb);
+    return std::ldexp(1.0f + (float)m / (float)(1u << mb), (int)e - 15);
+}
+
+uint8_t ToneByte(float v) {
+    const float c = v > 0 ? v / (1 + v) : 0;
+    return (uint8_t)std::clamp((int)std::lround(255.0 * std::pow(c, 1.0 / 2.2)), 0, 255);
+}
+
+void PutColor(const float* c, uint8_t* dst, Values& st) {
+    st.Add(c, 3);
+    if (!std::isfinite(c[0]) || !std::isfinite(c[1]) || !std::isfinite(c[2])) {
+        dst[0] = 255;
+        dst[1] = 0;
+        dst[2] = 255;
+        return;
+    }
+    for (int i = 0; i < 3; ++i) dst[i] = ToneByte(c[i]);
+}
+
+void PutGray(float v, uint8_t* dst, Values& st) {
+    st.Add(&v, 1);
+    if (!std::isfinite(v)) {
+        dst[0] = 255;
+        dst[1] = 0;
+        dst[2] = 255;
+        return;
+    }
+    dst[0] = dst[1] = dst[2] = (uint8_t)std::clamp((int)std::lround(255.0 * v), 0, 255);
+}
+
 // One mapped row into 8-bit RGB. The bytes are stored as the game wrote them (sRGB-encoded for the Submit textures),
 // so the PNG shows what the compositor gets.
-void ConvertRow(DXGI_FORMAT f, const uint8_t* src, uint8_t* dst, UINT w) {
+void ConvertRow(DXGI_FORMAT f, const uint8_t* src, uint8_t* dst, UINT w, Values& st) {
     switch (f) {
+        case DXGI_FORMAT_R11G11B10_FLOAT:
+            for (UINT x = 0; x < w; ++x, src += 4, dst += 3) {
+                uint32_t v;
+                memcpy(&v, src, 4);
+                const float c[3] = {Small(v & 0x7ff, 6), Small((v >> 11) & 0x7ff, 6), Small(v >> 22, 5)};
+                PutColor(c, dst, st);
+            }
+            break;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT:
+            for (UINT x = 0; x < w; ++x, src += 8, dst += 3) {
+                uint16_t h[3];
+                memcpy(h, src, 6);
+                const float c[3] = {Half(h[0]), Half(h[1]), Half(h[2])};
+                PutColor(c, dst, st);
+            }
+            break;
+        case DXGI_FORMAT_R16_TYPELESS: case DXGI_FORMAT_R16_FLOAT:
+            for (UINT x = 0; x < w; ++x, src += 2, dst += 3) {
+                uint16_t h;
+                memcpy(&h, src, 2);
+                PutGray(Half(h), dst, st);
+            }
+            break;
+        case DXGI_FORMAT_R16_UNORM:
+            for (UINT x = 0; x < w; ++x, src += 2, dst += 3) {
+                uint16_t h;
+                memcpy(&h, src, 2);
+                PutGray(h / 65535.0f, dst, st);
+            }
+            break;
+        case DXGI_FORMAT_R32_TYPELESS: case DXGI_FORMAT_R32_FLOAT:
+            for (UINT x = 0; x < w; ++x, src += 4, dst += 3) {
+                float v;
+                memcpy(&v, src, 4);
+                PutGray(v, dst, st);
+            }
+            break;
+        case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_R8_UNORM:
+            for (UINT x = 0; x < w; ++x, src += 1, dst += 3) PutGray(src[0] / 255.0f, dst, st);
+            break;
         case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
             for (UINT x = 0; x < w; ++x, src += 4, dst += 3) {
                 dst[0] = src[2];
@@ -313,10 +429,15 @@ void End(ID3D11DeviceContext* ctx) {
         img.h = d.Height;
         img.format = d.Format;
         img.rgb.resize((size_t)d.Width * d.Height * 3);
+        Values st;
         for (UINT y = 0; y < d.Height; ++y)
             ConvertRow(d.Format, (const uint8_t*)m.pData + (size_t)y * m.RowPitch, img.rgb.data() + (size_t)y * d.Width * 3,
-                       d.Width);
+                       d.Width, st);
         ctx->Unmap(g_staging[i].Get(), 0);
+        if (st.counted)
+            Log("Shot: %s (%u x %u fmt %d): values %.4g..%.4g, NaN or infinity in %llu pixels, all zero %.1f%%",
+                g_names[i], d.Width, d.Height, (int)d.Format, st.lo, st.hi, (unsigned long long)st.bad,
+                st.n ? 100.0 * st.zero / st.n : 0.0);
         job->index[i] = (int)job->images.size();
         job->images.push_back(std::move(img));
     }

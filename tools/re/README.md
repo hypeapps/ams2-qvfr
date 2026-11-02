@@ -34,6 +34,8 @@ Analyzed binaries are data: run the scripts with `-I` and never execute anything
 - `renderdoc/rdc_dump.py`: dumps textures and per-action bindings (outputs, depth, viewport, inputs) of a capture; runs in
   `qrenderdoc.exe --python` with `RDC_CAP` and `RDC_OUTDIR` set. `renderdoc/eye_targets.py` lists the eye-sized textures
   from that dump with their use per frame phase, and draws whose viewport does not cover the target.
+- `renderdoc/rdc_events.py`: every API call with its parameters in chosen event ranges (`RDC_RANGES=a-b;c-d`), for
+  comparing what two passes bind and set; same environment as `rdc_dump.py`.
 
 Example:
 
