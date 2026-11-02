@@ -31,6 +31,9 @@ Analyzed binaries are data: run the scripts with `-I` and never execute anything
   renderer anchors for `AMS2AVX.exe`. Twin functions with identical code (for example two task builders) match twice;
   tell them apart by order or by a unique anchor inside one of them.
 - `ghidra/`: headless Ghidra export scripts (string xrefs, references to RVAs, decompilation); see [ghidra/README.md](ghidra/README.md).
+- `renderdoc/rdc_dump.py`: dumps textures and per-action bindings (outputs, depth, viewport, inputs) of a capture; runs in
+  `qrenderdoc.exe --python` with `RDC_CAP` and `RDC_OUTDIR` set. `renderdoc/eye_targets.py` lists the eye-sized textures
+  from that dump with their use per frame phase, and draws whose viewport does not cover the target.
 
 Example:
 
