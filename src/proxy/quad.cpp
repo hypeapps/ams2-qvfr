@@ -13,6 +13,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "clones.h"
 #include "common.h"
 #include "compose.h"
 #include "focus_geometry.h"
@@ -255,6 +256,10 @@ char g_autoOuter[192] = "";  // watchdog reason (empty = none); cleared at the n
 int g_noComposeRun = 0;       // frames in a row with the focus groups running and no eye composed
 bool g_skipLeakLogged = false;
 bool g_outerKeyDown = false, g_overlayKeyDown = false, g_freezeKeyDown = false;
+// Clones of the eye-size targets for the focus groups (M7.3): setting and hotkey.
+bool g_clonesOn = true;
+bool g_clonesCfg = true;  // Cfg().clones last seen (a reload sets g_clonesOn)
+bool g_clonesKeyDown = false;
 
 // Debug overlay and gaze (NDC per eye from GetEyeTrackedFoveationCenter, x right, y up).
 bool g_overlay = false;
@@ -887,10 +892,11 @@ void FinishFrameLocked() {
     if (g_run[FocusL].projected && g_run[FocusR].projected) ++g_st.projected;
     // Expected: outer L writes into the left Submit texture, the other groups into the right one. Only frames
     // after the first Submit count (track loading runs the eye groups without Submit and without the D3D11 hook).
+    // With clones (M7.3) the focus groups write the clone of the right Submit texture.
     bool submitting = g_lastSubmit[0] && g_lastSubmit[1];
     bool outOk = g_run[OuterL].out && g_run[OuterL].out == g_lastSubmit[0];
     for (int g = OuterR; g < kGroups; ++g)
-        if (want & (1u << g)) outOk &= g_run[g].out && g_run[g].out == g_lastSubmit[1];
+        if (want & (1u << g)) outOk &= g_run[g].out && clones::Original(g_run[g].out) == g_lastSubmit[1];
     if (full && submitting && !outOk) ++g_st.outNotSubmit;
     if (full && submitting && g_detailLeft > 0) {
         --g_detailLeft;
@@ -947,6 +953,15 @@ void HandleToolsLocked() {
     if (Pressed(c.gazeKeyMod, c.gazeKey, g_gazeKeyDown)) {
         g_follow = !g_follow;
         Log("Quad: focus window %s (hotkey)", g_follow ? "follows the gaze (DFR)" : "fixed at the center (FFR)");
+    }
+    if (c.clones != g_clonesCfg) {
+        g_clonesCfg = c.clones;
+        g_clonesOn = c.clones;
+        Log("Quad: clones %s (ini)", g_clonesOn ? "on" : "off");
+    }
+    if (Pressed(c.clonesKeyMod, c.clonesKey, g_clonesKeyDown)) {
+        g_clonesOn = !g_clonesOn;
+        Log("Quad: clones %s (hotkey)", g_clonesOn ? "on" : "off");
     }
     if (Pressed(c.freezeKeyMod, c.freezeKey, g_freezeKeyDown)) {
         g_gazeFrozen = !g_gazeFrozen;
@@ -1080,13 +1095,15 @@ void NoComposeLocked(int e, const char* why) {
 }
 
 // The composed eye for this Submit, or null (the reason logged once). Outer L is the left Submit texture, outer R the
-// copy from its CEndEye; focus L the copy from its CEndEye, focus R the right Submit texture.
+// copy from its CEndEye; focus L the copy from its CEndEye, focus R what its CEndEye wrote.
 // The sources must be this frame's images: outer L in the left Submit texture; outer R, focus L and focus R one after
-// another in the right one (the copies were taken from it at their CEndEye). Review finding 6 (M4).
+// another in the right one (the copies were taken from it at their CEndEye). Review finding 6 (M4). With clones (M7.3)
+// both focus groups write the clone of the right Submit texture instead.
 bool OutputsMatchLocked(int e, void* submitTex) {
-    void* right = e ? submitTex : g_run[FocusR].out;
-    if (!right || g_run[OuterR].out != right || g_run[FocusL].out != right || g_run[FocusR].out != right) return false;
-    return e || g_run[OuterL].out == submitTex;
+    void* right = g_run[OuterR].out;
+    void* focus = g_run[FocusR].out;
+    if (!right || !focus || g_run[FocusL].out != focus || clones::Original(focus) != right) return false;
+    return e ? right == submitTex : g_run[OuterL].out == submitTex;
 }
 
 ID3D11Texture2D* ComposeLocked(int e, const vr::Texture_t* tex, const vr::VRTextureBounds_t* bounds) {
@@ -1109,9 +1126,12 @@ ID3D11Texture2D* ComposeLocked(int e, const vr::Texture_t* tex, const vr::VRText
         NoComposeLocked(e, why);
         return nullptr;
     }
+    // Left eye: outer L is the game texture. Right eye: focus R is what its CEndEye wrote (the right Submit texture, or
+    // its clone).
+    void* src = e ? g_run[FocusR].out : tex->handle;
     ID3D11Texture2D* game = nullptr;
-    if (FAILED(static_cast<IUnknown*>(tex->handle)->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&game)) || !game) {
-        NoComposeLocked(e, "the Submit texture is not an ID3D11Texture2D");
+    if (FAILED(static_cast<IUnknown*>(src)->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&game)) || !game) {
+        NoComposeLocked(e, e ? "the focus R output is not an ID3D11Texture2D" : "the Submit texture is not an ID3D11Texture2D");
         return nullptr;
     }
     const focus::Geometry& g = g_focus.geo;
@@ -1293,6 +1313,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         int view = *(int*)((uint8_t*)task + kTaskView);
         if (!ctx || view != kFocusView) return;
         SwapInLocked(ctx, g, kSourceView[g], r);
+        clones::BeginFocus(gpu::Context());
     });
     return o_beginExec(task, b, c, d);
 }
@@ -1310,6 +1331,7 @@ void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
         int g = Find(g_graph.end, task);
         if (g < 0) return;
         if (g_swap.ctx && g_swap.group == g) RestoreLocked();
+        if (g >= FocusL) clones::EndFocus(gpu::Context());  // no-op without its BeginFocus
         if (g_fault.load(std::memory_order_relaxed)) return;
         Run& run = g_run[g];
         run.t1 = NowMs();
@@ -1346,6 +1368,7 @@ void STDMETHODCALLTYPE D_OMSetRenderTargets(ID3D11DeviceContext* c, UINT n, ID3D
                                             ID3D11DepthStencilView* dsv) {
     if (t_inEndEye && !t_endRes && n && rtv && rtv[0] && c == gpu::Context())
         rtv[0]->GetResource(&t_endRes);
+    clones::OnOMSetRenderTargets(c, n, rtv, dsv);
     o_omSetRt(c, n, rtv, dsv);
 }
 
@@ -1449,6 +1472,7 @@ void SetupLocked(vr::IVRSystem* real) {
     g_focus.gameW = std::max(g_focus.outerW, g_focus.focusTexW);
     g_focus.gameH = std::max(g_focus.outerH, g_focus.focusTexH);
     g_focus.on = true;
+    clones::SetEyeSize(g_focus.gameW, g_focus.gameH);
     g_focus.engaged = true;
     for (int i = 0; i < 2; ++i) {
         float cx = 0, cy = 0;
@@ -1460,7 +1484,8 @@ void SetupLocked(vr::IVRSystem* real) {
         g.gridW, g.gridH, g_focus.outerW, g_focus.outerH, c.peripheralMultiplier, g.focusW, g.focusH,
         g_focus.dfr ? "DFR" : "FFR", secX, secY, g_focus.focusTexW, g_focus.focusTexH, c.focusMultiplier, g_focus.gameW,
         g_focus.gameH);
-    Log("Quad: no smaller targets yet (M7.2): outer and focus both render at the game size, so the density of 1:1 is "
+    Log("Quad: no smaller targets yet (M7.3: clones at the game size): outer and focus both render at the game size, "
+        "so the density of 1:1 is "
         "%.0f%% x %.0f%% for outer (wanted %.0f%%) and %.0f%% x %.0f%% for focus (wanted %.0f%%)",
         100.0 * g_focus.gameW / g.gridW, 100.0 * g_focus.gameH / g.gridH, 100.0 * c.peripheralMultiplier,
         100.0 * g_focus.gameW / g.focusW, 100.0 * g_focus.gameH / g.focusH, 100.0 * c.focusMultiplier);
@@ -1550,6 +1575,8 @@ void Install() {
             Log("Quad: app getter does not match; eye data not swapped (focus L lighting uses the right eye)");
         }
         g_patched = WritePatch(true);
+        // Clones (M7.3): the factory hooks must be in place before the engine creates its render target pool.
+        if (g_patched) clones::InstallEngineHooks();
         // Quad <-> outer only needs the focus tasks from the builder's "add task" calls and the executor patch.
         if (g_patched && hooks::Create(Anchor::TaskGroupAddTask, (void*)D_AddTask, (void**)&o_addTask))
             g_execPatched = PatchExecutor();
@@ -1559,6 +1586,7 @@ void Install() {
     });
     g_overlay = g_overlayCfg = Cfg().overlay;
     g_follow = g_followCfg = Cfg().followGaze;
+    g_clonesOn = g_clonesCfg = Cfg().clones;
     g_on = g_installed;
 }
 
@@ -1575,6 +1603,7 @@ void OnFrameStart() {
         if (g_fault.load(std::memory_order_relaxed)) {
             // Outer only after the fault, but never with stale group addresses (the menu reuses their memory).
             if (g_skipSet.load() && !GroupsAliveLocked()) ClearGroups();
+            clones::OnFrameStart(gpu::Context(), false);  // a swap left over goes back
             return;
         }
         FinishFrameLocked();
@@ -1582,6 +1611,7 @@ void OnFrameStart() {
         g_frameT0 = NowMs();
         HandleToolsLocked();
         HandleShotLocked();
+        clones::OnFrameStart(gpu::Context(), g_clonesOn && g_focus.on);
     });
 }
 
@@ -1698,6 +1728,7 @@ void OnSubmitBegin(vr::EVREye eye, const vr::Texture_t* tex) {
                                       "OMSetRenderTargets");
         Log("Quad: D3D11 hook %s (OMSetRenderTargets, finds the texture each CEndEye writes)",
             g_d3dHooked ? "installed" : "FAILED");
+        if (g_d3dHooked) clones::InstallD3DHooks(imm);
     });
 }
 
@@ -1779,6 +1810,7 @@ void LogStats(bool totals) {
         AddStats(g_tot, g_st);
         LogStatsLocked(totals ? g_tot : g_st, totals ? " (session total)" : "");
         g_st = Stats{};
+        clones::LogStats(totals);
     });
 }
 
@@ -1806,9 +1838,10 @@ std::string Describe() {
             snprintf(view, sizeof(view), "OUTER ONLY now (%s)", g_autoOuter[0] ? g_autoOuter : "hotkey");
         else
             snprintf(view, sizeof(view), "quad now");
-        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s%s",
+        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s, %s%s",
                  g_installed ? "engine hooks on" : "engine hooks off", g_patched ? "on" : "off",
-                 g_graph.ok ? "running" : "not running", focus, view, g_fault ? ", stopped after an exception" : "");
+                 g_graph.ok ? "running" : "not running", focus, view, clones::Describe().c_str(),
+                 g_fault ? ", stopped after an exception" : "");
     });
     return buf;
 }
@@ -1838,6 +1871,7 @@ void Shutdown() {
     Guard("Shutdown (state)", [&] {
         std::lock_guard lock(g_m);
         RestoreLocked();
+        clones::Shutdown();
         shots::Cancel();
         g_shotFrame = false;
         g_skip = false;

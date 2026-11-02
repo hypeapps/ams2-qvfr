@@ -171,6 +171,12 @@ const char kDefaultIni[] =
     "; Focus window: follow the gaze (DFR) <-> fixed at the center (FFR), like [quad] follow_gaze (0x75 = F6).\n"
     "gaze_modifier=0xA3\n"
     "gaze_key=0x75\n"
+    "; Clones (M7.3): 1 = the focus views render into their own copies of the engine's eye-size targets (the ones the\n"
+    "; focus views write), 0 = into the same targets as outer. The proxy finds the targets in the first frames with\n"
+    "; focus views. The hotkey switches while the game runs (0x74 = F5).\n"
+    "clones=1\n"
+    "clones_modifier=0xA3\n"
+    "clones_key=0x74\n"
     "\n"
     "; Settings marked live take effect while the game runs (the file is checked about once a second): [log]\n"
     "; stats_interval_s, [benchmark] all but auto_start_s, [gaze] read, [quad] the four *_offset keys,\n"
@@ -435,11 +441,15 @@ Config ReadConfig(const fs::path& ini) {
     c.outerKey = IniInt(ini, L"debug", L"outer_key", c.outerKey);
     c.gazeKeyMod = IniInt(ini, L"debug", L"gaze_modifier", c.gazeKeyMod);
     c.gazeKey = IniInt(ini, L"debug", L"gaze_key", c.gazeKey);
+    c.clones = IniInt(ini, L"debug", L"clones", 1) != 0;
+    c.clonesKeyMod = IniInt(ini, L"debug", L"clones_modifier", c.clonesKeyMod);
+    c.clonesKey = IniInt(ini, L"debug", L"clones_key", c.clonesKey);
     if (c.quadMode == QuadMode::Quad)
         Log("Settings: [debug] overlay=%d overlay_modifier=0x%X overlay_key=0x%X freeze_modifier=0x%X freeze_key=0x%X "
-            "outer_modifier=0x%X outer_key=0x%X gaze_modifier=0x%X gaze_key=0x%X",
+            "outer_modifier=0x%X outer_key=0x%X gaze_modifier=0x%X gaze_key=0x%X clones=%d clones_modifier=0x%X "
+            "clones_key=0x%X",
             c.overlay, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey,
-            c.gazeKeyMod, c.gazeKey);
+            c.gazeKeyMod, c.gazeKey, c.clones, c.clonesKeyMod, c.clonesKey);
     c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
     if (c.testFaultFrames > 0) Log("Settings: [test] fault_frames=%d (deliberate fault for testing)", c.testFaultFrames);
     return c;
@@ -544,15 +554,19 @@ bool ReloadConfig() {
     c.outerKey = n.outerKey;
     c.gazeKeyMod = n.gazeKeyMod;
     c.gazeKey = n.gazeKey;
+    c.clones = n.clones;
+    c.clonesKeyMod = n.clonesKeyMod;
+    c.clonesKey = n.clonesKey;
     Log("Settings reloaded (live): stats_interval_s=%d | benchmark modifier=0x%X key=0x%X delay_s=%.1f duration_s=%.1f "
         "freeze_pose=%d beep=%d | gaze read=%d | quad focus_offset=(%.3f, %.3f) fixed_offset=(%.3f, %.3f) "
         "smoothen_focus_view_edges=%.3f%s follow_gaze=%d gaze_hold_s=%.2f compose=%d margin_px=%d shot_modifier=0x%X "
-        "shot_key=0x%X shot_auto_s=%.1f | debug overlay=%d keys 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X%s%s",
+        "shot_key=0x%X shot_auto_s=%.1f | debug overlay=%d clones=%d keys 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, "
+        "0x%X+0x%X%s%s",
         c.statsIntervalS, c.benchKeyMod, c.benchKey, c.benchDelayS, c.benchDurationS, c.benchFreezePose, c.benchBeep,
         c.gazeRead, c.focusOffsetX, c.focusOffsetY, c.fixedOffsetX, c.fixedOffsetY, c.smoothen,
         c.legacyEdge ? " (pre-M7 feather_px instead)" : "", c.followGaze, c.gazeHoldS, c.quadCompose, c.quadMarginPx,
-        c.shotKeyMod, c.shotKey, c.shotAutoS, c.overlay, c.overlayKeyMod, c.overlayKey,
-        c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey, c.gazeKeyMod, c.gazeKey,
+        c.shotKeyMod, c.shotKey, c.shotAutoS, c.overlay, c.clones, c.overlayKeyMod, c.overlayKey,
+        c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey, c.gazeKeyMod, c.gazeKey, c.clonesKeyMod, c.clonesKey,
         restart.empty() ? "" : "; CHANGED BUT NEEDS A GAME RESTART: ", restart.c_str());
     return true;
 }

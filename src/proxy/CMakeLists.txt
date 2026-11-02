@@ -27,6 +27,7 @@ add_library(qvfr_proxy SHARED
   compose.cpp
   gpu.cpp
   callers.cpp
+  clones.cpp
   hooks.cpp
   probe.cpp
   quad.cpp

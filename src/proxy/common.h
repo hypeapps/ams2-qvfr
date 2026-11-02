@@ -103,6 +103,10 @@ struct Config {
     int outerKey = VK_F11;
     int gazeKeyMod = VK_RCONTROL;     // focus window: follow the gaze (DFR) <-> fixed (FFR)
     int gazeKey = VK_F6;
+    // Clones of the engine's eye-size targets for the focus groups (M7.3): 1 = on at start; the hotkey switches.
+    bool clones = true;
+    int clonesKeyMod = VK_RCONTROL;
+    int clonesKey = VK_F5;
     // [test] (not in the default ini; used by qvfr_proxy_smoke --fault)
     int testFaultFrames = 0;          // > 0: deliberate access violation in the diagnostics at this proxy frame
 };

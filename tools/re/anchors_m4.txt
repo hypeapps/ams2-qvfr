@@ -23,3 +23,7 @@ cddee0 TaskAddDependency task add dependency
 c8beb0 AppGetter app singleton getter (lea rax, [rip+disp] at +0x20 -> app; app+0xe0 = VR device)
 cd1322 ExecCallA task executor: mov rcx, rbx; call [rax+0x48] (task Execute; the proxy replaces these 6 bytes with a call to its filter)
 cd1352 ExecCallB task executor, second path: mov rcx, rbx; call [rax+0x48] (task Execute, same replacement)
+15dff20 CreateTexture engine device CreateTexture (vtable +0x828; rcx = device, rdx = spec, returns the texture object)
+15dc730 CreateRenderTarget engine device CreateRenderTarget (vtable +0x6a0; rcx = device, rdx = spec, returns the render target object)
+169c280 TextureDtor texture object destructor (vtable 0x21192f8; releases the D3D11 texture +0x58 and its views)
+164e760 RenderTargetDtor render target object destructor (vtable 0x21148f8; releases its view arrays and textures)
