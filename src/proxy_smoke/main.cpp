@@ -21,7 +21,9 @@
 //   --shots                           without SteamVR and without the proxy DLL: the proxy's shot module on synthetic
 //                                     textures (staging copies, PNG files, pixel differences)
 //   --quad-compose                    without SteamVR and without the proxy DLL: the proxy's composition module on
-//                                     synthetic textures (pixels by region, pipeline state restored)
+//                                     synthetic textures (pixels by region, also with the window in grid corners,
+//                                     pipeline state restored)
+//   --focus-geometry                  without SteamVR: focus window placement for a gaze point (Dream Air frusta)
 // smoke_home\qvfr.ini is rewritten on every run, so options never leak from one run into the next.
 
 #include <windows.h>
@@ -30,6 +32,7 @@
 #include <openvr.h>  // 0.9.12; functions are taken through GetProcAddress
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -41,6 +44,7 @@
 
 #include "common.h"
 #include "compose.h"
+#include "focus_geometry.h"
 #include "shots.h"
 
 namespace fs = std::filesystem;
@@ -437,22 +441,25 @@ int RunCompose() {
                    topoAfter == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
     if (rtvAfter) rtvAfter->Release();
 
-    // Read back the left eye and check each pixel by its distance to the focus window edge.
+    // Read back the left eye and check each pixel by its distance to the focus window edge; then the same with the
+    // window in two corners of the grid (M5: the window follows the gaze up to the frustum edge).
     uint64_t inner = 0, innerBad = 0, outside = 0, outsideBad = 0, band = 0, bandBad = 0;
-    bool readOk = false;
+    bool readOk = out[0] && out[1] && out[0] != out[1];
     D3D11_TEXTURE2D_DESC od{};
-    if (out[0] && out[1] && out[0] != out[1]) {
-        out[0]->GetDesc(&od);
+    if (readOk) out[0]->GetDesc(&od);
+    auto checkPixels = [&](ID3D11Texture2D* tex, const qvfr::compose::Layout& w) {
+        if (!tex) return false;
         D3D11_TEXTURE2D_DESC s = od;
         s.Usage = D3D11_USAGE_STAGING;
         s.BindFlags = 0;
         s.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         ID3D11Texture2D* staging = nullptr;
         D3D11_MAPPED_SUBRESOURCE m{};
+        bool mapped = false;
         if (SUCCEEDED(dev->CreateTexture2D(&s, nullptr, &staging))) {
-            ctx->CopyResource(staging, out[0]);
+            ctx->CopyResource(staging, tex);
             if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
-                readOk = true;
+                mapped = true;
                 auto near1 = [](uint32_t a, uint32_t b) {
                     for (int c = 0; c < 24; c += 8)
                         if (std::abs((int)((a >> c) & 255) - (int)((b >> c) & 255)) > 1) return false;
@@ -469,23 +476,33 @@ int RunCompose() {
                     const uint32_t* row = (const uint32_t*)((const uint8_t*)m.pData + (size_t)y * m.RowPitch);
                     for (uint32_t x = 0; x < od.Width; ++x) {
                         const uint32_t v = row[x];
-                        const float qx = x + 0.5f - l.x0, qy = y + 0.5f - l.y0;
-                        const float d = std::min(std::min(qx, l.focusW - qx), std::min(qy, l.focusH - qy));
-                        if (d >= l.marginPx + l.featherPx) {
+                        const float qx = x + 0.5f - w.x0, qy = y + 0.5f - w.y0;
+                        const float d = std::min(std::min(qx, w.focusW - qx), std::min(qy, w.focusH - qy));
+                        if (d >= w.marginPx + w.featherPx) {
                             ++inner;
-                            innerBad += v != focusPx(x - l.x0, y - l.y0);
-                        } else if (d <= l.marginPx) {
+                            innerBad += v != focusPx(x - w.x0, y - w.y0);
+                        } else if (d <= w.marginPx) {
                             ++outside;
                             outsideBad += !near1(v, outerPx);
                         } else {
                             ++band;
-                            bandBad += !between(v, outerPx, focusPx(x - l.x0, y - l.y0));
+                            bandBad += !between(v, outerPx, focusPx(x - w.x0, y - w.y0));
                         }
                     }
                 }
                 ctx->Unmap(staging, 0);
             }
             staging->Release();
+        }
+        return mapped;
+    };
+    if (readOk) {
+        readOk = checkPixels(out[0], l);
+        for (auto [x0, y0] : {std::pair<uint32_t, uint32_t>{0, 0}, {l.gridW - l.focusW, l.gridH - l.focusH}}) {
+            qvfr::compose::Layout lc = l;
+            lc.x0 = x0;
+            lc.y0 = y0;
+            readOk &= checkPixels(qvfr::compose::Draw(ctx, 0, outer, focus, lc), lc);
         }
     }
     // Debug overlay: the gaze dot and the outline of the margin edge, the rest unchanged.
@@ -551,6 +568,77 @@ int RunCompose() {
     return ok ? 0 : 7;
 }
 
+// Focus window placement for the gaze (M5) on the Dream Air frusta and grid from the game log (2026-11-02): the fixed
+// window at the optical axis as in the log, NDC corners to the frustum tangents, the window clamped into the grid
+// for a gaze at and beyond the frustum edge, and one gaze direction giving the same window tangents in both eyes.
+int RunGeometry() {
+    qvfr::focus::Geometry g;
+    g.gridW = 6048;
+    g.gridH = 5072;
+    g.focusW = 3024;
+    g.focusH = 2536;
+    const float fr[2][4] = {{-1.37856f, 1.15212f, -1.05537f, 1.05537f}, {-1.15212f, 1.37856f, -1.05537f, 1.05537f}};
+    for (int i = 0; i < 2; ++i) {
+        qvfr::focus::Eye& e = g.eye[i];
+        e.l = fr[i][0];
+        e.r = fr[i][1];
+        e.t = fr[i][2];
+        e.b = fr[i][3];
+    }
+    int bad = 0;
+    auto expect = [&](bool ok, const char* what) {
+        if (!ok) {
+            ++bad;
+            printf("Geometry: WRONG %s\n", what);
+        }
+    };
+    auto same = [](float a, float b) { return std::fabs(a - b) <= 1e-5f; };
+    // Window at the given center; its tangents must be its grid pixels and lie inside the frustum.
+    auto place = [&](int i, float cx, float cy) {
+        qvfr::focus::Eye e = g.eye[i];
+        qvfr::focus::Place(g, e, cx, cy);
+        const float px = (e.r - e.l) / g.gridW, py = (e.b - e.t) / g.gridH;
+        expect(same(e.fr - e.fl, g.focusW * px) && same(e.fb - e.ft, g.focusH * py), "window size in tangents");
+        expect(e.fl >= e.l - 1e-5f && e.fr <= e.r + 1e-5f && e.ft >= e.t - 1e-5f && e.fb <= e.b + 1e-5f,
+               "window inside the frustum");
+        expect(same(e.fl, e.l + e.x0 * px) && same(e.fb, e.b - e.y0 * py), "window edges on grid pixels");
+        return e;
+    };
+    qvfr::focus::Eye a = place(0, 0, 0), b = place(1, 0, 0);
+    expect(a.x0 == 1783 && a.y0 == 1268 && b.x0 == 1241 && b.y0 == 1268, "fixed window as in the game log");
+    float cx, cy;
+    qvfr::focus::NdcToTangent(g.eye[0], -1, -1, cx, cy);
+    expect(same(cx, g.eye[0].l) && same(cy, g.eye[0].t), "NDC (-1, -1) = tangents (l, t)");
+    qvfr::focus::NdcToTangent(g.eye[0], 1, 1, cx, cy);
+    expect(same(cx, g.eye[0].r) && same(cy, g.eye[0].b), "NDC (1, 1) = tangents (r, b)");
+    qvfr::focus::NdcToTangent(g.eye[0], 0, 0, cx, cy);
+    a = place(0, cx, cy);
+    expect(a.x0 == (g.gridW - g.focusW) / 2 && a.y0 == (g.gridH - g.focusH) / 2, "NDC (0, 0) = window in the grid center");
+    qvfr::focus::NdcToTangent(g.eye[0], -1, 1, cx, cy);
+    a = place(0, cx, cy);
+    expect(a.x0 == 0 && a.y0 == 0, "gaze at the upper left frustum corner: window in the grid corner");
+    qvfr::focus::NdcToTangent(g.eye[0], 1.5f, -2, cx, cy);
+    a = place(0, cx, cy);
+    expect(a.x0 == g.gridW - g.focusW && a.y0 == g.gridH - g.focusH, "gaze beyond the frustum: window clamped");
+    // One direction (tangents 0.3, -0.2) seen through both eyes' projections, as GetEyeTrackedFoveationCenter gives it.
+    float ndc[2][2];
+    for (int i = 0; i < 2; ++i) {
+        const qvfr::focus::Eye& e = g.eye[i];
+        ndc[i][0] = (0.3f - e.l) / (e.r - e.l) * 2 - 1;
+        ndc[i][1] = (-0.2f - e.t) / (e.b - e.t) * 2 - 1;
+    }
+    qvfr::focus::NdcToTangent(g.eye[0], ndc[0][0], ndc[0][1], cx, cy);
+    a = place(0, cx, cy);
+    qvfr::focus::NdcToTangent(g.eye[1], ndc[1][0], ndc[1][1], cx, cy);
+    b = place(1, cx, cy);
+    const float px = (g.eye[0].r - g.eye[0].l) / g.gridW;
+    expect(std::fabs(a.fl - b.fl) <= px && std::fabs(a.fb - b.fb) <= px, "one gaze direction: same window in both eyes");
+    printf("Geometry check %s: %d wrong; gaze (0.3, -0.2): left window (%u, %u) tangents l %.5f b %.5f, right (%u, %u) "
+           "l %.5f b %.5f\n",
+           bad ? "FAILED" : "OK", bad, a.x0, a.y0, a.fl, a.fb, b.x0, b.y0, b.fl, b.fb);
+    return bad ? 8 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -573,6 +661,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--quad")) quad = true;
         else if (!strcmp(argv[i], "--shots")) shotsTest = true;
         else if (!strcmp(argv[i], "--quad-compose")) composeTest = true;
+        else if (!strcmp(argv[i], "--focus-geometry")) return RunGeometry();
         else if (!strcmp(argv[i], "--center") && i + 2 < argc) {
             center = std::string("center_x=") + argv[i + 1] + "\ncenter_y=" + argv[i + 2] + "\n";
             i += 2;

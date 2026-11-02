@@ -70,8 +70,10 @@ struct Config {
     int shotKey = VK_F10;             // quad: shot key (0 = no hotkey)
     float shotAutoS = 0.0f;           // quad: > 0 = one shot this many seconds after the first frame with focus groups
     float quadFocusSize = 0.5f;       // quad: focus window, fraction of the tangent span; also the game's render size
-    float quadCenterX = 0.0f;         // quad: focus center tangents, right = +
+    float quadCenterX = 0.0f;         // quad: fixed focus center (FFR) tangents, right = +
     float quadCenterY = 0.0f;         // up = +
+    bool followGaze = true;           // quad: the focus window follows the gaze every frame (DFR, M5); 0 = fixed (FFR)
+    float gazeHoldS = 0.6f;           // quad: invalid gaze: the last valid one for this long, then the fixed center
     bool quadCompose = true;          // quad: the proxy composes outer and focus into one grid-size image per eye (M4.4)
     int quadMarginPx = 32;            // quad: hidden band at the focus edge (guard band), grid pixels
     int quadFeatherPx = 128;          // quad: blend band from outer to focus inside the margin, grid pixels
@@ -83,6 +85,8 @@ struct Config {
     int freezeKey = VK_F7;
     int outerKeyMod = VK_RCONTROL;    // quad <-> outer only: the focus groups do not run, SteamVR gets outer alone
     int outerKey = VK_F11;
+    int gazeKeyMod = VK_RCONTROL;     // focus window: follow the gaze (DFR) <-> fixed (FFR)
+    int gazeKey = VK_F6;
     // [test] (not in the default ini; used by qvfr_proxy_smoke --fault)
     int testFaultFrames = 0;          // > 0: deliberate access violation in the diagnostics at this proxy frame
 };

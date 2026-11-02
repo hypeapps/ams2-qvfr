@@ -108,7 +108,13 @@ const char kDefaultIni[] =
     "; quad: focus window as a fraction of the eye's tangent span, both axes (0.5 = 50% x 50%); also the size the game\n"
     "; renders at, so the outer density is focus_size of 1:1. Restart the game after a change.\n"
     "focus_size=0.5\n"
-    "; quad: focus center as view direction tangents, the same for both eyes (0,0 = optical axis; right and up are +).\n"
+    "; quad: 1 = the focus window follows the gaze every frame (DFR, gaze from SteamVR); 0 = the window stays at center_x,\n"
+    "; center_y (FFR). The window also goes to the center when the gaze is not valid for longer than gaze_hold_s\n"
+    "; (until then it stays at the last valid gaze, e.g. while blinking) and while a benchmark runs (unless the gaze is\n"
+    "; frozen: then at the frozen gaze).\n"
+    "follow_gaze=1\n"
+    "gaze_hold_s=0.6\n"
+    "; quad: fixed focus center as view direction tangents, the same for both eyes (0,0 = optical axis; right and up are +).\n"
     "center_x=0\n"
     "center_y=0\n"
     "; quad: 1 = the proxy composes each eye from outer (upscaled to the 1:1 grid) and focus (1:1 in its window) and\n"
@@ -145,10 +151,14 @@ const char kDefaultIni[] =
     "; when quad mode fails.\n"
     "outer_modifier=0xA3\n"
     "outer_key=0x7A\n"
+    "; Focus window: follow the gaze (DFR) <-> fixed at the center (FFR), like [quad] follow_gaze (0x75 = F6).\n"
+    "gaze_modifier=0xA3\n"
+    "gaze_key=0x75\n"
     "\n"
     "; Settings marked live take effect while the game runs (the file is checked about once a second): [log]\n"
-    "; stats_interval_s, [benchmark] all but auto_start_s, [gaze] read, [quad] compose, margin_px, feather_px, the\n"
-    "; shot keys and shot_auto_s, and all of [debug]. Everything else needs a game restart.\n";
+    "; stats_interval_s, [benchmark] all but auto_start_s, [gaze] read, [quad] follow_gaze, gaze_hold_s, center_x,\n"
+    "; center_y, compose, margin_px, feather_px, the shot keys and shot_auto_s, and all of [debug]. Everything else needs\n"
+    "; a game restart.\n";
 
 std::string IniString(const fs::path& ini, const wchar_t* sec, const wchar_t* key, const wchar_t* def) {
     wchar_t buf[64];
@@ -315,6 +325,12 @@ Config ReadConfig(const fs::path& ini) {
     }
     c.quadCenterX = IniFloat(ini, L"quad", L"center_x", 0.0f);
     c.quadCenterY = IniFloat(ini, L"quad", L"center_y", 0.0f);
+    c.followGaze = IniInt(ini, L"quad", L"follow_gaze", 1) != 0;
+    c.gazeHoldS = IniFloat(ini, L"quad", L"gaze_hold_s", c.gazeHoldS);
+    if (!(c.gazeHoldS >= 0.0f && c.gazeHoldS <= 10.0f)) {
+        Log("Settings: [quad] gaze_hold_s=%.2f outside 0..10, using 0.6", c.gazeHoldS);
+        c.gazeHoldS = 0.6f;
+    }
     c.quadCompose = IniInt(ini, L"quad", L"compose", 1) != 0;
     c.quadMarginPx = IniInt(ini, L"quad", L"margin_px", c.quadMarginPx);
     if (c.quadMarginPx < 0 || c.quadMarginPx > 512) {
@@ -327,10 +343,12 @@ Config ReadConfig(const fs::path& ini) {
         c.quadFeatherPx = 128;
     }
     if (c.quadMode != QuadMode::Off)
-        Log("Settings: [quad] mode=%s focus_size=%.3f center=(%.3f, %.3f) compose=%d margin_px=%d feather_px=%d "
-            "probe_frames=%d probe_engine=%d probe_d3d=%d shot_modifier=0x%X shot_key=0x%X shot_auto_s=%.1f",
-            QuadModeName(c.quadMode), c.quadFocusSize, c.quadCenterX, c.quadCenterY, c.quadCompose, c.quadMarginPx,
-            c.quadFeatherPx, c.probeFrames, c.probeEngine, c.probeD3D, c.shotKeyMod, c.shotKey, c.shotAutoS);
+        Log("Settings: [quad] mode=%s focus_size=%.3f follow_gaze=%d gaze_hold_s=%.2f center=(%.3f, %.3f) compose=%d "
+            "margin_px=%d feather_px=%d probe_frames=%d probe_engine=%d probe_d3d=%d shot_modifier=0x%X shot_key=0x%X "
+            "shot_auto_s=%.1f",
+            QuadModeName(c.quadMode), c.quadFocusSize, c.followGaze, c.gazeHoldS, c.quadCenterX, c.quadCenterY,
+            c.quadCompose, c.quadMarginPx, c.quadFeatherPx, c.probeFrames, c.probeEngine, c.probeD3D, c.shotKeyMod,
+            c.shotKey, c.shotAutoS);
     if (c.quadMode == QuadMode::Quad && c.expMode != ExpMode::Off) {
         Log("Settings: [experiment] mode=%s ignored: [quad] mode=quad sets the size and projection itself",
             ExpModeName(c.expMode));
@@ -343,10 +361,13 @@ Config ReadConfig(const fs::path& ini) {
     c.freezeKey = IniInt(ini, L"debug", L"freeze_key", c.freezeKey);
     c.outerKeyMod = IniInt(ini, L"debug", L"outer_modifier", c.outerKeyMod);
     c.outerKey = IniInt(ini, L"debug", L"outer_key", c.outerKey);
+    c.gazeKeyMod = IniInt(ini, L"debug", L"gaze_modifier", c.gazeKeyMod);
+    c.gazeKey = IniInt(ini, L"debug", L"gaze_key", c.gazeKey);
     if (c.quadMode == QuadMode::Quad)
         Log("Settings: [debug] overlay=%d overlay_modifier=0x%X overlay_key=0x%X freeze_modifier=0x%X freeze_key=0x%X "
-            "outer_modifier=0x%X outer_key=0x%X",
-            c.overlay, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey);
+            "outer_modifier=0x%X outer_key=0x%X gaze_modifier=0x%X gaze_key=0x%X",
+            c.overlay, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey,
+            c.gazeKeyMod, c.gazeKey);
     c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
     if (c.testFaultFrames > 0) Log("Settings: [test] fault_frames=%d (deliberate fault for testing)", c.testFaultFrames);
     return c;
@@ -412,8 +433,7 @@ bool ReloadConfig() {
          "[experiment]");
     need(n.traceCallers != c.traceCallers || n.traceDepth != c.traceDepth, "[trace]");
     need(n.quadMode != c.quadMode, "[quad] mode");
-    need(n.quadFocusSize != c.quadFocusSize || n.quadCenterX != c.quadCenterX || n.quadCenterY != c.quadCenterY,
-         "[quad] focus_size/center");
+    need(n.quadFocusSize != c.quadFocusSize, "[quad] focus_size");
     need(n.probeFrames != c.probeFrames || n.probeEngine != c.probeEngine || n.probeD3D != c.probeD3D, "[quad] probe_*");
     c.statsIntervalS = n.statsIntervalS;
     c.benchKeyMod = n.benchKeyMod;
@@ -423,6 +443,10 @@ bool ReloadConfig() {
     c.benchFreezePose = n.benchFreezePose;
     c.benchBeep = n.benchBeep;
     c.gazeRead = n.gazeRead;
+    c.quadCenterX = n.quadCenterX;
+    c.quadCenterY = n.quadCenterY;
+    c.followGaze = n.followGaze;
+    c.gazeHoldS = n.gazeHoldS;
     c.quadCompose = n.quadCompose;
     c.quadMarginPx = n.quadMarginPx;
     c.quadFeatherPx = n.quadFeatherPx;
@@ -436,12 +460,16 @@ bool ReloadConfig() {
     c.freezeKey = n.freezeKey;
     c.outerKeyMod = n.outerKeyMod;
     c.outerKey = n.outerKey;
+    c.gazeKeyMod = n.gazeKeyMod;
+    c.gazeKey = n.gazeKey;
     Log("Settings reloaded (live): stats_interval_s=%d | benchmark modifier=0x%X key=0x%X delay_s=%.1f duration_s=%.1f "
-        "freeze_pose=%d beep=%d | gaze read=%d | quad compose=%d margin_px=%d feather_px=%d shot_modifier=0x%X "
-        "shot_key=0x%X shot_auto_s=%.1f | debug overlay=%d keys 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X%s%s",
+        "freeze_pose=%d beep=%d | gaze read=%d | quad follow_gaze=%d gaze_hold_s=%.2f center=(%.3f, %.3f) compose=%d "
+        "margin_px=%d feather_px=%d shot_modifier=0x%X shot_key=0x%X shot_auto_s=%.1f | debug overlay=%d keys "
+        "0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X%s%s",
         c.statsIntervalS, c.benchKeyMod, c.benchKey, c.benchDelayS, c.benchDurationS, c.benchFreezePose, c.benchBeep,
-        c.gazeRead, c.quadCompose, c.quadMarginPx, c.quadFeatherPx, c.shotKeyMod, c.shotKey, c.shotAutoS, c.overlay,
-        c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey,
+        c.gazeRead, c.followGaze, c.gazeHoldS, c.quadCenterX, c.quadCenterY, c.quadCompose, c.quadMarginPx,
+        c.quadFeatherPx, c.shotKeyMod, c.shotKey, c.shotAutoS, c.overlay, c.overlayKeyMod, c.overlayKey,
+        c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey, c.gazeKeyMod, c.gazeKey,
         restart.empty() ? "" : "; CHANGED BUT NEEDS A GAME RESTART: ", restart.c_str());
     return true;
 }

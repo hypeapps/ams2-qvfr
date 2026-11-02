@@ -38,6 +38,7 @@ struct ProxyFrame {
     float submitMs = 0;       // total time spent in Submit
     int submits = 0;
     modern::Gaze gaze;
+    quad::FrameWindow window;  // where the focus window of the frame came from (quad mode)
     bool frozen = false;
     bool valid = false;
 };
@@ -76,6 +77,17 @@ uint64_t g_statsFrames = 0, g_gazeOk = 0, g_gazeSame = 0, g_gazeCalls = 0;
 uint64_t g_submitsInInterval = 0;
 modern::Gaze g_prevGaze;
 bool g_gazeFirstLogged = false;
+// Gaze stalls: a valid gaze that keeps exactly the same value for kStallMs or longer. The tracker lost the eye
+// (blink, headset lifted), but SteamVR keeps reporting the last value as valid (M5 data, docs/gaze-test.md).
+constexpr double kStallMs = 200;
+constexpr double kPauseMs = 250;  // a longer frame interval is a pause of the game, not a stall
+double g_valueSinceMs = -1;  // when the current valid value first came (-1 = no valid gaze)
+double g_valueLastMs = -1;   // the last frame with it
+uint64_t g_valueFrames = 0;  // frames with it
+struct Stalls {
+    uint64_t count = 0, frames = 0;
+    double longestMs = 0;
+} g_stalls, g_stallsTotal;
 
 // ---------------------------------------------------------------- CSV and benchmark
 
@@ -141,7 +153,8 @@ const char kCsvHeader[] =
 
 const char kFramesHeader[] =
     "frame,t_s,interval_ms,cpu_ms,wgp_block_ms,submit_ms,submits,gpu_frame_ms,gpu_outer_l_ms,gpu_outer_r_ms,"
-    "gpu_focus_l_ms,gpu_focus_r_ms,gpu_compose_ms,gpu_other_ms,gaze_ok,gaze_x_deg,gaze_y_deg,frozen\n";
+    "gpu_focus_l_ms,gpu_focus_r_ms,gpu_compose_ms,gpu_other_ms,gaze_ok,gaze_x_deg,gaze_y_deg,frozen,focus_src,"
+    "focus_x0_l,focus_y0_l\n";
 
 void Beeps(std::vector<std::pair<int, int>> tones) {
     if (!Cfg().benchBeep) return;
@@ -214,7 +227,11 @@ void WriteFramesRow(FILE* f, const ProxyFrame& p, const gpu::Result* g, double& 
     } else {
         fputs(",,,,,,,", f);
     }
-    fprintf(f, "%d,%.2f,%.2f,%d\n", p.gaze.ok, p.gaze.degX, p.gaze.degY, p.frozen ? 1 : 0);
+    fprintf(f, "%d,%.2f,%.2f,%d,", p.gaze.ok, p.gaze.degX, p.gaze.degY, p.frozen ? 1 : 0);
+    if (p.window.src != quad::SrcNone)
+        fprintf(f, "%s,%u,%u\n", quad::SourceName(p.window.src), p.window.x0, p.window.y0);
+    else
+        fputs(",,\n", f);
 }
 
 void AccumulateFrame(const ProxyFrame& p, const gpu::Result* g) {
@@ -488,6 +505,18 @@ void ProcessTimings(const modern::FrameTiming* rows, uint32_t n) {
     }
 }
 
+// The current valid gaze value ends at `now`: a stall if it lasted kStallMs or longer.
+void EndGazeValue(double now) {
+    if (g_valueSinceMs < 0) return;
+    const double ms = now - g_valueSinceMs;
+    if (ms < kStallMs) return;
+    for (Stalls* s : {&g_stalls, &g_stallsTotal}) {
+        ++s->count;
+        s->frames += g_valueFrames;
+        s->longestMs = std::max(s->longestMs, ms);
+    }
+}
+
 void PeriodicStats() {
     int interval = Cfg().statsIntervalS;
     double now = NowMs();
@@ -499,9 +528,16 @@ void PeriodicStats() {
         (unsigned long long)g_statsFrames, g_statsFrames / sec, (unsigned long long)g_submitsInInterval,
         g_handles[0].size(), g_handles[1].size());
     if (g_gazeCalls) {
-        Log("Gaze: valid in %.1f%% of frames, same value as the previous frame in %.1f%%, last (%.1f°, %.1f°)",
-            100.0 * g_gazeOk / g_gazeCalls, 100.0 * g_gazeSame / g_gazeCalls, g_prevGaze.degX, g_prevGaze.degY);
+        const double ongoing = g_valueSinceMs >= 0 ? now - g_valueSinceMs : 0;
+        Log("Gaze: valid in %.1f%% of frames, same value as the previous frame in %.1f%%, last (%.1f°, %.1f°); stalls "
+            "(same valid value for %.1f s or longer): %llu, %.1f%% of frames, longest %.1f s%s; session %llu, "
+            "longest %.1f s",
+            100.0 * g_gazeOk / g_gazeCalls, 100.0 * g_gazeSame / g_gazeCalls, g_prevGaze.degX, g_prevGaze.degY,
+            kStallMs / 1000, (unsigned long long)g_stalls.count, 100.0 * g_stalls.frames / g_gazeCalls,
+            g_stalls.longestMs / 1000, ongoing >= kStallMs ? " (one still going on)" : "",
+            (unsigned long long)g_stallsTotal.count, g_stallsTotal.longestMs / 1000);
     }
+    g_stalls = Stalls{};
     if (g_gpuSums.frames) {
         const GpuSums& s = g_gpuSums;
         auto avg = [&](int k) { return s.n[k] ? s.phase[k] / s.n[k] : -1.0; };
@@ -628,7 +664,19 @@ void OnWaitGetPosesEnd(vr::IVRCompositor* real, vr::TrackedDevicePose_t* render,
             g_cur.gaze = g;
             ++g_gazeCalls;
             g_gazeOk += g.ok;
-            if (g.ndcL[0] == g_prevGaze.ndcL[0] && g.ndcL[1] == g_prevGaze.ndcL[1]) ++g_gazeSame;
+            const bool same = g.ndcL[0] == g_prevGaze.ndcL[0] && g.ndcL[1] == g_prevGaze.ndcL[1];
+            if (same) ++g_gazeSame;
+            // A pause of the game (Alt+Tab, loading: one frame of seconds) ends the value at the previous frame, so it
+            // never counts as a stall (M5.1 run: 7 pauses of 4-26 s).
+            const bool pause = g_cur.intervalMs > kPauseMs;
+            if (same && g.ok && g_prevGaze.ok && !pause) {
+                ++g_valueFrames;
+                g_valueLastMs = g_cur.wgpExit;
+            } else {
+                EndGazeValue(pause ? g_valueLastMs : g_cur.wgpExit);
+                g_valueSinceMs = g_valueLastMs = g.ok ? g_cur.wgpExit : -1;
+                g_valueFrames = g.ok ? 1 : 0;
+            }
             if (!g_gazeFirstLogged) {
                 g_gazeFirstLogged = true;
                 Log("Gaze in game: GetEyeTrackedFoveationCenter = %d, NDC L (%.4f, %.4f) R (%.4f, %.4f), direction (%.2f°, %.2f°)",
@@ -648,8 +696,9 @@ void OnWaitGetPosesEnd(vr::IVRCompositor* real, vr::TrackedDevicePose_t* render,
         PeriodicStats();
         ReloadConfig();
         g_cur.frozen = g_frozen;
-        // Gaze for the debug overlay (and later DFR); after the hotkeys, so a frozen gaze is applied there.
-        quad::SetGaze(g_cur.gaze.ok, g_cur.gaze.ndcL, g_cur.gaze.ndcR);
+        // The gaze places this frame's focus window (DFR) and the overlay's gaze point; after the hotkeys, so a
+        // benchmark that starts now already has the window at the center.
+        g_cur.window = quad::SetGaze(g_cur.gaze.ok, g_cur.gaze.ndcL, g_cur.gaze.ndcR, g_bench != Bench::Idle);
 
         if (g_frozen) {
             if (!g_frozenPose.bPoseIsValid && render && nRender > 0 && render[0].bPoseIsValid) {
@@ -798,6 +847,8 @@ void OnShutdown() {
         g_sessionSysT0 = -1;
         g_frozen = false;
         g_frozenPose.bPoseIsValid = false;
+        g_valueSinceMs = g_valueLastMs = -1;
+        g_valueFrames = 0;
     });
     experiment::Shutdown();  // guards itself; runs even after a diagnostics fault
 }

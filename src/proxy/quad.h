@@ -4,7 +4,8 @@
 // while they run. M4.3: the game renders at the focus size with the full projection (outer), and the focus groups get
 // the focus window of their eye (projection in the eye camera and in the VR device eye data). M4.4: at Submit the proxy
 // composes each eye from outer and focus into a grid-size image (compose.h); shots compare the focus views with their
-// window in the outer views and in the composed eyes.
+// window in the outer views and in the composed eyes. M5: the focus window follows the gaze every frame (DFR), with
+// the fixed center (FFR) as the fallback.
 #pragma once
 
 #include <openvr.h>  // 0.9.12
@@ -21,8 +22,17 @@ bool Engaged();       // the game got the focus size this session: the wrappers 
 // WaitGetPoses entry (render thread): frame bookkeeping, hotkeys (shot, overlay, gaze freeze, quad <-> outer only), shot
 // read-back. M4.5: in outer-only mode (hotkey or watchdog) the focus groups' tasks are not executed and SteamVR gets outer.
 void OnFrameStart();
-// Gaze of the frame (NDC per eye of the full projection, x right, y up) for the debug overlay; ignored while frozen.
-void SetGaze(bool ok, const float ndcL[2], const float ndcR[2]);
+// M5 (DFR): where the frame's focus window comes from and the left eye's window position in the 1:1 grid.
+enum WindowSource { SrcNone = -1, SrcLive, SrcHeld, SrcFixed, SrcFrozen };
+struct FrameWindow {
+    int src = SrcNone;  // SrcNone: no focus window (quad mode off or not set up)
+    uint32_t x0 = 0, y0 = 0;
+};
+const char* SourceName(int src);  // "live", "held", "fixed", "frozen", "" for SrcNone
+// WaitGetPoses exit (render thread), every frame: the gaze (NDC per eye of the full projection, x right, y up; kept
+// while frozen) places this frame's focus window, used by the focus groups and the composition. `benchmark`: a
+// benchmark counts down or records, so the window stays at the fixed center unless the gaze is frozen.
+FrameWindow SetGaze(bool ok, const float ndcL[2], const float ndcR[2], bool benchmark);
 void OnSubmitBegin(vr::EVREye eye, const vr::Texture_t* tex);  // the first Submit gives the D3D11 device
 // With the focus groups running: a Texture_t (kept in `storage`) pointing to the composed eye, or without the
 // composition to outer at the focus size (right eye: this frame's outer R copy); otherwise `tex` unchanged.

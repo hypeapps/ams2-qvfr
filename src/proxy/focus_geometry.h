@@ -29,5 +29,11 @@ struct Geometry {
 // tangent span, both axes; cx, cy: center tangents, right and up are +). Checks that GetProjectionMatrix matches the
 // formula above, so a replaced matrix and the window always agree. `who` prefixes the log lines. False = unusable.
 bool Compute(vr::IVRSystem* real, float size, float cx, float cy, const char* who, Geometry& g);
+// Places the focus window of one eye (its frustum l, r, t, b set) around the center tangents cx, cy, clamped so the
+// whole window stays in the grid (M5: once per frame for the gaze).
+void Place(const Geometry& g, Eye& e, float cx, float cy);
+// Center tangents of a point given as NDC of the eye's full projection (x right, y up), e.g. the gaze from
+// GetEyeTrackedFoveationCenter.
+void NdcToTangent(const Eye& e, float ndcX, float ndcY, float& cx, float& cy);
 
 }  // namespace qvfr::focus

@@ -177,6 +177,7 @@ struct Run {
     bool swapped = false;     // view 2 fields taken from the source view (focus L)
     bool eyeSwapped = false;  // VR device eye data of view 2 replaced
     bool projected = false;   // focus projection in the camera and in the eye data
+    uint32_t x0 = 0, y0 = 0;  // with `projected`: the focus window it rendered (grid pixels), for the composition
 };
 
 struct Stats {
@@ -187,6 +188,8 @@ struct Stats {
     uint64_t rightAsIs = 0;      // right eye: game texture (focus R), no outer R copy in this frame
     uint64_t outerFrames = 0;         // frames with the focus groups skipped
     uint64_t skipLeaks = 0;      // outer-only frames in which a focus group still ran (executor path not covered)
+    uint64_t bySource[4] = {};   // frames with the focus groups by window source (live, held, fixed, frozen)
+    uint64_t gazeLost = 0;       // the window went to the fixed center: no valid gaze for longer than gaze_hold_s
     double cpuMs[kGroups] = {};
 };
 
@@ -252,6 +255,27 @@ bool g_overlay = false;
 bool g_overlayCfg = false;  // Cfg().overlay last seen (a reload sets g_overlay)
 bool g_gazeOk = false, g_gazeFrozen = false;
 float g_gaze[2][2] = {};
+
+// DFR (M5): the focus window of each frame, placed at WaitGetPoses exit (SetGaze), before the frame's eye groups run.
+// Like the mbucchia layer: on the gaze every frame, without smoothing or prediction; an invalid gaze keeps the last
+// valid one for gaze_hold_s, then the window goes to the fixed center. A gaze that keeps its value (the tracker lost
+// the eye, SteamVR still reports it valid) moves nothing and is only counted in frame.cpp.
+struct Window {
+    uint64_t frame = 0;  // g_frameNo it was placed for (0 = none)
+    int src = SrcFixed;
+    focus::Eye eye[2];   // frustum and focus window per eye
+};
+Window g_window;
+bool g_follow = true;
+bool g_followCfg = true;     // Cfg().followGaze last seen (a reload sets g_follow)
+bool g_gazeKeyDown = false;
+bool g_haveGood = false;     // a valid gaze was read in this session
+double g_goodMs = 0;         // when it was read
+float g_good[2][2] = {};
+bool g_lost = false;         // following, but the window is at the center: no valid gaze for gaze_hold_s
+int g_lostLogs = 0;          // loss and return lines logged (the rest only counted)
+bool g_benchWindow = false;  // the previous frame was a benchmark frame
+constexpr int kLostLogs = 10;
 
 thread_local bool t_inBuilder = false;
 thread_local int t_buildGroup = -1;
@@ -696,6 +720,12 @@ void LogFocusFirst(int group, const uint8_t* src, const uint8_t* foc, const uint
         m1[5], m1[8], m1[9], (const void*)cam);
 }
 
+// This frame's focus window of eye i: the one SetGaze placed, or the session's fixed one (SetupLocked) when SetGaze
+// did not run for this frame.
+const focus::Eye& WindowEyeLocked(int i) {
+    return g_window.frame && g_window.frame == g_frameNo ? g_window.eye[i] : g_focus.geo.eye[i];
+}
+
 // Before a focus group: view 2 takes the source view's camera slot, frustum block and visibility list (focus L),
 // and the camera and the VR device eye data of view 2 get the focus window of the group's eye. The deferred lighting
 // reads the eye tangents straight from the VR device by view - 1 (0x9ce0e8), the passes read the projection from the
@@ -737,8 +767,10 @@ void SwapInLocked(uint8_t* ctx, int group, int src, Run& run) {
     } else if (g_focus.on && !g_focus.projFailed) {
         char why[256] = "";
         uint8_t* cam = *(uint8_t**)(ctx + kCtxSlots + kFocusView * kSlotSize);
-        proj = CameraReady(cam, srcEye, why, sizeof(why)) &&
-               FocusEyeData(srcEye, g_focus.geo.eye[src - 1], data, why, sizeof(why));
+        const focus::Eye& win = WindowEyeLocked(src - 1);
+        proj = CameraReady(cam, srcEye, why, sizeof(why)) && FocusEyeData(srcEye, win, data, why, sizeof(why));
+        run.x0 = win.x0;
+        run.y0 = win.y0;
         if (!proj) {
             if (!g_focus.missLogged) {
                 g_focus.missLogged = true;
@@ -877,6 +909,15 @@ void HandleToolsLocked() {
     if (Pressed(c.overlayKeyMod, c.overlayKey, g_overlayKeyDown)) {
         g_overlay = !g_overlay;
         Log("Quad: debug overlay %s (hotkey)", g_overlay ? "on" : "off");
+    }
+    if (c.followGaze != g_followCfg) {
+        g_followCfg = c.followGaze;
+        g_follow = c.followGaze;
+        Log("Quad: focus window %s (ini)", g_follow ? "follows the gaze (DFR)" : "fixed at the center (FFR)");
+    }
+    if (Pressed(c.gazeKeyMod, c.gazeKey, g_gazeKeyDown)) {
+        g_follow = !g_follow;
+        Log("Quad: focus window %s (hotkey)", g_follow ? "follows the gaze (DFR)" : "fixed at the center (FFR)");
     }
     if (Pressed(c.freezeKeyMod, c.freezeKey, g_freezeKeyDown)) {
         g_gazeFrozen = !g_gazeFrozen;
@@ -1050,8 +1091,10 @@ ID3D11Texture2D* ComposeLocked(int e, const vr::Texture_t* tex, const vr::VRText
     l.gridH = g.gridH;
     l.focusW = g.focusW;
     l.focusH = g.focusH;
-    l.x0 = g.eye[e].x0;
-    l.y0 = g.eye[e].y0;
+    // The window the eye's focus group rendered (this frame's, checked above through `projected`).
+    const Run& foc = g_run[e ? FocusR : FocusL];
+    l.x0 = foc.x0;
+    l.y0 = foc.y0;
     l.marginPx = (float)Cfg().quadMarginPx;
     l.featherPx = (float)Cfg().quadFeatherPx;
     l.overlay = g_overlay;
@@ -1284,6 +1327,13 @@ void LogStatsLocked(const Stats& s, const char* what) {
         (unsigned long long)s.composed[1], (unsigned long long)s.outerOnly[0], (unsigned long long)s.outerOnly[1],
         (unsigned long long)s.rightAsIs, (unsigned long long)s.outerFrames, (unsigned long long)s.skipLeaks,
         (unsigned long long)g_skipped.load(), s.cpuMs[0] / f, s.cpuMs[1] / f, s.cpuMs[2] / f, s.cpuMs[3] / f);
+    const uint64_t* n = s.bySource;
+    const double all = (double)std::max<uint64_t>(1, n[0] + n[1] + n[2] + n[3]);
+    Log("Quad focus window%s: frames on the live gaze %llu (%.1f%%), held gaze %llu (%.1f%%), fixed center %llu "
+        "(%.1f%%), frozen gaze %llu (%.1f%%); gaze lost for longer than gaze_hold_s %llu times",
+        what, (unsigned long long)n[SrcLive], 100 * n[SrcLive] / all, (unsigned long long)n[SrcHeld],
+        100 * n[SrcHeld] / all, (unsigned long long)n[SrcFixed], 100 * n[SrcFixed] / all,
+        (unsigned long long)n[SrcFrozen], 100 * n[SrcFrozen] / all, (unsigned long long)s.gazeLost);
 }
 
 void AddStats(Stats& a, const Stats& b) {
@@ -1302,7 +1352,33 @@ void AddStats(Stats& a, const Stats& b) {
     a.rightAsIs += b.rightAsIs;
     a.outerFrames += b.outerFrames;
     a.skipLeaks += b.skipLeaks;
+    for (int s = 0; s < 4; ++s) a.bySource[s] += b.bySource[s];
+    a.gazeLost += b.gazeLost;
     for (int g = 0; g < kGroups; ++g) a.cpuMs[g] += b.cpuMs[g];
+}
+
+// Shot rectangles for the focus window of both eyes. Outer views are focusW x focusH over the whole grid, so the
+// window in them is (x0, y0, focusW, focusH) * scale; the composed eye is the grid (focus 1:1 in its window).
+void ShotRectsLocked(const focus::Eye* eye) {
+    const focus::Geometry& g = g_focus.geo;
+    const double sx = g.focusW / (double)g.gridW, sy = g.focusH / (double)g.gridH;
+    for (int i = 0; i < 2; ++i) {
+        const focus::Eye& e = eye[i];
+        shots::Pair& p = g_shotPairs[i];
+        p.rx = (float)(e.x0 * sx);
+        p.ry = (float)(e.y0 * sy);
+        p.rw = (float)(g.focusW * sx);
+        p.rh = (float)(g.focusH * sy);
+        shots::Pair& f = g_shotPairs[3 + i];
+        f.rx = (float)e.x0;
+        f.ry = (float)e.y0;
+        f.rw = (float)g.focusW;
+        f.rh = (float)g.focusH;
+        f.inset = (float)(Cfg().quadMarginPx + Cfg().quadFeatherPx);
+        shots::Pair& o = g_shotPairs[5 + i];
+        o.rw = (float)g.gridW;
+        o.rh = (float)g.gridH;
+    }
 }
 
 // First size query of a VR session: the focus window. Only with the engine hooks and the builder patch in place, so a
@@ -1329,30 +1405,21 @@ void SetupLocked(vr::IVRSystem* real) {
     Log("Quad: SteamVR size (1:1 grid) %u x %u, size returned to the game %u x %u (focus_size %.3f): outer = full FOV "
         "at %.0f%% density, focus = window at 1:1",
         g.gridW, g.gridH, g.focusW, g.focusH, c.quadFocusSize, 100.0 * g.focusW / g.gridW);
-    // Outer views are focusW x focusH over the whole grid, so the focus window is (x0, y0, focusW, focusH) * scale.
-    const double sx = g.focusW / (double)g.gridW, sy = g.focusH / (double)g.gridH;
     static const char* const labels[2] = {"focus L vs its window in outer L", "focus R vs its window in outer R"};
     for (int i = 0; i < 2; ++i) {
         const focus::Eye& e = g.eye[i];
-        Log("Quad: %s eye: full l %.5f r %.5f t %.5f b %.5f; focus l %.5f r %.5f t %.5f b %.5f at grid pixel (%u, %u)",
+        Log("Quad: %s eye: full l %.5f r %.5f t %.5f b %.5f; fixed focus (FFR) l %.5f r %.5f t %.5f b %.5f at grid "
+            "pixel (%u, %u)",
             i ? "right" : "left", e.l, e.r, e.t, e.b, e.fl, e.fr, e.ft, e.fb, e.x0, e.y0);
-        shots::Pair& p = g_shotPairs[i];
-        p.label = labels[i];
-        p.rx = (float)(e.x0 * sx);
-        p.ry = (float)(e.y0 * sy);
-        p.rw = (float)(g.focusW * sx);
-        p.rh = (float)(g.focusH * sy);
-        // The composed eye is the grid: focus 1:1 in its window, outer over the whole grid.
-        shots::Pair& f = g_shotPairs[3 + i];
-        f.rx = (float)e.x0;
-        f.ry = (float)e.y0;
-        f.rw = (float)g.focusW;
-        f.rh = (float)g.focusH;
-        f.inset = (float)(c.quadMarginPx + c.quadFeatherPx);
-        shots::Pair& o = g_shotPairs[5 + i];
-        o.rw = (float)g.gridW;
-        o.rh = (float)g.gridH;
+        g_shotPairs[i].label = labels[i];
+        g_window.eye[i] = e;
     }
+    ShotRectsLocked(g.eye);
+    g_window.frame = 0;
+    g_window.src = SrcFixed;
+    Log("Quad: focus window %s at start (follow_gaze=%d, gaze_hold_s=%.2f; hotkey 0x%X+0x%X switches)",
+        g_follow ? "follows the gaze (DFR)" : "fixed at the center (FFR)", c.followGaze, c.gazeHoldS, c.gazeKeyMod,
+        c.gazeKey);
     if (c.quadCompose) {
         const int band = c.quadMarginPx + c.quadFeatherPx;
         Log("Quad: composition on: each eye goes to SteamVR as a %u x %u image, outer upscaled bilinearly, focus 1:1 "
@@ -1419,6 +1486,7 @@ void Install() {
             Log("Quad: no add-task hook; no quad <-> outer only switch");
     });
     g_overlay = g_overlayCfg = Cfg().overlay;
+    g_follow = g_followCfg = Cfg().followGaze;
     g_on = g_installed;
 }
 
@@ -1445,17 +1513,91 @@ void OnFrameStart() {
     });
 }
 
-void SetGaze(bool ok, const float ndcL[2], const float ndcR[2]) {
-    if (!g_on) return;
+const char* SourceName(int src) {
+    switch (src) {
+        case SrcLive: return "live";
+        case SrcHeld: return "held";
+        case SrcFixed: return "fixed";
+        case SrcFrozen: return "frozen";
+        default: return "";
+    }
+}
+
+FrameWindow SetGaze(bool ok, const float ndcL[2], const float ndcR[2], bool benchmark) {
+    FrameWindow fw;
+    if (!g_on) return fw;
     Safe("SetGaze", [&] {
         std::lock_guard lock(g_m);
-        if (g_gazeFrozen) return;
-        g_gazeOk = ok;
-        g_gaze[0][0] = ndcL[0];
-        g_gaze[0][1] = ndcL[1];
-        g_gaze[1][0] = ndcR[0];
-        g_gaze[1][1] = ndcR[1];
+        const double now = NowMs();
+        if (!g_gazeFrozen) {
+            g_gazeOk = ok;
+            g_gaze[0][0] = ndcL[0];
+            g_gaze[0][1] = ndcL[1];
+            g_gaze[1][0] = ndcR[0];
+            g_gaze[1][1] = ndcR[1];
+            if (ok) {
+                g_haveGood = true;
+                g_goodMs = now;
+                memcpy(g_good, g_gaze, sizeof(g_good));
+            }
+        }
+        if (!g_focus.on) return;
+        const Config& c = Cfg();
+        // The window's center: the gaze (live, frozen, or the last valid one for gaze_hold_s) or the fixed center.
+        const float(*ndc)[2] = nullptr;
+        int src = SrcFixed;
+        bool lost = false;
+        if (g_follow && g_gazeFrozen) {
+            if (g_gazeOk) {
+                ndc = g_gaze;
+                src = SrcFrozen;
+            }
+        } else if (g_follow && !benchmark) {
+            if (g_gazeOk) {
+                ndc = g_gaze;
+                src = SrcLive;
+            } else if (g_haveGood && now - g_goodMs <= c.gazeHoldS * 1000.0) {
+                ndc = g_good;
+                src = SrcHeld;
+            } else {
+                lost = true;
+            }
+        }
+        if (lost != g_lost) {
+            g_lost = lost;
+            if (lost) ++g_st.gazeLost;
+            if (g_lostLogs < kLostLogs && (lost || src == SrcLive)) {
+                ++g_lostLogs;
+                Log("Quad: frame %llu: %s%s", (unsigned long long)g_frameNo,
+                    lost ? "no valid gaze for longer than gaze_hold_s, focus window at the fixed center"
+                         : "valid gaze again, focus window follows it",
+                    g_lostLogs == kLostLogs ? " (further losses only counted in the stats)" : "");
+            }
+        }
+        if (benchmark != g_benchWindow) {
+            g_benchWindow = benchmark;
+            if (g_follow)
+                Log("Quad: benchmark %s: focus window %s", benchmark ? "on" : "off",
+                    !benchmark      ? "follows the gaze again"
+                    : g_gazeFrozen ? "at the frozen gaze"
+                                   : "at the fixed center (freeze the gaze first to measure elsewhere)");
+        }
+        for (int i = 0; i < 2; ++i) {
+            focus::Eye& e = g_window.eye[i];
+            e = g_focus.geo.eye[i];
+            float cx = c.quadCenterX, cy = c.quadCenterY;
+            if (ndc) focus::NdcToTangent(e, ndc[i][0], ndc[i][1], cx, cy);
+            focus::Place(g_focus.geo, e, cx, cy);
+        }
+        g_window.frame = g_frameNo;
+        g_window.src = src;
+        if (g_graph.ok) ++g_st.bySource[src];
+        if (g_shotFrame) ShotRectsLocked(g_window.eye);
+        fw.src = src;
+        fw.x0 = g_window.eye[0].x0;
+        fw.y0 = g_window.eye[0].y0;
     });
+    return fw;
 }
 
 void OnSubmitBegin(vr::EVREye eye, const vr::Texture_t* tex) {
@@ -1570,15 +1712,16 @@ void LogStats(bool totals) {
 
 std::string Describe() {
     if (Cfg().quadMode != QuadMode::Quad) return "Quad: off";
-    char buf[768] = "Quad: (error)";
+    char buf[1024] = "Quad: (error)";
     Guard("Describe", [&] {
         std::lock_guard lock(g_m);
-        char focus[256] = "no focus window (the game renders at the SteamVR size)";
+        char focus[384] = "no focus window (the game renders at the SteamVR size)";
         const focus::Geometry& g = g_focus.geo;
         if (g_focus.on)
             snprintf(focus, sizeof(focus),
-                     "game size %u x %u of %u x %u (focus_size %.3f), focus projection %s, %s",
+                     "game size %u x %u of %u x %u (focus_size %.3f), focus window %s (now: %s), focus projection %s, %s",
                      g.focusW, g.focusH, g.gridW, g.gridH, Cfg().quadFocusSize,
+                     g_follow ? "follows the gaze (DFR)" : "fixed (FFR)", SourceName(g_window.src),
                      g_focus.projFailed ? "OFF after a check (see log)" : "on",
                      Cfg().quadCompose ? "composition on (margin and feather in the log)"
                                        : "composition off (outer only)");
@@ -1632,6 +1775,9 @@ void Shutdown() {
         g_noComposeRun = 0;
         g_skipLeakLogged = false;
         g_gazeOk = g_gazeFrozen = false;
+        g_window = Window{};
+        g_haveGood = g_lost = g_benchWindow = false;
+        g_lostLogs = 0;
         g_gen = 0;
         g_graph = Graph{};
         g_began = g_ended = 0;

@@ -44,23 +44,32 @@ bool Compute(vr::IVRSystem* real, float size, float cx, float cy, const char* wh
                 who, i ? "right" : "left", m.m[0][0], m.m[0][2], m.m[1][1], m.m[1][2], m00, m02, m11, m12);
             return false;
         }
-
-        const double densX = g.gridW / (double)(e.r - e.l);  // pixels per tangent unit
-        const double densY = g.gridH / (double)(e.b - e.t);
-        const double ccx = std::clamp((double)cx, (double)e.l, (double)e.r);
-        const double ccy = std::clamp((double)cy, (double)e.t, (double)e.b);
-        long x0 = std::lround((ccx - e.l) * densX - g.focusW / 2.0);
-        long y0 = std::lround((e.b - ccy) * densY - g.focusH / 2.0);
-        x0 = std::clamp(x0, 0L, (long)(g.gridW - g.focusW));
-        y0 = std::clamp(y0, 0L, (long)(g.gridH - g.focusH));
-        e.x0 = (uint32_t)x0;
-        e.y0 = (uint32_t)y0;
-        e.fl = (float)(e.l + x0 / densX);
-        e.fr = (float)(e.l + (x0 + g.focusW) / densX);
-        e.fb = (float)(e.b - y0 / densY);
-        e.ft = (float)(e.b - (y0 + g.focusH) / densY);
+        Place(g, e, cx, cy);
     }
     return true;
+}
+
+void Place(const Geometry& g, Eye& e, float cx, float cy) {
+    const double densX = g.gridW / (double)(e.r - e.l);  // pixels per tangent unit
+    const double densY = g.gridH / (double)(e.b - e.t);
+    const double ccx = std::clamp((double)cx, (double)e.l, (double)e.r);
+    const double ccy = std::clamp((double)cy, (double)e.t, (double)e.b);
+    long x0 = std::lround((ccx - e.l) * densX - g.focusW / 2.0);
+    long y0 = std::lround((e.b - ccy) * densY - g.focusH / 2.0);
+    x0 = std::clamp(x0, 0L, (long)(g.gridW - g.focusW));
+    y0 = std::clamp(y0, 0L, (long)(g.gridH - g.focusH));
+    e.x0 = (uint32_t)x0;
+    e.y0 = (uint32_t)y0;
+    e.fl = (float)(e.l + x0 / densX);
+    e.fr = (float)(e.l + (x0 + g.focusW) / densX);
+    e.fb = (float)(e.b - y0 / densY);
+    e.ft = (float)(e.b - (y0 + g.focusH) / densY);
+}
+
+// NDC x = -1 is tangent l and +1 is r; NDC y = +1 is tangent b (the upper edge, see the header) and -1 is t.
+void NdcToTangent(const Eye& e, float ndcX, float ndcY, float& cx, float& cy) {
+    cx = e.l + (ndcX + 1) * 0.5f * (e.r - e.l);
+    cy = e.t + (ndcY + 1) * 0.5f * (e.b - e.t);
 }
 
 }  // namespace qvfr::focus
