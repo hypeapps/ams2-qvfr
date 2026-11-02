@@ -36,8 +36,7 @@ const char* QuadModeName(QuadMode m);
 struct Config {
     // [runtime] (M8: what stands behind the proxy; read before the backend DLL is loaded, a change needs a restart)
     bool pathOpenXr = false;          // path=openvr: the Valve DLL; path=openxr: OpenComposite to the OpenXR runtime
-    std::wstring openComposite;       // opencomposite=: OpenComposite DLL (empty = the default next to the proxy)
-    std::wstring openxrRuntime;       // openxr_runtime=: empty = the system's active runtime, steamvr, or a .json path
+    std::wstring openComposite;       // opencomposite=: OpenComposite DLL (empty = the default in x64\qvfr\opencomposite)
     bool openxrLayer = true;          // openxr_layer=: our OpenXR API layer for the gaze on the OpenXR path
     // [proxy]
     bool wrap = true;                 // 0 = the game gets the real interfaces, the proxy only logs startup
@@ -130,7 +129,9 @@ void LoadConfig();                    // creates a default qvfr.ini if it does n
 // (listed at the end of the default ini) and logs the ones that need a restart. True when it reloaded.
 bool ReloadConfig();
 
-fs::path BaseDir();                   // %QVFR_HOME% or Documents\ams2-qvfr
+fs::path ModuleDir();                 // folder of the proxy DLL (the game's x64\)
+fs::path BaseDir();                   // %QVFR_HOME% (tests) or x64\qvfr; %TEMP%\ams2-qvfr when x64\qvfr is not writable
+bool BaseDirIsFallback();             // BaseDir is the %TEMP% fallback
 fs::path LogDir();
 fs::path BenchDir();
 

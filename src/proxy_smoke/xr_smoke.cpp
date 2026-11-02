@@ -3,7 +3,8 @@
 //                 negotiation, the added extension, the gaze set added to attach and sync, the layer's own sync when the
 //                 "application" stops syncing, the gaze direction from xrLocateSpace, two sessions in a row.
 //   RunOpenXrPath: [runtime] path=openxr with the Valve DLL standing in for OpenComposite: the backend path, the
-//                 process environment for the loader (layer path and name, runtime) and the layer manifest.
+//                 process environment for the loader (layer path and name; the runtime untouched) and the shipped
+//                 layer manifest.
 
 #include "xr_smoke.h"
 
@@ -446,9 +447,7 @@ int RunOpenXrPath(const fs::path& dll, const fs::path& home) {
     printf("[runtime] path=openxr with the Valve DLL as the backend (%ls)\n", dll.c_str());
     if (FILE* f = _wfopen((home / L"qvfr.ini").c_str(), L"wb")) {
         // Relative to the proxy's folder; the Valve DLL stands in for OpenComposite.
-        fputs("[runtime]\npath=openxr\nopencomposite=openvr_api_orig.dll\nopenxr_runtime=steamvr\nopenxr_layer=1\n"
-              "[proxy]\nwrap=1\n",
-              f);
+        fputs("[runtime]\npath=openxr\nopencomposite=qvfr\\openvr\\openvr_api.dll\nopenxr_layer=1\n[proxy]\nwrap=1\n", f);
         fclose(f);
     }
     SetEnvironmentVariableW(L"XR_ENABLE_API_LAYERS", L"XR_APILAYER_player_own");
@@ -463,32 +462,39 @@ int RunOpenXrPath(const fs::path& dll, const fs::path& home) {
     const bool hmd = present();  // the first export call loads the settings and the backend
     printf("  VR_IsHmdPresent = %d (through the backend)\n", hmd);
 
-    const fs::path layerDir = home / L"openxr";
+    // The layer manifest is a shipped file in x64\qvfr\ (here proxy\qvfr\), not one the proxy writes.
+    const fs::path layerDir = dll.parent_path() / L"qvfr";
     const std::wstring layerPath = Env(L"XR_API_LAYER_PATH"), enable = Env(L"XR_ENABLE_API_LAYERS"),
                        runtime = Env(L"XR_RUNTIME_JSON");
     printf("  XR_API_LAYER_PATH=%ls\n  XR_ENABLE_API_LAYERS=%ls\n  XR_RUNTIME_JSON=%ls\n", layerPath.c_str(),
            enable.c_str(), runtime.c_str());
-    Check(layerPath == layerDir.wstring(), "XR_API_LAYER_PATH is the manifest folder");
+    Check(layerPath == layerDir.wstring(), "XR_API_LAYER_PATH is x64\\qvfr (the shipped manifest's folder)");
     Check(enable == L"XR_APILAYER_AMS2QVFR_eye_gaze;XR_APILAYER_player_own",
           "XR_ENABLE_API_LAYERS: our layer first, the player's kept");
-    Check(runtime.size() > 18 && runtime.substr(runtime.size() - 18) == L"steamxr_win64.json" && fs::exists(runtime),
-          "openxr_runtime=steamvr found SteamVR's steamxr_win64.json");
+    Check(runtime.empty(), "XR_RUNTIME_JSON untouched (the mod never chooses the OpenXR runtime)");
 
     std::ifstream mf(layerDir / L"XR_APILAYER_AMS2QVFR_eye_gaze.json", std::ios::binary);
     std::stringstream ss;
     ss << mf.rdbuf();
     const std::string manifest = ss.str();
-    std::string escaped;
-    for (char ch : dll.string()) {
-        if (ch == '\\') escaped += '\\';
-        escaped += ch;
+    // The loader resolves a relative library_path against the manifest's folder.
+    const std::string key = "\"library_path\": \"";
+    const size_t k = manifest.find(key);
+    std::string lib;
+    for (size_t i = k == std::string::npos ? manifest.size() : k + key.size(); i < manifest.size() && manifest[i] != '"';
+         ++i) {
+        if (manifest[i] == '\\' && i + 1 < manifest.size()) ++i;
+        lib += manifest[i];
     }
+    std::error_code ec;
+    const fs::path resolved = fs::weakly_canonical(layerDir / lib, ec);
+    printf("  manifest library_path \"%s\" -> %ls\n", lib.c_str(), resolved.c_str());
     Check(manifest.find("\"name\": \"XR_APILAYER_AMS2QVFR_eye_gaze\"") != std::string::npos &&
-              manifest.find("\"library_path\": \"" + escaped + "\"") != std::string::npos,
-          "the manifest names the layer and points at the proxy DLL");
+              fs::equivalent(resolved, dll, ec),
+          "the manifest names the layer and its relative library_path is the proxy DLL");
 
     const std::string log = ReadNewestLog(home / L"logs");
-    Check(log.find("Backend: ") != std::string::npos && log.find("openvr_api_orig.dll") != std::string::npos &&
+    Check(log.find("Backend: ") != std::string::npos && log.find("qvfr\\openvr\\openvr_api.dll") != std::string::npos &&
               log.find("official Valve 0.9.12") != std::string::npos,
           "the log names the backend from opencomposite= (relative to the proxy)");
     Check(log.find("Runtime: OpenXR implicit layer") != std::string::npos ||

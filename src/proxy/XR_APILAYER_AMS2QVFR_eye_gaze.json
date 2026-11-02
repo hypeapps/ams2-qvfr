@@ -1,0 +1,10 @@
+{
+  "file_format_version": "1.0.0",
+  "api_layer": {
+    "name": "XR_APILAYER_AMS2QVFR_eye_gaze",
+    "library_path": "..\\openvr_api.dll",
+    "api_version": "1.0",
+    "implementation_version": "1",
+    "description": "ams2-qvfr eye gaze for the openvr_api.dll proxy (enabled only in AMS2 by the proxy)"
+  }
+}

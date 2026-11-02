@@ -76,6 +76,7 @@ int g_sessions = 0;
 
 std::mutex g_gm;  // the gaze result (read by the proxy on the game's render thread)
 Gaze g_gaze;
+std::atomic<int64_t> g_periodNs{0};  // predictedDisplayPeriod of the last xrWaitFrame
 
 constexpr double kOwnSyncAfterMs = 50;  // no xrSyncActions from OpenComposite for this long: we sync ourselves
 
@@ -503,6 +504,7 @@ XrResult XRAPI_CALL HookSync(XrSession session, const XrActionsSyncInfo* info) {
 
 XrResult XRAPI_CALL HookWaitFrame(XrSession session, const XrFrameWaitInfo* info, XrFrameState* state) {
     XrResult r = g_next.waitFrame(session, info, state);
+    if (XR_SUCCEEDED(r) && state) g_periodNs = state->predictedDisplayPeriod;
     if (XR_SUCCEEDED(r) && state)
         Guarded("xr WaitFrame", [&] {
             std::lock_guard lock(g_m);
@@ -699,6 +701,8 @@ bool GazeAttached() {
     std::lock_guard lock(g_m);
     return g_s.attached && g_s.gazeSpace && g_s.viewSpace;
 }
+
+double DisplayPeriodMs() { return g_periodNs.load() / 1e6; }
 
 bool ReadGaze(Gaze& out) {
     if (!g_loaded.load()) return false;

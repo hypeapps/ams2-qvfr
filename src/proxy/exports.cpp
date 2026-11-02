@@ -2,9 +2,9 @@
 // and VR_GetVRInitErrorAsEnglishDescription; the other main functions are handled here too. The remaining exports
 // (flat C API, Unity) are forwarded to the original by generated/forwards.inc.
 //
-// Backend ([runtime] path, runtime.cpp): openvr = openvr_api_orig.dll next to the proxy (the official Valve 0.9.12 DLL,
-// the same one the game ships); openxr = OpenComposite. The forwarded exports always go to openvr_api_orig.dll
-// (thunks to the chosen backend: M8.2).
+// Backend ([runtime] path, runtime.cpp): openvr = x64\qvfr\openvr\openvr_api.dll (the official Valve 0.9.12 DLL, the
+// same one the game ships); openxr = OpenComposite. Every other export is a thunk (generated/thunks.asm) that jumps to
+// the backend's export of the same name; its address is looked up on the first call (qvfr_ResolveThunk).
 
 #include <windows.h>
 
@@ -28,7 +28,23 @@
 #include "sysinfo.h"
 #include "wrappers.h"
 
-#include "generated/forwards.inc"
+namespace {
+
+// Stand-ins for an export the backend does not have (OpenComposite has 27 of the 253), so its thunk does not jump to
+// nothing. The x64 convention lets a caller of any signature survive them (the caller cleans its own stack); a struct
+// returned by value comes through a hidden pointer in rcx that the caller expects back in rax.
+uint64_t MissingZero() { return 0; }
+template <size_t N>
+void* MissingStruct(void* ret) {
+    if (ret) memset(ret, 0, N);
+    return ret;
+}
+
+}  // namespace
+
+#include "generated/exports.inc"  // kThunkNames, kThunkMissing, /EXPORT directives for generated/thunks.asm
+
+extern "C" void* qvfr_thunk_table[];
 
 namespace {
 
@@ -56,7 +72,7 @@ struct Orig {
     vr::IVROverlay*(VR_CALLTYPE* overlay)() = nullptr;
 } g_fn;
 
-const char kNoOrig[] = "ams2-qvfr: the backend DLL (openvr_api_orig.dll or OpenComposite) could not be loaded";
+const char kNoOrig[] = "ams2-qvfr: the backend DLL (x64\\qvfr\\openvr or OpenComposite) could not be loaded";
 
 wchar_t g_origPath[MAX_PATH + 32] = {};
 DWORD g_loadError = 0;
@@ -70,7 +86,7 @@ void Resolve(T& fn, const char* name) {
 }
 
 // Loads the real DLL with plain Win32 calls that cannot throw. `backend` comes from runtime::Prepare; when it is empty
-// (the settings or Prepare failed) the default openvr_api_orig.dll next to the proxy is used, so a failing log, ini or
+// (the settings or Prepare failed) the default x64\qvfr\openvr\openvr_api.dll is used, so a failing log, ini or
 // hash never keeps the game from starting VR.
 void LoadOriginal(const wchar_t* backend) noexcept {
     if (backend && backend[0] && wcslen(backend) < _countof(g_origPath)) {
@@ -85,7 +101,7 @@ void LoadOriginal(const wchar_t* backend) noexcept {
         wchar_t* slash = wcsrchr(self, L'\\');
         size_t dirLen = slash ? (size_t)(slash - self + 1) : 0;
         wmemcpy(g_origPath, self, dirLen);
-        wcscpy_s(g_origPath + dirLen, _countof(g_origPath) - dirLen, L"openvr_api_orig.dll");
+        wcscpy_s(g_origPath + dirLen, _countof(g_origPath) - dirLen, L"qvfr\\openvr\\openvr_api.dll");
     }
     g_orig = LoadLibraryExW(g_origPath, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!g_orig || g_orig == g_self) {
@@ -111,6 +127,8 @@ void LogHeader() {
     GetModuleFileNameW(g_self, self, MAX_PATH);
     Log("ams2-qvfr openvr_api.dll proxy, build " __DATE__ " " __TIME__);
     Log("Proxy: %s", Narrow(self).c_str());
+    Log("Mod folder (qvfr.ini, logs, CSV, shots): %s%s", Narrow(BaseDir().wstring()).c_str(),
+        BaseDirIsFallback() ? " (x64\\qvfr is not writable, so the temporary folder is used)" : "");
 }
 
 void LogStartup() {
@@ -271,6 +289,24 @@ IVROverlay* VR_CALLTYPE VROverlay() {
 }
 
 }  // namespace vr
+
+// ---------------------------------------------------------------- export thunks
+
+// First call of thunk i (from qvfr_lazy_common, any thread): loads the backend if needed, puts the backend's export
+// into the thunk's slot and returns it; the next calls jump there directly.
+extern "C" void* qvfr_ResolveThunk(unsigned i) {
+    void* p = nullptr;
+    if (i < kThunkCount && Ready()) p = reinterpret_cast<void*>(GetProcAddress(g_orig, kThunkNames[i]));
+    Guarded("export thunk (log)", [&] {
+        static std::atomic<int> logs{0};
+        if (logs++ < 32)
+            Log("Export %s: first call, %s", i < kThunkCount ? kThunkNames[i] : "?",
+                p ? "goes to the backend" : "THE BACKEND HAS NO SUCH EXPORT, returns zeros");
+    });
+    if (!p) p = i < kThunkCount ? kThunkMissing[i] : reinterpret_cast<void*>(&MissingZero);
+    if (i < kThunkCount) InterlockedExchangePointer(&qvfr_thunk_table[i], p);
+    return p;
+}
 
 // Not declared in the 0.9.12 header, but the original exports it.
 extern "C" __declspec(dllexport) const char* VR_CALLTYPE VR_GetStringForHmdError(int error) {

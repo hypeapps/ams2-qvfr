@@ -1,7 +1,5 @@
 #include "common.h"
 
-#include <shlobj.h>
-
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -38,14 +36,12 @@ const char kDefaultIni[] =
     "; Most changes take effect after restarting the game; the live ones are listed at the end.\n"
     "\n"
     "[runtime]\n"
-    "; openvr = the Valve openvr_api.dll (openvr_api_orig.dll next to the proxy) talks to SteamVR;\n"
-    "; openxr = OpenComposite (qvfr\\opencomposite\\openvr_api.dll next to the proxy) talks to an OpenXR runtime.\n"
+    "; openvr = the Valve openvr_api.dll (x64\\qvfr\\openvr\\) talks to SteamVR;\n"
+    "; openxr = OpenComposite (x64\\qvfr\\opencomposite\\) talks to the OpenXR runtime that is active in the system\n"
+    "; (choose it in SteamVR, Pimax Play, Meta, Varjo Base...; the mod never changes it).\n"
     "path=openvr\n"
-    "; openxr: another OpenComposite DLL (full path, or relative to the proxy's folder); empty = the default above.\n"
+    "; openxr: another OpenComposite DLL (full path, or relative to x64\\); empty = the default above.\n"
     "opencomposite=\n"
-    "; openxr: empty = the OpenXR runtime that is active in the system; steamvr = SteamVR's runtime (only for the game,\n"
-    "; the system setting does not change); or the full path of a runtime .json.\n"
-    "openxr_runtime=\n"
     "; openxr: 1 = the proxy's OpenXR API layer reads the gaze (XR_EXT_eye_gaze_interaction) under OpenComposite.\n"
     "openxr_layer=1\n"
     "\n"
@@ -61,7 +57,7 @@ const char kDefaultIni[] =
     "stats_interval_s=60\n"
     "\n"
     "[timing]\n"
-    "; 1 = frame timing CSV for the whole session (Documents\\ams2-qvfr\\bench\\<date>_session\\), 0 = only during a benchmark.\n"
+    "; 1 = frame timing CSV for the whole session (x64\\qvfr\\bench\\<date>_session\\), 0 = only during a benchmark.\n"
     "csv_always=0\n"
     "; 1 = GPU timestamps per frame phase (outer, focus, composition, whole frame) in frames.csv, the benchmark\n"
     "; summary and the stats lines. Works on any VR runtime; costs a few microseconds per frame.\n"
@@ -159,7 +155,7 @@ const char kDefaultIni[] =
     "probe_engine=1\n"
     "probe_d3d=1\n"
     "; quad: hotkey for a shot of the four views (outer L/R, focus L/R) and the composed eyes: PNG files in\n"
-    "; Documents\\ams2-qvfr\\shots\\ and pixel differences in the log. 0xA3 = right Ctrl, 0x79 = F10; shot_key=0 turns the hotkey off.\n"
+    "; x64\\qvfr\\shots\\ and pixel differences in the log. 0xA3 = right Ctrl, 0x79 = F10; shot_key=0 turns the hotkey off.\n"
     "shot_modifier=0xA3\n"
     "shot_key=0x79\n"
     "; quad: > 0 = one shot by itself this many seconds after the first frame with focus groups.\n"
@@ -348,6 +344,33 @@ std::wstring Widen(const std::string& s) {
     return w;
 }
 
+fs::path ModuleDir() {
+    HMODULE m = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&ModuleDir), &m);
+    wchar_t buf[MAX_PATH] = {};
+    DWORD n = GetModuleFileNameW(m, buf, MAX_PATH);
+    return n > 0 && n < MAX_PATH ? fs::path(buf).parent_path() : fs::path();
+}
+
+namespace {
+
+bool g_baseFallback = false;
+
+// A file can be created in `dir` (the game folder may sit where the user cannot write).
+bool Writable(const fs::path& dir) {
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    HANDLE h = CreateFileW((dir / L".qvfr_write_test").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);
+    return true;
+}
+
+}  // namespace
+
+// Never logs: the log itself opens through it.
 fs::path BaseDir() {
     if (g_base.empty()) {
         wchar_t env[MAX_PATH] = {};
@@ -355,17 +378,20 @@ fs::path BaseDir() {
         if (n > 0 && n < MAX_PATH) {
             g_base = env;
         } else {
-            PWSTR docs = nullptr;
-            if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Documents, 0, nullptr, &docs))) {
-                g_base = fs::path(docs) / L"ams2-qvfr";
-                CoTaskMemFree(docs);
-            } else {
+            g_base = ModuleDir() / L"qvfr";
+            if (ModuleDir().empty() || !Writable(g_base)) {
                 std::error_code ec;
                 g_base = fs::temp_directory_path(ec) / L"ams2-qvfr";
+                g_baseFallback = true;
             }
         }
     }
     return g_base;
+}
+
+bool BaseDirIsFallback() {
+    BaseDir();
+    return g_baseFallback;
 }
 
 fs::path LogDir() { return BaseDir() / L"logs"; }
@@ -384,7 +410,6 @@ Config ReadConfig(const fs::path& ini) {
         Log("Settings: unknown [runtime] path=\"%s\", using openvr", path.c_str());
     }
     c.openComposite = IniPathValue(ini, L"runtime", L"opencomposite");
-    c.openxrRuntime = IniPathValue(ini, L"runtime", L"openxr_runtime");
     c.openxrLayer = IniInt(ini, L"runtime", L"openxr_layer", 1) != 0;
     c.wrap = IniInt(ini, L"proxy", L"wrap", 1) != 0;
     c.firstCalls = IniInt(ini, L"log", L"first_calls", c.firstCalls);
@@ -521,9 +546,8 @@ void LoadConfig() {
     NoteIniTime();
     Config c = ReadConfig(ini);
     g_cfg = c;
-    Log("Settings %s: [runtime] path=%s opencomposite=\"%s\" openxr_runtime=\"%s\" openxr_layer=%d",
-        Narrow(ini.wstring()).c_str(), c.pathOpenXr ? "openxr" : "openvr", Narrow(c.openComposite).c_str(),
-        Narrow(c.openxrRuntime).c_str(), c.openxrLayer);
+    Log("Settings %s: [runtime] path=%s opencomposite=\"%s\" openxr_layer=%d", Narrow(ini.wstring()).c_str(),
+        c.pathOpenXr ? "openxr" : "openvr", Narrow(c.openComposite).c_str(), c.openxrLayer);
     Log("Settings %s: wrap=%d first_calls=%d stats_interval_s=%d csv_always=%d gpu=%d | benchmark: modifier=0x%X key=0x%X "
         "delay_s=%.1f duration_s=%.1f freeze_pose=%d beep=%d auto_start_s=%.1f | gaze read=%d | experiment: mode=%s "
         "focus_size=%.3f center=(%.3f, %.3f) pad=%d",
@@ -548,8 +572,7 @@ bool ReloadConfig() {
     auto need = [&](bool changed, const char* name) {
         if (changed) restart += restart.empty() ? name : std::string(", ") + name;
     };
-    need(n.pathOpenXr != c.pathOpenXr || n.openComposite != c.openComposite || n.openxrRuntime != c.openxrRuntime ||
-             n.openxrLayer != c.openxrLayer,
+    need(n.pathOpenXr != c.pathOpenXr || n.openComposite != c.openComposite || n.openxrLayer != c.openxrLayer,
          "[runtime]");
     need(n.wrap != c.wrap, "[proxy] wrap");
     need(n.firstCalls != c.firstCalls, "[log] first_calls");

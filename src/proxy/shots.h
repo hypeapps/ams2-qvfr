@@ -1,6 +1,6 @@
 // Screenshots of game textures for checks the agent cannot do in the headset: a staging copy on the render thread,
 // then PNG files (WIC, half resolution) and pixel differences between image pairs on a worker thread.
-// Files go to Documents\ams2-qvfr\shots\<date>\<name>.png.
+// Files go to x64\qvfr\shots\<date>\<name>.png (BaseDir).
 #pragma once
 
 #include <d3d11.h>

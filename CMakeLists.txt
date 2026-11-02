@@ -13,7 +13,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
-add_compile_options(/utf-8 /permissive- /Zi)
+add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:/utf-8;/permissive->" /Zi)
 add_link_options(/DEBUG:FULL)
 
 # All binaries go to build/bin/<Config>.

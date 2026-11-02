@@ -21,5 +21,6 @@ struct Gaze {
 bool Loaded();            // a loader negotiated with the layer in this process
 bool GazeAttached();      // the gaze action set is attached to the current session
 bool ReadGaze(Gaze& out); // the newest located gaze; false when the layer has none (not loaded, not attached)
+double DisplayPeriodMs(); // predictedDisplayPeriod of the last xrWaitFrame (0 = none yet)
 
 }  // namespace qvfr::xrlayer

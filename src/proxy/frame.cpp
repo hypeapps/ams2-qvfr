@@ -233,6 +233,12 @@ void Beeps(std::vector<std::pair<int, int>> tones) {
 
 float BudgetMs() {
     float hz = modern::DisplayHz();
+    // Without IVRSystem_026 (OpenComposite): the display period of xrWaitFrame from the OpenXR layer. OpenComposite's
+    // own Prop_DisplayFrequency_Float said 90 Hz on the 72 Hz Dream Air (smoke test 2026-11-02).
+    if (hz <= 1) {
+        const double periodMs = xrlayer::DisplayPeriodMs();
+        if (periodMs > 1) return (float)periodMs;
+    }
     return hz > 1 ? 1000.0f / hz : 1000.0f / 72.0f;
 }
 
@@ -304,6 +310,11 @@ void AccumulateFrame(const ProxyFrame& p, const gpu::Result* g) {
     ++r.proxyRows;
     if (r.proxyFirstMs < 0) r.proxyFirstMs = p.wgpExit;
     r.proxyLastMs = p.wgpExit;
+    // From the proxy's own frames, so the benchmark has them on both paths (OpenComposite has no frame timing).
+    if (p.intervalMs > 0) r.proxyInterval.Add(p.intervalMs);
+    if (p.submits) r.proxyCpu.Add((float)(p.lastSubmit - p.wgpExit));
+    r.wgpBlock.Add(p.wgpBlockMs);
+    r.gazeOk += p.gaze.ok;
     if (!g) return;
     if (g->frameMs >= 0) r.gpuFrame.Add(g->frameMs);
     for (int k = 0; k < gpu::kPhases; ++k)
@@ -353,7 +364,7 @@ void ProcessFrames(uint64_t current) {
     }
 }
 
-void AccumulateRun(const modern::FrameTiming& t, const ProxyFrame* p) {
+void AccumulateRun(const modern::FrameTiming& t) {
     RunStats& r = g_run;
     ++r.frames;
     r.totalGpu.Add(t.totalRenderGpuMs);
@@ -368,12 +379,6 @@ void AccumulateRun(const modern::FrameTiming& t, const ProxyFrame* p) {
     if (t.reprojectionFlags & 0x03) ++r.reprojAny;
     if (r.sysFirst < 0) r.sysFirst = t.systemTimeS;
     r.sysLast = t.systemTimeS;
-    if (p) {
-        if (p->intervalMs > 0) r.proxyInterval.Add(p->intervalMs);
-        if (p->submits) r.proxyCpu.Add((float)(p->lastSubmit - p->wgpExit));
-        r.wgpBlock.Add(p->wgpBlockMs);
-        r.gazeOk += p->gaze.ok;
-    }
 }
 
 std::string StatLine(const char* name, Series& s, float budget = 0) {
@@ -460,19 +465,25 @@ void FinishRun(bool aborted) {
     char buf[512];
     snprintf(buf, sizeof(buf), "Benchmark %s: %s", aborted ? "ABORTED" : "finished", Narrow(g_runDir.wstring()).c_str());
     lines.push_back(buf);
-    snprintf(buf, sizeof(buf), "Frames %llu in %.2f s (%.2f fps), budget %.2f ms (%.1f Hz)", (unsigned long long)r.frames,
-             dur, dur > 0 ? (r.frames - 1) / dur : 0.0, budget, 1000.0 / budget);
+    if (r.frames)
+        snprintf(buf, sizeof(buf), "Frames %llu in %.2f s (%.2f fps), budget %.2f ms (%.1f Hz)",
+                 (unsigned long long)r.frames, dur, dur > 0 ? (r.frames - 1) / dur : 0.0, budget, 1000.0 / budget);
+    else
+        snprintf(buf, sizeof(buf), "No SteamVR frame timing (backend without IVRCompositor_029, e.g. OpenComposite): "
+                 "the proxy's frames and GPU timestamps below; budget %.2f ms (%.1f Hz)", budget, 1000.0 / budget);
     lines.push_back(buf);
     snprintf(buf, sizeof(buf), "Size recommended by SteamVR %u x %u, returned to the game %u x %u; Submit texture: %s", g_recW,
              g_recH, g_gameW, g_gameH, g_texDesc.c_str());
     lines.push_back(buf);
     lines.push_back(experiment::Describe());
     lines.push_back(quad::Describe());
-    lines.push_back(StatLine("GPU total (total_gpu)", r.totalGpu, budget));
-    lines.push_back(StatLine("Game GPU before Submit", r.preGpu, budget));
-    lines.push_back(StatLine("Game GPU after Submit", r.postGpu));
-    lines.push_back(StatLine("Compositor GPU", r.compGpu));
-    lines.push_back(StatLine("Compositor CPU", r.compCpu));
+    if (r.frames) {
+        lines.push_back(StatLine("GPU total (total_gpu)", r.totalGpu, budget));
+        lines.push_back(StatLine("Game GPU before Submit", r.preGpu, budget));
+        lines.push_back(StatLine("Game GPU after Submit", r.postGpu));
+        lines.push_back(StatLine("Compositor GPU", r.compGpu));
+        lines.push_back(StatLine("Compositor CPU", r.compCpu));
+    }
     lines.push_back(StatLine("Frame interval (proxy)", r.proxyInterval, budget * 1.5f));
     lines.push_back(StatLine("Game CPU WGP->Submit (proxy)", r.proxyCpu, budget));
     lines.push_back(StatLine("Wait in WGP (proxy)", r.wgpBlock));
@@ -488,9 +499,13 @@ void FinishRun(bool aborted) {
         if (!r.gpuPhase[k].v.empty()) lines.push_back(StatLine(phaseLabels[k], r.gpuPhase[k]));
     if (!r.gpuCompose.v.empty()) lines.push_back(StatLine("GPU compose (both eyes)", r.gpuCompose));
     lines.push_back(StatLine("GPU other (frame - phases)", r.gpuOther));
-    snprintf(buf, sizeof(buf), "Dropped %llu, mispresented %llu, reprojected frames %llu (CPU %llu, GPU %llu), gaze valid %.1f%%",
-             (unsigned long long)r.dropped, (unsigned long long)r.mispresented, (unsigned long long)r.reprojAny,
-             (unsigned long long)r.reprojCpu, (unsigned long long)r.reprojGpu, r.frames ? 100.0 * r.gazeOk / r.frames : 0.0);
+    if (r.frames) {
+        snprintf(buf, sizeof(buf), "Dropped %llu, mispresented %llu, reprojected frames %llu (CPU %llu, GPU %llu)",
+                 (unsigned long long)r.dropped, (unsigned long long)r.mispresented, (unsigned long long)r.reprojAny,
+                 (unsigned long long)r.reprojCpu, (unsigned long long)r.reprojGpu);
+        lines.push_back(buf);
+    }
+    snprintf(buf, sizeof(buf), "Gaze valid in %.1f%% of the proxy frames", r.proxyRows ? 100.0 * r.gazeOk / r.proxyRows : 0.0);
     lines.push_back(buf);
     if (cum) {
         snprintf(buf, sizeof(buf), "SteamVR (cumulative stats, delta): presents %u, dropped %u, reprojected %u, Submit %u",
@@ -565,7 +580,7 @@ void ProcessTimings(const modern::FrameTiming* rows, uint32_t n) {
         if (g_bench == Bench::Running && g_runCsv && t.frameIndex >= g_runFirstIndex) {
             if (g_runSysT0 < 0) g_runSysT0 = t.systemTimeS;
             WriteRow(g_runCsv, t, g_runSysT0, p);
-            AccumulateRun(t, p);
+            AccumulateRun(t);
         }
     }
 }

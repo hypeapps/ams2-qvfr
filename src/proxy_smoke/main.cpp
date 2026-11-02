@@ -1,7 +1,7 @@
 // qvfr_proxy_smoke: tests the openvr_api.dll proxy without the game.
 //
 // Loads proxy\openvr_api.dll (next to the exe) with LoadLibrary and calls the same exports as AMS2.
-// The proxy writes its logs to smoke_home\ next to the exe (QVFR_HOME variable), not to Documents.
+// The proxy writes its logs to smoke_home\ next to the exe (QVFR_HOME variable), not to proxy\qvfr\.
 //
 //   qvfr_proxy_smoke.exe              Background application: VR_Init, projection queries, VR_Shutdown
 //                                     (does not take the HMD from other applications; needs SteamVR running)
@@ -31,8 +31,8 @@
 //                                     fake runtime (extension, gaze set in attach and sync, own sync, gaze, 2 sessions)
 //   --openxr-path                     [runtime] path=openxr with the Valve DLL as the backend: loader environment,
 //                                     layer manifest, backend path (needs no SteamVR running)
-//   --openxr                          [runtime] path=openxr openxr_runtime=steamvr for the other modes (with --scene: the
-//                                     scene through OpenComposite in proxy/qvfr/opencomposite/, SteamVR OpenXR, our layer)
+//   --openxr                          [runtime] path=openxr for the other modes (with --scene: the scene through
+//                                     OpenComposite in proxy/qvfr/opencomposite/, the system's OpenXR runtime, our layer)
 //   --openxr-nolayer                  the same without our OpenXR layer (openxr_layer=0), for A/B
 // smoke_home\qvfr.ini is rewritten on every run, so options never leak from one run into the next.
 
@@ -1160,7 +1160,7 @@ int main(int argc, char** argv) {
         if (probe) fputs("[quad]\nmode=probe\nprobe_frames=2\n", f);
         if (quad) fputs("[quad]\nmode=quad\n", f);
         if (openxr)
-            fprintf(f, "[runtime]\npath=openxr\nopenxr_runtime=steamvr\nopenxr_layer=%d\n", noLayer ? 0 : 1);
+            fprintf(f, "[runtime]\npath=openxr\nopenxr_layer=%d\n", noLayer ? 0 : 1);
         fclose(f);
     }
 
@@ -1176,12 +1176,16 @@ int main(int argc, char** argv) {
     auto overlay = (OverlayFn)GetProcAddress(m, "VROverlay");
     auto errDesc = (ErrFn)GetProcAddress(m, "VR_GetVRInitErrorAsEnglishDescription");
     auto generic = (GenericFn)GetProcAddress(m, "VR_GetGenericInterface");
-    auto forwarded = GetProcAddress(m, "VR_IVRSystem_GetRecommendedRenderTargetSize");  // forwarded export
+    // Flat C exports are thunks to the backend (generated/thunks.asm), resolved on their first call.
+    using FlatSizeFn = void(VR_CALLTYPE*)(intptr_t, uint32_t*, uint32_t*);
+    using FlatProjFn = vr::HmdMatrix44_t(VR_CALLTYPE*)(intptr_t, vr::EVREye, float, float, vr::EGraphicsAPIConvention);
+    auto flatSize = (FlatSizeFn)GetProcAddress(m, "VR_IVRSystem_GetRecommendedRenderTargetSize");
+    auto flatProj = (FlatProjFn)GetProcAddress(m, "VR_IVRSystem_GetProjectionMatrix");
     printf("Exports: VR_Init %p, VR_Shutdown %p, VRCompositor %p, VROverlay %p, error description %p, generic %p, "
-           "forwarded VR_IVRSystem_GetRecommendedRenderTargetSize %p\n",
+           "thunks VR_IVRSystem_GetRecommendedRenderTargetSize %p, VR_IVRSystem_GetProjectionMatrix %p\n",
            (void*)init, (void*)shutdown, (void*)compositor, (void*)overlay, (void*)errDesc, (void*)generic,
-           (void*)forwarded);
-    if (!init || !shutdown || !compositor || !overlay || !errDesc || !generic) return 1;
+           (void*)flatSize, (void*)flatProj);
+    if (!init || !shutdown || !compositor || !overlay || !errDesc || !generic || !flatSize || !flatProj) return 1;
 
     vr::EVRInitError err = vr::VRInitError_None;
     vr::IVRSystem* sys = init(&err, scene > 0 ? vr::VRApplication_Scene : vr::VRApplication_Background);
@@ -1203,10 +1207,18 @@ int main(int argc, char** argv) {
         void* sys9 = generic(vr::IVRSystem_Version, &err);
         printf("VRCompositor %p, VROverlay %p, VR_GetGenericInterface(IVRSystem_009) %p (same as VR_Init: %s)\n",
                (void*)comp, (void*)ov, sys9, sys9 == sys ? "yes" : "no");
-        // Forwarded exports work once the original is loaded (after the first call into the proxy).
-        printf("Forwarded VR_IVRSystem_GetRecommendedRenderTargetSize after VR_Init: %p\n",
-               (void*)GetProcAddress(m, "VR_IVRSystem_GetRecommendedRenderTargetSize"));
-        if (scene > 0 && comp) rc = RunScene(sys, comp, ov, scene, probe);
+        // The thunks must hand every argument through: integer registers, xmm2/xmm3 floats, a stack argument and the
+        // hidden return pointer of HmdMatrix44_t. OpenComposite has no flat exports, so there they return 0.
+        uint32_t fw = 0, fh = 0;
+        flatSize((intptr_t)sys, &fw, &fh);
+        const vr::HmdMatrix44_t want = sys->GetProjectionMatrix(vr::Eye_Right, 0.05f, 1000.0f, vr::API_DirectX);
+        const vr::HmdMatrix44_t got = flatProj((intptr_t)sys, vr::Eye_Right, 0.05f, 1000.0f, vr::API_DirectX);
+        const bool sameProj = memcmp(&want, &got, sizeof(want)) == 0;
+        printf("Thunks: GetRecommendedRenderTargetSize %u x %u (%s), GetProjectionMatrix(right) %s\n", fw, fh,
+               fw == w && fh == h ? "same as the interface" : "DIFFERENT (0 x 0 = backend without the export)",
+               sameProj ? "same as the interface" : "DIFFERENT");
+        if (!openxr && (fw != w || fh != h || !sameProj)) rc = 1;
+        if (scene > 0 && comp && rc == 0) rc = RunScene(sys, comp, ov, scene, probe);
         shutdown();
         if (trace && rc == 0) rc = CheckTrace(home / L"logs");
         if (probe && rc == 0) rc = CheckProbe(home / L"logs");
