@@ -193,13 +193,19 @@ struct Stats {
     double cpuMs[kGroups] = {};
 };
 
-// Focus window for this VR session (M4.3): the game gets the focus size and the full projection (outer), the focus
-// groups get the focus window of their eye.
+// Focus window for this VR session (M4.3, M7.2): the game gets the render size and the full projection (outer), the
+// focus groups get the focus window of their eye. The window (geo.focusW x geo.focusH grid pixels) is the DFR or the FFR
+// section, by follow_gaze at the start of the session. Without smaller targets (M7.2) both sets render at the game
+// size, the larger of the outer and the focus texture sizes per axis.
 struct Focus {
     bool setupDone = false;
-    bool on = false;          // geometry ready: the game got the focus size
+    bool on = false;          // geometry ready: the game got the render size
     bool engaged = false;     // the size was replaced in this session (the wrappers must stay)
+    bool dfr = true;          // the window has the DFR section (else the FFR one)
     focus::Geometry geo;
+    uint32_t outerW = 0, outerH = 0;    // outer texture wanted (peripheral_multiplier)
+    uint32_t focusTexW = 0, focusTexH = 0;  // focus texture wanted (focus_multiplier x window)
+    uint32_t gameW = 0, gameH = 0;      // size returned to the game = size of all four views
     bool projFailed = false;  // engine data did not match the geometry: focus groups render the eye views
     int projMisses = 0;       // consecutive focus groups without the projection (projFailed at kProjMissLimit)
     bool missLogged = false;
@@ -726,6 +732,29 @@ const focus::Eye& WindowEyeLocked(int i) {
     return g_window.frame && g_window.frame == g_frameNo ? g_window.eye[i] : g_focus.geo.eye[i];
 }
 
+// Window center tangents of eye i (0 = left) as in the mbucchia layer: the gaze (NDC of the full projection, null =
+// none) plus the focus offsets, or straight ahead (plus the pre-M7 center_x/center_y tangents) plus the fixed offsets.
+// Offsets are NDC; the horizontal one is negated for the left eye, so + moves both windows away from the nose.
+void WindowCenter(const focus::Eye& e, int i, const float* ndc, float& cx, float& cy) {
+    const Config& c = Cfg();
+    const float mirror = i ? 1.0f : -1.0f;
+    if (ndc) {
+        focus::NdcToTangent(e, ndc[0] + mirror * c.focusOffsetX, ndc[1] + c.focusOffsetY, cx, cy);
+        return;
+    }
+    cx = c.quadCenterX + mirror * c.fixedOffsetX * 0.5f * (e.r - e.l);
+    cy = c.quadCenterY + c.fixedOffsetY * 0.5f * (e.b - e.t);
+}
+
+// Grid pixels from the window edge to where the focus shows pixel for pixel (the larger axis with the mbucchia curve),
+// left out of the focus vs composed shot comparison.
+float SharpInsetLocked() {
+    const Config& c = Cfg();
+    if (c.legacyEdge) return (float)(c.quadMarginPx + c.quadFeatherPx);
+    const float shown = (float)std::max(g_focus.geo.focusW, g_focus.geo.focusH) - 2.0f * c.quadMarginPx;
+    return c.quadMarginPx + c.smoothen * std::max(0.0f, shown);
+}
+
 // Before a focus group: view 2 takes the source view's camera slot, frustum block and visibility list (focus L),
 // and the camera and the VR device eye data of view 2 get the focus window of the group's eye. The deferred lighting
 // reads the eye tangents straight from the VR device by view - 1 (0x9ce0e8), the passes read the projection from the
@@ -969,7 +998,7 @@ void HandleShotLocked() {
     if (autoShot) g_autoShotDone = true;
     const char* why = autoShot ? "shot_auto_s" : "hotkey";
     // The blend band may have changed (live reload).
-    for (int i = 0; i < 2; ++i) g_shotPairs[3 + i].inset = (float)(c.quadMarginPx + c.quadFeatherPx);
+    for (int i = 0; i < 2; ++i) g_shotPairs[3 + i].inset = SharpInsetLocked();
     if (!gpu::Context() || !g_graph.ok) {
         Log("Quad: shot (%s) skipped: no focus groups or no D3D11 device yet", why);
     } else if (!shots::Begin(kShotNames, kShotImages, g_shotPairs, (int)std::size(g_shotPairs))) {
@@ -996,12 +1025,12 @@ void CopyLocked(int k, ID3D11Resource* res) {
     if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&src)) || !src) return;
     D3D11_TEXTURE2D_DESC d{};
     src->GetDesc(&d);
-    if (d.Width != g_focus.geo.focusW || d.Height != g_focus.geo.focusH) {
+    if (d.Width != g_focus.gameW || d.Height != g_focus.gameH) {
         // Not an eye texture (the desktop mirror after leaving the race in the first M4.3 run).
         if (!c.sizeLogged) {
             c.sizeLogged = true;
-            Log("Quad: %s output %u x %u fmt %d is not the focus size; no copy", kCopyNames[k], d.Width, d.Height,
-                (int)d.Format);
+            Log("Quad: %s output %u x %u fmt %d is not the game's render size; no copy", kCopyNames[k], d.Width,
+                d.Height, (int)d.Format);
         }
         src->Release();
         return;
@@ -1046,7 +1075,7 @@ bool FullBounds(const vr::VRTextureBounds_t* b) {
 void NoComposeLocked(int e, const char* why) {
     if (strcmp(g_noCompose[e], why) == 0) return;
     snprintf(g_noCompose[e], sizeof(g_noCompose[e]), "%s", why);
-    Log("Quad: %s eye without the composition (%s): outer only at the focus size%s", e ? "right" : "left", why,
+    Log("Quad: %s eye without the composition (%s): outer only at the game's render size%s", e ? "right" : "left", why,
         e ? " if this frame's outer R copy exists" : "");
 }
 
@@ -1089,14 +1118,20 @@ ID3D11Texture2D* ComposeLocked(int e, const vr::Texture_t* tex, const vr::VRText
     compose::Layout l;
     l.gridW = g.gridW;
     l.gridH = g.gridH;
+    // No smaller targets yet (M7.2): outer and focus both at the game's render size.
+    l.outerW = l.focusTexW = g_focus.gameW;
+    l.outerH = l.focusTexH = g_focus.gameH;
     l.focusW = g.focusW;
     l.focusH = g.focusH;
     // The window the eye's focus group rendered (this frame's, checked above through `projected`).
     const Run& foc = g_run[e ? FocusR : FocusL];
     l.x0 = foc.x0;
     l.y0 = foc.y0;
-    l.marginPx = (float)Cfg().quadMarginPx;
-    l.featherPx = (float)Cfg().quadFeatherPx;
+    const Config& c = Cfg();
+    l.marginPx = (float)c.quadMarginPx;
+    l.smoothen = c.smoothen;
+    l.legacyEdge = c.legacyEdge;
+    l.featherPx = (float)c.quadFeatherPx;
     l.overlay = g_overlay;
     if (g_gazeOk) {
         // NDC of the full eye projection (x right, y up) to grid pixels (row 0 at the top).
@@ -1357,11 +1392,11 @@ void AddStats(Stats& a, const Stats& b) {
     for (int g = 0; g < kGroups; ++g) a.cpuMs[g] += b.cpuMs[g];
 }
 
-// Shot rectangles for the focus window of both eyes. Outer views are focusW x focusH over the whole grid, so the
-// window in them is (x0, y0, focusW, focusH) * scale; the composed eye is the grid (focus 1:1 in its window).
+// Shot rectangles for the focus window of both eyes. Outer views are gameW x gameH over the whole grid, so the window
+// in them is (x0, y0, focusW, focusH) * scale; the composed eye is the grid (focus in its window).
 void ShotRectsLocked(const focus::Eye* eye) {
     const focus::Geometry& g = g_focus.geo;
-    const double sx = g.focusW / (double)g.gridW, sy = g.focusH / (double)g.gridH;
+    const double sx = g_focus.gameW / (double)g.gridW, sy = g_focus.gameH / (double)g.gridH;
     for (int i = 0; i < 2; ++i) {
         const focus::Eye& e = eye[i];
         shots::Pair& p = g_shotPairs[i];
@@ -1374,7 +1409,7 @@ void ShotRectsLocked(const focus::Eye* eye) {
         f.ry = (float)e.y0;
         f.rw = (float)g.focusW;
         f.rh = (float)g.focusH;
-        f.inset = (float)(Cfg().quadMarginPx + Cfg().quadFeatherPx);
+        f.inset = SharpInsetLocked();
         shots::Pair& o = g_shotPairs[5 + i];
         o.rw = (float)g.gridW;
         o.rh = (float)g.gridH;
@@ -1395,16 +1430,40 @@ void SetupLocked(vr::IVRSystem* real) {
     if (!g_installed || !g_patched || !real) return;
     const Config& c = Cfg();
     focus::Geometry& g = g_focus.geo;
-    if (!focus::Compute(real, c.quadFocusSize, c.quadCenterX, c.quadCenterY, "Quad", g)) {
+    // The window area of this session: the DFR section when it starts following the gaze, else the FFR one.
+    g_focus.dfr = g_follow;
+    const float secX = g_focus.dfr ? c.focusSectionX : c.fixedSectionX;
+    const float secY = g_focus.dfr ? c.focusSectionY : c.fixedSectionY;
+    if (!focus::Compute(real, secX, secY, 0, 0, "Quad", g)) {
         Log("Quad: no focus window (see the line above); the game keeps the SteamVR size, the focus groups render the "
             "eye views");
         return;
     }
+    // Texture sizes as in mbucchia: multiplier x SteamVR size (focus: x section too). The game renders all four views
+    // at its one size, so it gets the larger per axis.
+    auto px = [](double v) { return (uint32_t)std::clamp(std::lround(v), 16L, 16384L); };
+    g_focus.outerW = px(c.peripheralMultiplier * g.gridW);
+    g_focus.outerH = px(c.peripheralMultiplier * g.gridH);
+    g_focus.focusTexW = px((double)c.focusMultiplier * secX * g.gridW);
+    g_focus.focusTexH = px((double)c.focusMultiplier * secY * g.gridH);
+    g_focus.gameW = std::max(g_focus.outerW, g_focus.focusTexW);
+    g_focus.gameH = std::max(g_focus.outerH, g_focus.focusTexH);
     g_focus.on = true;
     g_focus.engaged = true;
-    Log("Quad: SteamVR size (1:1 grid) %u x %u, size returned to the game %u x %u (focus_size %.3f): outer = full FOV "
-        "at %.0f%% density, focus = window at 1:1",
-        g.gridW, g.gridH, g.focusW, g.focusH, c.quadFocusSize, 100.0 * g.focusW / g.gridW);
+    for (int i = 0; i < 2; ++i) {
+        float cx = 0, cy = 0;
+        WindowCenter(g.eye[i], i, nullptr, cx, cy);
+        focus::Place(g, g.eye[i], cx, cy);
+    }
+    Log("Quad: SteamVR size (1:1 grid) %u x %u; outer wants %u x %u (peripheral_multiplier %.3f); focus window %u x %u "
+        "grid pixels (%s section %.3f x %.3f) wants %u x %u (focus_multiplier %.3f); size returned to the game %u x %u",
+        g.gridW, g.gridH, g_focus.outerW, g_focus.outerH, c.peripheralMultiplier, g.focusW, g.focusH,
+        g_focus.dfr ? "DFR" : "FFR", secX, secY, g_focus.focusTexW, g_focus.focusTexH, c.focusMultiplier, g_focus.gameW,
+        g_focus.gameH);
+    Log("Quad: no smaller targets yet (M7.2): outer and focus both render at the game size, so the density of 1:1 is "
+        "%.0f%% x %.0f%% for outer (wanted %.0f%%) and %.0f%% x %.0f%% for focus (wanted %.0f%%)",
+        100.0 * g_focus.gameW / g.gridW, 100.0 * g_focus.gameH / g.gridH, 100.0 * c.peripheralMultiplier,
+        100.0 * g_focus.gameW / g.focusW, 100.0 * g_focus.gameH / g.focusH, 100.0 * c.focusMultiplier);
     static const char* const labels[2] = {"focus L vs its window in outer L", "focus R vs its window in outer R"};
     for (int i = 0; i < 2; ++i) {
         const focus::Eye& e = g.eye[i];
@@ -1421,16 +1480,29 @@ void SetupLocked(vr::IVRSystem* real) {
         g_follow ? "follows the gaze (DFR)" : "fixed at the center (FFR)", c.followGaze, c.gazeHoldS, c.gazeKeyMod,
         c.gazeKey);
     if (c.quadCompose) {
-        const int band = c.quadMarginPx + c.quadFeatherPx;
-        Log("Quad: composition on: each eye goes to SteamVR as a %u x %u image, outer upscaled bilinearly, focus 1:1 "
-            "with margin %d px and feather %d px (%u x %u shown fully sharp)",
-            g.gridW, g.gridH, c.quadMarginPx, c.quadFeatherPx, g.focusW > 2u * band ? g.focusW - 2 * band : 0u,
-            g.focusH > 2u * band ? g.focusH - 2 * band : 0u);
-        if (2u * band >= std::min(g.focusW, g.focusH))
-            Log("Quad: WARNING: margin_px + feather_px = %d is half the focus size or more; the focus never shows fully",
-                band);
+        const bool exact = g_focus.gameW == g.focusW && g_focus.gameH == g.focusH;
+        const char* how = exact ? "pixel for pixel" : "bilinearly";
+        if (c.legacyEdge) {
+            const int band = c.quadMarginPx + c.quadFeatherPx;
+            Log("Quad: composition on: each eye goes to SteamVR as a %u x %u image, outer scaled bilinearly, focus %s "
+                "with margin %d px and the pre-M7 feather %d px (%u x %u shown fully sharp)",
+                g.gridW, g.gridH, how, c.quadMarginPx, c.quadFeatherPx, g.focusW > 2u * band ? g.focusW - 2 * band : 0u,
+                g.focusH > 2u * band ? g.focusH - 2 * band : 0u);
+            if (2u * band >= std::min(g.focusW, g.focusH))
+                Log("Quad: WARNING: margin_px + feather_px = %d is half the focus size or more; the focus never shows "
+                    "fully", band);
+        } else {
+            const double shownW = (double)g.focusW - 2.0 * c.quadMarginPx, shownH = (double)g.focusH - 2.0 * c.quadMarginPx;
+            Log("Quad: composition on: each eye goes to SteamVR as a %u x %u image, outer scaled bilinearly, focus %s "
+                "with margin %d px and smoothen_focus_view_edges %.3f (%.0f x %.0f shown, %.0f x %.0f fully sharp)",
+                g.gridW, g.gridH, how, c.quadMarginPx, c.smoothen, std::max(0.0, shownW), std::max(0.0, shownH),
+                std::max(0.0, shownW * (1 - 2 * c.smoothen)), std::max(0.0, shownH * (1 - 2 * c.smoothen)));
+            if (shownW <= 0 || shownH <= 0)
+                Log("Quad: WARNING: margin_px = %d is half the focus window or more; the focus never shows",
+                    c.quadMarginPx);
+        }
     } else {
-        Log("Quad: composition off (compose=0): SteamVR gets outer at the focus size");
+        Log("Quad: composition off (compose=0): SteamVR gets outer at the game's render size");
     }
 }
 
@@ -1585,8 +1657,8 @@ FrameWindow SetGaze(bool ok, const float ndcL[2], const float ndcR[2], bool benc
         for (int i = 0; i < 2; ++i) {
             focus::Eye& e = g_window.eye[i];
             e = g_focus.geo.eye[i];
-            float cx = c.quadCenterX, cy = c.quadCenterY;
-            if (ndc) focus::NdcToTangent(e, ndc[i][0], ndc[i][1], cx, cy);
+            float cx = 0, cy = 0;
+            WindowCenter(e, i, ndc ? ndc[i] : nullptr, cx, cy);
             focus::Place(g_focus.geo, e, cx, cy);
         }
         g_window.frame = g_frameNo;
@@ -1635,8 +1707,8 @@ void AdjustSize(vr::IVRSystem* real, uint32_t* w, uint32_t* h) {
         std::lock_guard lock(g_m);
         SetupLocked(real);
         if (!g_focus.on || !w || !h) return;
-        *w = g_focus.geo.focusW;
-        *h = g_focus.geo.focusH;
+        *w = g_focus.gameW;
+        *h = g_focus.gameH;
     });
 }
 
@@ -1715,12 +1787,14 @@ std::string Describe() {
     char buf[1024] = "Quad: (error)";
     Guard("Describe", [&] {
         std::lock_guard lock(g_m);
-        char focus[384] = "no focus window (the game renders at the SteamVR size)";
+        char focus[512] = "no focus window (the game renders at the SteamVR size)";
         const focus::Geometry& g = g_focus.geo;
         if (g_focus.on)
             snprintf(focus, sizeof(focus),
-                     "game size %u x %u of %u x %u (focus_size %.3f), focus window %s (now: %s), focus projection %s, %s",
-                     g.focusW, g.focusH, g.gridW, g.gridH, Cfg().quadFocusSize,
+                     "game size %u x %u of %u x %u (outer wants %u x %u, focus %u x %u in a %u x %u %s window), focus "
+                     "window %s (now: %s), focus projection %s, %s",
+                     g_focus.gameW, g_focus.gameH, g.gridW, g.gridH, g_focus.outerW, g_focus.outerH, g_focus.focusTexW,
+                     g_focus.focusTexH, g.focusW, g.focusH, g_focus.dfr ? "DFR" : "FFR",
                      g_follow ? "follows the gaze (DFR)" : "fixed (FFR)", SourceName(g_window.src),
                      g_focus.projFailed ? "OFF after a check (see log)" : "on",
                      Cfg().quadCompose ? "composition on (margin and feather in the log)"

@@ -25,10 +25,10 @@ struct Geometry {
     Eye eye[2];
 };
 
-// Reads the SteamVR size and both eye frusta from the real IVRSystem and places the focus window (size: fraction of the
-// tangent span, both axes; cx, cy: center tangents, right and up are +). Checks that GetProjectionMatrix matches the
-// formula above, so a replaced matrix and the window always agree. `who` prefixes the log lines. False = unusable.
-bool Compute(vr::IVRSystem* real, float size, float cx, float cy, const char* who, Geometry& g);
+// Reads the SteamVR size and both eye frusta from the real IVRSystem and places the focus window (sizeX, sizeY: fraction
+// of the tangent span per axis; cx, cy: center tangents, right and up are +). Checks that GetProjectionMatrix matches
+// the formula above, so a replaced matrix and the window always agree. `who` prefixes the log lines. False = unusable.
+bool Compute(vr::IVRSystem* real, float sizeX, float sizeY, float cx, float cy, const char* who, Geometry& g);
 // Places the focus window of one eye (its frustum l, r, t, b set) around the center tangents cx, cy, clamped so the
 // whole window stays in the grid (M5: once per frame for the gaze).
 void Place(const Geometry& g, Eye& e, float cx, float cy);

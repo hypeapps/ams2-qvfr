@@ -105,25 +105,42 @@ const char kDefaultIni[] =
     ";   quad  = two extra eye groups render the focus views; the game renders at the focus size (outer: full FOV,\n"
     ";           focus: the focus window at 1:1 density). Replaces [experiment] while on.\n"
     "mode=off\n"
-    "; quad: focus window as a fraction of the eye's tangent span, both axes (0.5 = 50% x 50%); also the size the game\n"
-    "; renders at, so the outer density is focus_size of 1:1. Restart the game after a change.\n"
-    "focus_size=0.5\n"
-    "; quad: 1 = the focus window follows the gaze every frame (DFR, gaze from SteamVR); 0 = the window stays at center_x,\n"
-    "; center_y (FFR). The window also goes to the center when the gaze is not valid for longer than gaze_hold_s\n"
-    "; (until then it stays at the last valid gaze, e.g. while blinking) and while a benchmark runs (unless the gaze is\n"
-    "; frozen: then at the frozen gaze).\n"
+    "; The next keys have the names, meaning and defaults of the Quad-Views-Foveated OpenXR layer by mbucchia, so its\n"
+    "; guides apply (https://github.com/mbucchia/Quad-Views-Foveated/wiki/Advanced-Configuration).\n"
+    "; Pixel density of the outer view (the whole field of view) and of the focus view, as a multiplier of each\n"
+    "; dimension of the resolution set in SteamVR (1.0 = that resolution, above 1 = supersampling).\n"
+    "; Restart the game after a change.\n"
+    "peripheral_multiplier=0.5\n"
+    "focus_multiplier=1.0\n"
+    "; Focus area as a fraction of the field of view in each direction (0.1..0.9): with eye tracking (follow_gaze=1)\n"
+    "; and without it (follow_gaze=0). The game session keeps the area of the follow_gaze value it started with; the\n"
+    "; DFR <-> FFR hotkey only moves the window. Restart the game after a change.\n"
+    "horizontal_focus_section=0.35\n"
+    "vertical_focus_section=0.35\n"
+    "horizontal_fixed_section=0.5\n"
+    "vertical_fixed_section=0.45\n"
+    "; Shift of the focus area from the gaze point (focus) and from straight ahead (fixed), in screen units of the eye\n"
+    "; (-1..1 across the field of view), -0.5..0.5. Horizontal: + moves both eyes' areas outward (away from the nose).\n"
+    "; Vertical: + is up.\n"
+    "horizontal_focus_offset=0\n"
+    "vertical_focus_offset=0\n"
+    "horizontal_fixed_offset=0\n"
+    "vertical_fixed_offset=0\n"
+    "; Soft edge between focus and outer: blend band on each side as a fraction of the focus area (0..0.5, 0 = hard\n"
+    "; edge). As in mbucchia, the focus keeps at least half weight up to its edge.\n"
+    "smoothen_focus_view_edges=0.2\n"
+    "; quad: 1 = the focus window follows the gaze every frame (DFR, gaze from SteamVR); 0 = the window stays straight\n"
+    "; ahead plus the fixed offsets (FFR). The window also goes there when the gaze is not valid for longer than\n"
+    "; gaze_hold_s (until then it stays at the last valid gaze, e.g. while blinking) and while a benchmark runs (unless\n"
+    "; the gaze is frozen: then at the frozen gaze).\n"
     "follow_gaze=1\n"
     "gaze_hold_s=0.6\n"
-    "; quad: fixed focus center as view direction tangents, the same for both eyes (0,0 = optical axis; right and up are +).\n"
-    "center_x=0\n"
-    "center_y=0\n"
-    "; quad: 1 = the proxy composes each eye from outer (upscaled to the 1:1 grid) and focus (1:1 in its window) and\n"
-    "; sends the grid-size image to SteamVR; 0 = outer only, at the focus size (diagnostics).\n"
+    "; quad: 1 = the proxy composes each eye from outer (upscaled to the SteamVR resolution) and focus (in its window)\n"
+    "; and sends that image to SteamVR; 0 = outer only, at the game's render size (diagnostics).\n"
     "compose=1\n"
-    "; quad: the outermost margin_px grid pixels of the focus are not shown (guard band for screen-space effects), the\n"
-    "; next feather_px blend from outer into focus.\n"
-    "margin_px=32\n"
-    "feather_px=128\n"
+    "; quad, advanced (not in mbucchia): the outermost margin_px pixels of the focus area are not shown (guard band for\n"
+    "; screen-space effects that break at the image edge); the soft edge starts inside them. 0 = the whole focus area.\n"
+    "margin_px=0\n"
     "; probe: how many frames to log in full after the first in-game frame (one more every stats_interval_s).\n"
     "probe_frames=3\n"
     "; probe: 1 = hooks in the game engine (eye tasks, builder); 1 = hooks in the D3D11 immediate context (counters).\n"
@@ -156,9 +173,9 @@ const char kDefaultIni[] =
     "gaze_key=0x75\n"
     "\n"
     "; Settings marked live take effect while the game runs (the file is checked about once a second): [log]\n"
-    "; stats_interval_s, [benchmark] all but auto_start_s, [gaze] read, [quad] follow_gaze, gaze_hold_s, center_x,\n"
-    "; center_y, compose, margin_px, feather_px, the shot keys and shot_auto_s, and all of [debug]. Everything else needs\n"
-    "; a game restart.\n";
+    "; stats_interval_s, [benchmark] all but auto_start_s, [gaze] read, [quad] the four *_offset keys,\n"
+    "; smoothen_focus_view_edges, follow_gaze, gaze_hold_s, compose, margin_px, the shot keys and shot_auto_s, and all\n"
+    "; of [debug]. Everything else needs a game restart.\n";
 
 std::string IniString(const fs::path& ini, const wchar_t* sec, const wchar_t* key, const wchar_t* def) {
     wchar_t buf[64];
@@ -177,6 +194,69 @@ float IniFloat(const fs::path& ini, const wchar_t* sec, const wchar_t* key, floa
     wchar_t buf[64];
     GetPrivateProfileStringW(sec, key, L"", buf, 64, ini.c_str());
     return buf[0] ? (float)_wtof(buf) : def;
+}
+
+bool IniHas(const fs::path& ini, const wchar_t* sec, const wchar_t* key) {
+    wchar_t buf[8];
+    GetPrivateProfileStringW(sec, key, L"", buf, 8, ini.c_str());
+    return buf[0] != 0;
+}
+
+// Clamps like the mbucchia layer does, and logs a changed value.
+float Ranged(const char* key, float v, float lo, float hi) {
+    const float r = !(v >= lo) ? lo : v > hi ? hi : v;
+    if (r != v) Log("Settings: [quad] %s=%.3f outside %.2f..%.2f, using %.3f", key, v, lo, hi, r);
+    return r;
+}
+
+// The [quad] keys of M7 (mbucchia's), after the pre-M7 keys that still work with a warning.
+void ReadQuadView(const fs::path& ini, Config& c) {
+    const wchar_t* q = L"quad";
+    if (IniHas(ini, q, L"focus_size")) {
+        const float s = Ranged("focus_size", IniFloat(ini, q, L"focus_size", 0.5f), 0.1f, 0.9f);
+        Log("Settings: WARNING: [quad] focus_size is a pre-M7 key; it sets peripheral_multiplier and the four *_section "
+            "keys that are not given to %.3f (the old meaning). Use those keys instead", s);
+        if (!IniHas(ini, q, L"peripheral_multiplier")) c.peripheralMultiplier = s;
+        c.focusSectionX = c.focusSectionY = c.fixedSectionX = c.fixedSectionY = s;
+    }
+    if (IniHas(ini, q, L"center_x") || IniHas(ini, q, L"center_y")) {
+        c.quadCenterX = IniFloat(ini, q, L"center_x", 0.0f);
+        c.quadCenterY = IniFloat(ini, q, L"center_y", 0.0f);
+        Log("Settings: WARNING: [quad] center_x/center_y are pre-M7 keys (view direction tangents, added to the fixed "
+            "center: %.3f, %.3f); use horizontal_fixed_offset/vertical_fixed_offset instead", c.quadCenterX,
+            c.quadCenterY);
+    }
+    if (IniHas(ini, q, L"feather_px")) {
+        if (IniHas(ini, q, L"smoothen_focus_view_edges")) {
+            Log("Settings: WARNING: [quad] feather_px (pre-M7) ignored: smoothen_focus_view_edges is given");
+        } else {
+            c.legacyEdge = true;
+            c.quadFeatherPx = IniInt(ini, q, L"feather_px", 128);
+            if (c.quadFeatherPx < 0 || c.quadFeatherPx > 1024) {
+                Log("Settings: [quad] feather_px=%d outside 0..1024, using 128", c.quadFeatherPx);
+                c.quadFeatherPx = 128;
+            }
+            Log("Settings: WARNING: [quad] feather_px is a pre-M7 key: the old soft edge (%d px after the margin, from 0 "
+                "to full focus); use smoothen_focus_view_edges instead", c.quadFeatherPx);
+        }
+    }
+    c.peripheralMultiplier = Ranged("peripheral_multiplier",
+                                    IniFloat(ini, q, L"peripheral_multiplier", c.peripheralMultiplier), 0.1f, 1e6f);
+    c.focusMultiplier = Ranged("focus_multiplier", IniFloat(ini, q, L"focus_multiplier", c.focusMultiplier), 0.1f, 1e6f);
+    c.focusSectionX = Ranged("horizontal_focus_section",
+                             IniFloat(ini, q, L"horizontal_focus_section", c.focusSectionX), 0.1f, 0.9f);
+    c.focusSectionY = Ranged("vertical_focus_section",
+                             IniFloat(ini, q, L"vertical_focus_section", c.focusSectionY), 0.1f, 0.9f);
+    c.fixedSectionX = Ranged("horizontal_fixed_section",
+                             IniFloat(ini, q, L"horizontal_fixed_section", c.fixedSectionX), 0.1f, 0.9f);
+    c.fixedSectionY = Ranged("vertical_fixed_section",
+                             IniFloat(ini, q, L"vertical_fixed_section", c.fixedSectionY), 0.1f, 0.9f);
+    c.focusOffsetX = Ranged("horizontal_focus_offset", IniFloat(ini, q, L"horizontal_focus_offset", 0.0f), -0.5f, 0.5f);
+    c.focusOffsetY = Ranged("vertical_focus_offset", IniFloat(ini, q, L"vertical_focus_offset", 0.0f), -0.5f, 0.5f);
+    c.fixedOffsetX = Ranged("horizontal_fixed_offset", IniFloat(ini, q, L"horizontal_fixed_offset", 0.0f), -0.5f, 0.5f);
+    c.fixedOffsetY = Ranged("vertical_fixed_offset", IniFloat(ini, q, L"vertical_fixed_offset", 0.0f), -0.5f, 0.5f);
+    c.smoothen = Ranged("smoothen_focus_view_edges", IniFloat(ini, q, L"smoothen_focus_view_edges", c.smoothen), 0.0f,
+                        0.5f);
 }
 
 }  // namespace
@@ -318,13 +398,7 @@ Config ReadConfig(const fs::path& ini) {
     c.shotKeyMod = IniInt(ini, L"quad", L"shot_modifier", c.shotKeyMod);
     c.shotKey = IniInt(ini, L"quad", L"shot_key", c.shotKey);
     c.shotAutoS = IniFloat(ini, L"quad", L"shot_auto_s", 0.0f);
-    c.quadFocusSize = IniFloat(ini, L"quad", L"focus_size", c.quadFocusSize);
-    if (!(c.quadFocusSize >= 0.1f && c.quadFocusSize <= 1.0f)) {
-        Log("Settings: [quad] focus_size=%.3f outside 0.1..1, using 0.5", c.quadFocusSize);
-        c.quadFocusSize = 0.5f;
-    }
-    c.quadCenterX = IniFloat(ini, L"quad", L"center_x", 0.0f);
-    c.quadCenterY = IniFloat(ini, L"quad", L"center_y", 0.0f);
+    if (c.quadMode == QuadMode::Quad) ReadQuadView(ini, c);
     c.followGaze = IniInt(ini, L"quad", L"follow_gaze", 1) != 0;
     c.gazeHoldS = IniFloat(ini, L"quad", L"gaze_hold_s", c.gazeHoldS);
     if (!(c.gazeHoldS >= 0.0f && c.gazeHoldS <= 10.0f)) {
@@ -334,21 +408,19 @@ Config ReadConfig(const fs::path& ini) {
     c.quadCompose = IniInt(ini, L"quad", L"compose", 1) != 0;
     c.quadMarginPx = IniInt(ini, L"quad", L"margin_px", c.quadMarginPx);
     if (c.quadMarginPx < 0 || c.quadMarginPx > 512) {
-        Log("Settings: [quad] margin_px=%d outside 0..512, using 32", c.quadMarginPx);
-        c.quadMarginPx = 32;
-    }
-    c.quadFeatherPx = IniInt(ini, L"quad", L"feather_px", c.quadFeatherPx);
-    if (c.quadFeatherPx < 0 || c.quadFeatherPx > 1024) {
-        Log("Settings: [quad] feather_px=%d outside 0..1024, using 128", c.quadFeatherPx);
-        c.quadFeatherPx = 128;
+        Log("Settings: [quad] margin_px=%d outside 0..512, using 0", c.quadMarginPx);
+        c.quadMarginPx = 0;
     }
     if (c.quadMode != QuadMode::Off)
-        Log("Settings: [quad] mode=%s focus_size=%.3f follow_gaze=%d gaze_hold_s=%.2f center=(%.3f, %.3f) compose=%d "
-            "margin_px=%d feather_px=%d probe_frames=%d probe_engine=%d probe_d3d=%d shot_modifier=0x%X shot_key=0x%X "
-            "shot_auto_s=%.1f",
-            QuadModeName(c.quadMode), c.quadFocusSize, c.followGaze, c.gazeHoldS, c.quadCenterX, c.quadCenterY,
-            c.quadCompose, c.quadMarginPx, c.quadFeatherPx, c.probeFrames, c.probeEngine, c.probeD3D, c.shotKeyMod,
-            c.shotKey, c.shotAutoS);
+        Log("Settings: [quad] mode=%s peripheral_multiplier=%.3f focus_multiplier=%.3f focus_section=%.3f x %.3f "
+            "fixed_section=%.3f x %.3f focus_offset=(%.3f, %.3f) fixed_offset=(%.3f, %.3f) "
+            "smoothen_focus_view_edges=%.3f%s follow_gaze=%d gaze_hold_s=%.2f compose=%d margin_px=%d probe_frames=%d "
+            "probe_engine=%d probe_d3d=%d shot_modifier=0x%X shot_key=0x%X shot_auto_s=%.1f",
+            QuadModeName(c.quadMode), c.peripheralMultiplier, c.focusMultiplier, c.focusSectionX, c.focusSectionY,
+            c.fixedSectionX, c.fixedSectionY, c.focusOffsetX, c.focusOffsetY, c.fixedOffsetX, c.fixedOffsetY,
+            c.smoothen, c.legacyEdge ? " (overridden by the pre-M7 feather_px)" : "", c.followGaze, c.gazeHoldS,
+            c.quadCompose, c.quadMarginPx, c.probeFrames, c.probeEngine, c.probeD3D, c.shotKeyMod, c.shotKey,
+            c.shotAutoS);
     if (c.quadMode == QuadMode::Quad && c.expMode != ExpMode::Off) {
         Log("Settings: [experiment] mode=%s ignored: [quad] mode=quad sets the size and projection itself",
             ExpModeName(c.expMode));
@@ -433,7 +505,11 @@ bool ReloadConfig() {
          "[experiment]");
     need(n.traceCallers != c.traceCallers || n.traceDepth != c.traceDepth, "[trace]");
     need(n.quadMode != c.quadMode, "[quad] mode");
-    need(n.quadFocusSize != c.quadFocusSize, "[quad] focus_size");
+    need(n.peripheralMultiplier != c.peripheralMultiplier || n.focusMultiplier != c.focusMultiplier,
+         "[quad] *_multiplier");
+    need(n.focusSectionX != c.focusSectionX || n.focusSectionY != c.focusSectionY ||
+             n.fixedSectionX != c.fixedSectionX || n.fixedSectionY != c.fixedSectionY,
+         "[quad] *_section");
     need(n.probeFrames != c.probeFrames || n.probeEngine != c.probeEngine || n.probeD3D != c.probeD3D, "[quad] probe_*");
     c.statsIntervalS = n.statsIntervalS;
     c.benchKeyMod = n.benchKeyMod;
@@ -443,13 +519,19 @@ bool ReloadConfig() {
     c.benchFreezePose = n.benchFreezePose;
     c.benchBeep = n.benchBeep;
     c.gazeRead = n.gazeRead;
+    c.focusOffsetX = n.focusOffsetX;
+    c.focusOffsetY = n.focusOffsetY;
+    c.fixedOffsetX = n.fixedOffsetX;
+    c.fixedOffsetY = n.fixedOffsetY;
+    c.smoothen = n.smoothen;
     c.quadCenterX = n.quadCenterX;
     c.quadCenterY = n.quadCenterY;
+    c.legacyEdge = n.legacyEdge;
+    c.quadFeatherPx = n.quadFeatherPx;
     c.followGaze = n.followGaze;
     c.gazeHoldS = n.gazeHoldS;
     c.quadCompose = n.quadCompose;
     c.quadMarginPx = n.quadMarginPx;
-    c.quadFeatherPx = n.quadFeatherPx;
     c.shotKeyMod = n.shotKeyMod;
     c.shotKey = n.shotKey;
     c.shotAutoS = n.shotAutoS;
@@ -463,12 +545,13 @@ bool ReloadConfig() {
     c.gazeKeyMod = n.gazeKeyMod;
     c.gazeKey = n.gazeKey;
     Log("Settings reloaded (live): stats_interval_s=%d | benchmark modifier=0x%X key=0x%X delay_s=%.1f duration_s=%.1f "
-        "freeze_pose=%d beep=%d | gaze read=%d | quad follow_gaze=%d gaze_hold_s=%.2f center=(%.3f, %.3f) compose=%d "
-        "margin_px=%d feather_px=%d shot_modifier=0x%X shot_key=0x%X shot_auto_s=%.1f | debug overlay=%d keys "
-        "0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X%s%s",
+        "freeze_pose=%d beep=%d | gaze read=%d | quad focus_offset=(%.3f, %.3f) fixed_offset=(%.3f, %.3f) "
+        "smoothen_focus_view_edges=%.3f%s follow_gaze=%d gaze_hold_s=%.2f compose=%d margin_px=%d shot_modifier=0x%X "
+        "shot_key=0x%X shot_auto_s=%.1f | debug overlay=%d keys 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X%s%s",
         c.statsIntervalS, c.benchKeyMod, c.benchKey, c.benchDelayS, c.benchDurationS, c.benchFreezePose, c.benchBeep,
-        c.gazeRead, c.followGaze, c.gazeHoldS, c.quadCenterX, c.quadCenterY, c.quadCompose, c.quadMarginPx,
-        c.quadFeatherPx, c.shotKeyMod, c.shotKey, c.shotAutoS, c.overlay, c.overlayKeyMod, c.overlayKey,
+        c.gazeRead, c.focusOffsetX, c.focusOffsetY, c.fixedOffsetX, c.fixedOffsetY, c.smoothen,
+        c.legacyEdge ? " (pre-M7 feather_px instead)" : "", c.followGaze, c.gazeHoldS, c.quadCompose, c.quadMarginPx,
+        c.shotKeyMod, c.shotKey, c.shotAutoS, c.overlay, c.overlayKeyMod, c.overlayKey,
         c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey, c.gazeKeyMod, c.gazeKey,
         restart.empty() ? "" : "; CHANGED BUT NEEDS A GAME RESTART: ", restart.c_str());
     return true;

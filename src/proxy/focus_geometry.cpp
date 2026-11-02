@@ -13,7 +13,7 @@ bool Near(float a, float b) { return std::fabs(a - b) <= 1e-3f; }
 
 }  // namespace
 
-bool Compute(vr::IVRSystem* real, float size, float cx, float cy, const char* who, Geometry& g) {
+bool Compute(vr::IVRSystem* real, float sizeX, float sizeY, float cx, float cy, const char* who, Geometry& g) {
     g = Geometry{};
     if (!real) return false;
     real->GetRecommendedRenderTargetSize(&g.gridW, &g.gridH);
@@ -21,8 +21,8 @@ bool Compute(vr::IVRSystem* real, float size, float cx, float cy, const char* wh
         Log("%s: SteamVR size %u x %u is not usable", who, g.gridW, g.gridH);
         return false;
     }
-    g.focusW = std::max(16u, (uint32_t)std::lround(size * g.gridW));
-    g.focusH = std::max(16u, (uint32_t)std::lround(size * g.gridH));
+    g.focusW = std::max(16u, (uint32_t)std::lround(sizeX * g.gridW));
+    g.focusH = std::max(16u, (uint32_t)std::lround(sizeY * g.gridH));
     g.focusW = std::min(g.focusW, g.gridW);
     g.focusH = std::min(g.focusH, g.gridH);
 

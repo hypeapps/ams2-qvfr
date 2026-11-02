@@ -69,14 +69,30 @@ struct Config {
     int shotKeyMod = VK_RCONTROL;     // quad: shot of the four views (PNG + pixel differences), modifier (0 = none)
     int shotKey = VK_F10;             // quad: shot key (0 = no hotkey)
     float shotAutoS = 0.0f;           // quad: > 0 = one shot this many seconds after the first frame with focus groups
-    float quadFocusSize = 0.5f;       // quad: focus window, fraction of the tangent span; also the game's render size
-    float quadCenterX = 0.0f;         // quad: fixed focus center (FFR) tangents, right = +
-    float quadCenterY = 0.0f;         // up = +
+    // quad, M7: the settings of the mbucchia Quad-Views-Foveated layer (names, meaning, defaults and ranges).
+    // Densities multiply each dimension of the SteamVR size (the 1:1 grid); sections are fractions of the eye's
+    // tangent span; offsets are NDC of the full eye projection, horizontal mirrored (+ = away from the nose).
+    float peripheralMultiplier = 0.5f;  // outer density
+    float focusMultiplier = 1.0f;       // focus density (> 1 = supersampling)
+    float focusSectionX = 0.35f;        // focus window with DFR (follow_gaze=1 at the start of the VR session)
+    float focusSectionY = 0.35f;
+    float fixedSectionX = 0.5f;         // focus window with FFR (follow_gaze=0 at the start of the VR session)
+    float fixedSectionY = 0.45f;
+    float focusOffsetX = 0.0f;          // DFR: window center = gaze + offset
+    float focusOffsetY = 0.0f;
+    float fixedOffsetX = 0.0f;          // FFR (and DFR without a valid gaze): window center = straight ahead + offset
+    float fixedOffsetY = 0.0f;
+    float smoothen = 0.2f;              // smoothen_focus_view_edges: blend band per side, fraction of the shown focus
     bool followGaze = true;           // quad: the focus window follows the gaze every frame (DFR, M5); 0 = fixed (FFR)
     float gazeHoldS = 0.6f;           // quad: invalid gaze: the last valid one for this long, then the fixed center
     bool quadCompose = true;          // quad: the proxy composes outer and focus into one grid-size image per eye (M4.4)
-    int quadMarginPx = 32;            // quad: hidden band at the focus edge (guard band), grid pixels
-    int quadFeatherPx = 128;          // quad: blend band from outer to focus inside the margin, grid pixels
+    int quadMarginPx = 0;             // quad: hidden band at the focus edge (guard band), grid pixels; not in mbucchia
+    // Pre-M7 keys, still read with a warning: focus_size (sets the sections and peripheral_multiplier when those are
+    // not given), center_x/center_y (tangents added to the fixed center) and feather_px (the old edge curve).
+    float quadCenterX = 0.0f;
+    float quadCenterY = 0.0f;
+    bool legacyEdge = false;          // feather_px given without smoothen_focus_view_edges
+    int quadFeatherPx = 0;            // with legacyEdge: blend band inside the margin, grid pixels
     // [debug] (M4.5 tools; quad mode)
     bool overlay = false;             // debug overlay in the composed image at start (blend band edges, gaze point)
     int overlayKeyMod = VK_RCONTROL;  // overlay on/off hotkey

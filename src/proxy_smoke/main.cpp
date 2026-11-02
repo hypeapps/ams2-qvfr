@@ -382,38 +382,46 @@ int RunCompose() {
     }
     ID3D11InfoQueue* info = nullptr;
     if (debugLayer) dev->QueryInterface(__uuidof(ID3D11InfoQueue), (void**)&info);
+    // Pre-M7 edge curve first (margin, then feather from 0 to full focus); the mbucchia curve and a focus texture
+    // larger than its window below.
     qvfr::compose::Layout l;
     l.gridW = 1024;
     l.gridH = 768;
-    l.focusW = 512;
-    l.focusH = 384;
+    l.outerW = l.focusTexW = l.focusW = 512;
+    l.outerH = l.focusTexH = l.focusH = 384;
     l.x0 = 300;
     l.y0 = 200;
     l.marginPx = 8;
+    l.legacyEdge = true;
     l.featherPx = 32;
     const uint32_t outerPx = 0xFF967D32u;  // r 50, g 125, b 150
+    const uint32_t flatPx = 0xFFC04020u;   // the supersampled focus: one color, so bilinear reads it exactly
     auto focusPx = [](uint32_t x, uint32_t y) {
         return ((x * 7) & 255) | ((y * 13) & 255) << 8 | (((x ^ y) * 5) & 255) << 16 | 0xFF000000u;
     };
-    std::vector<uint32_t> px((size_t)l.focusW * l.focusH);
-    auto make = [&](bool focus, UINT bind, ID3D11Texture2D** t) {
-        for (uint32_t y = 0; y < l.focusH; ++y)
-            for (uint32_t x = 0; x < l.focusW; ++x) px[(size_t)y * l.focusW + x] = focus ? focusPx(x, y) : outerPx;
+    std::vector<uint32_t> px;
+    auto make = [&](uint32_t w, uint32_t h, auto pixel, UINT bind, ID3D11Texture2D** t) {
+        px.assign((size_t)w * h, 0);
+        for (uint32_t y = 0; y < h; ++y)
+            for (uint32_t x = 0; x < w; ++x) px[(size_t)y * w + x] = pixel(x, y);
         D3D11_TEXTURE2D_DESC d{};
-        d.Width = l.focusW;
-        d.Height = l.focusH;
+        d.Width = w;
+        d.Height = h;
         d.MipLevels = 1;
         d.ArraySize = 1;
         d.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
         d.SampleDesc.Count = 1;
         d.BindFlags = bind;
-        D3D11_SUBRESOURCE_DATA init{px.data(), l.focusW * 4, 0};
+        D3D11_SUBRESOURCE_DATA init{px.data(), w * 4, 0};
         return SUCCEEDED(dev->CreateTexture2D(&d, &init, t));
     };
-    ID3D11Texture2D *outer = nullptr, *focus = nullptr, *dummy = nullptr;
+    auto plain = [&](uint32_t, uint32_t) { return outerPx; };
+    auto flat = [&](uint32_t, uint32_t) { return flatPx; };
+    ID3D11Texture2D *outer = nullptr, *focus = nullptr, *focusBig = nullptr, *dummy = nullptr;
     ID3D11RenderTargetView* dummyRtv = nullptr;
-    bool made = make(false, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, &outer) &&
-                make(true, D3D11_BIND_RENDER_TARGET, &focus) && make(false, D3D11_BIND_RENDER_TARGET, &dummy);
+    const UINT rtSrv = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    bool made = make(512, 384, plain, rtSrv, &outer) && make(512, 384, focusPx, D3D11_BIND_RENDER_TARGET, &focus) &&
+                make(768, 576, flat, rtSrv, &focusBig) && make(512, 384, plain, D3D11_BIND_RENDER_TARGET, &dummy);
     D3D11_RENDER_TARGET_VIEW_DESC rv{};
     rv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
@@ -441,13 +449,27 @@ int RunCompose() {
                    topoAfter == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
     if (rtvAfter) rtvAfter->Release();
 
-    // Read back the left eye and check each pixel by its distance to the focus window edge; then the same with the
-    // window in two corners of the grid (M5: the window follows the gaze up to the frustum edge).
+    // Read back the left eye and check each pixel by its zone (outer, blend band, focus shown exactly); then the same
+    // with the window in two corners of the grid (M5: the window follows the gaze up to the frustum edge), with the
+    // mbucchia curve, and with a focus texture larger than its window (read bilinearly).
     uint64_t inner = 0, innerBad = 0, outside = 0, outsideBad = 0, band = 0, bandBad = 0;
     bool readOk = out[0] && out[1] && out[0] != out[1];
     D3D11_TEXTURE2D_DESC od{};
     if (readOk) out[0]->GetDesc(&od);
-    auto checkPixels = [&](ID3D11Texture2D* tex, const qvfr::compose::Layout& w) {
+    // 0 = outer, 1 = blend band, 2 = focus; pixel center (qx, qy) in window pixels.
+    auto zone = [](const qvfr::compose::Layout& w, float qx, float qy) {
+        const float m = w.marginPx;
+        if (w.legacyEdge) {
+            const float d = std::min(std::min(qx, w.focusW - qx), std::min(qy, w.focusH - qy));
+            return d >= m + w.featherPx ? 2 : d <= m ? 0 : 1;
+        }
+        const float ux = (qx - m) / (w.focusW - 2 * m), uy = (qy - m) / (w.focusH - 2 * m);
+        if (ux <= 0 || ux >= 1 || uy <= 0 || uy >= 1) return 0;
+        const float a = w.smoothen, eps = 1e-4f;
+        if (a <= 0) return 2;
+        return ux >= a + eps && ux <= 1 - a - eps && uy >= a + eps && uy <= 1 - a - eps ? 2 : 1;
+    };
+    auto checkPixels = [&](ID3D11Texture2D* tex, const qvfr::compose::Layout& w, bool bigFocus) {
         if (!tex) return false;
         D3D11_TEXTURE2D_DESC s = od;
         s.Usage = D3D11_USAGE_STAGING;
@@ -477,16 +499,17 @@ int RunCompose() {
                     for (uint32_t x = 0; x < od.Width; ++x) {
                         const uint32_t v = row[x];
                         const float qx = x + 0.5f - w.x0, qy = y + 0.5f - w.y0;
-                        const float d = std::min(std::min(qx, w.focusW - qx), std::min(qy, w.focusH - qy));
-                        if (d >= w.marginPx + w.featherPx) {
+                        const int z = zone(w, qx, qy);
+                        const uint32_t f = bigFocus ? flatPx : z ? focusPx(x - w.x0, y - w.y0) : 0;
+                        if (z == 2) {
                             ++inner;
-                            innerBad += v != focusPx(x - w.x0, y - w.y0);
-                        } else if (d <= w.marginPx) {
+                            innerBad += bigFocus ? !near1(v, f) : v != f;
+                        } else if (z == 0) {
                             ++outside;
                             outsideBad += !near1(v, outerPx);
                         } else {
                             ++band;
-                            bandBad += !between(v, outerPx, focusPx(x - w.x0, y - w.y0));
+                            bandBad += !between(v, outerPx, f);
                         }
                     }
                 }
@@ -496,14 +519,37 @@ int RunCompose() {
         }
         return mapped;
     };
+    int cases = 0;
     if (readOk) {
-        readOk = checkPixels(out[0], l);
+        readOk = checkPixels(out[0], l, false);
+        ++cases;
         for (auto [x0, y0] : {std::pair<uint32_t, uint32_t>{0, 0}, {l.gridW - l.focusW, l.gridH - l.focusH}}) {
             qvfr::compose::Layout lc = l;
             lc.x0 = x0;
             lc.y0 = y0;
-            readOk &= checkPixels(qvfr::compose::Draw(ctx, 0, outer, focus, lc), lc);
+            readOk &= checkPixels(qvfr::compose::Draw(ctx, 0, outer, focus, lc), lc, false);
+            ++cases;
         }
+        // mbucchia's curve (smoothen_focus_view_edges 0.2, then a hard edge without a margin), then the focus texture
+        // 1.5x its window.
+        qvfr::compose::Layout lm = l;
+        lm.legacyEdge = false;
+        lm.featherPx = 0;
+        lm.smoothen = 0.2f;
+        readOk &= checkPixels(qvfr::compose::Draw(ctx, 0, outer, focus, lm), lm, false);
+        qvfr::compose::Layout lh = lm;
+        lh.smoothen = 0;
+        lh.marginPx = 0;  // the default since M7.2
+        lh.x0 = l.gridW - l.focusW;
+        lh.y0 = 0;
+        readOk &= checkPixels(qvfr::compose::Draw(ctx, 0, outer, focus, lh), lh, false);
+        qvfr::compose::Layout lb = lm;
+        lb.focusTexW = 768;
+        lb.focusTexH = 576;
+        readOk &= checkPixels(qvfr::compose::Draw(ctx, 0, outer, focusBig, lb), lb, true);
+        // A focus texture of a size other than the layout's is refused.
+        readOk &= qvfr::compose::Draw(ctx, 0, outer, focus, lb) == nullptr;
+        cases += 4;
     }
     // Debug overlay: the gaze dot and the outline of the margin edge, the rest unchanged.
     bool overlayOk = false;
@@ -553,15 +599,16 @@ int RunCompose() {
         }
         info->Release();
     }
-    for (IUnknown* u : {(IUnknown*)outer, (IUnknown*)focus, (IUnknown*)dummy, (IUnknown*)dummyRtv}) u->Release();
+    for (IUnknown* u : {(IUnknown*)outer, (IUnknown*)focus, (IUnknown*)focusBig, (IUnknown*)dummy, (IUnknown*)dummyRtv})
+        u->Release();
     ctx->Release();
     dev->Release();
     bool ok = readOk && stateOk && od.Width == l.gridW && od.Height == l.gridH &&
               od.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS && inner && outside && band && !innerBad && !outsideBad &&
               !bandBad && !warnings && overlayOk;
-    printf("Compose check %s: outputs %p/%p (%u x %u fmt %d), state restored %d, pixels wrong: focus %llu of %llu, "
-           "outer %llu of %llu, blend band %llu of %llu; overlay %s; debug layer %s, %d warnings\n",
-           ok ? "OK" : "FAILED", (void*)out[0], (void*)out[1], od.Width, od.Height, (int)od.Format, stateOk,
+    printf("Compose check %s: outputs %p/%p (%u x %u fmt %d), state restored %d, %d layouts, pixels wrong: focus %llu of "
+           "%llu, outer %llu of %llu, blend band %llu of %llu; overlay %s; debug layer %s, %d warnings\n",
+           ok ? "OK" : "FAILED", (void*)out[0], (void*)out[1], od.Width, od.Height, (int)od.Format, stateOk, cases,
            (unsigned long long)innerBad, (unsigned long long)inner, (unsigned long long)outsideBad,
            (unsigned long long)outside, (unsigned long long)bandBad, (unsigned long long)band,
            overlayOk ? "ok" : "WRONG", debugLayer ? "on" : "not installed", warnings);

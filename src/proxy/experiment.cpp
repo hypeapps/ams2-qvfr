@@ -65,7 +65,7 @@ void Setup(vr::IVRSystem* real) {
     g_s.mode = Cfg().expMode;
     if (g_s.mode == ExpMode::Off || !real) return;
     const float size = Cfg().expFocusSize;
-    if (!focus::Compute(real, size, Cfg().expCenterX, Cfg().expCenterY, "Experiment", g_s.geo)) {
+    if (!focus::Compute(real, size, size, Cfg().expCenterX, Cfg().expCenterY, "Experiment", g_s.geo)) {
         Log("Experiment: off (see the line above)");
         return;
     }

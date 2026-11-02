@@ -16,8 +16,9 @@ namespace {
 struct Constants {
     float gridW, gridH, x0, y0, focusW, focusH, margin, feather;
     float gazeX, gazeY, gazeMode, overlay;
+    float smoothen, legacyEdge, exact, pad;
 };
-static_assert(sizeof(Constants) == 48);
+static_assert(sizeof(Constants) == 64);
 
 struct Pipeline {
     ID3D11Device* dev = nullptr;  // referenced: the objects below belong to it
@@ -347,9 +348,9 @@ ID3D11Texture2D* Draw(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* outer,
     outer->GetDesc(&od);
     focus->GetDesc(&fd);
     const char* side = eye ? "right" : "left";
-    if (od.Width != l.focusW || od.Height != l.focusH || fd.Width != l.focusW || fd.Height != l.focusH) {
-        Fail(eye, SiteSize, "%s eye sources outer %u x %u, focus %u x %u are not the focus size %u x %u", side,
-             od.Width, od.Height, fd.Width, fd.Height, l.focusW, l.focusH);
+    if (od.Width != l.outerW || od.Height != l.outerH || fd.Width != l.focusTexW || fd.Height != l.focusTexH) {
+        Fail(eye, SiteSize, "%s eye sources outer %u x %u, focus %u x %u; expected %u x %u and %u x %u", side, od.Width,
+             od.Height, fd.Width, fd.Height, l.outerW, l.outerH, l.focusTexW, l.focusTexH);
         return nullptr;
     }
     if (od.SampleDesc.Count != 1 || fd.SampleDesc.Count != 1 || od.Format != fd.Format) {
@@ -377,9 +378,11 @@ ID3D11Texture2D* Draw(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* outer,
         Fail(eye, SiteMap, "cannot map the constant buffer (0x%08lX)", (unsigned long)hr);
         return nullptr;
     }
+    const bool exact = l.focusTexW == l.focusW && l.focusTexH == l.focusH;
     const Constants k = {(float)l.gridW,  (float)l.gridH,     (float)l.x0,         (float)l.y0,
                          (float)l.focusW, (float)l.focusH,    l.marginPx,          l.featherPx > 0 ? l.featherPx : 1e-3f,
-                         l.gazeX,         l.gazeY,            (float)l.gazeMode,   l.overlay ? 1.0f : 0.0f};
+                         l.gazeX,         l.gazeY,            (float)l.gazeMode,   l.overlay ? 1.0f : 0.0f,
+                         l.smoothen,      l.legacyEdge ? 1.0f : 0.0f, exact ? 1.0f : 0.0f, 0.0f};
     memcpy(m.pData, &k, sizeof(k));
     ctx->Unmap(g_p.cb, 0);
 
@@ -405,12 +408,17 @@ ID3D11Texture2D* Draw(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* outer,
     Restore(ctx, g_state);
     if (!o.logged) {
         o.logged = true;
-        Log("Compose: first %s eye: outer %p + focus %p (%u x %u fmt %d, shader resource binding %s/%s) -> %p, focus at "
-            "(%u, %u), margin %.0f px, feather %.0f px",
-            side, (void*)outer, (void*)focus, od.Width, od.Height, (int)od.Format,
+        char edge[96];
+        if (l.legacyEdge)
+            snprintf(edge, sizeof(edge), "pre-M7 feather %.0f px", l.featherPx);
+        else
+            snprintf(edge, sizeof(edge), "smoothen_focus_view_edges %.3f", l.smoothen);
+        Log("Compose: first %s eye: outer %p (%u x %u) + focus %p (%u x %u, %s into its %u x %u window), fmt %d, shader "
+            "resource binding %s/%s -> %p, window at (%u, %u), margin %.0f px, %s",
+            side, (void*)outer, od.Width, od.Height, (void*)focus, fd.Width, fd.Height,
+            exact ? "pixel for pixel" : "bilinear", l.focusW, l.focusH, (int)od.Format,
             (od.BindFlags & D3D11_BIND_SHADER_RESOURCE) ? "yes" : "no",
-            (fd.BindFlags & D3D11_BIND_SHADER_RESOURCE) ? "yes" : "no", (void*)o.tex, l.x0, l.y0, l.marginPx,
-            l.featherPx);
+            (fd.BindFlags & D3D11_BIND_SHADER_RESOURCE) ? "yes" : "no", (void*)o.tex, l.x0, l.y0, l.marginPx, edge);
     }
     return o.tex;
 }
