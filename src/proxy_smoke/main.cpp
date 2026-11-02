@@ -27,6 +27,13 @@
 //   --clones                          without SteamVR and without the proxy DLL: the proxy's clones module on fake engine
 //                                     objects (learning, clones in the sets' sizes, swap of fields, sizes and bound
 //                                     views, viewports, restore, leaks, destroy; focus or outer smaller)
+//   --xr-layer                        without SteamVR: the proxy DLL as an OpenXR API layer between a fake loader and a
+//                                     fake runtime (extension, gaze set in attach and sync, own sync, gaze, 2 sessions)
+//   --openxr-path                     [runtime] path=openxr with the Valve DLL as the backend: loader environment,
+//                                     layer manifest, backend path (needs no SteamVR running)
+//   --openxr                          [runtime] path=openxr openxr_runtime=steamvr for the other modes (with --scene: the
+//                                     scene through OpenComposite in proxy/qvfr/opencomposite/, SteamVR OpenXR, our layer)
+//   --openxr-nolayer                  the same without our OpenXR layer (openxr_layer=0), for A/B
 // smoke_home\qvfr.ini is rewritten on every run, so options never leak from one run into the next.
 
 #include <windows.h>
@@ -52,6 +59,7 @@
 #include "focus_geometry.h"
 #include "hooks.h"
 #include "shots.h"
+#include "xr_smoke.h"
 
 namespace fs = std::filesystem;
 
@@ -1107,6 +1115,10 @@ int main(int argc, char** argv) {
     bool shotsTest = false;
     bool composeTest = false;
     bool clonesTest = false;
+    bool xrLayerTest = false;
+    bool openxrPathTest = false;
+    bool openxr = false;
+    bool noLayer = false;
     auto hasValue = [&](int i) { return i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0; };
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--scene")) scene = hasValue(i) ? atof(argv[++i]) : 12.0;
@@ -1119,6 +1131,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--quad-compose")) composeTest = true;
         else if (!strcmp(argv[i], "--focus-geometry")) return RunGeometry();
         else if (!strcmp(argv[i], "--clones")) clonesTest = true;
+        else if (!strcmp(argv[i], "--xr-layer")) xrLayerTest = true;
+        else if (!strcmp(argv[i], "--openxr-path")) openxrPathTest = true;
+        else if (!strcmp(argv[i], "--openxr")) openxr = true;
+        else if (!strcmp(argv[i], "--openxr-nolayer")) openxr = noLayer = true;
         else if (!strcmp(argv[i], "--center") && i + 2 < argc) {
             center = std::string("center_x=") + argv[i + 1] + "\ncenter_y=" + argv[i + 2] + "\n";
             i += 2;
@@ -1134,6 +1150,8 @@ int main(int argc, char** argv) {
     if (shotsTest) return RunShots(home);
     if (composeTest) return RunCompose();
     if (clonesTest) return RunClones();
+    if (xrLayerTest) return RunXrLayer(ExeDir() / L"proxy" / L"openvr_api.dll", home);
+    if (openxrPathTest) return RunOpenXrPath(ExeDir() / L"proxy" / L"openvr_api.dll", home);
     if (FILE* f = _wfopen((home / L"qvfr.ini").c_str(), L"wb")) {
         fputs(scene > 0 ? kSceneIni : kBackgroundIni, f);
         if (!experiment.empty()) fprintf(f, "[experiment]\nmode=%s\n%s", experiment.c_str(), center.c_str());
@@ -1141,6 +1159,8 @@ int main(int argc, char** argv) {
         if (trace) fputs("[trace]\ncallers=1\ndepth=12\n", f);
         if (probe) fputs("[quad]\nmode=probe\nprobe_frames=2\n", f);
         if (quad) fputs("[quad]\nmode=quad\n", f);
+        if (openxr)
+            fprintf(f, "[runtime]\npath=openxr\nopenxr_runtime=steamvr\nopenxr_layer=%d\n", noLayer ? 0 : 1);
         fclose(f);
     }
 

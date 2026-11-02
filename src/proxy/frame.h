@@ -8,6 +8,7 @@
 
 namespace qvfr::frame {
 
+void NoteSystem(vr::IVRSystem* real);  // after VR_Init: the backend's IVRSystem (eye frusta for the OpenXR gaze)
 void OnWaitGetPosesBegin();
 void OnWaitGetPosesEnd(vr::IVRCompositor* real, vr::TrackedDevicePose_t* render, uint32_t nRender,
                        vr::TrackedDevicePose_t* game, uint32_t nGame, vr::EVRCompositorError err, double blockMs);

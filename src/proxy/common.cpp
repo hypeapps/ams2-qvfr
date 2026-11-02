@@ -37,6 +37,18 @@ const char kDefaultIni[] =
     "; ams2-qvfr: openvr_api.dll proxy settings. The file is created on the first game start.\n"
     "; Most changes take effect after restarting the game; the live ones are listed at the end.\n"
     "\n"
+    "[runtime]\n"
+    "; openvr = the Valve openvr_api.dll (openvr_api_orig.dll next to the proxy) talks to SteamVR;\n"
+    "; openxr = OpenComposite (qvfr\\opencomposite\\openvr_api.dll next to the proxy) talks to an OpenXR runtime.\n"
+    "path=openvr\n"
+    "; openxr: another OpenComposite DLL (full path, or relative to the proxy's folder); empty = the default above.\n"
+    "opencomposite=\n"
+    "; openxr: empty = the OpenXR runtime that is active in the system; steamvr = SteamVR's runtime (only for the game,\n"
+    "; the system setting does not change); or the full path of a runtime .json.\n"
+    "openxr_runtime=\n"
+    "; openxr: 1 = the proxy's OpenXR API layer reads the gaze (XR_EXT_eye_gaze_interaction) under OpenComposite.\n"
+    "openxr_layer=1\n"
+    "\n"
     "[proxy]\n"
     "; 1 = the proxy wraps IVRSystem, IVRCompositor and IVROverlay (logs, timings, benchmark).\n"
     "; 0 = the game gets the real interfaces and the proxy only logs startup (fallback).\n"
@@ -211,6 +223,12 @@ float IniFloat(const fs::path& ini, const wchar_t* sec, const wchar_t* key, floa
     return buf[0] ? (float)_wtof(buf) : def;
 }
 
+std::wstring IniPathValue(const fs::path& ini, const wchar_t* sec, const wchar_t* key) {
+    wchar_t buf[1024];
+    GetPrivateProfileStringW(sec, key, L"", buf, 1024, ini.c_str());
+    return buf;
+}
+
 bool IniHas(const fs::path& ini, const wchar_t* sec, const wchar_t* key) {
     wchar_t buf[8];
     GetPrivateProfileStringW(sec, key, L"", buf, 8, ini.c_str());
@@ -359,6 +377,15 @@ namespace {
 
 Config ReadConfig(const fs::path& ini) {
     Config c;
+    const std::string path = IniString(ini, L"runtime", L"path", L"openvr");
+    if (path == "openxr") {
+        c.pathOpenXr = true;
+    } else if (path != "openvr") {
+        Log("Settings: unknown [runtime] path=\"%s\", using openvr", path.c_str());
+    }
+    c.openComposite = IniPathValue(ini, L"runtime", L"opencomposite");
+    c.openxrRuntime = IniPathValue(ini, L"runtime", L"openxr_runtime");
+    c.openxrLayer = IniInt(ini, L"runtime", L"openxr_layer", 1) != 0;
     c.wrap = IniInt(ini, L"proxy", L"wrap", 1) != 0;
     c.firstCalls = IniInt(ini, L"log", L"first_calls", c.firstCalls);
     c.statsIntervalS = IniInt(ini, L"log", L"stats_interval_s", c.statsIntervalS);
@@ -494,6 +521,9 @@ void LoadConfig() {
     NoteIniTime();
     Config c = ReadConfig(ini);
     g_cfg = c;
+    Log("Settings %s: [runtime] path=%s opencomposite=\"%s\" openxr_runtime=\"%s\" openxr_layer=%d",
+        Narrow(ini.wstring()).c_str(), c.pathOpenXr ? "openxr" : "openvr", Narrow(c.openComposite).c_str(),
+        Narrow(c.openxrRuntime).c_str(), c.openxrLayer);
     Log("Settings %s: wrap=%d first_calls=%d stats_interval_s=%d csv_always=%d gpu=%d | benchmark: modifier=0x%X key=0x%X "
         "delay_s=%.1f duration_s=%.1f freeze_pose=%d beep=%d auto_start_s=%.1f | gaze read=%d | experiment: mode=%s "
         "focus_size=%.3f center=(%.3f, %.3f) pad=%d",
@@ -518,6 +548,9 @@ bool ReloadConfig() {
     auto need = [&](bool changed, const char* name) {
         if (changed) restart += restart.empty() ? name : std::string(", ") + name;
     };
+    need(n.pathOpenXr != c.pathOpenXr || n.openComposite != c.openComposite || n.openxrRuntime != c.openxrRuntime ||
+             n.openxrLayer != c.openxrLayer,
+         "[runtime]");
     need(n.wrap != c.wrap, "[proxy] wrap");
     need(n.firstCalls != c.firstCalls, "[log] first_calls");
     need(n.csvAlways != c.csvAlways, "[timing] csv_always");

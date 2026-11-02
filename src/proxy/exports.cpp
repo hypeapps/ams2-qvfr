@@ -2,7 +2,9 @@
 // and VR_GetVRInitErrorAsEnglishDescription; the other main functions are handled here too. The remaining exports
 // (flat C API, Unity) are forwarded to the original by generated/forwards.inc.
 //
-// Original: openvr_api_orig.dll next to the proxy (the official Valve 0.9.12 DLL, the same one the game ships).
+// Backend ([runtime] path, runtime.cpp): openvr = openvr_api_orig.dll next to the proxy (the official Valve 0.9.12 DLL,
+// the same one the game ships); openxr = OpenComposite. The forwarded exports always go to openvr_api_orig.dll
+// (thunks to the chosen backend: M8.2).
 
 #include <windows.h>
 
@@ -22,6 +24,7 @@
 #include "modern_vr.h"
 #include "probe.h"
 #include "quad.h"
+#include "runtime.h"
 #include "sysinfo.h"
 #include "wrappers.h"
 
@@ -36,6 +39,8 @@ HMODULE g_orig = nullptr;
 std::once_flag g_once;
 
 constexpr const char* kOrigMd5 = "864be5a92276ce2b902b6f3a0f850703";  // official openvr_api.dll 0.9.12 (win64)
+// OpenComposite builds seen on the user's machine (only named in the log).
+constexpr const char* kOpenCompositeMd5 = "1a89f94450ab870d74b5c20da2e52d85";  // 2025-10-17, the user's copy
 
 struct Orig {
     vr::IVRSystem*(VR_CALLTYPE* init)(vr::EVRInitError*, vr::EVRApplicationType) = nullptr;
@@ -51,7 +56,7 @@ struct Orig {
     vr::IVROverlay*(VR_CALLTYPE* overlay)() = nullptr;
 } g_fn;
 
-const char kNoOrig[] = "ams2-qvfr: openvr_api_orig.dll not found next to the proxy";
+const char kNoOrig[] = "ams2-qvfr: the backend DLL (openvr_api_orig.dll or OpenComposite) could not be loaded";
 
 wchar_t g_origPath[MAX_PATH + 32] = {};
 DWORD g_loadError = 0;
@@ -64,19 +69,24 @@ void Resolve(T& fn, const char* name) {
     if (!fn && g_missingCount < 16) g_missing[g_missingCount++] = name;
 }
 
-// Loads the real DLL with plain Win32 calls that cannot throw, before any diagnostics: a failing log,
-// ini or hash must never keep the game from starting VR.
-void LoadOriginal() noexcept {
-    wchar_t self[MAX_PATH] = {};
-    DWORD n = GetModuleFileNameW(g_self, self, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) {
-        g_loadError = n ? ERROR_INSUFFICIENT_BUFFER : GetLastError();
-        return;
+// Loads the real DLL with plain Win32 calls that cannot throw. `backend` comes from runtime::Prepare; when it is empty
+// (the settings or Prepare failed) the default openvr_api_orig.dll next to the proxy is used, so a failing log, ini or
+// hash never keeps the game from starting VR.
+void LoadOriginal(const wchar_t* backend) noexcept {
+    if (backend && backend[0] && wcslen(backend) < _countof(g_origPath)) {
+        wcscpy_s(g_origPath, backend);
+    } else {
+        wchar_t self[MAX_PATH] = {};
+        DWORD n = GetModuleFileNameW(g_self, self, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH) {
+            g_loadError = n ? ERROR_INSUFFICIENT_BUFFER : GetLastError();
+            return;
+        }
+        wchar_t* slash = wcsrchr(self, L'\\');
+        size_t dirLen = slash ? (size_t)(slash - self + 1) : 0;
+        wmemcpy(g_origPath, self, dirLen);
+        wcscpy_s(g_origPath + dirLen, _countof(g_origPath) - dirLen, L"openvr_api_orig.dll");
     }
-    wchar_t* slash = wcsrchr(self, L'\\');
-    size_t dirLen = slash ? (size_t)(slash - self + 1) : 0;
-    wmemcpy(g_origPath, self, dirLen);
-    wcscpy_s(g_origPath + dirLen, _countof(g_origPath) - dirLen, L"openvr_api_orig.dll");
     g_orig = LoadLibraryExW(g_origPath, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     if (!g_orig || g_orig == g_self) {
         g_loadError = g_orig ? ERROR_INVALID_HANDLE : GetLastError();
@@ -96,32 +106,45 @@ void LoadOriginal() noexcept {
     Resolve(g_fn.overlay, "VROverlay");
 }
 
-void LogStartup() {
+void LogHeader() {
     wchar_t self[MAX_PATH] = {};
     GetModuleFileNameW(g_self, self, MAX_PATH);
     Log("ams2-qvfr openvr_api.dll proxy, build " __DATE__ " " __TIME__);
     Log("Proxy: %s", Narrow(self).c_str());
+}
+
+void LogStartup() {
     sysinfo::LogProcessInfo();
+    runtime::LogStartup();
 
     fs::path orig = g_origPath;
     std::error_code ec;
     auto size = fs::file_size(orig, ec);
     std::string md5 = sysinfo::HashFile(orig, BCRYPT_MD5_ALGORITHM);
-    Log("Original: %s (%llu B, MD5 %s%s)", Narrow(orig.wstring()).c_str(), ec ? 0ull : (unsigned long long)size,
-        md5.c_str(), md5 == kOrigMd5 ? ", official 0.9.12" : ", NOT THE OFFICIAL 0.9.12");
+    const char* what = md5 == kOrigMd5            ? ", official Valve 0.9.12"
+                       : md5 == kOpenCompositeMd5 ? ", OpenComposite 2025-10-17 (the user's copy)"
+                       : runtime::OpenXrPath()    ? ", OpenComposite of unknown build"
+                                                  : ", NOT THE OFFICIAL 0.9.12";
+    Log("Backend: %s (%llu B, MD5 %s%s)", Narrow(orig.wstring()).c_str(), ec ? 0ull : (unsigned long long)size,
+        md5.c_str(), what);
     if (!g_orig) {
-        Log("ERROR: cannot load the original (error %lu). The game will not start VR.", g_loadError);
+        Log("ERROR: cannot load the backend (error %lu). The game will not start VR.", g_loadError);
         return;
     }
-    for (int i = 0; i < g_missingCount; ++i) Log("ERROR: the original has no export %s", g_missing[i]);
+    for (int i = 0; i < g_missingCount; ++i) Log("ERROR: the backend has no export %s", g_missing[i]);
     sysinfo::LogGameConfig();
     sysinfo::LogModules("proxy start");
 }
 
 bool Ready() {
     std::call_once(g_once, [] {
-        LoadOriginal();
+        // The settings come first: [runtime] picks the backend and prepares the OpenXR loader's environment before
+        // OpenComposite is loaded. A fault there leaves `backend` empty and LoadOriginal takes the default.
+        std::wstring backend;
+        Guarded("LogHeader", LogHeader);
         Guarded("LoadConfig", LoadConfig);
+        Guarded("runtime::Prepare", [&] { backend = runtime::Prepare(g_self); });
+        LoadOriginal(backend.c_str());
         Guarded("LogStartup", LogStartup);
     });
     return g_orig != nullptr;
@@ -159,7 +182,20 @@ IVRSystem* VR_CALLTYPE VR_Init(EVRInitError* peError, EVRApplicationType eApplic
         Log("wrap=0: the game gets the real interfaces");
         return real;
     }
-    if (g_fn.getGeneric) modern::Init(reinterpret_cast<modern::GetGenericFn>(g_fn.getGeneric));
+    // OpenComposite answers an interface it does not implement with a message box ("Missing interface") and an abort,
+    // not with an error code, so on the OpenXR path the proxy never asks it for the newer SteamVR interfaces.
+    if (g_fn.getGeneric && !runtime::OpenXrPath())
+        modern::Init(reinterpret_cast<modern::GetGenericFn>(g_fn.getGeneric));
+    frame::NoteSystem(real);  // eye frusta for the gaze from the OpenXR layer
+    Guarded("VR_Init (backend log)", [] {
+        if (!modern::HasSystem())
+            Log("%s: gaze %s, no SteamVR frame timing (GPU timestamps only)",
+                runtime::OpenXrPath() ? "path=openxr: IVRSystem_026 and IVRCompositor_029 not requested (OpenComposite "
+                                        "aborts on interfaces it does not have)"
+                                      : modern::HasCompositor() ? "Backend has no IVRSystem_026"
+                                                                : "Backend has no IVRSystem_026 and no IVRCompositor_029",
+                runtime::OpenXrPath() ? "through the OpenXR layer" : "unavailable");
+    });
     Guarded("LogModules", [] { sysinfo::LogModules("after VR_Init"); });
     probe::Install();  // [quad] mode=probe; guards itself
     quad::Install();   // [quad] mode=quad; guards itself

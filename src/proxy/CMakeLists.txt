@@ -33,10 +33,12 @@ add_library(qvfr_proxy SHARED
   quad.cpp
   shots.cpp
   modern_vr.cpp
+  runtime.cpp
+  xr_layer.cpp
   sysinfo.cpp
   common.cpp
 )
-target_link_libraries(qvfr_proxy PRIVATE qvfr_shaders openvr_0912 minhook bcrypt version psapi shell32 ole32 windowscodecs)
+target_link_libraries(qvfr_proxy PRIVATE qvfr_shaders openvr_0912 openxr_headers minhook bcrypt version psapi shell32 ole32 windowscodecs)
 target_compile_definitions(qvfr_proxy PRIVATE VR_API_EXPORT)
 # /EHa instead of the default /EHsc: an SEH fault caught by Guarded/Safe then unwinds C++ objects (lock_guard),
 # so no mutex stays locked after a fault in our code. Directory scope: only this target is built here.

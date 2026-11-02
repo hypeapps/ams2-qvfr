@@ -18,3 +18,7 @@ add_library(minhook STATIC
 )
 target_include_directories(minhook PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/minhook/include)
 target_compile_options(minhook PRIVATE /W3)
+
+# OpenXR SDK 1.1.65: headers only, for the OpenXR API layer in the proxy (path=openxr, M8).
+add_library(openxr_headers INTERFACE)
+target_include_directories(openxr_headers INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/openxr-1.1.65/include)

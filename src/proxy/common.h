@@ -34,6 +34,11 @@ enum class QuadMode { Off, Probe, Quad };
 const char* QuadModeName(QuadMode m);
 
 struct Config {
+    // [runtime] (M8: what stands behind the proxy; read before the backend DLL is loaded, a change needs a restart)
+    bool pathOpenXr = false;          // path=openvr: the Valve DLL; path=openxr: OpenComposite to the OpenXR runtime
+    std::wstring openComposite;       // opencomposite=: OpenComposite DLL (empty = the default next to the proxy)
+    std::wstring openxrRuntime;       // openxr_runtime=: empty = the system's active runtime, steamvr, or a .json path
+    bool openxrLayer = true;          // openxr_layer=: our OpenXR API layer for the gaze on the OpenXR path
     // [proxy]
     bool wrap = true;                 // 0 = the game gets the real interfaces, the proxy only logs startup
     // [log]

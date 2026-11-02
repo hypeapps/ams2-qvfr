@@ -20,12 +20,77 @@
 #include "modern_vr.h"
 #include "quad.h"
 #include "sysinfo.h"
+#include "xr_layer.h"
 
 namespace qvfr::frame {
 
 namespace {
 
 std::mutex g_mutex;  // WaitGetPoses and Submit may arrive from different threads
+
+// ---------------------------------------------------------------- gaze from the OpenXR layer (path=openxr)
+
+vr::IVRSystem* g_sys = nullptr;  // the backend's IVRSystem_009
+
+// Per eye: what projects a head-relative direction to NDC of GetProjectionMatrix, the same NDC that
+// GetEyeTrackedFoveationCenter gives on the OpenVR path.
+struct EyeMap {
+    bool ok = false;
+    float m00 = 0, m02 = 0, m11 = 0, m12 = 0;
+    float rot[3][3] = {};  // eye-to-head rotation (GetEyeToHeadTransform)
+};
+EyeMap g_eyeMap[2];
+bool g_eyeMapTried = false;
+
+void BuildEyeMaps() {
+    g_eyeMapTried = true;
+    if (!g_sys) return;
+    for (int i = 0; i < 2; ++i) {
+        const vr::EVREye ev = i ? vr::Eye_Right : vr::Eye_Left;
+        const vr::HmdMatrix44_t m = g_sys->GetProjectionMatrix(ev, 0.1f, 100.0f, vr::API_DirectX);
+        const vr::HmdMatrix34_t e = g_sys->GetEyeToHeadTransform(ev);
+        EyeMap& em = g_eyeMap[i];
+        em.m00 = m.m[0][0];
+        em.m02 = m.m[0][2];
+        em.m11 = m.m[1][1];
+        em.m12 = m.m[1][2];
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 3; ++c) em.rot[r][c] = e.m[r][c];
+        em.ok = em.m00 != 0 && em.m11 != 0;
+        Log("Gaze (OpenXR layer): %s eye projection m00 %.5f m02 %.5f m11 %.5f m12 %.5f, eye-to-head rotation rows "
+            "(%.4f %.4f %.4f) (%.4f %.4f %.4f) (%.4f %.4f %.4f), offset (%.4f, %.4f, %.4f) m",
+            i ? "right" : "left", em.m00, em.m02, em.m11, em.m12, e.m[0][0], e.m[0][1], e.m[0][2], e.m[1][0], e.m[1][1],
+            e.m[1][2], e.m[2][0], e.m[2][1], e.m[2][2], e.m[0][3], e.m[1][3], e.m[2][3]);
+    }
+}
+
+// The layer's gaze as the OpenVR path delivers it: NDC per eye (x right, y up) and the direction in degrees.
+// The eye position offset is ignored (the gaze target is far away compared with half the IPD).
+void XrGaze(modern::Gaze& g) {
+    g = modern::Gaze{};
+    xrlayer::Gaze x;
+    if (!xrlayer::ReadGaze(x) || !x.ok) return;
+    if (!g_eyeMapTried) BuildEyeMaps();
+    float ndc[2][2] = {};
+    for (int i = 0; i < 2; ++i) {
+        const EyeMap& em = g_eyeMap[i];
+        if (!em.ok) return;
+        double d[3];
+        for (int c = 0; c < 3; ++c) d[c] = em.rot[0][c] * x.dir[0] + em.rot[1][c] * x.dir[1] + em.rot[2][c] * x.dir[2];
+        if (d[2] > -1e-3) return;  // not in front of the eye
+        const double tx = d[0] / -d[2], ty = d[1] / -d[2];
+        ndc[i][0] = (float)(em.m00 * tx - em.m02);
+        ndc[i][1] = (float)(em.m11 * ty - em.m12);
+    }
+    g.ok = true;
+    g.ndcL[0] = ndc[0][0];
+    g.ndcL[1] = ndc[0][1];
+    g.ndcR[0] = ndc[1][0];
+    g.ndcR[1] = ndc[1][1];
+    constexpr double kRadToDeg = 57.29577951308232;
+    g.degX = (float)(std::atan2(x.dir[0], -x.dir[2]) * kRadToDeg);
+    g.degY = (float)(std::atan2(x.dir[1], -x.dir[2]) * kRadToDeg);
+}
 
 // ---------------------------------------------------------------- proxy frame data
 
@@ -612,6 +677,12 @@ std::string DescribeTexture(void* handle, int type) {
 
 // ---------------------------------------------------------------- API
 
+void NoteSystem(vr::IVRSystem* real) {
+    std::lock_guard lock(g_mutex);
+    g_sys = real;
+    g_eyeMapTried = false;
+}
+
 void OnWaitGetPosesBegin() {
     Guarded("WaitGetPoses (before)", [&] {
         std::lock_guard lock(g_mutex);
@@ -658,9 +729,14 @@ void OnWaitGetPosesEnd(vr::IVRCompositor* real, vr::TrackedDevicePose_t* render,
         OpenSessionCsv();
         ProcessTimings(rows, n);
 
-        if (Cfg().gazeRead && modern::HasSystem()) {
+        const bool xrGaze = !modern::HasSystem() && xrlayer::Loaded();
+        if (Cfg().gazeRead && (modern::HasSystem() || xrGaze)) {
             modern::Gaze g;
-            modern::ReadGaze(g);
+            if (xrGaze) {
+                XrGaze(g);
+            } else {
+                modern::ReadGaze(g);
+            }
             g_cur.gaze = g;
             ++g_gazeCalls;
             g_gazeOk += g.ok;
@@ -677,10 +753,13 @@ void OnWaitGetPosesEnd(vr::IVRCompositor* real, vr::TrackedDevicePose_t* render,
                 g_valueSinceMs = g_valueLastMs = g.ok ? g_cur.wgpExit : -1;
                 g_valueFrames = g.ok ? 1 : 0;
             }
-            if (!g_gazeFirstLogged) {
+            // The OpenXR layer has no gaze until OpenComposite attaches its action sets, so its first valid one is logged.
+            if (!g_gazeFirstLogged && (!xrGaze || g.ok)) {
                 g_gazeFirstLogged = true;
-                Log("Gaze in game: GetEyeTrackedFoveationCenter = %d, NDC L (%.4f, %.4f) R (%.4f, %.4f), direction (%.2f°, %.2f°)",
-                    g.ok, g.ndcL[0], g.ndcL[1], g.ndcR[0], g.ndcR[1], g.degX, g.degY);
+                Log("Gaze in game (%s): valid %d at proxy frame %llu, NDC L (%.4f, %.4f) R (%.4f, %.4f), direction "
+                    "(%.2f°, %.2f°)",
+                    xrGaze ? "OpenXR layer, XR_EXT_eye_gaze_interaction" : "GetEyeTrackedFoveationCenter", g.ok,
+                    (unsigned long long)g_proxyFrames, g.ndcL[0], g.ndcL[1], g.ndcR[0], g.ndcR[1], g.degX, g.degY);
             }
             g_prevGaze = g;
         }
