@@ -16,6 +16,7 @@
 
 #include "common.h"
 #include "experiment.h"
+#include "gpu.h"
 #include "modern_vr.h"
 #include "quad.h"
 #include "sysinfo.h"
@@ -29,6 +30,7 @@ std::mutex g_mutex;  // WaitGetPoses and Submit may arrive from different thread
 // ---------------------------------------------------------------- proxy frame data
 
 struct ProxyFrame {
+    uint64_t no = 0;          // proxy frame number (also the GPU timing frame)
     uint32_t compIndex = 0;   // m_nFrameIndex of the newest compositor frame right after WaitGetPoses
     double wgpEnter = 0, wgpExit = 0, lastSubmit = 0;
     float wgpBlockMs = 0;
@@ -36,11 +38,13 @@ struct ProxyFrame {
     float submitMs = 0;       // total time spent in Submit
     int submits = 0;
     modern::Gaze gaze;
+    bool frozen = false;
     bool valid = false;
 };
 
 constexpr uint32_t kRing = 128;
-ProxyFrame g_ring[kRing];
+ProxyFrame g_ring[kRing];   // by compositor frame index (joined with GetFrameTimings rows)
+ProxyFrame g_byNo[kRing];   // by proxy frame number (frames.csv)
 ProxyFrame g_cur;
 uint64_t g_proxyFrames = 0;
 int g_badSubmitLogs = 0;
@@ -90,6 +94,26 @@ double g_runSysT0 = -1;
 double g_sessionSysT0 = -1;
 modern::Cumulative g_cumStart{};
 
+// frames.csv: one row per proxy frame with our own GPU timestamps; works without SteamVR frame timing.
+struct GpuRow {
+    uint64_t no = 0;
+    bool ok = false;
+    gpu::Result r;
+};
+GpuRow g_gpuRows[kRing];
+uint64_t g_framesNext = 1;    // next proxy frame number to write
+uint64_t g_runFirstNo = 0;    // first proxy frame of the benchmark
+FILE* g_runFrames = nullptr;
+FILE* g_sessionFrames = nullptr;
+double g_runFramesT0 = -1, g_sessionFramesT0 = -1;
+// Frames a GPU result may take before the row is written without it (gpu.cpp keeps 6 frames in flight).
+constexpr uint64_t kGpuWait = 8;
+// GPU averages for the periodic stats line.
+struct GpuSums {
+    uint64_t frames = 0, n[gpu::kPhases] = {};
+    double frame = 0, phase[gpu::kPhases] = {};
+} g_gpuSums;
+
 bool g_frozen = false;
 vr::TrackedDevicePose_t g_frozenPose{};
 vr::ETrackingUniverseOrigin g_trackingSpace = vr::TrackingUniverseSeated;
@@ -101,6 +125,9 @@ struct Series {
 };
 struct RunStats {
     Series totalGpu, preGpu, postGpu, compGpu, compCpu, proxyInterval, proxyCpu, wgpBlock;
+    Series gpuFrame, gpuPhase[gpu::kPhases], gpuCompose, gpuOther;  // our timestamps (frames.csv)
+    uint64_t proxyRows = 0;
+    double proxyFirstMs = -1, proxyLastMs = -1;
     uint64_t frames = 0, dropped = 0, mispresented = 0, reprojCpu = 0, reprojGpu = 0, reprojAny = 0, gazeOk = 0;
     double sysFirst = -1, sysLast = -1;
 } g_run;
@@ -111,6 +138,10 @@ const char kCsvHeader[] =
     "submit_frame_ms,present_call_cpu_ms,wait_for_present_cpu_ms,presents,mispresented,dropped,reprojection_flags,"
     "vsyncs_ready,vsyncs_to_first_view,transfer_latency_ms,proxy_interval_ms,proxy_cpu_ms,proxy_wgp_block_ms,proxy_submit_ms,"
     "proxy_submits,gaze_ok,gaze_x_deg,gaze_y_deg,frozen\n";
+
+const char kFramesHeader[] =
+    "frame,t_s,interval_ms,cpu_ms,wgp_block_ms,submit_ms,submits,gpu_frame_ms,gpu_outer_l_ms,gpu_outer_r_ms,"
+    "gpu_focus_l_ms,gpu_focus_r_ms,gpu_compose_ms,gpu_other_ms,gaze_ok,gaze_x_deg,gaze_y_deg,frozen\n";
 
 void Beeps(std::vector<std::pair<int, int>> tones) {
     if (!Cfg().benchBeep) return;
@@ -147,6 +178,97 @@ void WriteRow(FILE* f, const modern::FrameTiming& t, double t0, const ProxyFrame
 const ProxyFrame* FindProxy(uint32_t compIndex) {
     const ProxyFrame& p = g_ring[compIndex % kRing];
     return p.valid && p.compIndex == compIndex ? &p : nullptr;
+}
+
+void Field(FILE* f, float ms) {
+    if (ms >= 0)
+        fprintf(f, "%.3f,", ms);
+    else
+        fputc(',', f);
+}
+
+// Compose = both eyes; other = the frame span minus the measured groups and the composition (shadows, reflections,
+// postmain, the SteamVR copy of the left eye...).
+float ComposeMs(const gpu::Result& r) {
+    float a = r.phaseMs[gpu::ComposeL], b = r.phaseMs[gpu::ComposeR];
+    return a < 0 && b < 0 ? -1 : std::max(a, 0.0f) + std::max(b, 0.0f);
+}
+
+float OtherMs(const gpu::Result& r) {
+    if (r.frameMs < 0) return -1;
+    float o = r.frameMs;
+    for (int p = 0; p < gpu::kPhases; ++p) o -= std::max(r.phaseMs[p], 0.0f);
+    return o;
+}
+
+void WriteFramesRow(FILE* f, const ProxyFrame& p, const gpu::Result* g, double& t0) {
+    if (t0 < 0) t0 = p.wgpExit;
+    float cpu = p.submits ? (float)(p.lastSubmit - p.wgpExit) : 0.0f;
+    fprintf(f, "%llu,%.4f,%.3f,%.3f,%.3f,%.3f,%d,", (unsigned long long)p.no, (p.wgpExit - t0) / 1000.0, p.intervalMs,
+            cpu, p.wgpBlockMs, p.submitMs, p.submits);
+    if (g) {
+        Field(f, g->frameMs);
+        for (int k = gpu::OuterL; k <= gpu::FocusR; ++k) Field(f, g->phaseMs[k]);
+        Field(f, ComposeMs(*g));
+        Field(f, OtherMs(*g));
+    } else {
+        fputs(",,,,,,,", f);
+    }
+    fprintf(f, "%d,%.2f,%.2f,%d\n", p.gaze.ok, p.gaze.degX, p.gaze.degY, p.frozen ? 1 : 0);
+}
+
+void AccumulateFrame(const ProxyFrame& p, const gpu::Result* g) {
+    RunStats& r = g_run;
+    ++r.proxyRows;
+    if (r.proxyFirstMs < 0) r.proxyFirstMs = p.wgpExit;
+    r.proxyLastMs = p.wgpExit;
+    if (!g) return;
+    if (g->frameMs >= 0) r.gpuFrame.Add(g->frameMs);
+    for (int k = 0; k < gpu::kPhases; ++k)
+        if (g->phaseMs[k] >= 0) r.gpuPhase[k].Add(g->phaseMs[k]);
+    if (float c = ComposeMs(*g); c >= 0) r.gpuCompose.Add(c);
+    if (float o = OtherMs(*g); o >= 0) r.gpuOther.Add(o);
+}
+
+// Rows of complete proxy frames (saved at the next WaitGetPoses) once their GPU result is in, or kGpuWait frames
+// later without it. `current` is the frame that just started.
+void ProcessFrames(uint64_t current) {
+    gpu::Result res[16];
+    int n;
+    while ((n = gpu::Take(res, 16)) > 0) {
+        for (int i = 0; i < n; ++i) {
+            GpuRow& row = g_gpuRows[res[i].frame % kRing];
+            row.no = res[i].frame;
+            row.ok = true;
+            row.r = res[i];
+            const gpu::Result& g = res[i];
+            if (g.frameMs >= 0) {
+                ++g_gpuSums.frames;
+                g_gpuSums.frame += g.frameMs;
+            }
+            for (int k = 0; k < gpu::kPhases; ++k) {
+                if (g.phaseMs[k] < 0) continue;
+                ++g_gpuSums.n[k];
+                g_gpuSums.phase[k] += g.phaseMs[k];
+            }
+        }
+    }
+    if (current > g_framesNext + kRing / 2) g_framesNext = current - kRing / 2;  // after a long stall
+    const bool waitGpu = gpu::Enabled();
+    while (g_framesNext < current) {
+        const uint64_t no = g_framesNext;
+        const ProxyFrame& p = g_byNo[no % kRing];
+        const GpuRow& row = g_gpuRows[no % kRing];
+        const gpu::Result* g = row.ok && row.no == no ? &row.r : nullptr;
+        if (!g && waitGpu && current - no <= kGpuWait) break;
+        ++g_framesNext;
+        if (!p.valid || p.no != no) continue;
+        if (g_sessionFrames) WriteFramesRow(g_sessionFrames, p, g, g_sessionFramesT0);
+        if (g_bench == Bench::Running && no >= g_runFirstNo) {
+            if (g_runFrames) WriteFramesRow(g_runFrames, p, g, g_runFramesT0);
+            AccumulateFrame(p, g);
+        }
+    }
 }
 
 void AccumulateRun(const modern::FrameTiming& t, const ProxyFrame* p) {
@@ -207,9 +329,13 @@ void StartRun(uint32_t newestIndex) {
     fs::create_directories(g_runDir, ec);
     g_runCsv = _wfopen((g_runDir / L"timing.csv").c_str(), L"wb");
     if (g_runCsv) fputs(kCsvHeader, g_runCsv);
+    g_runFrames = _wfopen((g_runDir / L"frames.csv").c_str(), L"wb");
+    if (g_runFrames) fputs(kFramesHeader, g_runFrames);
+    g_runFramesT0 = -1;
     g_run = RunStats{};
     experiment::MarkRunStart();
     g_runFirstIndex = newestIndex + 1;
+    g_runFirstNo = g_proxyFrames + 1;
     g_runSysT0 = -1;
     modern::GetCumulative(g_cumStart);
     g_bench = Bench::Running;
@@ -238,6 +364,10 @@ void FinishRun(bool aborted) {
         fclose(g_runCsv);
         g_runCsv = nullptr;
     }
+    if (g_runFrames) {
+        fclose(g_runFrames);
+        g_runFrames = nullptr;
+    }
     modern::Cumulative end{};
     bool cum = modern::GetCumulative(end);
     RunStats& r = g_run;
@@ -264,6 +394,18 @@ void FinishRun(bool aborted) {
     lines.push_back(StatLine("Frame interval (proxy)", r.proxyInterval, budget * 1.5f));
     lines.push_back(StatLine("Game CPU WGP->Submit (proxy)", r.proxyCpu, budget));
     lines.push_back(StatLine("Wait in WGP (proxy)", r.wgpBlock));
+    double pdur = r.proxyLastMs > r.proxyFirstMs ? (r.proxyLastMs - r.proxyFirstMs) / 1000.0 : 0;
+    snprintf(buf, sizeof(buf), "Proxy frames %llu in %.2f s (%.2f fps); GPU spans from proxy timestamps "
+             "(frames.csv, GPU time between points in the game's commands, idle included):",
+             (unsigned long long)r.proxyRows, pdur, pdur > 0 ? (r.proxyRows - 1) / pdur : 0.0);
+    lines.push_back(buf);
+    lines.push_back(StatLine("GPU frame (WGP->last Submit)", r.gpuFrame, budget));
+    static const char* const phaseLabels[gpu::kPhases] = {"GPU outer L", "GPU outer R", "GPU focus L", "GPU focus R",
+                                                          "GPU compose L", "GPU compose R"};
+    for (int k = 0; k < gpu::kPhases; ++k)
+        if (!r.gpuPhase[k].v.empty()) lines.push_back(StatLine(phaseLabels[k], r.gpuPhase[k]));
+    if (!r.gpuCompose.v.empty()) lines.push_back(StatLine("GPU compose (both eyes)", r.gpuCompose));
+    lines.push_back(StatLine("GPU other (frame - phases)", r.gpuOther));
     snprintf(buf, sizeof(buf), "Dropped %llu, mispresented %llu, reprojected frames %llu (CPU %llu, GPU %llu), gaze valid %.1f%%",
              (unsigned long long)r.dropped, (unsigned long long)r.mispresented, (unsigned long long)r.reprojAny,
              (unsigned long long)r.reprojCpu, (unsigned long long)r.reprojGpu, r.frames ? 100.0 * r.gazeOk / r.frames : 0.0);
@@ -318,7 +460,10 @@ void OpenSessionCsv() {
     fs::create_directories(dir, ec);
     g_sessionCsv = _wfopen((dir / L"timing.csv").c_str(), L"wb");
     if (g_sessionCsv) fputs(kCsvHeader, g_sessionCsv);
-    Log("Session CSV: %s", Narrow((dir / L"timing.csv").wstring()).c_str());
+    g_sessionFrames = _wfopen((dir / L"frames.csv").c_str(), L"wb");
+    if (g_sessionFrames) fputs(kFramesHeader, g_sessionFrames);
+    g_sessionFramesT0 = -1;
+    Log("Session CSV: %s (timing.csv, frames.csv)", Narrow(dir.wstring()).c_str());
 }
 
 void ProcessTimings(const modern::FrameTiming* rows, uint32_t n) {
@@ -357,6 +502,15 @@ void PeriodicStats() {
         Log("Gaze: valid in %.1f%% of frames, same value as the previous frame in %.1f%%, last (%.1f°, %.1f°)",
             100.0 * g_gazeOk / g_gazeCalls, 100.0 * g_gazeSame / g_gazeCalls, g_prevGaze.degX, g_prevGaze.degY);
     }
+    if (g_gpuSums.frames) {
+        const GpuSums& s = g_gpuSums;
+        auto avg = [&](int k) { return s.n[k] ? s.phase[k] / s.n[k] : -1.0; };
+        Log("GPU (proxy timestamps, %llu frames): frame %.2f ms; outer L %.2f, outer R %.2f, focus L %.2f, focus R "
+            "%.2f, compose L %.2f, compose R %.2f ms (-1 = did not run)",
+            (unsigned long long)s.frames, s.frame / s.frames, avg(gpu::OuterL), avg(gpu::OuterR), avg(gpu::FocusL),
+            avg(gpu::FocusR), avg(gpu::ComposeL), avg(gpu::ComposeR));
+    }
+    g_gpuSums = GpuSums{};
     LogCallStats(false);
     g_statsFrames = g_gazeOk = g_gazeSame = g_gazeCalls = g_submitsInInterval = 0;
 }
@@ -434,6 +588,7 @@ void OnWaitGetPosesBegin() {
             }
             g_cur.valid = true;
             g_ring[g_cur.compIndex % kRing] = g_cur;
+            g_byNo[g_cur.no % kRing] = g_cur;
         }
         g_cur = ProxyFrame{};
         g_cur.wgpEnter = now;
@@ -449,7 +604,9 @@ void OnWaitGetPosesEnd(vr::IVRCompositor* real, vr::TrackedDevicePose_t* render,
         std::lock_guard lock(g_mutex);
         ++g_proxyFrames;
         ++g_statsFrames;
+        g_cur.no = g_proxyFrames;
         g_cur.wgpExit = NowMs();
+        gpu::FrameStart(g_proxyFrames);
         g_cur.wgpBlockMs = (float)blockMs;
         if (!g_trackingSpaceKnown) {
             g_trackingSpace = real->GetTrackingSpace();
@@ -486,8 +643,13 @@ void OnWaitGetPosesEnd(vr::IVRCompositor* real, vr::TrackedDevicePose_t* render,
             *static_cast<volatile int*>(nullptr) = 0;
         }
 
+        ProcessFrames(g_proxyFrames);
         HandleHotkey(newest);
         PeriodicStats();
+        ReloadConfig();
+        g_cur.frozen = g_frozen;
+        // Gaze for the debug overlay (and later DFR); after the hotkeys, so a frozen gaze is applied there.
+        quad::SetGaze(g_cur.gaze.ok, g_cur.gaze.ndcL, g_cur.gaze.ndcR);
 
         if (g_frozen) {
             if (!g_frozenPose.bPoseIsValid && render && nRender > 0 && render[0].bPoseIsValid) {
@@ -617,9 +779,17 @@ void OnShutdown() {
             fclose(g_sessionCsv);
             g_sessionCsv = nullptr;
         }
+        if (g_sessionFrames) {
+            fclose(g_sessionFrames);
+            g_sessionFrames = nullptr;
+        }
         Log("VR session end: %llu proxy frames", (unsigned long long)g_proxyFrames);
         // Per-session state, in case the game starts VR again in the same process.
         for (auto& f : g_ring) f = ProxyFrame{};
+        for (auto& f : g_byNo) f = ProxyFrame{};
+        for (auto& r : g_gpuRows) r = GpuRow{};
+        g_framesNext = g_proxyFrames + 1;
+        g_gpuSums = GpuSums{};
         g_cur = ProxyFrame{};
         g_prevWgpEnter = 0;
         g_lastWrittenIndex = 0;

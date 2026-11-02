@@ -35,7 +35,7 @@ void OpenLogLocked() {
 
 const char kDefaultIni[] =
     "; ams2-qvfr: openvr_api.dll proxy settings. The file is created on the first game start.\n"
-    "; Changes take effect after restarting the game.\n"
+    "; Most changes take effect after restarting the game; the live ones are listed at the end.\n"
     "\n"
     "[proxy]\n"
     "; 1 = the proxy wraps IVRSystem, IVRCompositor and IVROverlay (logs, timings, benchmark).\n"
@@ -51,6 +51,9 @@ const char kDefaultIni[] =
     "[timing]\n"
     "; 1 = frame timing CSV for the whole session (Documents\\ams2-qvfr\\bench\\<date>_session\\), 0 = only during a benchmark.\n"
     "csv_always=0\n"
+    "; 1 = GPU timestamps per frame phase (outer, focus, composition, whole frame) in frames.csv, the benchmark\n"
+    "; summary and the stats lines. Works on any VR runtime; costs a few microseconds per frame.\n"
+    "gpu=1\n"
     "\n"
     "[benchmark]\n"
     "; Hotkey: modifier + key (VK codes). 0xA3 = right Ctrl, 0x78 = F9. modifier=0 means the key alone.\n"
@@ -125,7 +128,27 @@ const char kDefaultIni[] =
     "shot_modifier=0xA3\n"
     "shot_key=0x79\n"
     "; quad: > 0 = one shot by itself this many seconds after the first frame with focus groups.\n"
-    "shot_auto_s=0\n";
+    "shot_auto_s=0\n"
+    "\n"
+    "[debug]\n"
+    "; Tools for quad mode. Hotkeys: modifier + key (VK codes, 0xA3 = right Ctrl; key=0 turns a hotkey off).\n"
+    "; Debug overlay in the composed image: yellow = where the focus starts to blend in, green = from where it is\n"
+    "; fully sharp, red ring = gaze point (blue when frozen). 1 = on at start. 0x77 = F8.\n"
+    "overlay=0\n"
+    "overlay_modifier=0xA3\n"
+    "overlay_key=0x77\n"
+    "; Freeze the gaze point (0x76 = F7).\n"
+    "freeze_modifier=0xA3\n"
+    "freeze_key=0x76\n"
+    "; Quad <-> outer only (0x7A = F11): the focus views are not rendered and SteamVR gets outer alone, at the game's\n"
+    "; smaller render size (not the 1:1 stereo of [quad] mode=off). The proxy also switches to outer only by itself\n"
+    "; when quad mode fails.\n"
+    "outer_modifier=0xA3\n"
+    "outer_key=0x7A\n"
+    "\n"
+    "; Settings marked live take effect while the game runs (the file is checked about once a second): [log]\n"
+    "; stats_interval_s, [benchmark] all but auto_start_s, [gaze] read, [quad] compose, margin_px, feather_px, the\n"
+    "; shot keys and shot_auto_s, and all of [debug]. Everything else needs a game restart.\n";
 
 std::string IniString(const fs::path& ini, const wchar_t* sec, const wchar_t* key, const wchar_t* def) {
     wchar_t buf[64];
@@ -227,22 +250,15 @@ fs::path BenchDir() { return BaseDir() / L"bench"; }
 
 const Config& Cfg() { return g_cfg; }
 
-void LoadConfig() {
-    std::error_code ec;
-    fs::create_directories(BaseDir(), ec);
-    fs::path ini = BaseDir() / L"qvfr.ini";
-    if (!fs::exists(ini, ec)) {
-        if (FILE* f = _wfopen(ini.c_str(), L"wb")) {
-            fwrite(kDefaultIni, 1, sizeof(kDefaultIni) - 1, f);
-            fclose(f);
-            Log("Created default %s", Narrow(ini.wstring()).c_str());
-        }
-    }
+namespace {
+
+Config ReadConfig(const fs::path& ini) {
     Config c;
     c.wrap = IniInt(ini, L"proxy", L"wrap", 1) != 0;
     c.firstCalls = IniInt(ini, L"log", L"first_calls", c.firstCalls);
     c.statsIntervalS = IniInt(ini, L"log", L"stats_interval_s", c.statsIntervalS);
     c.csvAlways = IniInt(ini, L"timing", L"csv_always", 0) != 0;
+    c.gpuTiming = IniInt(ini, L"timing", L"gpu", 1) != 0;
     c.benchKeyMod = IniInt(ini, L"benchmark", L"modifier", c.benchKeyMod);
     c.benchKey = IniInt(ini, L"benchmark", L"key", c.benchKey);
     c.benchDelayS = IniFloat(ini, L"benchmark", L"delay_s", c.benchDelayS);
@@ -320,15 +336,114 @@ void LoadConfig() {
             ExpModeName(c.expMode));
         c.expMode = ExpMode::Off;
     }
+    c.overlay = IniInt(ini, L"debug", L"overlay", 0) != 0;
+    c.overlayKeyMod = IniInt(ini, L"debug", L"overlay_modifier", c.overlayKeyMod);
+    c.overlayKey = IniInt(ini, L"debug", L"overlay_key", c.overlayKey);
+    c.freezeKeyMod = IniInt(ini, L"debug", L"freeze_modifier", c.freezeKeyMod);
+    c.freezeKey = IniInt(ini, L"debug", L"freeze_key", c.freezeKey);
+    c.outerKeyMod = IniInt(ini, L"debug", L"outer_modifier", c.outerKeyMod);
+    c.outerKey = IniInt(ini, L"debug", L"outer_key", c.outerKey);
+    if (c.quadMode == QuadMode::Quad)
+        Log("Settings: [debug] overlay=%d overlay_modifier=0x%X overlay_key=0x%X freeze_modifier=0x%X freeze_key=0x%X "
+            "outer_modifier=0x%X outer_key=0x%X",
+            c.overlay, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey);
     c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
     if (c.testFaultFrames > 0) Log("Settings: [test] fault_frames=%d (deliberate fault for testing)", c.testFaultFrames);
+    return c;
+}
+
+fs::path IniPath() { return BaseDir() / L"qvfr.ini"; }
+
+FILETIME g_iniTime{};
+double g_iniCheckMs = 0;
+
+void NoteIniTime() {
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (GetFileAttributesExW(IniPath().c_str(), GetFileExInfoStandard, &a)) g_iniTime = a.ftLastWriteTime;
+}
+
+}  // namespace
+
+void LoadConfig() {
+    std::error_code ec;
+    fs::create_directories(BaseDir(), ec);
+    fs::path ini = IniPath();
+    if (!fs::exists(ini, ec)) {
+        if (FILE* f = _wfopen(ini.c_str(), L"wb")) {
+            fwrite(kDefaultIni, 1, sizeof(kDefaultIni) - 1, f);
+            fclose(f);
+            Log("Created default %s", Narrow(ini.wstring()).c_str());
+        }
+    }
+    NoteIniTime();
+    Config c = ReadConfig(ini);
     g_cfg = c;
-    Log("Settings %s: wrap=%d first_calls=%d stats_interval_s=%d csv_always=%d | benchmark: modifier=0x%X key=0x%X "
+    Log("Settings %s: wrap=%d first_calls=%d stats_interval_s=%d csv_always=%d gpu=%d | benchmark: modifier=0x%X key=0x%X "
         "delay_s=%.1f duration_s=%.1f freeze_pose=%d beep=%d auto_start_s=%.1f | gaze read=%d | experiment: mode=%s "
         "focus_size=%.3f center=(%.3f, %.3f) pad=%d",
-        Narrow(ini.wstring()).c_str(), c.wrap, c.firstCalls, c.statsIntervalS, c.csvAlways, c.benchKeyMod, c.benchKey,
+        Narrow(ini.wstring()).c_str(), c.wrap, c.firstCalls, c.statsIntervalS, c.csvAlways, c.gpuTiming, c.benchKeyMod,
+        c.benchKey,
         c.benchDelayS, c.benchDurationS, c.benchFreezePose, c.benchBeep, c.benchAutoStartS, c.gazeRead,
         ExpModeName(c.expMode), c.expFocusSize, c.expCenterX, c.expCenterY, c.expPad);
+}
+
+bool ReloadConfig() {
+    const double now = NowMs();
+    if (now - g_iniCheckMs < 1000) return false;
+    g_iniCheckMs = now;
+    WIN32_FILE_ATTRIBUTE_DATA a{};
+    if (!GetFileAttributesExW(IniPath().c_str(), GetFileExInfoStandard, &a)) return false;
+    if (CompareFileTime(&a.ftLastWriteTime, &g_iniTime) == 0) return false;
+    g_iniTime = a.ftLastWriteTime;
+    const Config n = ReadConfig(IniPath());
+    Config& c = g_cfg;
+    // Settings that need a restart: the size, projection and hooks are fixed for the VR session.
+    std::string restart;
+    auto need = [&](bool changed, const char* name) {
+        if (changed) restart += restart.empty() ? name : std::string(", ") + name;
+    };
+    need(n.wrap != c.wrap, "[proxy] wrap");
+    need(n.firstCalls != c.firstCalls, "[log] first_calls");
+    need(n.csvAlways != c.csvAlways, "[timing] csv_always");
+    need(n.gpuTiming != c.gpuTiming, "[timing] gpu");
+    need(n.benchAutoStartS != c.benchAutoStartS, "[benchmark] auto_start_s");
+    need(n.expMode != c.expMode || n.expFocusSize != c.expFocusSize || n.expCenterX != c.expCenterX ||
+             n.expCenterY != c.expCenterY || n.expPad != c.expPad,
+         "[experiment]");
+    need(n.traceCallers != c.traceCallers || n.traceDepth != c.traceDepth, "[trace]");
+    need(n.quadMode != c.quadMode, "[quad] mode");
+    need(n.quadFocusSize != c.quadFocusSize || n.quadCenterX != c.quadCenterX || n.quadCenterY != c.quadCenterY,
+         "[quad] focus_size/center");
+    need(n.probeFrames != c.probeFrames || n.probeEngine != c.probeEngine || n.probeD3D != c.probeD3D, "[quad] probe_*");
+    c.statsIntervalS = n.statsIntervalS;
+    c.benchKeyMod = n.benchKeyMod;
+    c.benchKey = n.benchKey;
+    c.benchDelayS = n.benchDelayS;
+    c.benchDurationS = n.benchDurationS;
+    c.benchFreezePose = n.benchFreezePose;
+    c.benchBeep = n.benchBeep;
+    c.gazeRead = n.gazeRead;
+    c.quadCompose = n.quadCompose;
+    c.quadMarginPx = n.quadMarginPx;
+    c.quadFeatherPx = n.quadFeatherPx;
+    c.shotKeyMod = n.shotKeyMod;
+    c.shotKey = n.shotKey;
+    c.shotAutoS = n.shotAutoS;
+    c.overlay = n.overlay;
+    c.overlayKeyMod = n.overlayKeyMod;
+    c.overlayKey = n.overlayKey;
+    c.freezeKeyMod = n.freezeKeyMod;
+    c.freezeKey = n.freezeKey;
+    c.outerKeyMod = n.outerKeyMod;
+    c.outerKey = n.outerKey;
+    Log("Settings reloaded (live): stats_interval_s=%d | benchmark modifier=0x%X key=0x%X delay_s=%.1f duration_s=%.1f "
+        "freeze_pose=%d beep=%d | gaze read=%d | quad compose=%d margin_px=%d feather_px=%d shot_modifier=0x%X "
+        "shot_key=0x%X shot_auto_s=%.1f | debug overlay=%d keys 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X%s%s",
+        c.statsIntervalS, c.benchKeyMod, c.benchKey, c.benchDelayS, c.benchDurationS, c.benchFreezePose, c.benchBeep,
+        c.gazeRead, c.quadCompose, c.quadMarginPx, c.quadFeatherPx, c.shotKeyMod, c.shotKey, c.shotAutoS, c.overlay,
+        c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey,
+        restart.empty() ? "" : "; CHANGED BUT NEEDS A GAME RESTART: ", restart.c_str());
+    return true;
 }
 
 const char* ExpModeName(ExpMode m) {

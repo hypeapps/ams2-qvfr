@@ -488,6 +488,40 @@ int RunCompose() {
             staging->Release();
         }
     }
+    // Debug overlay: the gaze dot and the outline of the margin edge, the rest unchanged.
+    bool overlayOk = false;
+    {
+        qvfr::compose::Layout lo = l;
+        lo.overlay = true;
+        lo.gazeMode = 1;
+        lo.gazeX = 100.5f;
+        lo.gazeY = 100.5f;
+        ID3D11Texture2D* o = qvfr::compose::Draw(ctx, 0, outer, focus, lo);
+        D3D11_TEXTURE2D_DESC s = od;
+        s.Usage = D3D11_USAGE_STAGING;
+        s.BindFlags = 0;
+        s.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ID3D11Texture2D* staging = nullptr;
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (o && SUCCEEDED(dev->CreateTexture2D(&s, nullptr, &staging))) {
+            ctx->CopyResource(staging, o);
+            if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
+                auto at = [&](uint32_t x, uint32_t y) {
+                    return ((const uint32_t*)((const uint8_t*)m.pData + (size_t)y * m.RowPitch))[x];
+                };
+                auto ch = [](uint32_t v, int c) { return (int)((v >> (8 * c)) & 255); };
+                const uint32_t dot = at(100, 100), gap = at(120, 100), edge = at(l.x0 + (uint32_t)l.marginPx, l.y0 + 100);
+                const uint32_t sharp = at(l.x0 + (uint32_t)(l.marginPx + l.featherPx), l.y0 + 150);
+                overlayOk = ch(dot, 0) > 200 && ch(dot, 1) < 120 && ch(dot, 2) < 120 && gap == outerPx &&
+                            ch(edge, 0) > 200 && ch(edge, 1) > 200 && ch(edge, 2) < 60 && ch(sharp, 0) < 60 &&
+                            ch(sharp, 1) > 200 && ch(sharp, 2) < 160;
+                printf("Overlay: gaze dot %08X, between dot and ring %08X, margin edge %08X, sharp edge %08X\n", dot,
+                       gap, edge, sharp);
+                ctx->Unmap(staging, 0);
+            }
+            staging->Release();
+        }
+    }
     qvfr::compose::Release();
     int warnings = 0;
     if (info) {
@@ -507,13 +541,13 @@ int RunCompose() {
     dev->Release();
     bool ok = readOk && stateOk && od.Width == l.gridW && od.Height == l.gridH &&
               od.Format == DXGI_FORMAT_R8G8B8A8_TYPELESS && inner && outside && band && !innerBad && !outsideBad &&
-              !bandBad && !warnings;
+              !bandBad && !warnings && overlayOk;
     printf("Compose check %s: outputs %p/%p (%u x %u fmt %d), state restored %d, pixels wrong: focus %llu of %llu, "
-           "outer %llu of %llu, blend band %llu of %llu; debug layer %s, %d warnings\n",
+           "outer %llu of %llu, blend band %llu of %llu; overlay %s; debug layer %s, %d warnings\n",
            ok ? "OK" : "FAILED", (void*)out[0], (void*)out[1], od.Width, od.Height, (int)od.Format, stateOk,
            (unsigned long long)innerBad, (unsigned long long)inner, (unsigned long long)outsideBad,
            (unsigned long long)outside, (unsigned long long)bandBad, (unsigned long long)band,
-           debugLayer ? "on" : "not installed", warnings);
+           overlayOk ? "ok" : "WRONG", debugLayer ? "on" : "not installed", warnings);
     return ok ? 0 : 7;
 }
 

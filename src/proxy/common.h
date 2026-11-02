@@ -41,6 +41,7 @@ struct Config {
     int statsIntervalS = 60;          // interval of call counters and gaze state in seconds (0 = only on exit)
     // [timing]
     bool csvAlways = false;           // frame timing CSV for the whole session, not only during a benchmark
+    bool gpuTiming = true;            // GPU timestamps per frame phase (frames.csv, benchmark summary, stats)
     // [benchmark]
     int benchKeyMod = VK_RCONTROL;    // modifier key (VK code, 0 = none)
     int benchKey = VK_F9;             // start and abort key
@@ -74,12 +75,23 @@ struct Config {
     bool quadCompose = true;          // quad: the proxy composes outer and focus into one grid-size image per eye (M4.4)
     int quadMarginPx = 32;            // quad: hidden band at the focus edge (guard band), grid pixels
     int quadFeatherPx = 128;          // quad: blend band from outer to focus inside the margin, grid pixels
+    // [debug] (M4.5 tools; quad mode)
+    bool overlay = false;             // debug overlay in the composed image at start (blend band edges, gaze point)
+    int overlayKeyMod = VK_RCONTROL;  // overlay on/off hotkey
+    int overlayKey = VK_F8;
+    int freezeKeyMod = VK_RCONTROL;   // freeze/unfreeze the gaze point
+    int freezeKey = VK_F7;
+    int outerKeyMod = VK_RCONTROL;    // quad <-> outer only: the focus groups do not run, SteamVR gets outer alone
+    int outerKey = VK_F11;
     // [test] (not in the default ini; used by qvfr_proxy_smoke --fault)
     int testFaultFrames = 0;          // > 0: deliberate access violation in the diagnostics at this proxy frame
 };
 
 const Config& Cfg();
 void LoadConfig();                    // creates a default qvfr.ini if it does not exist
+// Render thread, every frame: at most once a second checks the ini date; a changed file updates the live settings
+// (listed at the end of the default ini) and logs the ones that need a restart. True when it reloaded.
+bool ReloadConfig();
 
 fs::path BaseDir();                   // %QVFR_HOME% or Documents\ams2-qvfr
 fs::path LogDir();

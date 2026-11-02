@@ -17,6 +17,10 @@ struct Layout {
     uint32_t x0 = 0, y0 = 0;          // focus window position in the grid
     float marginPx = 0;               // hidden band at the focus edge
     float featherPx = 0;              // blend band inside the margin (0 = hard edge)
+    // Debug overlay (M4.5): blend band edges and the gaze point.
+    bool overlay = false;
+    int gazeMode = 0;                 // 0 = no gaze, 1 = live, 2 = frozen
+    float gazeX = 0, gazeY = 0;       // gaze point in grid pixels
 };
 
 // Composes one eye (0 = left, 1 = right) from outer and focus (2D textures of the focus size, one sample, the same

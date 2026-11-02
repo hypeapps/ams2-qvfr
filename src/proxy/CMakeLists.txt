@@ -25,6 +25,7 @@ add_library(qvfr_proxy SHARED
   experiment.cpp
   focus_geometry.cpp
   compose.cpp
+  gpu.cpp
   callers.cpp
   hooks.cpp
   probe.cpp

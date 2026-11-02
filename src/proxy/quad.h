@@ -18,7 +18,11 @@ void Install();       // VR_Init: engine hooks and the builder patch (only on th
 // The first call of a VR session places the focus window; with the hooks in place the game gets the focus size.
 void AdjustSize(vr::IVRSystem* real, uint32_t* w, uint32_t* h);
 bool Engaged();       // the game got the focus size this session: the wrappers must stay in place
-void OnFrameStart();  // WaitGetPoses entry (render thread): frame bookkeeping, shot hotkey, shot read-back
+// WaitGetPoses entry (render thread): frame bookkeeping, hotkeys (shot, overlay, gaze freeze, quad <-> outer only), shot
+// read-back. M4.5: in outer-only mode (hotkey or watchdog) the focus groups' tasks are not executed and SteamVR gets outer.
+void OnFrameStart();
+// Gaze of the frame (NDC per eye of the full projection, x right, y up) for the debug overlay; ignored while frozen.
+void SetGaze(bool ok, const float ndcL[2], const float ndcR[2]);
 void OnSubmitBegin(vr::EVREye eye, const vr::Texture_t* tex);  // the first Submit gives the D3D11 device
 // With the focus groups running: a Texture_t (kept in `storage`) pointing to the composed eye, or without the
 // composition to outer at the focus size (right eye: this frame's outer R copy); otherwise `tex` unchanged.

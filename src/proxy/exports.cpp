@@ -18,6 +18,7 @@
 #include "common.h"
 #include "experiment.h"
 #include "frame.h"
+#include "gpu.h"
 #include "modern_vr.h"
 #include "probe.h"
 #include "quad.h"
@@ -172,6 +173,7 @@ void VR_CALLTYPE VR_Shutdown() {
     Guarded("LogCallStats", [] { LogCallStats(true); });
     probe::Shutdown();
     quad::Shutdown();
+    gpu::Release();  // after everything that drew with the device
     modern::Shutdown();
     if (g_fn.shutdown) g_fn.shutdown();
 }

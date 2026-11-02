@@ -15,8 +15,9 @@ namespace {
 // Matches cbuffer Params in compose.hlsl.
 struct Constants {
     float gridW, gridH, x0, y0, focusW, focusH, margin, feather;
+    float gazeX, gazeY, gazeMode, overlay;
 };
-static_assert(sizeof(Constants) == 32);
+static_assert(sizeof(Constants) == 48);
 
 struct Pipeline {
     ID3D11Device* dev = nullptr;  // referenced: the objects below belong to it
@@ -376,8 +377,9 @@ ID3D11Texture2D* Draw(ID3D11DeviceContext* ctx, int eye, ID3D11Texture2D* outer,
         Fail(eye, SiteMap, "cannot map the constant buffer (0x%08lX)", (unsigned long)hr);
         return nullptr;
     }
-    const Constants k = {(float)l.gridW,  (float)l.gridH,  (float)l.x0, (float)l.y0,
-                         (float)l.focusW, (float)l.focusH, l.marginPx,  l.featherPx > 0 ? l.featherPx : 1e-3f};
+    const Constants k = {(float)l.gridW,  (float)l.gridH,     (float)l.x0,         (float)l.y0,
+                         (float)l.focusW, (float)l.focusH,    l.marginPx,          l.featherPx > 0 ? l.featherPx : 1e-3f,
+                         l.gazeX,         l.gazeY,            (float)l.gazeMode,   l.overlay ? 1.0f : 0.0f};
     memcpy(m.pData, &k, sizeof(k));
     ctx->Unmap(g_p.cb, 0);
 

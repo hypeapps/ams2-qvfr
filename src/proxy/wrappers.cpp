@@ -12,6 +12,7 @@
 #include "common.h"
 #include "experiment.h"
 #include "frame.h"
+#include "gpu.h"
 #include "generated/wrappers_0912.h"
 #include "probe.h"
 #include "quad.h"
@@ -247,11 +248,14 @@ public:
         // Focus experiment: the compositor gets the game image placed into a full-FOV texture.
         vr::Texture_t padded{};
         const vr::Texture_t* out = experiment::PrepareSubmit(eye, tex, bounds, padded);
+        // The game's device, checked at every Submit (guards itself, also after a diagnostics fault).
+        if (tex && tex->eType == vr::API_DirectX) gpu::OnSubmitTexture(tex->handle);
         probe::OnSubmitBegin(eye, tex);
         quad::OnSubmitBegin(eye, tex);
         // Quad mode: the compositor gets the composed eye (outer upscaled to the grid, focus 1:1 in its window).
         vr::Texture_t composed{};
         out = quad::PrepareSubmit(eye, out, bounds, composed);
+        if (eye == vr::Eye_Right) gpu::FrameEnd();
         double t0 = NowMs();
         vr::EVRCompositorError err = CompositorWrapBase::Submit(eye, out, bounds, flags);
         probe::OnSubmitEnd(eye);
