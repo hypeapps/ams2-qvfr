@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "common.h"
+#include "diag.h"
 
 namespace qvfr::xrlayer {
 
@@ -185,6 +186,11 @@ void LogSystem(XrSystemId sys) {
         p.graphicsProperties.maxSwapchainImageHeight, p.trackingProperties.orientationTracking,
         p.trackingProperties.positionTracking, g_extEnabled ? (eye.supportsEyeGazeInteraction ? "yes" : "NO") : "(no extension)",
         (int)r, R(r));
+    if (XR_FAILED(r)) return;
+    char buf[320];
+    snprintf(buf, sizeof(buf), "\"%s\" (OpenXR system, vendor 0x%X), eye tracking for applications: %s", p.systemName,
+             p.vendorId, g_extEnabled ? (eye.supportsEyeGazeInteraction ? "yes" : "no") : "no (no extension)");
+    diag::Set("Headset", buf);
 }
 
 void ResetSession() {
@@ -472,6 +478,8 @@ XrResult XRAPI_CALL HookAttach(XrSession session, const XrSessionActionSetsAttac
         if (XR_FAILED(rs)) g_s.gazeSpace = XR_NULL_HANDLE;
         Log("OpenXR layer: session %d: gaze set attached, action space = %d (%s), VIEW space %s", g_s.number, (int)rs,
             R(rs), g_s.viewSpace ? "ok" : "MISSING");
+        diag::Set("OpenXR mod layer", XR_SUCCEEDED(rs) && g_s.viewSpace ? "loaded, gaze action set attached to the session"
+                                                                         : "loaded, gaze action set attached, NO gaze space");
     });
     if (done) return r;
     r = g_next.attach(session, info);
@@ -655,7 +663,12 @@ XrResult XRAPI_CALL CreateApiLayerInstance(const XrInstanceCreateInfo* info, con
             exts.push_back(XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME);
             added = true;
         }
-        if (!has) Log("OpenXR layer: the runtime has no %s; no gaze", XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME);
+        if (!has) {
+            Log("OpenXR layer: the runtime has no %s; no gaze", XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME);
+            diag::Report(diag::Level::Info, "xr-no-gaze-ext",
+                         "The OpenXR runtime has no eye tracking for applications (XR_EXT_eye_gaze_interaction), so the "
+                         "focus area stays straight ahead (FFR).");
+        }
     });
     XrInstanceCreateInfo ci = *info;
     if (added) {
@@ -688,6 +701,10 @@ XrResult XRAPI_CALL CreateApiLayerInstance(const XrInstanceCreateInfo* info, con
             Log("OpenXR layer: instance created, runtime \"%s\" %u.%u.%u, gaze extension %s", p.runtimeName,
                 XR_VERSION_MAJOR(p.runtimeVersion), XR_VERSION_MINOR(p.runtimeVersion), XR_VERSION_PATCH(p.runtimeVersion),
                 g_extEnabled ? "enabled" : "off");
+            char buf[192];
+            snprintf(buf, sizeof(buf), "\"%s\" %u.%u.%u", p.runtimeName, XR_VERSION_MAJOR(p.runtimeVersion),
+                     XR_VERSION_MINOR(p.runtimeVersion), XR_VERSION_PATCH(p.runtimeVersion));
+            diag::Set("OpenXR runtime", buf);
         }
     });
     return r;
@@ -729,6 +746,7 @@ extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderApiLayerIn
     request->createApiLayerInstance = xrlayer::CreateApiLayerInstance;
     xrlayer::g_loaded = true;
     Guarded("xr Negotiate (log)", [&] {
+        diag::Set("OpenXR mod layer", "loaded by the OpenXR loader, gaze action set not attached yet");
         Log("OpenXR layer: negotiated with the loader (interface %u..%u, API %u.%u..%u.%u)", loaderInfo->minInterfaceVersion,
             loaderInfo->maxInterfaceVersion, XR_VERSION_MAJOR(loaderInfo->minApiVersion),
             XR_VERSION_MINOR(loaderInfo->minApiVersion), XR_VERSION_MAJOR(loaderInfo->maxApiVersion),

@@ -447,7 +447,7 @@ int RunOpenXrPath(const fs::path& dll, const fs::path& home) {
     printf("[runtime] path=openxr with the Valve DLL as the backend (%ls)\n", dll.c_str());
     if (FILE* f = _wfopen((home / L"qvfr.ini").c_str(), L"wb")) {
         // Relative to the proxy's folder; the Valve DLL stands in for OpenComposite.
-        fputs("[runtime]\npath=openxr\nopencomposite=qvfr\\openvr\\openvr_api.dll\nopenxr_layer=1\n[proxy]\nwrap=1\n", f);
+        fputs("[runtime]\npath=openxr\nopencomposite=qvfr\\openvr\\openvr_api.dll\nopenxr_layer=1\n[proxy]\nwrap=1\n[log]\nwarning_box=0\n", f);
         fclose(f);
     }
     SetEnvironmentVariableW(L"XR_ENABLE_API_LAYERS", L"XR_APILAYER_player_own");

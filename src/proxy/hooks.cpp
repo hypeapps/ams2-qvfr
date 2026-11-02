@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "common.h"
+#include "diag.h"
 #include "sysinfo.h"
 
 namespace qvfr::hooks {
@@ -103,9 +104,24 @@ void IdentifyExe() {
     std::string file = Narrow(path.filename().wstring());
     std::error_code ec;
     uint64_t size = fs::file_size(path, ec);
-    if (_stricmp(file.c_str(), kExe.file) != 0 || ec || size != kExe.size) {
+    if (_stricmp(file.c_str(), kExe.file) != 0) {
         Log("Hooks: %s (%llu B) is not the supported %s (%llu B); engine hooks off", file.c_str(),
             (unsigned long long)size, kExe.file, (unsigned long long)kExe.size);
+        diag::Set("Game", file + " (not " + kExe.file + "): quad views off");
+        diag::Report(diag::Level::Serious, "exe",
+                     "The game runs as %s. The mod's quad views work only with %s, so the game renders as without "
+                     "the mod.",
+                     file.c_str(), kExe.file);
+        return;
+    }
+    if (ec || size != kExe.size) {
+        Log("Hooks: %s (%llu B) is not the supported %s (%llu B); engine hooks off", file.c_str(),
+            (unsigned long long)size, kExe.file, (unsigned long long)kExe.size);
+        diag::Set("Game", file + " of an unsupported build (" + std::to_string(size) + " B): quad views off");
+        diag::Report(diag::Level::Serious, "exe-build",
+                     "This %s build (%llu B) is not the one this mod version supports, probably after a game update. "
+                     "Quad views are off and the game renders as without the mod; look for a mod update.",
+                     file.c_str(), (unsigned long long)size);
         return;
     }
     double t0 = NowMs();
@@ -113,6 +129,11 @@ void IdentifyExe() {
     if (sha != kExe.sha256) {
         Log("Hooks: %s SHA256 %s differs from the supported build %s (game update?); engine hooks off", file.c_str(),
             sha.c_str(), kExe.sha256);
+        diag::Set("Game", file + " of an unsupported build (SHA256 " + sha.substr(0, 8) + "...): quad views off");
+        diag::Report(diag::Level::Serious, "exe-build",
+                     "This %s build (SHA256 %.8s...) is not the one this mod version supports (%.8s...), probably after "
+                     "a game update. Quad views are off and the game renders as without the mod; look for a mod update.",
+                     file.c_str(), sha.c_str(), kExe.sha256);
         return;
     }
     int bad = 0;
@@ -120,9 +141,15 @@ void IdentifyExe() {
         if (!CheckAnchor(a)) ++bad;
     if (bad) {
         Log("Hooks: %d of %zu anchors do not match in memory; engine hooks off", bad, std::size(kAnchors));
+        diag::Set("Game", file + ", supported build, but changed in memory: quad views off");
+        diag::Report(diag::Level::Serious, "exe-memory",
+                     "%s is the supported build, but %d of %zu places the mod needs differ in memory (another program "
+                     "may patch the game). Quad views are off and the game renders as without the mod.",
+                     file.c_str(), bad, std::size(kAnchors));
         return;
     }
     g_engine = true;
+    diag::Set("Game", file + ", supported build (SHA256 " + sha.substr(0, 8) + "...)");
     Log("Hooks: %s build matches (SHA256 checked in %.0f ms), all %zu anchors match, engine hooks available", file.c_str(),
         NowMs() - t0, std::size(kAnchors));
 }

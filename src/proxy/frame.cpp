@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "common.h"
+#include "diag.h"
 #include "experiment.h"
 #include "gpu.h"
 #include "modern_vr.h"
@@ -745,7 +746,10 @@ void OnWaitGetPosesEnd(vr::IVRCompositor* real, vr::TrackedDevicePose_t* render,
         ProcessTimings(rows, n);
 
         const bool xrGaze = !modern::HasSystem() && xrlayer::Loaded();
+        const char* gazeSource = nullptr;
         if (Cfg().gazeRead && (modern::HasSystem() || xrGaze)) {
+            gazeSource = xrGaze ? "OpenXR layer (XR_EXT_eye_gaze_interaction)"
+                                : "SteamVR (IVRSystem_026::GetEyeTrackedFoveationCenter)";
             modern::Gaze g;
             if (xrGaze) {
                 XrGaze(g);
@@ -793,6 +797,7 @@ void OnWaitGetPosesEnd(vr::IVRCompositor* real, vr::TrackedDevicePose_t* render,
         // The gaze places this frame's focus window (DFR) and the overlay's gaze point; after the hotkeys, so a
         // benchmark that starts now already has the window at the center.
         g_cur.window = quad::SetGaze(g_cur.gaze.ok, g_cur.gaze.ndcL, g_cur.gaze.ndcR, g_bench != Bench::Idle);
+        diag::OnFrame(gazeSource, g_cur.gaze.ok, g_cur.window.src);
 
         if (g_frozen) {
             if (!g_frozenPose.bPoseIsValid && render && nRender > 0 && render[0].bPoseIsValid) {
@@ -843,6 +848,7 @@ void OnSubmit(vr::EVREye eye, const vr::Texture_t* tex, const vr::VRTextureBound
             g_firstSubmitMs = now;
             Log("First Submit (thread %lu)", GetCurrentThreadId());
             sysinfo::LogModules("first Submit");
+            diag::ShowPendingBox();
         }
         ++g_cur.submits;
         ++g_submitsInInterval;
@@ -917,6 +923,7 @@ void OnShutdown() {
     Guarded("frame::OnShutdown", [&] {
         std::lock_guard lock(g_mutex);
         if (g_bench == Bench::Running) FinishRun(true);
+        diag::OnShutdown();
         g_bench = Bench::Idle;
         if (g_sessionCsv) {
             fclose(g_sessionCsv);

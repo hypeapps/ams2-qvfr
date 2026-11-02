@@ -37,6 +37,7 @@ add_library(qvfr_proxy SHARED
   shots.cpp
   modern_vr.cpp
   runtime.cpp
+  diag.cpp
   xr_layer.cpp
   sysinfo.cpp
   common.cpp

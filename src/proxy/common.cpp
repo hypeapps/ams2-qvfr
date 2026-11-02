@@ -15,6 +15,7 @@ namespace {
 std::mutex g_logMutex;
 FILE* g_log = nullptr;
 bool g_logTried = false;
+fs::path g_logFile;
 Config g_cfg;
 fs::path g_base;
 
@@ -28,12 +29,15 @@ void OpenLogLocked() {
     wchar_t exe[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     std::wstring name = L"qvfr_" + Widen(LocalTimeStamp()) + L"_" + fs::path(exe).stem().wstring() + L".log";
-    g_log = _wfopen((LogDir() / name).c_str(), L"wb");
+    g_logFile = LogDir() / name;
+    g_log = _wfopen(g_logFile.c_str(), L"wb");
 }
 
 const char kDefaultIni[] =
-    "; ams2-qvfr: openvr_api.dll proxy settings. The file is created on the first game start.\n"
-    "; Most changes take effect after restarting the game; the live ones are listed at the end.\n"
+    "; ams2-qvfr settings: quad views foveated rendering for Automobilista 2 in VR. The file is created on the first game\n"
+    "; start; delete it to get the defaults back. Most changes take effect after restarting the game; the ones that work\n"
+    "; while the game runs are listed at the end. What the mod detected at the last start: the \"Detected\" block in the\n"
+    "; newest log in x64\\qvfr\\logs\\.\n"
     "\n"
     "[runtime]\n"
     "; openvr = the Valve openvr_api.dll (x64\\qvfr\\openvr\\) talks to SteamVR;\n"
@@ -45,29 +49,120 @@ const char kDefaultIni[] =
     "; openxr: 1 = the proxy's OpenXR API layer reads the gaze (XR_EXT_eye_gaze_interaction) under OpenComposite.\n"
     "openxr_layer=1\n"
     "\n"
-    "[proxy]\n"
-    "; 1 = the proxy wraps IVRSystem, IVRCompositor and IVROverlay (logs, timings, benchmark).\n"
-    "; 0 = the game gets the real interfaces and the proxy only logs startup (fallback).\n"
-    "wrap=1\n"
+    "[quad]\n"
+    "; quad = quad views: the game renders the whole field of view at a lower density (outer) and a smaller area at\n"
+    ";        full density (focus) that follows your gaze, and the mod puts both together for each eye;\n"
+    "; off  = the mod changes nothing (the game renders as without it).\n"
+    "; Works only with AMS2AVX.exe of the build this mod version knows; otherwise the game renders as without the mod.\n"
+    "mode=quad\n"
+    "; Size of the focus area and density of the outer view:\n"
+    ";   quality     = focus 45% x 45% of the field of view (60% x 55% without eye tracking), outer at 0.6\n"
+    ";   balanced    = focus 35% x 35% (50% x 45% without eye tracking), outer at 0.5 (the mbucchia defaults)\n"
+    ";   performance = focus 30% x 30% (40% x 40% without eye tracking), outer at 0.4\n"
+    "; Restart the game after a change.\n"
+    "preset=balanced\n"
+    "; The next keys have the names, meaning and defaults of the Quad-Views-Foveated OpenXR layer by mbucchia, so its\n"
+    "; guides apply (https://github.com/mbucchia/Quad-Views-Foveated/wiki/Advanced-Configuration).\n"
+    "; Empty = the value of the preset; a number here wins over the preset.\n"
+    "; Pixel density of the outer view (the whole field of view) and of the focus view, as a multiplier of each\n"
+    "; dimension of the resolution set in SteamVR (1.0 = that resolution, above 1 = supersampling).\n"
+    "; Restart the game after a change.\n"
+    "peripheral_multiplier=\n"
+    "focus_multiplier=1.0\n"
+    "; Focus area as a fraction of the field of view in each direction (0.1..0.9): with eye tracking (follow_gaze=1)\n"
+    "; and without it (follow_gaze=0). The game session keeps the area of the follow_gaze value it started with; the\n"
+    "; DFR <-> FFR hotkey only moves the window. Restart the game after a change.\n"
+    "horizontal_focus_section=\n"
+    "vertical_focus_section=\n"
+    "horizontal_fixed_section=\n"
+    "vertical_fixed_section=\n"
+    "; Shift of the focus area from the gaze point (focus) and from straight ahead (fixed), in screen units of the eye\n"
+    "; (-1..1 across the field of view), -0.5..0.5. Horizontal: + moves both eyes' areas outward (away from the nose).\n"
+    "; Vertical: + is up.\n"
+    "horizontal_focus_offset=0\n"
+    "vertical_focus_offset=0\n"
+    "horizontal_fixed_offset=0\n"
+    "vertical_fixed_offset=0\n"
+    "; Soft edge between focus and outer: blend band on each side as a fraction of the focus area (0..0.5, 0 = hard\n"
+    "; edge). As in mbucchia, the focus keeps at least half weight up to its edge.\n"
+    "smoothen_focus_view_edges=0.2\n"
+    "; 1 = the focus area follows your gaze every frame (dynamic foveated rendering, DFR; needs eye tracking);\n"
+    "; 0 = it stays straight ahead plus the fixed offsets (fixed foveated rendering, FFR). It also goes there when the\n"
+    "; gaze is not valid for longer than gaze_hold_s (until then it stays at the last valid gaze, e.g. while blinking)\n"
+    "; and while a benchmark runs.\n"
+    "follow_gaze=1\n"
+    "gaze_hold_s=0.6\n"
+    "; Advanced: 1 = the mod composes each eye from outer (upscaled to the SteamVR resolution) and focus (in its\n"
+    "; window); 0 = outer only, at the game's render size (diagnostics).\n"
+    "compose=1\n"
+    "; Advanced (not in mbucchia): the outermost margin_px pixels of the focus area are not shown (guard band for\n"
+    "; screen-space effects that break at the image edge); the soft edge starts inside them. 0 = the whole focus area.\n"
+    "margin_px=0\n"
+    "; Testers: hotkey for a shot of the four views (outer L/R, focus L/R) and the composed eyes: PNG files in\n"
+    "; x64\\qvfr\\shots\\ and pixel differences in the log. 0xA3 = right Ctrl, 0x79 = F10; shot_key=0 = no hotkey.\n"
+    "shot_modifier=0xA3\n"
+    "shot_key=0\n"
+    "; Testers: > 0 = one shot by itself this many seconds after the first frame with focus views.\n"
+    "shot_auto_s=0\n"
+    "; Developers ([quad] mode=probe): frames logged in full, hooks in the game engine and in D3D11.\n"
+    "probe_frames=3\n"
+    "probe_engine=1\n"
+    "probe_d3d=1\n"
+    "\n"
+    "[debug]\n"
+    "; Hotkeys: modifier + key (VK codes, 0xA3 = right Ctrl; key=0 = no hotkey).\n"
+    "; Focus area: follow the gaze (DFR) <-> fixed straight ahead (FFR), like [quad] follow_gaze. 0x75 = F6.\n"
+    "gaze_modifier=0xA3\n"
+    "gaze_key=0x75\n"
+    "; The keys below are tools for testers and are off for players (the values in brackets are the tester hotkeys).\n"
+    "; Debug overlay in the composed image: yellow = where the focus starts to blend in, green = from where it is\n"
+    "; fully sharp, red ring = gaze point (blue when frozen). overlay=1 = on at start. (0x77 = F8)\n"
+    "overlay=0\n"
+    "overlay_modifier=0xA3\n"
+    "overlay_key=0\n"
+    "; Freeze the gaze point. (0x76 = F7)\n"
+    "freeze_modifier=0xA3\n"
+    "freeze_key=0\n"
+    "; Quad <-> outer only: the focus views are not rendered and the headset gets outer alone, at the game's smaller\n"
+    "; render size (not the full-density image of [quad] mode=off). The mod also switches to outer only by itself when\n"
+    "; quad mode fails. (0x7A = F11)\n"
+    "outer_modifier=0xA3\n"
+    "outer_key=0\n"
+    "; Clones: 1 = the views whose size differs from the game's render size (with the presets the focus views) render\n"
+    "; into their own copies of the engine's eye-size targets in their own size, 0 = into the game-size targets of\n"
+    "; outer. The hotkey switches while the game runs. (0x74 = F5)\n"
+    "clones=1\n"
+    "clones_modifier=0xA3\n"
+    "clones_key=0\n"
+    "; 1 = a viewport the game sets for a full-size target while its smaller copy is bound is scaled to the copy.\n"
+    "clones_viewport_fix=1\n"
+    "; 1 = a pass that binds a full-size target by its own D3D11 view while the copies are in gets the copy instead.\n"
+    "clones_bind_fix=1\n"
+    "; 1 = each shot also saves every copy of the focus views (the game stops for about 3 s).\n"
+    "shot_clones=0\n"
     "\n"
     "[log]\n"
+    "; 1 = serious problems found at the start (for example TAA on, Pimax LibMagic loaded, an unsupported game build)\n"
+    "; also show in a Windows message box; the game keeps running. 0 = only in the log.\n"
+    "warning_box=1\n"
     "; How many first calls of key methods (projection, size, Submit) to log with values.\n"
     "first_calls=3\n"
     "; Interval in seconds for call counters and gaze state in the log (0 = only on game exit).\n"
     "stats_interval_s=60\n"
     "\n"
     "[timing]\n"
-    "; 1 = frame timing CSV for the whole session (x64\\qvfr\\bench\\<date>_session\\), 0 = only during a benchmark.\n"
+    "; Testers: 1 = frame timing CSV for the whole session (x64\\qvfr\\bench\\<date>_session\\), 0 = only during a benchmark.\n"
     "csv_always=0\n"
-    "; 1 = GPU timestamps per frame phase (outer, focus, composition, whole frame) in frames.csv, the benchmark\n"
-    "; summary and the stats lines. Works on any VR runtime; costs a few microseconds per frame.\n"
+    "; 1 = GPU timestamps per frame phase (outer, focus, composition, whole frame) in the CSV, the benchmark summary and\n"
+    "; the stats lines in the log. Costs a few microseconds per frame.\n"
     "gpu=1\n"
     "\n"
     "[benchmark]\n"
-    "; Hotkey: modifier + key (VK codes). 0xA3 = right Ctrl, 0x78 = F9. modifier=0 means the key alone.\n"
-    "; Pressing it during the countdown or the recording aborts the measurement.\n"
+    "; Testers: a measurement of the frame times into x64\\qvfr\\bench\\. Hotkey: modifier + key (VK codes; 0xA3 = right\n"
+    "; Ctrl, 0x78 = F9; modifier=0 = the key alone, key=0 = no hotkey). Pressing it during the countdown or the recording\n"
+    "; aborts the measurement.\n"
     "modifier=0xA3\n"
-    "key=0x78\n"
+    "key=0\n"
     "; Seconds from key press to recording start (time to rest your hands and keep your head still).\n"
     "delay_s=5\n"
     "; Recording length in seconds.\n"
@@ -80,12 +175,17 @@ const char kDefaultIni[] =
     "auto_start_s=0\n"
     "\n"
     "[gaze]\n"
-    "; 1 = read gaze through IVRSystem_026::GetEyeTrackedFoveationCenter every frame (log and CSV).\n"
+    "; 1 = read the gaze every frame (SteamVR on path=openvr, the OpenXR layer on path=openxr); 0 = no gaze (FFR only).\n"
     "read=1\n"
     "\n"
+    "[proxy]\n"
+    "; 1 = the proxy wraps IVRSystem, IVRCompositor and IVROverlay (needed for quad views, logs, timings, benchmark).\n"
+    "; 0 = the game gets the real interfaces and the proxy only logs startup (fallback).\n"
+    "wrap=1\n"
+    "\n"
     "[experiment]\n"
-    "; Size and projection test without engine hooks. The game reads both once per VR session, so restart the game\n"
-    "; after a change. The size reported by SteamVR is treated as the 1:1 grid.\n"
+    "; Developers: size and projection test without engine hooks ([quad] mode=off). The game reads both once per VR\n"
+    "; session, so restart the game after a change. The size reported by SteamVR is treated as the 1:1 grid.\n"
     ";   off   = no change (reference)\n"
     ";   focus = the game renders only the focus window (focus_size of the tangent span) at 1:1 density\n"
     ";   outer = the game renders the full FOV into a texture of the focus size\n"
@@ -100,105 +200,16 @@ const char kDefaultIni[] =
     "pad=1\n"
     "\n"
     "[trace]\n"
-    "; 1 = log where in the game the key OpenVR calls come from (size, projection, eye transforms, poses, Submit, overlays):\n"
-    "; every unique call stack once as module+RVA, hit counts in the stats. For reverse engineering, normally 0.\n"
+    "; Developers: 1 = log where in the game the key OpenVR calls come from (size, projection, eye transforms, poses,\n"
+    "; Submit, overlays): every unique call stack once as module+RVA, hit counts in the stats. Normally 0.\n"
     "callers=0\n"
     "; Game frames per stack (1..48).\n"
     "depth=12\n"
     "\n"
-    "[quad]\n"
-    "; Quad views through extra eye groups in the game engine (hooks in AMS2AVX.exe, only for the known exe build).\n"
-    ";   off   = no engine hooks\n"
-    ";   probe = logging hooks only (task order, render context fields, D3D11 calls per eye); the image does not change\n"
-    ";   quad  = two extra eye groups render the focus views; the game renders at the focus size (outer: full FOV,\n"
-    ";           focus: the focus window at 1:1 density). Replaces [experiment] while on.\n"
-    "mode=off\n"
-    "; The next keys have the names, meaning and defaults of the Quad-Views-Foveated OpenXR layer by mbucchia, so its\n"
-    "; guides apply (https://github.com/mbucchia/Quad-Views-Foveated/wiki/Advanced-Configuration).\n"
-    "; Pixel density of the outer view (the whole field of view) and of the focus view, as a multiplier of each\n"
-    "; dimension of the resolution set in SteamVR (1.0 = that resolution, above 1 = supersampling).\n"
-    "; Restart the game after a change.\n"
-    "peripheral_multiplier=0.5\n"
-    "focus_multiplier=1.0\n"
-    "; Focus area as a fraction of the field of view in each direction (0.1..0.9): with eye tracking (follow_gaze=1)\n"
-    "; and without it (follow_gaze=0). The game session keeps the area of the follow_gaze value it started with; the\n"
-    "; DFR <-> FFR hotkey only moves the window. Restart the game after a change.\n"
-    "horizontal_focus_section=0.35\n"
-    "vertical_focus_section=0.35\n"
-    "horizontal_fixed_section=0.5\n"
-    "vertical_fixed_section=0.45\n"
-    "; Shift of the focus area from the gaze point (focus) and from straight ahead (fixed), in screen units of the eye\n"
-    "; (-1..1 across the field of view), -0.5..0.5. Horizontal: + moves both eyes' areas outward (away from the nose).\n"
-    "; Vertical: + is up.\n"
-    "horizontal_focus_offset=0\n"
-    "vertical_focus_offset=0\n"
-    "horizontal_fixed_offset=0\n"
-    "vertical_fixed_offset=0\n"
-    "; Soft edge between focus and outer: blend band on each side as a fraction of the focus area (0..0.5, 0 = hard\n"
-    "; edge). As in mbucchia, the focus keeps at least half weight up to its edge.\n"
-    "smoothen_focus_view_edges=0.2\n"
-    "; quad: 1 = the focus window follows the gaze every frame (DFR, gaze from SteamVR); 0 = the window stays straight\n"
-    "; ahead plus the fixed offsets (FFR). The window also goes there when the gaze is not valid for longer than\n"
-    "; gaze_hold_s (until then it stays at the last valid gaze, e.g. while blinking) and while a benchmark runs (unless\n"
-    "; the gaze is frozen: then at the frozen gaze).\n"
-    "follow_gaze=1\n"
-    "gaze_hold_s=0.6\n"
-    "; quad: 1 = the proxy composes each eye from outer (upscaled to the SteamVR resolution) and focus (in its window)\n"
-    "; and sends that image to SteamVR; 0 = outer only, at the game's render size (diagnostics).\n"
-    "compose=1\n"
-    "; quad, advanced (not in mbucchia): the outermost margin_px pixels of the focus area are not shown (guard band for\n"
-    "; screen-space effects that break at the image edge); the soft edge starts inside them. 0 = the whole focus area.\n"
-    "margin_px=0\n"
-    "; probe: how many frames to log in full after the first in-game frame (one more every stats_interval_s).\n"
-    "probe_frames=3\n"
-    "; probe: 1 = hooks in the game engine (eye tasks, builder); 1 = hooks in the D3D11 immediate context (counters).\n"
-    "probe_engine=1\n"
-    "probe_d3d=1\n"
-    "; quad: hotkey for a shot of the four views (outer L/R, focus L/R) and the composed eyes: PNG files in\n"
-    "; x64\\qvfr\\shots\\ and pixel differences in the log. 0xA3 = right Ctrl, 0x79 = F10; shot_key=0 turns the hotkey off.\n"
-    "shot_modifier=0xA3\n"
-    "shot_key=0x79\n"
-    "; quad: > 0 = one shot by itself this many seconds after the first frame with focus groups.\n"
-    "shot_auto_s=0\n"
-    "\n"
-    "[debug]\n"
-    "; Tools for quad mode. Hotkeys: modifier + key (VK codes, 0xA3 = right Ctrl; key=0 turns a hotkey off).\n"
-    "; Debug overlay in the composed image: yellow = where the focus starts to blend in, green = from where it is\n"
-    "; fully sharp, red ring = gaze point (blue when frozen). 1 = on at start. 0x77 = F8.\n"
-    "overlay=0\n"
-    "overlay_modifier=0xA3\n"
-    "overlay_key=0x77\n"
-    "; Freeze the gaze point (0x76 = F7).\n"
-    "freeze_modifier=0xA3\n"
-    "freeze_key=0x76\n"
-    "; Quad <-> outer only (0x7A = F11): the focus views are not rendered and SteamVR gets outer alone, at the game's\n"
-    "; smaller render size (not the 1:1 stereo of [quad] mode=off). The proxy also switches to outer only by itself\n"
-    "; when quad mode fails.\n"
-    "outer_modifier=0xA3\n"
-    "outer_key=0x7A\n"
-    "; Focus window: follow the gaze (DFR) <-> fixed at the center (FFR), like [quad] follow_gaze (0x75 = F6).\n"
-    "gaze_modifier=0xA3\n"
-    "gaze_key=0x75\n"
-    "; Clones (M7.3, M7.4): 1 = the views whose size differs from the game's render size (with the default sizes the\n"
-    "; focus views) render into their own copies of the engine's eye-size targets in their own size, 0 = into the\n"
-    "; game-size targets of outer. The proxy finds the targets in the first frames with focus views. The hotkey\n"
-    "; switches while the game runs (0x74 = F5).\n"
-    "clones=1\n"
-    "clones_modifier=0xA3\n"
-    "clones_key=0x74\n"
-    "; 1 = a viewport the game sets for a full-size target while its smaller copy is bound is scaled to the copy\n"
-    "; (counted and logged either way).\n"
-    "clones_viewport_fix=1\n"
-    "; 1 = a pass that binds a full-size target by its own D3D11 view while the copies are in gets the copy instead\n"
-    "; (counted and logged either way).\n"
-    "clones_bind_fix=1\n"
-    "; 1 = each shot also saves every copy of the focus views (diagnostics; the game stops for about 3 s).\n"
-    "shot_clones=0\n"
-    "\n"
-    "; Settings marked live take effect while the game runs (the file is checked about once a second): [log]\n"
-    "; stats_interval_s, [benchmark] all but auto_start_s, [gaze] read, [quad] the four *_offset keys,\n"
-    "; smoothen_focus_view_edges, follow_gaze, gaze_hold_s, compose, margin_px, the shot keys and shot_auto_s, and all\n"
-    "; of [debug]. Everything else needs a game restart.\n";
+    "; Settings that work while the game runs (the file is checked about once a second): [quad] the four *_offset keys,\n"
+    "; smoothen_focus_view_edges, follow_gaze, gaze_hold_s, compose, margin_px, the shot keys and shot_auto_s; all of\n"
+    "; [debug]; [log] warning_box and stats_interval_s; [benchmark] all but auto_start_s; [gaze] read. Everything else\n"
+    "; needs a game restart.\n";
 
 std::string IniString(const fs::path& ini, const wchar_t* sec, const wchar_t* key, const wchar_t* def) {
     wchar_t buf[64];
@@ -239,8 +250,46 @@ float Ranged(const char* key, float v, float lo, float hi) {
 }
 
 // The [quad] keys of M7 (mbucchia's), after the pre-M7 keys that still work with a warning.
+// M8.5 presets: the focus area with and without eye tracking and the outer density; focus_multiplier stays 1.0 (1:1
+// in the focus). balanced = the mbucchia defaults.
+struct Preset {
+    const char* name;
+    float peripheral, focusX, focusY, fixedX, fixedY;
+};
+const Preset kPresets[] = {
+    {"quality", 0.6f, 0.45f, 0.45f, 0.6f, 0.55f},
+    {"balanced", 0.5f, 0.35f, 0.35f, 0.5f, 0.45f},
+    {"performance", 0.4f, 0.3f, 0.3f, 0.4f, 0.4f},
+};
+
+void ApplyPreset(const fs::path& ini, Config& c) {
+    std::string name = IniString(ini, L"quad", L"preset", L"balanced");
+    if (name.empty()) name = "balanced";
+    const Preset* p = nullptr;
+    for (const Preset& k : kPresets)
+        if (name == k.name) p = &k;
+    if (!p) {
+        Log("Settings: unknown [quad] preset=\"%s\", using balanced", name.c_str());
+        p = &kPresets[1];
+    }
+    c.preset = p->name;
+    c.peripheralMultiplier = p->peripheral;
+    c.focusSectionX = p->focusX;
+    c.focusSectionY = p->focusY;
+    c.fixedSectionX = p->fixedX;
+    c.fixedSectionY = p->fixedY;
+    std::string given;
+    for (const wchar_t* k : {L"peripheral_multiplier", L"horizontal_focus_section", L"vertical_focus_section",
+                             L"horizontal_fixed_section", L"vertical_fixed_section"})
+        if (IniHas(ini, L"quad", k)) given += (given.empty() ? "" : ", ") + Narrow(k);
+    Log("Settings: [quad] preset=%s (peripheral_multiplier %.2f, focus section %.2f x %.2f, fixed section %.2f x %.2f)%s%s",
+        p->name, p->peripheral, p->focusX, p->focusY, p->fixedX, p->fixedY, given.empty() ? "" : "; given in the ini: ",
+        given.c_str());
+}
+
 void ReadQuadView(const fs::path& ini, Config& c) {
     const wchar_t* q = L"quad";
+    ApplyPreset(ini, c);
     if (IniHas(ini, q, L"focus_size")) {
         const float s = Ranged("focus_size", IniFloat(ini, q, L"focus_size", 0.5f), 0.1f, 0.9f);
         Log("Settings: WARNING: [quad] focus_size is a pre-M7 key; it sets peripheral_multiplier and the four *_section "
@@ -395,6 +444,14 @@ bool BaseDirIsFallback() {
 }
 
 fs::path LogDir() { return BaseDir() / L"logs"; }
+
+fs::path LogFile() {
+    std::lock_guard lock(g_logMutex);
+    OpenLogLocked();
+    return g_logFile;
+}
+
+fs::path IniFile() { return BaseDir() / L"qvfr.ini"; }
 fs::path BenchDir() { return BaseDir() / L"bench"; }
 
 const Config& Cfg() { return g_cfg; }
@@ -414,6 +471,7 @@ Config ReadConfig(const fs::path& ini) {
     c.wrap = IniInt(ini, L"proxy", L"wrap", 1) != 0;
     c.firstCalls = IniInt(ini, L"log", L"first_calls", c.firstCalls);
     c.statsIntervalS = IniInt(ini, L"log", L"stats_interval_s", c.statsIntervalS);
+    c.warningBox = IniInt(ini, L"log", L"warning_box", 1) != 0;
     c.csvAlways = IniInt(ini, L"timing", L"csv_always", 0) != 0;
     c.gpuTiming = IniInt(ini, L"timing", L"gpu", 1) != 0;
     c.benchKeyMod = IniInt(ini, L"benchmark", L"modifier", c.benchKeyMod);
@@ -479,11 +537,11 @@ Config ReadConfig(const fs::path& ini) {
         c.quadMarginPx = 0;
     }
     if (c.quadMode != QuadMode::Off)
-        Log("Settings: [quad] mode=%s peripheral_multiplier=%.3f focus_multiplier=%.3f focus_section=%.3f x %.3f "
+        Log("Settings: [quad] mode=%s preset=%s peripheral_multiplier=%.3f focus_multiplier=%.3f focus_section=%.3f x %.3f "
             "fixed_section=%.3f x %.3f focus_offset=(%.3f, %.3f) fixed_offset=(%.3f, %.3f) "
             "smoothen_focus_view_edges=%.3f%s follow_gaze=%d gaze_hold_s=%.2f compose=%d margin_px=%d probe_frames=%d "
             "probe_engine=%d probe_d3d=%d shot_modifier=0x%X shot_key=0x%X shot_auto_s=%.1f",
-            QuadModeName(c.quadMode), c.peripheralMultiplier, c.focusMultiplier, c.focusSectionX, c.focusSectionY,
+            QuadModeName(c.quadMode), c.preset.c_str(), c.peripheralMultiplier, c.focusMultiplier, c.focusSectionX, c.focusSectionY,
             c.fixedSectionX, c.fixedSectionY, c.focusOffsetX, c.focusOffsetY, c.fixedOffsetX, c.fixedOffsetY,
             c.smoothen, c.legacyEdge ? " (overridden by the pre-M7 feather_px)" : "", c.followGaze, c.gazeHoldS,
             c.quadCompose, c.quadMarginPx, c.probeFrames, c.probeEngine, c.probeD3D, c.shotKeyMod, c.shotKey,
@@ -520,14 +578,13 @@ Config ReadConfig(const fs::path& ini) {
     return c;
 }
 
-fs::path IniPath() { return BaseDir() / L"qvfr.ini"; }
 
 FILETIME g_iniTime{};
 double g_iniCheckMs = 0;
 
 void NoteIniTime() {
     WIN32_FILE_ATTRIBUTE_DATA a{};
-    if (GetFileAttributesExW(IniPath().c_str(), GetFileExInfoStandard, &a)) g_iniTime = a.ftLastWriteTime;
+    if (GetFileAttributesExW(IniFile().c_str(), GetFileExInfoStandard, &a)) g_iniTime = a.ftLastWriteTime;
 }
 
 }  // namespace
@@ -535,7 +592,7 @@ void NoteIniTime() {
 void LoadConfig() {
     std::error_code ec;
     fs::create_directories(BaseDir(), ec);
-    fs::path ini = IniPath();
+    fs::path ini = IniFile();
     if (!fs::exists(ini, ec)) {
         if (FILE* f = _wfopen(ini.c_str(), L"wb")) {
             fwrite(kDefaultIni, 1, sizeof(kDefaultIni) - 1, f);
@@ -562,10 +619,10 @@ bool ReloadConfig() {
     if (now - g_iniCheckMs < 1000) return false;
     g_iniCheckMs = now;
     WIN32_FILE_ATTRIBUTE_DATA a{};
-    if (!GetFileAttributesExW(IniPath().c_str(), GetFileExInfoStandard, &a)) return false;
+    if (!GetFileAttributesExW(IniFile().c_str(), GetFileExInfoStandard, &a)) return false;
     if (CompareFileTime(&a.ftLastWriteTime, &g_iniTime) == 0) return false;
     g_iniTime = a.ftLastWriteTime;
-    const Config n = ReadConfig(IniPath());
+    const Config n = ReadConfig(IniFile());
     Config& c = g_cfg;
     // Settings that need a restart: the size, projection and hooks are fixed for the VR session.
     std::string restart;
@@ -584,6 +641,7 @@ bool ReloadConfig() {
          "[experiment]");
     need(n.traceCallers != c.traceCallers || n.traceDepth != c.traceDepth, "[trace]");
     need(n.quadMode != c.quadMode, "[quad] mode");
+    need(n.preset != c.preset, "[quad] preset");
     need(n.peripheralMultiplier != c.peripheralMultiplier || n.focusMultiplier != c.focusMultiplier,
          "[quad] *_multiplier");
     need(n.focusSectionX != c.focusSectionX || n.focusSectionY != c.focusSectionY ||
@@ -591,6 +649,7 @@ bool ReloadConfig() {
          "[quad] *_section");
     need(n.probeFrames != c.probeFrames || n.probeEngine != c.probeEngine || n.probeD3D != c.probeD3D, "[quad] probe_*");
     c.statsIntervalS = n.statsIntervalS;
+    c.warningBox = n.warningBox;
     c.benchKeyMod = n.benchKeyMod;
     c.benchKey = n.benchKey;
     c.benchDelayS = n.benchDelayS;

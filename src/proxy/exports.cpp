@@ -18,6 +18,7 @@
 #include <string>
 
 #include "common.h"
+#include "diag.h"
 #include "experiment.h"
 #include "frame.h"
 #include "gpu.h"
@@ -145,10 +146,19 @@ void LogStartup() {
                                                   : ", NOT THE OFFICIAL 0.9.12";
     Log("Backend: %s (%llu B, MD5 %s%s)", Narrow(orig.wstring()).c_str(), ec ? 0ull : (unsigned long long)size,
         md5.c_str(), what);
+    diag::Set("Backend", Narrow(orig.filename().wstring()) + " in " + Narrow(orig.parent_path().wstring()) + " (MD5 " +
+                             md5.substr(0, 8) + "..." + what + ")");
     if (!g_orig) {
         Log("ERROR: cannot load the backend (error %lu). The game will not start VR.", g_loadError);
+        diag::Report(diag::Level::Serious, "backend",
+                     "The mod cannot load %s (error %lu), so the game cannot start VR. Reinstall the mod.",
+                     Narrow(orig.wstring()).c_str(), g_loadError);
         return;
     }
+    if (!runtime::OpenXrPath() && md5 != kOrigMd5)
+        diag::Report(diag::Level::Warning, "backend-md5",
+                     "%s is not the official Valve openvr_api.dll 0.9.12 (MD5 %s). Reinstall the mod if VR does not work.",
+                     Narrow(orig.wstring()).c_str(), md5.c_str());
     for (int i = 0; i < g_missingCount; ++i) Log("ERROR: the backend has no export %s", g_missing[i]);
     sysinfo::LogGameConfig();
     sysinfo::LogModules("proxy start");
@@ -164,6 +174,8 @@ bool Ready() {
         Guarded("runtime::Prepare", [&] { backend = runtime::Prepare(g_self); });
         LoadOriginal(backend.c_str());
         Guarded("LogStartup", LogStartup);
+        diag::SetQuadDescribe(&quad::Describe);
+        Guarded("diag::CheckStartup", diag::CheckStartup);
     });
     return g_orig != nullptr;
 }
@@ -205,6 +217,8 @@ IVRSystem* VR_CALLTYPE VR_Init(EVRInitError* peError, EVRApplicationType eApplic
     if (g_fn.getGeneric && !runtime::OpenXrPath())
         modern::Init(reinterpret_cast<modern::GetGenericFn>(g_fn.getGeneric));
     frame::NoteSystem(real);  // eye frusta for the gaze from the OpenXR layer
+    // OpenComposite is not asked for device properties: it aborts the game on calls it does not implement.
+    if (!runtime::OpenXrPath()) Guarded("diag::NoteOpenVrSystem", [&] { diag::NoteOpenVrSystem(real); });
     Guarded("VR_Init (backend log)", [] {
         if (!modern::HasSystem())
             Log("%s: gaze %s, no SteamVR frame timing (GPU timestamps only)",

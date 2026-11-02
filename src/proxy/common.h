@@ -43,12 +43,13 @@ struct Config {
     // [log]
     int firstCalls = 3;               // how many first calls of key methods to log with values
     int statsIntervalS = 60;          // interval of call counters and gaze state in seconds (0 = only on exit)
+    bool warningBox = true;           // serious findings (diag.h) also in a Windows message box
     // [timing]
     bool csvAlways = false;           // frame timing CSV for the whole session, not only during a benchmark
     bool gpuTiming = true;            // GPU timestamps per frame phase (frames.csv, benchmark summary, stats)
     // [benchmark]
     int benchKeyMod = VK_RCONTROL;    // modifier key (VK code, 0 = none)
-    int benchKey = VK_F9;             // start and abort key
+    int benchKey = 0;                 // start and abort key (testers: VK_F9; 0 = no hotkey, as for players)
     float benchDelayS = 5.0f;         // from key press to recording start (time to settle)
     float benchDurationS = 30.0f;     // recording length
     bool benchFreezePose = true;      // constant head pose for the game while recording
@@ -71,8 +72,11 @@ struct Config {
     bool probeEngine = true;          // probe: hooks in the game engine (eye tasks, builder)
     bool probeD3D = true;             // probe: hooks in the D3D11 immediate context (draw and copy counters)
     int shotKeyMod = VK_RCONTROL;     // quad: shot of the four views (PNG + pixel differences), modifier (0 = none)
-    int shotKey = VK_F10;             // quad: shot key (0 = no hotkey)
+    int shotKey = 0;                  // quad: shot key (testers: VK_F10; 0 = no hotkey)
     float shotAutoS = 0.0f;           // quad: > 0 = one shot this many seconds after the first frame with focus groups
+    // quad, M8.5: preset=quality|balanced|performance gives the defaults of peripheral_multiplier and the four
+    // *_section keys; a key given in the ini wins. balanced = the mbucchia defaults below.
+    std::string preset = "balanced";
     // quad, M7: the settings of the mbucchia Quad-Views-Foveated layer (names, meaning, defaults and ranges).
     // Densities multiply each dimension of the SteamVR size (the 1:1 grid); sections are fractions of the eye's
     // tangent span; offsets are NDC of the full eye projection, horizontal mirrored (+ = away from the nose).
@@ -100,17 +104,17 @@ struct Config {
     // [debug] (M4.5 tools; quad mode)
     bool overlay = false;             // debug overlay in the composed image at start (blend band edges, gaze point)
     int overlayKeyMod = VK_RCONTROL;  // overlay on/off hotkey
-    int overlayKey = VK_F8;
+    int overlayKey = 0;               // testers: VK_F8 (debug hotkeys are off for players, M8.5)
     int freezeKeyMod = VK_RCONTROL;   // freeze/unfreeze the gaze point
-    int freezeKey = VK_F7;
+    int freezeKey = 0;                // testers: VK_F7
     int outerKeyMod = VK_RCONTROL;    // quad <-> outer only: the focus groups do not run, SteamVR gets outer alone
-    int outerKey = VK_F11;
+    int outerKey = 0;                 // testers: VK_F11
     int gazeKeyMod = VK_RCONTROL;     // focus window: follow the gaze (DFR) <-> fixed (FFR)
     int gazeKey = VK_F6;
     // Clones of the engine's eye-size targets (M7.3, M7.4): 1 = on at start; the hotkey switches.
     bool clones = true;
     int clonesKeyMod = VK_RCONTROL;
-    int clonesKey = VK_F5;
+    int clonesKey = 0;                // testers: VK_F5
     // A viewport the engine sets for an original while a smaller clone is bound is scaled to the clone (M7.4).
     bool clonesViewportFix = true;
     // In an eye group with clones every bind, clear and copy of a cloned original goes to its clone, and in the other
@@ -133,6 +137,8 @@ fs::path ModuleDir();                 // folder of the proxy DLL (the game's x64
 fs::path BaseDir();                   // %QVFR_HOME% (tests) or x64\qvfr; %TEMP%\ams2-qvfr when x64\qvfr is not writable
 bool BaseDirIsFallback();             // BaseDir is the %TEMP% fallback
 fs::path LogDir();
+fs::path LogFile();                   // this session's log
+fs::path IniFile();                   // qvfr.ini
 fs::path BenchDir();
 
 // ---------------------------------------------------------------- method call counters

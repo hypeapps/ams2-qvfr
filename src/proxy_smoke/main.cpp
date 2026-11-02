@@ -79,9 +79,10 @@ fs::path ExeDir() {
 }
 
 const char kSceneIni[] =
-    "[proxy]\nwrap=1\n[log]\nfirst_calls=2\nstats_interval_s=5\n[timing]\ncsv_always=1\n"
+    "[proxy]\nwrap=1\n[log]\nwarning_box=0\nfirst_calls=2\nstats_interval_s=5\n[timing]\ncsv_always=1\n"
     "[benchmark]\nmodifier=0xA3\nkey=0x78\ndelay_s=1\nduration_s=5\nfreeze_pose=1\nbeep=0\nauto_start_s=2\n[gaze]\nread=1\n";
-const char kBackgroundIni[] = "[proxy]\nwrap=1\n";
+// warning_box=0: the smoke exe is never AMS2AVX.exe, so quad runs always have a serious finding (checked in the log).
+const char kBackgroundIni[] = "[proxy]\nwrap=1\n[log]\nwarning_box=0\n";
 
 int RunScene(vr::IVRSystem* sys, vr::IVRCompositor* comp, vr::IVROverlay* ov, double seconds, bool probe) {
     ID3D11Device* dev = nullptr;
@@ -254,6 +255,8 @@ int CheckQuad(const fs::path& logDir) {
         return 5;
     }
     bool settings = false, notSupported = false, hooked = false, faults = false, size = false, resized = false;
+    // M8.5: the default preset, the serious finding about the exe (log only with warning_box=0), the Detected block.
+    bool preset = false, exeWarning = false, boxOff = false, detected = false, detectedGame = false;
     std::string line;
     while (std::getline(in, line)) {
         settings |= line.find("Settings: [quad] mode=quad") != std::string::npos;
@@ -265,11 +268,19 @@ int CheckQuad(const fs::path& logDir) {
         size |= line.find("IVRSystem::GetRecommendedRenderTargetSize = ") != std::string::npos;
         resized |= line.find("quad focus size") != std::string::npos ||
                    line.find("size returned to the game") != std::string::npos;
+        preset |= line.find("Settings: [quad] preset=balanced (peripheral_multiplier 0.50, focus section 0.35 x 0.35, "
+                            "fixed section 0.50 x 0.45)") != std::string::npos;
+        exeWarning |= line.find("WARNING: The game runs as qvfr_proxy_smoke.exe") != std::string::npos;
+        boxOff |= line.find("Warning box: off ([log] warning_box=0), 1 serious finding(s)") != std::string::npos;
+        detected |= line.find("] Detected (") != std::string::npos;
+        detectedGame |= line.find("  Game: qvfr_proxy_smoke.exe (not AMS2AVX.exe): quad views off") != std::string::npos;
     }
-    bool ok = settings && notSupported && !hooked && !faults && size && !resized;
+    bool ok = settings && notSupported && !hooked && !faults && size && !resized && preset && exeWarning && boxOff &&
+              detected && detectedGame;
     printf("Quad check %s: settings %d, exe not supported %d, hooks or patch %d, faults %d, size logged %d, size "
-           "replaced %d (%ls)\n",
-           ok ? "OK" : "FAILED", settings, notSupported, hooked, faults, size, resized, log.filename().c_str());
+           "replaced %d, preset %d, exe warning %d, box off %d, Detected block %d with the game line %d (%ls)\n",
+           ok ? "OK" : "FAILED", settings, notSupported, hooked, faults, size, resized, preset, exeWarning, boxOff,
+           detected, detectedGame, log.filename().c_str());
     return ok ? 0 : 5;
 }
 

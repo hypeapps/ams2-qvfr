@@ -1,5 +1,7 @@
 #include "sysinfo.h"
 
+#include "diag.h"
+
 #include <bcrypt.h>
 #include <psapi.h>
 #include <shlobj.h>
@@ -18,6 +20,9 @@ namespace {
 
 std::mutex g_modMutex;
 std::set<std::wstring> g_seenModules;
+std::vector<std::string> g_known;  // known modules seen in this process, in order
+std::mutex g_cfgMutex;
+std::string g_graphics;            // key="value" pairs of graphicsconfigopenvrdx11.xml
 
 // Modules worth flagging in the log (file name fragment, lower case) and what they are.
 struct Known {
@@ -149,6 +154,7 @@ void LogModules(const char* when) {
         if (added == 1) Log("Modules in process (%s)%s:", when, first ? "" : ", new since the previous list");
         Log("  %p %s%s%s", (void*)mods[i], Narrow(path).c_str(), ver.empty() ? "" : "  v", ver.c_str());
         std::wstring name = Lower(fs::path(path).filename().wstring());
+        diag::CheckModule(name);
         for (const auto& k : kKnown) {
             if (name.find(k.part) != std::wstring::npos) {
                 known.push_back(std::string(k.what) + " (" + Narrow(fs::path(path).filename().wstring()) + ")");
@@ -157,6 +163,7 @@ void LogModules(const char* when) {
         }
     }
     if (!added && !first) Log("Modules in process (%s): unchanged", when);
+    g_known.insert(g_known.end(), known.begin(), known.end());
     if (!known.empty()) {
         std::string s;
         for (auto& k : known) s += (s.empty() ? "" : ", ") + k;
@@ -193,7 +200,28 @@ void LogGameConfig() {
             out += (out.empty() ? "" : " ") + rest;
         }
         Log("Game config %s: %s", Narrow(name).c_str(), out.c_str());
+        if (name == std::wstring(L"graphicsconfigopenvrdx11.xml")) {
+            std::lock_guard lock(g_cfgMutex);
+            g_graphics = " " + out;
+        }
     }
+}
+
+std::string GameSetting(const char* key) {
+    std::lock_guard lock(g_cfgMutex);
+    const std::string k = std::string(" ") + key + "=\"";
+    size_t p = g_graphics.find(k);
+    if (p == std::string::npos) return {};
+    p += k.size();
+    size_t q = g_graphics.find('"', p);
+    return q == std::string::npos ? std::string() : g_graphics.substr(p, q - p);
+}
+
+std::string KnownModules() {
+    std::lock_guard lock(g_modMutex);
+    std::string s;
+    for (const auto& k : g_known) s += (s.empty() ? "" : ", ") + k;
+    return s;
 }
 
 void CopyGameConfig(const fs::path& target) {
