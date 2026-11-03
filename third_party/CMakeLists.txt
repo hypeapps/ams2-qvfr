@@ -22,3 +22,16 @@ target_compile_options(minhook PRIVATE /W3)
 # OpenXR SDK 1.1.65: headers only, for the OpenXR API layer in the proxy (path=openxr, M8).
 add_library(openxr_headers INTERFACE)
 target_include_directories(openxr_headers INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/openxr-1.1.65/include)
+
+# FreeType 2.15.0 (FreeType License, FTL) and RmlUi 6.3 (MIT): the settings GUI (src/config). Both static, FreeType
+# without its optional compression and shaping libraries.
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+foreach(opt FT_DISABLE_ZLIB FT_DISABLE_BZIP2 FT_DISABLE_PNG FT_DISABLE_HARFBUZZ FT_DISABLE_BROTLI)
+  set(${opt} ON CACHE BOOL "" FORCE)
+endforeach()
+add_subdirectory(freetype-2.15.0 EXCLUDE_FROM_ALL)
+add_library(Freetype::Freetype ALIAS freetype)
+target_compile_options(freetype PRIVATE /wd4005)  # builds/windows/ftsystem.c defines WIN32_LEAN_AND_MEAN again
+set(RMLUI_FONT_ENGINE "freetype" CACHE STRING "" FORCE)
+set(RMLUI_THIRDPARTY_CONTAINERS OFF CACHE BOOL "" FORCE)  # std containers: a settings window does not need the faster ones
+add_subdirectory(rmlui-6.3 EXCLUDE_FROM_ALL)
