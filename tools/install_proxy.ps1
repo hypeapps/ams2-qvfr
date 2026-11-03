@@ -8,6 +8,8 @@
     qvfr\openvr\openvr_api.dll                  the official Valve 0.9.12 DLL ([runtime] path=openvr)
     qvfr\opencomposite\openvr_api.dll           OpenComposite ([runtime] path=openxr)
     qvfr\XR_APILAYER_AMS2QVFR_eye_gaze.json     OpenXR layer manifest (points at ..\openvr_api.dll)
+    qvfr\qvfr_config.exe                        settings GUI
+    qvfr\proxy\openvr_api.dll                   spare copy of the proxy (the GUI's Repair puts it back in x64\)
     qvfr\qvfr.ini, qvfr\logs\, bench\, shots\   settings and output (created by the proxy)
 
   Install (default):
@@ -19,8 +21,8 @@
        x64\openvr_api_orig.dll.
   -OpenComposite <dll>: the OpenComposite DLL for qvfr\opencomposite\.
   -Path openvr|openxr: sets [runtime] path in x64\qvfr\qvfr.ini (takes effect at the next game start).
-  -Uninstall: restores x64\openvr_api.dll from the backup and removes the mod's binaries; qvfr.ini and the
-    output folders in x64\qvfr\ stay.
+  -Uninstall: restores x64\openvr_api.dll from the backup and removes the mod's binaries (also the GUI and the
+    spare proxy); qvfr.ini and the output folders in x64\qvfr\ stay.
   -Status: only shows the current state.
 
 .EXAMPLE
@@ -49,6 +51,8 @@ $qvfr = Join-Path $x64 "qvfr"
 $valve = Join-Path $qvfr "openvr\openvr_api.dll"
 $ocDll = Join-Path $qvfr "opencomposite\openvr_api.dll"
 $manifest = Join-Path $qvfr $LayerManifest
+$gui = Join-Path $qvfr "qvfr_config.exe"
+$spare = Join-Path $qvfr "proxy\openvr_api.dll"
 $ini = Join-Path $qvfr "qvfr.ini"
 $backupDir = Join-Path $x64 "bckp_qvfr"
 $backup = Join-Path $backupDir "openvr_api.dll"
@@ -90,6 +94,8 @@ function Show-Status {
     "  qvfr\openvr\openvr_api.dll     : " + (Describe $valve)
     "  qvfr\opencomposite\openvr_api  : " + (Describe $ocDll)
     "  qvfr\$LayerManifest : " + $(if (Test-Path $manifest) { "present" } else { "missing" })
+    "  qvfr\qvfr_config.exe           : " + $(if (Test-Path $gui) { "present (MD5 $(Md5 $gui))" } else { "missing" })
+    "  qvfr\proxy\openvr_api.dll      : " + $(if (-not (Test-Path $spare)) { "missing" } elseif ((Md5 $spare) -eq (Md5 $dll)) { "same as x64\openvr_api.dll" } else { Describe $spare })
     "  qvfr\qvfr.ini [runtime]        : " + (IniPath)
     "  bckp_qvfr\openvr_api.dll       : " + (Describe $backup)
     if (Test-Path $oldOrig) { "  openvr_api_orig.dll (old layout): " + (Describe $oldOrig) }
@@ -135,8 +141,8 @@ if ($Uninstall) {
         if ((Md5 $dll) -ne (Md5 $restore)) { throw "After restoring, x64\openvr_api.dll does not match $restore." }
         "Restored x64\openvr_api.dll from $restore ($(Describe $dll))."
     }
-    foreach ($f in @($pdb, $oldOrig, $valve, $ocDll, $manifest)) { if (Test-Path $f) { Remove-Item $f -Force } }
-    foreach ($d in @((Join-Path $qvfr "openvr"), (Join-Path $qvfr "opencomposite"))) {
+    foreach ($f in @($pdb, $oldOrig, $valve, $ocDll, $manifest, $gui, $spare)) { if (Test-Path $f) { Remove-Item $f -Force } }
+    foreach ($d in @((Join-Path $qvfr "openvr"), (Join-Path $qvfr "opencomposite"), (Join-Path $qvfr "proxy"))) {
         if ((Test-Path $d) -and -not (Get-ChildItem $d -Force)) { Remove-Item $d -Force }
     }
     "Mod binaries removed. Kept: bckp_qvfr\ and x64\qvfr\ (qvfr.ini, logs, bench, shots), if present."
@@ -149,9 +155,13 @@ $srcDll = Join-Path $build "openvr_api.dll"
 $srcPdb = Join-Path $build "openvr_api.pdb"
 $srcValve = Join-Path $build "qvfr\openvr\openvr_api.dll"
 $srcManifest = Join-Path $build "qvfr\$LayerManifest"
+$srcGui = Join-Path $build "qvfr\qvfr_config.exe"
+$srcSpare = Join-Path $build "qvfr\proxy\openvr_api.dll"
 if (-not (Test-Path $srcDll)) { throw "$srcDll not found. Run .\build.ps1 first" }
 if ((Md5 $srcValve) -ne $ValveMd5) { throw "$srcValve is not the official 0.9.12 DLL." }
 if (-not (Test-Path $srcManifest)) { throw "$srcManifest not found. Run .\build.ps1 first" }
+if (-not (Test-Path $srcGui)) { throw "$srcGui not found. Run .\build.ps1 first" }
+if ((Md5 $srcSpare) -ne (Md5 $srcDll)) { throw "$srcSpare is not the same build as $srcDll. Run .\build.ps1 first" }
 if ($OpenComposite -and -not (IsOpenComposite $OpenComposite)) {
     throw "$OpenComposite is not OpenComposite ($(Describe $OpenComposite)). Nothing changed."
 }
@@ -176,13 +186,16 @@ if (Test-Path $srcPdb) { Copy-Item $srcPdb $pdb -Force }
 New-Item -ItemType Directory -Force (Split-Path $valve) | Out-Null
 Copy-Item $srcValve $valve -Force
 Copy-Item $srcManifest $manifest -Force
+Copy-Item $srcGui $gui -Force
+New-Item -ItemType Directory -Force (Split-Path $spare) | Out-Null
+Copy-Item $srcSpare $spare -Force
 if ($OpenComposite) {
     New-Item -ItemType Directory -Force (Split-Path $ocDll) | Out-Null
     Copy-Item $OpenComposite $ocDll -Force
     if ((Md5 $ocDll) -ne (Md5 $OpenComposite)) { throw "The OpenComposite copy does not match $OpenComposite." }
     "OpenComposite copied to $ocDll (backend of [runtime] path=openxr)."
 }
-if ((Md5 $dll) -ne (Md5 $srcDll) -or (Md5 $valve) -ne $ValveMd5) { throw "Copied files do not match the build. Check x64\ manually." }
+if ((Md5 $dll) -ne (Md5 $srcDll) -or (Md5 $spare) -ne (Md5 $srcDll) -or (Md5 $gui) -ne (Md5 $srcGui) -or (Md5 $valve) -ne $ValveMd5) { throw "Copied files do not match the build. Check x64\ manually." }
 if ((Md5 $oldOrig) -eq $ValveMd5) {
     Remove-Item $oldOrig -Force
     "Removed x64\openvr_api_orig.dll (pre-M8.2 layout; the Valve DLL is now in qvfr\openvr\)."
