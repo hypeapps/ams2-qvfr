@@ -35,7 +35,7 @@ let Steam verify the game files and delete `x64\qvfr`.
 **IMPORTANT: The mod does its own quad views inside the game.** It does not ask the VR runtime for quad views, so runtime-side
   quad views (mbucchia's Quad-Views-Foveated layer, Pimax quad views, VectorXR) have no effect on AMS2 and need no change.
 
-You can customize setting using GUI: x64\qvfr\qvfr_config.exe
+You can customize settings using the GUI: `x64\qvfr\qvfr_config.exe`
 
 - **Settings:** quad views on/off, VR API, eye tracking (with the time the focus waits when the tracker loses your eyes,
   and a switch that shows your gaze and the focus edges in the game), focus position, debug options.
