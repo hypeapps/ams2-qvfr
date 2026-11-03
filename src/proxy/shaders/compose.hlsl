@@ -4,8 +4,8 @@
 // allows, so filtering and blending run on linear values and untouched focus pixels come out bit for bit.
 // Soft edge: the curve of the Quad-Views-Foveated layer by Matthieu Bucchianeri (ProjectionPS.hlsl, MIT License,
 // https://github.com/mbucchia/Quad-Views-Foveated), or the pre-M7 one (legacyEdge).
-// Debug overlay (M4.5): the edges of the blend band (yellow: where the focus starts to show, green: from where it is
-// fully sharp) and the gaze point (red ring, blue when frozen).
+// Debug overlay (M4.5): the edges of the blend band (red as the focus frame in the settings GUI's preview: where the
+// focus starts to show; green: from where it is fully sharp) and the gaze point (white ring, blue when frozen).
 
 cbuffer Params : register(b0) {
     float2 gridSize;     // output size in pixels (the 1:1 grid)
@@ -64,11 +64,11 @@ float4 PSMain(float4 pos : SV_Position) : SV_Target {
     [branch] if (overlay > 0) {
         const float lineW = 6;
         float2 sharp = legacyEdge > 0 ? margin + feather : margin + smoothen * (focusSize - 2 * margin);
-        if (Outline(q, margin, lineW) > 0) c = float4(1, 0.85, 0, 1);
+        if (Outline(q, margin, lineW) > 0) c = float4(1, 0.102, 0.069, 1);  // #ff5a4a (linear, written to sRGB)
         if (Outline(q, sharp, lineW) > 0) c = float4(0, 1, 0.2, 1);
         if (gazeMode > 0) {
             float r = length(pos.xy - gaze);
-            if (abs(r - 36) <= 5 || r <= 6) c = gazeMode > 1 ? float4(0.1, 0.4, 1, 1) : float4(1, 0.1, 0.1, 1);
+            if (abs(r - 36) <= 5 || r <= 6) c = gazeMode > 1 ? float4(0.1, 0.4, 1, 1) : float4(1, 1, 1, 1);
         }
     }
     return c;

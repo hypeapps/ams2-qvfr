@@ -606,7 +606,7 @@ int RunCompose() {
         readOk &= qvfr::compose::Draw(ctx, 0, outer, focus, lb) == nullptr;
         cases += 4;
     }
-    // Debug overlay: the gaze dot and the outline of the margin edge, the rest unchanged.
+    // Debug overlay: the gaze dot and the outlines of the margin and sharp edges, the rest unchanged.
     bool overlayOk = false;
     {
         qvfr::compose::Layout lo = l;
@@ -630,9 +630,10 @@ int RunCompose() {
                 auto ch = [](uint32_t v, int c) { return (int)((v >> (8 * c)) & 255); };
                 const uint32_t dot = at(100, 100), gap = at(120, 100), edge = at(l.x0 + (uint32_t)l.marginPx, l.y0 + 100);
                 const uint32_t sharp = at(l.x0 + (uint32_t)(l.marginPx + l.featherPx), l.y0 + 150);
-                overlayOk = ch(dot, 0) > 200 && ch(dot, 1) < 120 && ch(dot, 2) < 120 && gap == outerPx &&
-                            ch(edge, 0) > 200 && ch(edge, 1) > 200 && ch(edge, 2) < 60 && ch(sharp, 0) < 60 &&
-                            ch(sharp, 1) > 200 && ch(sharp, 2) < 160;
+                // White gaze dot, red margin edge (#ff5a4a as in the settings GUI), green sharp edge.
+                overlayOk = ch(dot, 0) > 200 && ch(dot, 1) > 200 && ch(dot, 2) > 200 && gap == outerPx &&
+                            ch(edge, 0) > 200 && ch(edge, 1) > 60 && ch(edge, 1) < 120 && ch(edge, 2) > 40 &&
+                            ch(edge, 2) < 110 && ch(sharp, 0) < 60 && ch(sharp, 1) > 200 && ch(sharp, 2) < 160;
                 printf("Overlay: gaze dot %08X, between dot and ring %08X, margin edge %08X, sharp edge %08X\n", dot,
                        gap, edge, sharp);
                 ctx->Unmap(staging, 0);
