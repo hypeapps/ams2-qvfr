@@ -1,6 +1,6 @@
 # AMS2 QVFR
 
-**EXPERIMENTAL:** Quad views foveated rendering for **Automobilista 2** in VR.
+**EXPERIMENTAL** Quad views foveated rendering for **Automobilista 2** in VR 
 
 The game renders each eye in two parts: the whole field of view at a lower pixel density (the *outer* view) and a
 smaller area at full density (the *focus* view). With eye tracking the focus follows your gaze; without it, it stays in
@@ -16,7 +16,7 @@ MSAA keeps working.
 3. Extract the zip into the folder with `AMS2.exe` and confirm overwriting `x64\openvr_api.dll`.
 4. Settings: `x64\qvfr\qvfr_config.exe`
 5. Choose the VR API in `qvfr_config.exe` → **Settings** → **VR API**. The mod works
-   with both: **OpenVR** (the default) talks to SteamVR; **OpenXR** goes through OpenComposite, which comes with the mod,
+   with both: **OpenVR** (the default); **OpenXR** goes through OpenComposite, which comes with the mod,
    to the OpenXR runtime active in your system. Details: [VR API](#vr-api-openvr-or-openxr).
 6. Then start the game as usual.
 
@@ -32,8 +32,10 @@ let Steam verify the game files and delete `x64\qvfr`.
 
 ## Settings
 
-**IMPORANT: The mod does its own quad views inside the game.** It does not ask the VR runtime for quad views, so runtime-side
+**IMPORTANT: The mod does its own quad views inside the game.** It does not ask the VR runtime for quad views, so runtime-side
   quad views (mbucchia's Quad-Views-Foveated layer, Pimax quad views, VectorXR) have no effect on AMS2 and need no change.
+
+You can customize setting using GUI: x64\qvfr\qvfr_config.exe
 
 - **Settings:** quad views on/off, VR API, eye tracking (with the time the focus waits when the tracker loses your eyes,
   and a switch that shows your gaze and the focus edges in the game), focus position, debug options.
