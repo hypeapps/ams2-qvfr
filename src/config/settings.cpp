@@ -33,7 +33,7 @@ const char* const kPresetKeys[] = {"peripheral_multiplier", "horizontal_focus_se
 
 Settings Read(const IniFile& ini) {
     Settings s;
-    s.openxr = ini.GetOr("runtime", "path", "openvr") == "openxr";
+    s.openxr = ini.GetOr("runtime", "path", "openxr") != "openvr";  // openxr is the default
     s.modeText = ini.GetOr("quad", "mode", "off");
     s.quad = s.modeText == "quad";
     s.presetText = ini.GetOr("quad", "preset", "balanced");

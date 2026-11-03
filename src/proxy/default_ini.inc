@@ -9,7 +9,7 @@
     "; openvr = the Valve openvr_api.dll (x64\\qvfr\\openvr\\) talks to SteamVR;\n"
     "; openxr = OpenComposite (x64\\qvfr\\opencomposite\\) talks to the OpenXR runtime that is active in the system\n"
     "; (choose it in SteamVR, Pimax Play, Meta, Varjo Base...; the mod never changes it).\n"
-    "path=openvr\n"
+    "path=openxr\n"
     "; openxr: another OpenComposite DLL (full path, or relative to x64\\); empty = the default above.\n"
     "opencomposite=\n"
     "; openxr: 1 = the proxy's OpenXR API layer reads the gaze (XR_EXT_eye_gaze_interaction) under OpenComposite.\n"

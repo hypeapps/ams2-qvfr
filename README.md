@@ -14,13 +14,13 @@ MSAA keeps working.
    [Releases](https://github.com/hypeapps/ams2-qvfr/releases/latest).
 2. In Steam: right-click Automobilista 2 → **Manage** → **Browse local files**. This opens the folder with `AMS2.exe`.
 3. Copy `x64\openvr_api.dll` from that folder to a safe place outside the game folder. If you already run AMS2 through
-   your own OpenComposite, that file is your OpenComposite: keep the copy (see [VR API](#vr-api-openvr-or-openxr)).
+   your own OpenComposite, that file is your OpenComposite: keep the copy (see [VR API](#vr-api-openxr-or-openvr)).
 4. Extract the zip into the folder with `AMS2.exe` and confirm overwriting `x64\openvr_api.dll`.
 5. Customize the settings in `x64\qvfr\qvfr_config.exe`. The mod's files are not code-signed, so on the first start
    Windows SmartScreen may show a warning, and some antivirus programs may flag or quarantine `qvfr_config.exe` or
    `x64\openvr_api.dll` as a false positive. If that happens, restore the file and add an exception.
-6. Choose the VR API in `qvfr_config.exe` → **Settings** → **VR API**. The mod works
-   with both: **OpenVR** (the default); **OpenXR** (important: OpenComposite comes with the mod Details: [VR API](#vr-api-openvr-or-openxr)).
+6. The mod starts on the **OpenXR** VR API (the default; OpenComposite comes with the mod). To use **OpenVR** instead,
+   change it in `qvfr_config.exe` → **Settings** → **VR API**. Details: [VR API](#vr-api-openxr-or-openvr).
 7. Then start the game as usual.
 
 Everything the mod needs is in `x64\qvfr\`
@@ -63,21 +63,22 @@ in the GUI they are percentages (multiplier × 100):
 - Serious problems found at game start (TAA on, Pimax foveated rendering on, unsupported game build) also show in a
   Windows message box; the game keeps running.
 
-## VR API: OpenVR / OpenXR
+## VR API: OpenXR or OpenVR
 
-Choose it in the GUI (**Settings → VR API**) or with `[runtime] path` in `qvfr.ini`; it applies at the next game start.
+Choose it in the GUI (**Settings → VR API**) or with `[runtime] path` in `qvfr.ini` (`openxr` or `openvr`); it applies at
+the next game start.
 
-- **OpenVR** (default): the game talks to SteamVR through the Valve DLL in `x64\qvfr\openvr\`. Eye tracking: what SteamVR
-  gives games (tested with the Pimax Dream Air).
-- **OpenXR:** the game goes through OpenComposite, included with the mod in `x64\qvfr\opencomposite\`, to the OpenXR
+- **OpenXR** (default): the game goes through OpenComposite, included with the mod in `x64\qvfr\opencomposite\`, to the OpenXR
   runtime active in your system (SteamVR, Pimax Play, Meta, Varjo Base…). The mod never changes which runtime is active.
   Eye tracking comes from the runtime's `XR_EXT_eye_gaze_interaction`, read by a small OpenXR layer of the mod that only
   the game process loads. To use your own OpenComposite build instead, set `[runtime] opencomposite=` to its full path.
+- **OpenVR:** the game talks to SteamVR through the Valve DLL in `x64\qvfr\openvr\`. Eye tracking: what SteamVR
+  gives games (tested with the Pimax Dream Air).
 
 ## Requirements
 
 - Automobilista 2 on Steam, in VR (DirectX 11), Windows 10 or 11, 64-bit.
-- SteamVR, or any OpenXR runtime when you use the OpenXR path.
+- An OpenXR runtime (SteamVR, Pimax Play, Meta, Varjo Base…) for the default OpenXR path, or SteamVR for the OpenVR path.
 - Eye tracking is optional. Without it you get fixed foveated rendering (the focus stays in the middle).
 - MSAA in the game. Temporal anti-aliasing (TAA) is not supported: with TAA the focus area can smear or flicker.
 
@@ -86,7 +87,8 @@ Choose it in the GUI (**Settings → VR API**) or with `[runtime] path` in `qvfr
 - **Pimax:** turn off **Foveated rendering** in Pimax Play for AMS2 (its LibMagic does not work with AMS2; the log warns).
 - **Pimax's SteamVR driver and eye tracking:** with Pimax's own SteamVR driver, eye tracking works only on the OpenXR
   path. On the OpenVR path the driver gives the game a wrong gaze and the sharp area does not follow your eyes; the mod
-  warns at the game start. Choose **OpenXR** in VR API, or use the CustomHeadsetOpenVR driver, which works on both paths.
+  warns at the game start. Keep **OpenXR** in VR API (the default), or use the CustomHeadsetOpenVR driver, which works on
+  both paths.
 - **OpenXR Toolkit:** on the OpenXR path, turn off Eye tracking, Foveated rendering and upscaling for AMS2. If the game
   still closes at start with the OpenComposite error `XR_ERROR_ACTIONSETS_ALREADY_ATTACHED` (seen with some Toolkit forks),
   disable the Toolkit for AMS2. On the OpenVR path the Toolkit does not work at all.

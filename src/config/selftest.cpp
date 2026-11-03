@@ -51,7 +51,7 @@ int RunSelfTest(const fs::path& dir) {
     ini.LoadText(DefaultIniText());
     const int comments = CountComments(ini.Text());
     Settings s = Read(ini);
-    Expect(s.quad && !s.openxr && s.preset == 1 && !s.Custom(), "default ini: quad, openvr, balanced, no overrides");
+    Expect(s.quad && s.openxr && s.preset == 1 && !s.Custom(), "default ini: quad, openxr, balanced, no overrides");
     Expect(Near(s.peripheral, 0.5f) && Near(s.focusX, 0.35f) && Near(s.fixedY, 0.45f) && Near(s.focusMultiplier, 1.0f),
           "default ini: balanced values");
     Expect(s.gazeKey == 0x75 && s.benchKey == 0 && s.outerKey == 0 && s.warningBox, "default ini: player hotkeys");

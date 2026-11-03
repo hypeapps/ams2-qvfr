@@ -1173,6 +1173,8 @@ int main(int argc, char** argv) {
         if (quad) fputs("[quad]\nmode=quad\n", f);
         if (openxr)
             fprintf(f, "[runtime]\npath=openxr\nopenxr_layer=%d\n", noLayer ? 0 : 1);
+        else
+            fputs("[runtime]\npath=openvr\n", f);  // openxr is the default
         fclose(f);
     }
 

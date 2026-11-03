@@ -493,7 +493,7 @@ void BindModel(Rml::Context* ctx) {
     });
     c.BindEventCallback("confirm_reset", [](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
         if (!g.askReset) return;
-        const std::string path = g.ini.GetOr("runtime", "path", "openvr");
+        const std::string path = g.ini.GetOr("runtime", "path", "openxr");
         g.ini.LoadText(DefaultIniText());
         g.ini.Set("runtime", "path", path);
         Changed();

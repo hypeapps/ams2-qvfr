@@ -83,9 +83,9 @@ function Describe($p) {
 }
 
 function IniPath() {
-    if (-not (Test-Path $ini)) { return "(no qvfr.ini yet: path=openvr by default)" }
+    if (-not (Test-Path $ini)) { return "(no qvfr.ini yet: path=openxr by default)" }
     $line = Select-String -Path $ini -Pattern "^\s*path\s*=" | Select-Object -First 1
-    if ($line) { return $line.Line.Trim() } else { return "(no path key: path=openvr)" }
+    if ($line) { return $line.Line.Trim() } else { return "(no path key: path=openxr)" }
 }
 
 function Show-Status {

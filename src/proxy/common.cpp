@@ -276,12 +276,10 @@ namespace {
 
 Config ReadConfig(const fs::path& ini) {
     Config c;
-    const std::string path = IniString(ini, L"runtime", L"path", L"openvr");
-    if (path == "openxr") {
-        c.pathOpenXr = true;
-    } else if (path != "openvr") {
-        Log("Settings: unknown [runtime] path=\"%s\", using openvr", path.c_str());
-    }
+    // OpenXR is the default path: only path=openvr selects the Valve DLL.
+    const std::string path = IniString(ini, L"runtime", L"path", L"openxr");
+    c.pathOpenXr = path != "openvr";
+    if (path != "openvr" && path != "openxr") Log("Settings: unknown [runtime] path=\"%s\", using openxr", path.c_str());
     c.openComposite = IniPathValue(ini, L"runtime", L"opencomposite");
     c.openxrLayer = IniInt(ini, L"runtime", L"openxr_layer", 1) != 0;
     c.wrap = IniInt(ini, L"proxy", L"wrap", 1) != 0;
