@@ -10,15 +10,17 @@ MSAA keeps working.
 
 ## Install
 
-1. In Steam: right-click Automobilista 2 → **Manage** → **Browse local files**. This opens the folder with `AMS2.exe`.
-2. Copy `x64\openvr_api.dll` from that folder to a safe place outside the game folder. If you already run AMS2 through
+1. Download `ams2-qvfr-<version>.zip` of the latest release from
+   [Releases](https://github.com/hypeapps/ams2-qvfr/releases/latest).
+2. In Steam: right-click Automobilista 2 → **Manage** → **Browse local files**. This opens the folder with `AMS2.exe`.
+3. Copy `x64\openvr_api.dll` from that folder to a safe place outside the game folder. If you already run AMS2 through
    your own OpenComposite, that file is your OpenComposite: keep the copy (see [VR API](#vr-api-openvr-or-openxr)).
-3. Extract the zip into the folder with `AMS2.exe` and confirm overwriting `x64\openvr_api.dll`.
-4. Settings: `x64\qvfr\qvfr_config.exe`
-5. Choose the VR API in `qvfr_config.exe` → **Settings** → **VR API**. The mod works
+4. Extract the zip into the folder with `AMS2.exe` and confirm overwriting `x64\openvr_api.dll`.
+5. Settings: `x64\qvfr\qvfr_config.exe`
+6. Choose the VR API in `qvfr_config.exe` → **Settings** → **VR API**. The mod works
    with both: **OpenVR** (the default); **OpenXR** goes through OpenComposite, which comes with the mod,
    to the OpenXR runtime active in your system. Details: [VR API](#vr-api-openvr-or-openxr).
-6. Then start the game as usual.
+7. Then start the game as usual.
 
 Everything the mod needs is in `x64\qvfr\`
 
