@@ -1,0 +1,76 @@
+# Builds the mod on every push and pull request, runs the tests that need no GPU or headset, and keeps the release zip
+# as an artifact. A tag v<version> (the version in CMakeLists.txt) also publishes a GitHub release with the zip.
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (Release)
+        shell: pwsh
+        run: ./build.ps1 -Config Release
+
+      - name: Tests without GPU or headset
+        shell: pwsh
+        run: |
+          $home_ = Join-Path $env:RUNNER_TEMP "selftest"
+          New-Item -ItemType Directory -Force $home_ | Out-Null
+          # qvfr_config.exe is a window application: wait for it and read its exit code.
+          $p = Start-Process build/bin/Release/qvfr_config.exe -ArgumentList @('--selftest', "`"$home_`"") -Wait -PassThru `
+                 -RedirectStandardOutput selftest.txt
+          Get-Content selftest.txt
+          if ($p.ExitCode -ne 0) { throw "qvfr_config --selftest: exit $($p.ExitCode)" }
+          foreach ($t in '--focus-geometry', '--xr-layer') {
+            & build/bin/Release/qvfr_proxy_smoke.exe $t
+            if ($LASTEXITCODE -ne 0) { throw "qvfr_proxy_smoke $($t): exit $LASTEXITCODE" }
+          }
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          ./tools/package.ps1
+          $zip = Get-ChildItem dist/*.zip | Select-Object -First 1
+          $version = $zip.BaseName -replace '^ams2-qvfr-', ''
+          "zip=$($zip.FullName)" >> $env:GITHUB_OUTPUT
+          "name=$($zip.Name)" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.zip }}
+          if-no-files-found: error
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.package.outputs.version }}
+          ZIP: ${{ steps.package.outputs.zip }}
+        run: |
+          if ($env:TAG -ne "v$env:VERSION") { throw "Tag $env:TAG does not match the project version $env:VERSION (CMakeLists.txt)." }
+          $notes = @"
+          AMS2 QVFR $env:VERSION: quad views foveated rendering for Automobilista 2 in VR.
+
+          **Install:** download ``ams2-qvfr-$env:VERSION.zip``, back up ``x64\openvr_api.dll`` of the game and extract the zip into
+          the folder with ``AMS2.exe``. Settings: ``x64\qvfr\qvfr_config.exe``. Details, requirements and compatibility notes are
+          in the [README](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:TAG/README.md).
+
+          Licensed under the PolyForm Noncommercial License 1.0.0. The zip includes OpenComposite 1.0.1539 (GPLv3, unmodified);
+          see [THIRD_PARTY.md](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:TAG/THIRD_PARTY.md) for its source.
+          "@
+          gh release create $env:TAG $env:ZIP --title "AMS2 QVFR $env:VERSION" --notes $notes
