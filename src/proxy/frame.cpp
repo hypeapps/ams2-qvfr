@@ -143,6 +143,8 @@ uint64_t g_statsFrames = 0, g_gazeOk = 0, g_gazeSame = 0, g_gazeCalls = 0;
 uint64_t g_submitsInInterval = 0;
 modern::Gaze g_prevGaze;
 bool g_gazeFirstLogged = false;
+constexpr double kGazeSampleForMs = 120000, kGazeSampleEveryMs = 500;  // SteamVR gaze samples in the log
+double g_gazeSampleFirstMs = -1, g_gazeSampleLastMs = -1;
 // Gaze stalls: a valid gaze that keeps exactly the same value for kStallMs or longer. The tracker lost the eye
 // (blink, headset lifted), but SteamVR keeps reporting the last value as valid (M5 data, docs/gaze-test.md).
 constexpr double kStallMs = 200;
@@ -779,6 +781,25 @@ void OnWaitGetPosesEnd(vr::IVRCompositor* real, vr::TrackedDevicePose_t* render,
                     "(%.2f°, %.2f°)",
                     xrGaze ? "OpenXR layer, XR_EXT_eye_gaze_interaction" : "GetEyeTrackedFoveationCenter", g.ok,
                     (unsigned long long)g_proxyFrames, g.ndcL[0], g.ndcL[1], g.ndcR[0], g.ndcR[1], g.degX, g.degY);
+            }
+            // SteamVR's gaze for two minutes after the first valid one, with the head pose, to see how a driver reports
+            // it (Pimax's driver gives NDC far outside the frame; the OpenXR layer logs its own samples).
+            if (!xrGaze && g.ok) {
+                if (g_gazeSampleFirstMs < 0) g_gazeSampleFirstMs = g_cur.wgpExit;
+                const double t = g_cur.wgpExit - g_gazeSampleFirstMs;
+                if (t < kGazeSampleForMs &&
+                    (g_gazeSampleLastMs < 0 || g_cur.wgpExit - g_gazeSampleLastMs >= kGazeSampleEveryMs)) {
+                    g_gazeSampleLastMs = g_cur.wgpExit;
+                    char head[128] = "no head pose";
+                    if (render && nRender > vr::k_unTrackedDeviceIndex_Hmd &&
+                        render[vr::k_unTrackedDeviceIndex_Hmd].bPoseIsValid) {
+                        const auto& m = render[vr::k_unTrackedDeviceIndex_Hmd].mDeviceToAbsoluteTracking.m;
+                        snprintf(head, sizeof head, "head (%.3f, %.3f, %.3f) m forward (%.3f, %.3f, %.3f)", m[0][3],
+                                 m[1][3], m[2][3], -m[0][2], -m[1][2], -m[2][2]);
+                    }
+                    Log("Gaze sample %.1f s: NDC L (%.4f, %.4f) R (%.4f, %.4f), %.1f deg right, %.1f deg up; %s", t / 1000,
+                        g.ndcL[0], g.ndcL[1], g.ndcR[0], g.ndcR[1], g.degX, g.degY, head);
+                }
             }
             g_prevGaze = g;
         }
