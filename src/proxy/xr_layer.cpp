@@ -67,6 +67,8 @@ struct Session {
     XrSpace gazeSpace = XR_NULL_HANDLE, viewSpace = XR_NULL_HANDLE;
     uint64_t waits = 0, endFrames = 0;
     uint64_t appSyncs = 0, ownSyncs = 0, gazeOk = 0, gazeInactive = 0, gazeInvalid = 0, locateFail = 0;
+    uint64_t gazeFlipped = 0;       // located gazes whose -Z pointed backwards (mirrored in Z)
+    double firstGazeMs = -1, lastSampleMs = -1;  // the first located gaze; the last gaze sample logged
     double lastAppSyncMs = -1;
     std::vector<XrActiveActionSet> appSets;  // the game's (OpenComposite's) last active sets, for our own sync
     std::string endFrameSig;                 // layer layout of the last logged xrEndFrame
@@ -80,6 +82,7 @@ Gaze g_gaze;
 std::atomic<int64_t> g_periodNs{0};  // predictedDisplayPeriod of the last xrWaitFrame
 
 constexpr double kOwnSyncAfterMs = 50;  // no xrSyncActions from OpenComposite for this long: we sync ourselves
+constexpr double kSampleForMs = 60000, kSampleEveryMs = 500;  // gaze samples in the log after the first gaze
 
 const char* R(XrResult r) {
     switch (r) {
@@ -206,10 +209,11 @@ void ResetSession() {
 void LogSessionStats(const char* why) {
     const Session& s = g_s;
     Log("OpenXR layer: session %d %s: %llu xrWaitFrame, %llu xrEndFrame; xrSyncActions by OpenComposite %llu, by the "
-        "layer %llu; gaze located %llu, action inactive %llu, orientation invalid %llu, xrLocateSpace failed %llu",
+        "layer %llu; gaze located %llu (mirrored in Z %llu), action inactive %llu, orientation invalid %llu, xrLocateSpace "
+        "failed %llu",
         s.number, why, (unsigned long long)s.waits, (unsigned long long)s.endFrames, (unsigned long long)s.appSyncs,
-        (unsigned long long)s.ownSyncs, (unsigned long long)s.gazeOk, (unsigned long long)s.gazeInactive,
-        (unsigned long long)s.gazeInvalid, (unsigned long long)s.locateFail);
+        (unsigned long long)s.ownSyncs, (unsigned long long)s.gazeOk, (unsigned long long)s.gazeFlipped,
+        (unsigned long long)s.gazeInactive, (unsigned long long)s.gazeInvalid, (unsigned long long)s.locateFail);
 }
 
 // After xrWaitFrame: our own sync when OpenComposite has not synced lately, then the gaze at the display time.
@@ -254,13 +258,35 @@ void UpdateGaze(XrSession session, XrTime time) {
                                  v[2] + 2 * (q.x * t[1] - q.y * t[0])};
             const double len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
             if (len > 1e-6) {
-                for (int i = 0; i < 3; ++i) g.dir[i] = (float)(d[i] / len);
+                // An eye cannot look backwards: -Z of the pose pointing behind the head means a runtime whose gaze
+                // pose has +Z forward with right and up as usual (Pimax's SteamVR driver "aapvr"; checked in the
+                // headset 2026-11-03: the fully reversed vector moved the focus left for a gaze to the right and down
+                // for a gaze up). The gaze is then the pose's -Z mirrored in Z.
+                const bool flipped = d[2] > 0;
+                g.dir[0] = (float)(d[0] / len);
+                g.dir[1] = (float)(d[1] / len);
+                g.dir[2] = (float)((flipped ? -d[2] : d[2]) / len);
                 g.ok = true;
-                if (s.gazeOk++ == 0)
+                if (flipped && s.gazeFlipped++ == 0)
+                    Log("OpenXR layer: session %d: the gaze pose's -Z points backwards (%.4f, %.4f, %.4f); the runtime "
+                        "has +Z forward, the gaze is mirrored in Z",
+                        s.number, d[0] / len, d[1] / len, d[2] / len);
+                if (s.gazeOk++ == 0) {
+                    s.firstGazeMs = now;
                     Log("OpenXR layer: session %d: first gaze, direction (%.4f, %.4f, %.4f), flags 0x%llX, position "
                         "(%.3f, %.3f, %.3f) m",
                         s.number, g.dir[0], g.dir[1], g.dir[2], (unsigned long long)loc.locationFlags,
                         loc.pose.position.x, loc.pose.position.y, loc.pose.position.z);
+                }
+                // A minute of samples, to see how a runtime reports the gaze (head-relative or not).
+                if (now - s.firstGazeMs < kSampleForMs && (s.lastSampleMs < 0 || now - s.lastSampleMs >= kSampleEveryMs)) {
+                    s.lastSampleMs = now;
+                    constexpr double kRadToDeg = 57.29577951308232;
+                    Log("OpenXR layer: gaze sample %.1f s: %.1f deg right, %.1f deg up%s, position (%.3f, %.3f, %.3f) m",
+                        (now - s.firstGazeMs) / 1000, std::atan2(g.dir[0], -g.dir[2]) * kRadToDeg,
+                        std::atan2(g.dir[1], -g.dir[2]) * kRadToDeg, flipped ? " (mirrored in Z)" : "", loc.pose.position.x,
+                        loc.pose.position.y, loc.pose.position.z);
+                }
             }
         }
     }

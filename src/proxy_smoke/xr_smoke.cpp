@@ -46,6 +46,7 @@ struct Fake {
     bool lastSyncHadOurs = false;
     int locates = 0, waits = 0, endFrames = 0, spaces = 0;
     XrActionSet ourSet = XR_NULL_HANDLE;  // the set named "ams2qvfr-gaze"
+    bool reversedAxis = false;  // the gaze pose with +Z forward, as Pimax's SteamVR driver reports it
 } g_f;
 
 XrResult XRAPI_CALL FEnumerateExt(const char*, uint32_t cap, uint32_t* count, XrExtensionProperties* props) {
@@ -184,9 +185,11 @@ XrResult XRAPI_CALL FGetActionStatePose(XrSession, const XrActionStateGetInfo*, 
 }
 
 // The gaze 10 degrees to the right: a rotation of -10 degrees about +y turns (0, 0, -1) into (sin 10, 0, -cos 10).
+// With the reversed axis (Pimax's SteamVR driver: +Z forward, right and up as usual) the same gaze is a pose whose
+// -Z is (sin 10, 0, cos 10): a rotation of -170 degrees about +y.
 XrResult XRAPI_CALL FLocateSpace(XrSpace, XrSpace, XrTime, XrSpaceLocation* loc) {
     ++g_f.locates;
-    const double half = -10.0 * 3.14159265358979 / 180.0 / 2.0;
+    const double half = (g_f.reversedAxis ? -170.0 : -10.0) * 3.14159265358979 / 180.0 / 2.0;
     loc->pose.orientation = {0.0f, (float)std::sin(half), 0.0f, (float)std::cos(half)};
     loc->pose.position = {0.03f, 0.0f, 0.0f};
     loc->locationFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
@@ -371,6 +374,7 @@ int RunXrLayer(const fs::path& dll, const fs::path& home) {
 
     for (int sessionNo = 1; sessionNo <= 2; ++sessionNo) {
         printf(" session %d\n", sessionNo);
+        g_f.reversedAxis = sessionNo == 2;  // the second session: a runtime with the opposite axis convention
         XrSessionCreateInfo sci{XR_TYPE_SESSION_CREATE_INFO};
         sci.systemId = sys;
         XrSession s = XR_NULL_HANDLE;
@@ -434,8 +438,16 @@ int RunXrLayer(const fs::path& dll, const fs::path& home) {
     destroyInstance(inst);
 
     const std::string log = ReadNewestLog(home / L"logs");
-    Check(log.find("first gaze, direction (0.1736, 0.0000, -0.9848)") != std::string::npos,
+    Check(log.find("session 1: first gaze, direction (0.1736, 0.0000, -0.9848)") != std::string::npos,
           "the log has the gaze 10 degrees right: direction (0.1736, 0.0000, -0.9848)");
+    Check(log.find("session 1: the gaze pose's -Z points backwards") == std::string::npos &&
+              log.find("session 2: the gaze pose's -Z points backwards (0.1736, 0.0000, 0.9848)") != std::string::npos,
+          "a gaze pose pointing backwards is noticed only on the reversed axis");
+    Check(log.find("session 2: first gaze, direction (0.1736, 0.0000, -0.9848)") != std::string::npos,
+          "with the reversed axis the gaze is the same 10 degrees right");
+    Check(log.find("gaze sample 0.0 s: 10.0 deg right, 0.0 deg up, position") != std::string::npos &&
+              log.find("gaze sample 0.0 s: 10.0 deg right, 0.0 deg up (mirrored in Z)") != std::string::npos,
+          "the log has gaze samples on both axes");
     Check(log.find("eye gaze interaction supported yes") != std::string::npos, "the log has the eye gaze system property");
     Check(log.find("2 layers: projection2 quad") != std::string::npos, "the log has the frame layer layout");
     Check(log.find("the layer syncs itself") != std::string::npos, "the log names the layer's own sync");
