@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(ams2_qvfr LANGUAGES C CXX)
+project(ams2_qvfr VERSION 0.1.0 LANGUAGES C CXX RC)
 
 if(NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "This project builds with MSVC x64 only (AMS2 is 64-bit).")
@@ -24,3 +24,4 @@ add_subdirectory(third_party)
 add_subdirectory(src/gaze_test)
 add_subdirectory(src/proxy)
 add_subdirectory(src/proxy_smoke)
+add_subdirectory(src/config)

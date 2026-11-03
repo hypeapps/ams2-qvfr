@@ -1,0 +1,482 @@
+/* QVFR settings look: dark graphite with one red accent (the AMS2 mood), condensed uppercase headings, values as large
+   readouts like a telemetry screen. RmlUi has no browser default style sheet, so block elements are declared here.
+   Units: dp (scaled by the monitor DPI). */
+
+div, p, h1, body { display: block; }
+
+body {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: row;
+    /* Like the game's menus: a red glow in the middle, a little below half the height (centred on the page area right
+       of the sidebar), fading to black towards the top, the bottom and the corners. */
+    background-color: #060505;
+    decorator: radial-gradient(ellipse farthest-side at 58% 60%, #7c0303 0%, #5a0202 22%, #300101 50%, #140101 78%, #060505 100%);
+    color: #e9eaee;
+    font-family: "Inter";  /* text; Barlow Condensed only for the title, menu, buttons and values */
+    font-size: 14dp;
+    font-weight: 400;
+}
+
+/* ---------------------------------------------------------------- sidebar */
+
+#side {
+    width: 224dp;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 22dp 0 18dp 0;
+    background-color: #00000099;  /* translucent: the red background shows through */
+    border-right: 1dp #ffffff12;
+}
+
+/* Banner: the icon with the name, then a bar for the field of view with the focus in red. */
+#brand { padding: 0 20dp 24dp 20dp; }
+.brand-row { display: flex; flex-direction: row; align-items: center; }
+/* The icon in CSS: a dark tile, the outer view as a light frame, the focus as a red square up and right in it. */
+.logo {
+    width: 22dp;
+    height: 22dp;
+    margin: 0 14dp 0 0;
+    padding: 7dp;
+    border: 1dp #ffffff1c;
+    border-radius: 8dp;
+    background-color: #161619;
+}
+.logo-outer { width: 18dp; height: 18dp; border: 2dp #ececf0; border-radius: 2dp; }
+.logo-focus { width: 8dp; height: 8dp; margin: 2dp 0 0 8dp; background-color: #e2231a; }
+.brand-name { font-family: "Barlow Condensed"; font-weight: 800; font-size: 25dp; letter-spacing: 1dp; line-height: 25dp; white-space: nowrap; }
+.brand-red { color: #e2231a; }
+.brand-sub, .brand-for {
+    font-family: "Barlow Condensed";
+    font-weight: 600;
+    font-size: 11.5dp;
+    letter-spacing: 1.4dp;
+    color: #9a9ea8;
+    white-space: nowrap;
+}
+.brand-sub { margin-top: 4dp; }
+.brand-bar { margin-top: 10dp; height: 3dp; background-color: #ffffff2a; }
+.brand-bar-focus { width: 30%; height: 3dp; margin-left: 58%; background-color: #e2231a; }
+.brand-for { margin-top: 6dp; }
+
+.nav {
+    padding: 10dp 20dp 10dp 17dp;
+    border-left: 3dp #00000000;
+    font-family: "Barlow Condensed";
+    font-weight: 600;
+    font-size: 16dp;
+    letter-spacing: 1dp;
+    text-transform: uppercase;
+    color: #8c909c;
+    cursor: pointer;
+    transition: color background-color 0.12s;
+}
+.nav { display: flex; flex-direction: row; align-items: center; }
+.nav .icon { width: 22dp; margin-right: 10dp; font-size: 19dp; letter-spacing: 0; }
+.nav .ntext { display: block; }
+.nav:hover { color: #e9eaee; background-color: #ffffff0d; }
+.nav.active {
+    color: #ffffff;
+    border-left-color: #e2231a;
+    decorator: horizontal-gradient(#e2231a26 #e2231a00);
+}
+
+.spacer { flex: 1; }
+
+/* Links above the game status: quieter than the menu. */
+.slink {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 6dp 20dp;
+    font-size: 13dp;
+    color: #8c909c;
+    cursor: pointer;
+    transition: color 0.12s;
+}
+.slink .icon { width: 22dp; margin-right: 10dp; font-size: 18dp; }
+.slink .ltext { display: block; flex: 1; }
+.slink:hover { color: #ffffff; }
+.slink:hover .icon { color: #e2231a; }
+.slink + .game { margin-top: 12dp; }
+
+.game { display: flex; flex-direction: row; align-items: center; padding: 0 20dp; font-size: 13dp; color: #8c909c; }
+.game .dot { display: block; width: 8dp; height: 8dp; border-radius: 4dp; margin-right: 8dp; background-color: #4c505b; }
+.game .gtext { display: block; }
+.game.on { color: #d6f0dd; }
+.game.on .dot { background-color: #3ccb68; }
+.ver { padding: 6dp 20dp 0 20dp; font-size: 12dp; color: #555a66; }
+
+/* ---------------------------------------------------------------- page */
+
+#main {
+    flex: 1;
+    overflow-y: auto;
+    padding: 24dp 34dp 34dp 34dp;
+}
+
+h1 {
+    font-family: "Barlow Condensed";
+    font-weight: 700;
+    font-size: 32dp;
+    letter-spacing: 1dp;
+    text-transform: uppercase;
+}
+.lead { color: #b0b3bb; margin: 4dp 0 6dp 0; max-width: 700dp; line-height: 20dp; }
+
+/* "Game restart needed": a red label, shown next to a setting only while it waits for a game restart. */
+.tag {
+    font-family: "Barlow Condensed";
+    font-size: 12dp;
+    font-weight: 700;
+    letter-spacing: 0.8dp;
+    text-transform: uppercase;
+    color: #ffffff;
+    background-color: #e2231a;
+    border-radius: 2dp;
+    padding: 1dp 6dp;
+    margin-left: 8dp;
+}
+.lead .tag { margin: 0 2dp; }
+
+.banner {
+    margin: 12dp 0 4dp 0;
+    padding: 10dp 14dp;
+    border-radius: 4dp;
+    background-color: #2b0f0d;
+    border: 1dp #5a1b16;
+    color: #ffc2bc;
+}
+.banner-title { font-weight: 600; color: #ffffff; margin-right: 6dp; }
+
+/* Card like the tiles of the game's Options menu: a lighter grey header strip with the title over a darker body,
+   rounded corners, hairlines between the rows. */
+.card {
+    margin-top: 16dp;
+    border-radius: 12dp;
+    background-color: #1b1b1b;
+    decorator: vertical-gradient(#222222 #181818);
+}
+.chead {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 9dp 18dp 9dp 22dp;
+    border-radius: 12dp 12dp 0 0;
+    decorator: vertical-gradient(#525252 #434343);
+    font-size: 17dp;
+    font-weight: 600;
+    color: #ffffff;
+}
+.ctitle { display: block; flex: 1; }
+
+/* Icons are glyphs of the Tabler Icons font (white like the game's tile icons). */
+.icon { display: block; font-family: "Tabler Icons"; font-weight: 400; }
+.chead .icon { font-size: 24dp; color: #ffffff; }
+.cbody { padding: 2dp 22dp 4dp 22dp; }
+
+.row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    padding: 12dp 0;
+    border-top: 1dp #303030;
+}
+.cbody > .row:first-child { border-top-width: 0; }
+.label { flex: 1; padding-right: 24dp; }
+.name { font-size: 14.5dp; font-weight: 600; color: #f4f5f7; }
+.desc { font-size: 13dp; color: #a3a7b0; margin-top: 3dp; line-height: 18dp; }
+.control {
+    flex-shrink: 0;
+    width: 320dp;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-end;
+}
+
+/* Value readout: a large condensed number with a small unit. */
+.value { width: 78dp; margin-left: 14dp; text-align: right; }
+.value .num { font-family: "Barlow Condensed"; font-weight: 700; font-size: 24dp; color: #ffffff; }
+.value .unit { font-family: "Barlow Condensed"; font-weight: 600; font-size: 15dp; color: #7f8390; margin-left: 2dp; }
+.value .from { font-size: 11dp; color: #6c707c; margin-top: -3dp; }
+
+.note { display: flex; flex-direction: row; align-items: center; padding: 2dp 0 12dp 0; }
+.note-text { display: block; flex: 1; color: #f0a39d; }
+.note-quiet { display: block; flex: 1; font-size: 13dp; color: #8d919b; }
+
+/* ---------------------------------------------------------------- controls */
+
+button.primary {
+    padding: 6dp 14dp;
+    border-radius: 3dp;
+    background-color: #e2231a;
+    font-family: "Barlow Condensed";
+    font-weight: 700;
+    font-size: 15dp;
+    letter-spacing: 1dp;
+    text-transform: uppercase;
+    color: #ffffff;
+    cursor: pointer;
+}
+button.primary:hover { background-color: #f23a30; }
+
+/* Secondary button: a frame in the card grey. */
+button.ghost {
+    padding: 6dp 14dp;
+    border-radius: 3dp;
+    border: 1dp #4a4a4a;
+    background-color: #1c1c1c;
+    font-family: "Barlow Condensed";
+    font-weight: 600;
+    font-size: 15dp;
+    letter-spacing: 1dp;
+    text-transform: uppercase;
+    color: #d6d8dd;
+    cursor: pointer;
+}
+button.ghost:hover { border-color: #6a6a6a; color: #ffffff; }
+/* Not possible now (the callback refuses it too). */
+button.off, button.off:hover { opacity: 0.35; cursor: default; }
+
+/* ---------------------------------------------------------------- Resolution page */
+
+/* Quad View preview. Colours tie the drawing, the pixel bar and the key together:
+   outer grey, blend dark red, sharp red, full render dark; the gaze is a white ring. */
+.prow { display: flex; flex-direction: row; align-items: center; padding-top: 12dp; border-top: 1dp #303030; }
+.ptitle {
+    display: block;
+    flex: 1;
+    font-size: 12dp;
+    font-weight: 600;
+    letter-spacing: 0.5dp;
+    text-transform: uppercase;
+    color: #8d919b;
+}
+.seg.small button { padding: 3dp 10dp; font-size: 13dp; }
+.preview { display: flex; flex-direction: row; align-items: flex-start; padding: 14dp 0 16dp 0; }
+/* The left eye's field of view to scale; grid lines (data-style-decorator) show the pixel density. */
+.canvas { position: relative; width: 400dp; flex-shrink: 0; background-color: #353535; border: 1dp #5a5a5a; }
+.clabel, .flabel {
+    position: absolute;
+    font-family: "Barlow Condensed";
+    font-weight: 700;
+    font-size: 13dp;
+    letter-spacing: 1dp;
+    white-space: nowrap;
+}
+.clabel { left: 8dp; top: 5dp; color: #d6d6d6; }
+.flabel { left: -2dp; top: -20dp; color: #ff8a7a; }
+/* The image size after the label, quieter and not in capitals. */
+.lpx { margin-left: 8dp; font-weight: 600; letter-spacing: 0.5dp; color: #ffffffb0; }
+.flabel .lpx { color: #ffb3a8; }
+.fov-focus { position: absolute; background-color: #3e100c; border: 2dp #ff5a4a; }
+.fov-sharp { position: absolute; background-color: #c8352a; border: 1dp #ffd6cf; }
+.gaze {
+    position: absolute;
+    z-index: 2;
+    left: 50%;
+    top: 50%;
+    width: 16dp;
+    height: 16dp;
+    margin: -8dp 0 0 -8dp;
+    border: 2dp #ffffff;
+    border-radius: 8dp;
+}
+.gaze-dot { display: block; width: 4dp; height: 4dp; margin: 4dp auto 0 auto; border-radius: 2dp; background-color: #ffffff; }
+
+.legend { flex: 1; padding-left: 26dp; }
+.big .num { font-family: "Barlow Condensed"; font-weight: 700; font-size: 38dp; color: #ffffff; }
+.big .unit { font-family: "Barlow Condensed"; font-weight: 600; font-size: 17dp; color: #a3a7b0; margin-left: 6dp; }
+.bigsub { font-size: 13dp; color: #c4c7ce; margin-top: 2dp; }
+/* Pixel bar: the whole bar is a full render; outer and focus fill their share. */
+.bar { display: flex; flex-direction: row; height: 14dp; margin-top: 12dp; background-color: #161616; border: 1dp #5a5a5a; }
+.bar-outer { height: 14dp; background-color: #5a5a5a; }
+.bar-focus { height: 14dp; background-color: #d9362a; }
+.barkey { display: flex; flex-direction: row; flex-wrap: wrap; align-items: center; margin-top: 8dp; font-size: 12.5dp; color: #c4c7ce; }
+.barkey .sw { margin-right: 6dp; }
+.bkg { display: flex; flex-direction: row; align-items: center; margin: 0 16dp 4dp 0; }
+.bk { display: block; }
+.sw { display: block; flex-shrink: 0; width: 12dp; height: 12dp; border: 1dp #5a5a5a; background-color: #353535; }
+.sw.outer { background-color: #5a5a5a; }
+.sw.focus { background-color: #d9362a; border-color: #d9362a; }
+.sw.full { background-color: #161616; }
+.sw.blend { background-color: #3e100c; border-color: #ff5a4a; }
+.sw.sharp { background-color: #c8352a; border-color: #ffd6cf; }
+.sw.gz { width: 10dp; height: 10dp; border: 2dp #ffffff; border-radius: 7dp; background-color: #00000000; }
+.sw.gz .gaze-dot { margin-top: 3dp; }
+.key { margin-top: 16dp; padding-top: 10dp; border-top: 1dp #303030; }
+.kr { display: flex; flex-direction: row; align-items: flex-start; margin-top: 8dp; }
+.kr .sw { margin: 3dp 10dp 0 0; }
+.kt { display: block; flex: 1; font-size: 13dp; color: #c4c7ce; line-height: 18dp; }
+.kb { font-weight: 600; color: #ffffff; }
+
+/* Page head: title with an action on the right. */
+.phead { display: flex; flex-direction: row; align-items: center; }
+.phead h1 { flex: 1; }
+button.link { color: #ff6a5a; text-decoration: underline; cursor: pointer; }
+button.link:hover { color: #ff9a8e; }
+
+input.numin {
+    width: 80dp;
+    padding: 5dp 8dp;
+    border: 1dp #4a4a4a;
+    background-color: #141414;
+    color: #ffffff;
+    text-align: right;
+}
+input.numin:focus { border-color: #e2231a; }
+.times { display: block; margin: 0 8dp; color: #a3a7b0; }
+
+/* ---------------------------------------------------------------- Status page */
+
+.toolbar { display: flex; flex-direction: row; align-items: center; margin: 4dp 0 0 0; }
+.lead-inline { display: block; flex: 1; color: #b0b3bb; }
+.toolbar button { margin-left: 8dp; }
+.badge {
+    display: block;
+    flex-shrink: 0;
+    width: 70dp;
+    margin-right: 14dp;
+    padding: 3dp 0;
+    text-align: center;
+    border-radius: 3dp;
+    background-color: #333333;
+    font-family: "Barlow Condensed";
+    font-weight: 700;
+    font-size: 13dp;
+    letter-spacing: 1dp;
+    text-transform: uppercase;
+    color: #c9ccd4;
+}
+.badge.warn { background-color: #e2231a; color: #ffffff; }
+.ftext { color: #e6e7eb; line-height: 20dp; }
+.good { color: #62d483; }
+.kv { align-items: flex-start; }
+.kv .k { display: block; width: 150dp; flex-shrink: 0; font-weight: 600; color: #f4f5f7; }
+.kv .v { display: block; flex: 1; color: #c4c7ce; line-height: 20dp; }
+
+/* ---------------------------------------------------------------- Files page */
+
+.frow { align-items: flex-start; }
+.mark {
+    display: block;
+    flex-shrink: 0;
+    width: 30dp;
+    min-width: 30dp;
+    font-family: "Barlow Condensed";
+    font-weight: 800;
+    font-size: 16dp;
+}
+.mark.ok { color: #62d483; }
+.mark.info { color: #8d919b; }
+.mark.warn { color: #ffb84d; }
+.mark.err { color: #ff4d42; }
+.fitem { display: block; width: 360dp; min-width: 360dp; flex-shrink: 0; padding-right: 16dp; font-weight: 600; color: #f4f5f7; }
+/* Paths have no spaces to wrap at: break anywhere instead of running out of the card. */
+.fdetail { display: block; flex: 1; min-width: 0; color: #c4c7ce; line-height: 20dp; word-break: break-all; }
+
+.actions { display: flex; flex-direction: row; margin-top: 16dp; }
+.actions button { margin-right: 10dp; }
+.confirm {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    margin-top: 12dp;
+    padding: 12dp 16dp;
+    border-radius: 6dp;
+    background-color: #1c1c1c;
+}
+.ctext { display: block; flex: 1; font-weight: 500; }
+.confirm button { margin-left: 10dp; }
+.msg { margin-top: 12dp; color: #f4f5f7; font-weight: 500; }
+.foot { margin-top: 18dp; font-size: 13dp; color: #8d919b; }
+
+/* ---------------------------------------------------------------- Log page */
+
+.quiet { color: #8d919b; }
+/* The end of the newest log in its own scroll box (opened at the end, like a terminal). */
+#logbox {
+    margin-top: 12dp;
+    height: 600dp;
+    overflow-y: auto;
+    padding: 10dp 14dp;
+    border-radius: 12dp;
+    background-color: #141414;
+    font-family: "Log Mono";
+    font-size: 12.5dp;
+    line-height: 18dp;
+    color: #c9ccd2;
+}
+.lline { white-space: pre-wrap; word-break: break-all; }
+.lline.warn { color: #ff6b5f; }
+.lline.note { color: #ffcf7a; }
+
+.cintro { padding: 12dp 0 4dp 0; font-size: 13dp; color: #c4c7ce; line-height: 19dp; }
+
+/* Slider: a rail with the red part up to the handle under an input with an empty track. The handle is a slanted
+   white bar 10dp wide that travels 200 - 10 = 190dp, so the rail starts at half a handle and is that long. */
+.slider { position: relative; width: 200dp; height: 22dp; }
+.rail { position: absolute; left: 5dp; top: 9dp; width: 190dp; height: 4dp; background-color: #363636; }
+.fill { height: 4dp; background-color: #e2231a; }
+input.range { position: relative; z-index: 1; width: 200dp; height: 22dp; cursor: pointer; }
+input.range slidertrack { margin-top: 9dp; height: 4dp; }
+input.range sliderbar {
+    margin-top: 1dp;
+    width: 10dp;
+    height: 20dp;
+    background-color: #f2f3f5;
+    transform: skewX(-12deg);
+}
+input.range sliderbar:hover, input.range sliderbar:active { background-color: #ffffff; }
+input.range sliderarrowdec, input.range sliderarrowinc { width: 0; height: 0; }
+
+/* Switch: a square frame with a square knob; red when on. */
+.switch { position: relative; width: 48dp; height: 24dp; }
+.switch input.checkbox {
+    display: block;
+    width: 46dp;
+    height: 22dp;
+    background-color: #141414;
+    border: 1dp #444444;
+    cursor: pointer;
+    transition: background-color border-color 0.12s;
+}
+.switch input.checkbox:checked { background-color: #e2231a; border-color: #e2231a; }
+.switch .knob {
+    position: absolute;
+    top: 4dp;
+    left: 4dp;
+    width: 16dp;
+    height: 16dp;
+    background-color: #8a8e9a;
+    pointer-events: none;
+    transition: left 0.12s cubic-out;
+}
+.switch input.checkbox:checked + .knob { left: 28dp; background-color: #ffffff; }
+
+/* Segmented control: one framed group, the chosen part filled. */
+.seg { display: flex; flex-direction: row; border: 1dp #3a3a3a; border-radius: 4dp; background-color: #141414; padding: 2dp; }
+.seg button {
+    padding: 5dp 14dp;
+    border-radius: 3dp;
+    font-family: "Barlow Condensed";
+    font-weight: 600;
+    font-size: 15dp;
+    letter-spacing: 0.8dp;
+    text-transform: uppercase;
+    color: #9da1ad;
+    cursor: pointer;
+    transition: background-color color 0.1s;
+}
+.seg button:hover { color: #ffffff; }
+.seg button.on { background-color: #e2231a; color: #ffffff; }
+
+/* Scrollbar like the game's lists: a dark rectangular track with a red rectangular thumb of the same width. */
+scrollbarvertical { width: 10dp; margin: 4dp 4dp 4dp 0; }
+scrollbarvertical slidertrack { background-color: #1e1e1e; }
+scrollbarvertical sliderbar { background-color: #c00d0d; min-height: 30dp; }
+scrollbarvertical sliderbar:hover, scrollbarvertical sliderbar:active { background-color: #e01a14; }
+scrollbarvertical sliderarrowdec, scrollbarvertical sliderarrowinc { width: 0; height: 0; }

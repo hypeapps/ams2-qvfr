@@ -1,0 +1,53 @@
+// Resources of qvfr_config.exe: icon, the window's layout and fonts, version. The version numbers come from
+// project(VERSION) in the root CMakeLists.txt (QVFR_VERSION_* definitions); an unsigned exe without a version resource
+// looks more suspicious to antivirus heuristics.
+#include <winver.h>
+
+#define QVFR_STR2(x) #x
+#define QVFR_STR(x) QVFR_STR2(x)
+#define QVFR_VERSION_STR QVFR_STR(QVFR_VERSION_MAJOR) "." QVFR_STR(QVFR_VERSION_MINOR) "." QVFR_STR(QVFR_VERSION_PATCH)
+
+1 ICON "qvfr_config.ico"
+
+// The page files; main.cpp maps "main.rml" to MAIN_RML.
+MAIN_RML RCDATA "ui/main.rml"
+STYLE_RCSS RCDATA "ui/style.rcss"
+
+// Fonts (third_party/fonts): Inter and Barlow Condensed (SIL Open Font License 1.1), Tabler Icons (MIT) cut to the used
+// glyphs (third_party/README.md lists them and the fontTools command). main.cpp LoadFonts lists them by these names.
+FONT_BODY_400 RCDATA "../../third_party/fonts/inter/Inter-Regular.ttf"
+FONT_BODY_500 RCDATA "../../third_party/fonts/inter/Inter-Medium.ttf"
+FONT_BODY_600 RCDATA "../../third_party/fonts/inter/Inter-SemiBold.ttf"
+FONT_HEAD_600 RCDATA "../../third_party/fonts/barlowcondensed/BarlowCondensed-SemiBold.ttf"
+FONT_HEAD_700 RCDATA "../../third_party/fonts/barlowcondensed/BarlowCondensed-Bold.ttf"
+FONT_HEAD_800 RCDATA "../../third_party/fonts/barlowcondensed/BarlowCondensed-ExtraBold.ttf"
+FONT_ICONS RCDATA "../../third_party/fonts/tabler-icons/tabler-icons-qvfr.ttf"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION QVFR_VERSION_MAJOR, QVFR_VERSION_MINOR, QVFR_VERSION_PATCH, 0
+PRODUCTVERSION QVFR_VERSION_MAJOR, QVFR_VERSION_MINOR, QVFR_VERSION_PATCH, 0
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "ams2-qvfr"
+            VALUE "FileDescription", "AMS2 QVFR settings"
+            VALUE "FileVersion", QVFR_VERSION_STR
+            VALUE "InternalName", "qvfr_config"
+            VALUE "LegalCopyright", "ams2-qvfr contributors, noncommercial mod"
+            VALUE "OriginalFilename", "qvfr_config.exe"
+            VALUE "ProductName", "ams2-qvfr: quad views foveated rendering for Automobilista 2"
+            VALUE "ProductVersion", QVFR_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

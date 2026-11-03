@@ -1,0 +1,464 @@
+<rml>
+<head>
+    <title>AMS2 QVFR</title>
+    <link type="text/rcss" href="style.rcss"/>
+</head>
+<body data-model="s">
+    <div id="side">
+        <div id="brand">
+            <div class="brand-row">
+                <div class="logo"><div class="logo-outer"><div class="logo-focus"/></div></div>
+                <div>
+                    <div class="brand-name">QUAD<span class="brand-red">VIEW</span></div>
+                    <div class="brand-sub">FOVEATED RENDERING</div>
+                </div>
+            </div>
+            <div class="brand-bar"><div class="brand-bar-focus"/></div>
+            <div class="brand-for">FOR AUTOMOBILISTA 2</div>
+        </div>
+        <div class="nav" data-class-active="page == 0" data-event-click="page = 0"><span class="icon"></span><span class="ntext">Settings</span></div>
+        <div class="nav" data-class-active="page == 1" data-event-click="page = 1"><span class="icon"></span><span class="ntext">Resolution</span></div>
+        <div class="nav" data-class-active="page == 2" data-event-click="page = 2"><span class="icon"></span><span class="ntext">Status</span></div>
+        <div class="nav" data-class-active="page == 3" data-event-click="page = 3"><span class="icon"></span><span class="ntext">Files</span></div>
+        <div class="nav" data-class-active="page == 4" data-event-click="page = 4"><span class="icon"></span><span class="ntext">Log</span></div>
+        <div class="spacer"/>
+        <div class="slink" data-event-click="open_url('github')"><span class="icon"></span><span class="ltext">GitHub</span></div>
+        <div class="slink" data-event-click="open_url('youtube')"><span class="icon"></span><span class="ltext">Subscribe to my YouTube channel</span></div>
+        <div class="game" data-class-on="game">
+            <span class="dot"/><span class="gtext" data-if="game">Game running</span><span class="gtext" data-if="!game">Game not running</span>
+        </div>
+        <div class="ver">Version 0.1.0</div>
+    </div>
+
+    <div id="main">
+        <div class="banner" data-if="restart != ''">
+            <span class="banner-title">Restart the game to apply:</span> {{ restart }}
+        </div>
+        <div class="banner" data-if="save_error != ''">{{ save_error }}</div>
+
+        <!-- ============================================================ Settings -->
+        <div data-if="page == 0">
+            <div class="phead"><h1>Settings</h1><button class="ghost" data-event-click="reset_defaults()">Reset to the defaults</button></div>
+            <p class="lead">Changes save automatically and most take effect within a second, even while you drive. The VR API
+                and the sizes on the Resolution page apply at the next game start.</p>
+            <div class="confirm" data-if="ask_reset">
+                <span class="ctext">Are you sure you want to reset all settings to the defaults? The VR API stays as it is.</span>
+                <button class="primary" data-event-click="confirm_reset()">Yes, reset</button>
+                <button class="ghost" data-event-click="cancel_reset()">Cancel</button>
+            </div>
+
+            <div class="card">
+                <div class="chead"><span class="ctitle">Mode</span><span class="icon"></span></div>
+                <div class="cbody">
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Quad views <span class="tag" data-if="rs_quad">Game restart needed</span></div>
+                            <div class="desc">Foveated rendering. Off: the game renders as without the mod.</div>
+                        </div>
+                        <div class="control">
+                            <div class="switch"><input type="checkbox" data-checked="quad"/><div class="knob"/></div>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">VR API <span class="tag" data-if="rs_path">Game restart needed</span></div>
+                            <div class="desc" data-if="path == 'openvr'">OpenVR: the game talks to SteamVR.</div>
+                            <div class="desc" data-if="path == 'openxr'">OpenXR: the game goes through OpenComposite to the OpenXR runtime active in your system. OpenComposite is included with the mod.</div>
+                        </div>
+                        <div class="control">
+                            <div class="seg">
+                                <button data-class-on="path == 'openvr'" data-event-click="path = 'openvr'">OpenVR</button>
+                                <button data-class-on="path == 'openxr'" data-event-click="path = 'openxr'">OpenXR</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="chead"><span class="ctitle">Eye tracking</span><span class="icon"></span></div>
+                <div class="cbody">
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Enable eye tracking</div>
+                            <div class="desc">Dynamic foveated rendering. Off: the sharp area stays straight ahead. Without valid eye tracking it goes there anyway after the hold time below.</div>
+                        </div>
+                        <div class="control">
+                            <div class="switch"><input type="checkbox" data-checked="follow"/><div class="knob"/></div>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Hold the last gaze</div>
+                            <div class="desc">How long the sharp area waits when the eye tracker loses your eyes (blinking).</div>
+                        </div>
+                        <div class="control">
+                            <div class="slider"><div class="rail"><div class="fill" data-style-width="(hold_tenths / 20 * 100) + '%'"/></div><input type="range" min="0" max="20" step="1" data-value="hold_tenths"/></div>
+                            <div class="value"><span class="num">{{ hold_text }}</span></div>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Show the gaze in the game</div>
+                            <div class="desc">A white ring where you look, and the focus area's edges: red where it starts to blend in, green where it is fully sharp.</div>
+                        </div>
+                        <div class="control">
+                            <div class="switch"><input type="checkbox" data-checked="gaze_overlay"/><div class="knob"/></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="chead"><span class="ctitle">Focus position</span><span class="icon"></span></div>
+                <div class="cbody">
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Horizontal shift</div>
+                            <div class="desc">Shift of the sharp area from your gaze. + moves both eyes' areas away from the nose.</div>
+                        </div>
+                        <div class="control">
+                            <div class="slider"><div class="rail"><div class="fill" data-style-width="((offset_x + 50) / 100 * 100) + '%'"/></div><input type="range" min="-50" max="50" step="1" data-value="offset_x"/></div>
+                            <div class="value"><span class="num">{{ offset_x }}</span><span class="unit">%</span></div>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Vertical shift</div>
+                            <div class="desc">Shift of the sharp area from your gaze. + moves both eyes' areas up.</div>
+                        </div>
+                        <div class="control">
+                            <div class="slider"><div class="rail"><div class="fill" data-style-width="((offset_y + 50) / 100 * 100) + '%'"/></div><input type="range" min="-50" max="50" step="1" data-value="offset_y"/></div>
+                            <div class="value"><span class="num">{{ offset_y }}</span><span class="unit">%</span></div>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Horizontal shift without eye tracking</div>
+                            <div class="desc">Shift of the sharp area from the middle of the view when it stays there: headsets without eye tracking, 'Enable eye tracking' off, or eye tracking lost. + moves both eyes' areas away from the nose.</div>
+                        </div>
+                        <div class="control">
+                            <div class="slider"><div class="rail"><div class="fill" data-style-width="((fixed_offset_x + 50) / 100 * 100) + '%'"/></div><input type="range" min="-50" max="50" step="1" data-value="fixed_offset_x"/></div>
+                            <div class="value"><span class="num">{{ fixed_offset_x }}</span><span class="unit">%</span></div>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Vertical shift without eye tracking</div>
+                            <div class="desc">Shift of the sharp area from the middle of the view when it stays there: headsets without eye tracking, 'Enable eye tracking' off, or eye tracking lost. + moves both eyes' areas up.</div>
+                        </div>
+                        <div class="control">
+                            <div class="slider"><div class="rail"><div class="fill" data-style-width="((fixed_offset_y + 50) / 100 * 100) + '%'"/></div><input type="range" min="-50" max="50" step="1" data-value="fixed_offset_y"/></div>
+                            <div class="value"><span class="num">{{ fixed_offset_y }}</span><span class="unit">%</span></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="chead"><span class="ctitle">Debug</span><span class="icon"></span></div>
+                <div class="cbody">
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Hotkey right Ctrl + F6</div>
+                            <div class="desc">Turns eye tracking on or off while you play.</div>
+                        </div>
+                        <div class="control">
+                            <div class="switch"><input type="checkbox" data-checked="gaze_hotkey"/><div class="knob"/></div>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Show serious problems at game start</div>
+                            <div class="desc">For example TAA on, Pimax LibMagic loaded or an unsupported game build. They are always in the log too.</div>
+                        </div>
+                        <div class="control">
+                            <div class="switch"><input type="checkbox" data-checked="warning_box"/><div class="knob"/></div>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Frame timing CSV for the whole session <span class="tag" data-if="rs_csv">Game restart needed</span></div>
+                            <div class="desc">Writes the frame times and GPU markers to x64\qvfr\bench\ while you play.</div>
+                        </div>
+                        <div class="control">
+                            <div class="switch"><input type="checkbox" data-checked="csv"/><div class="knob"/></div>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Benchmark hotkey right Ctrl + F9</div>
+                            <div class="desc">Freezes the head pose and records a measurement.</div>
+                        </div>
+                        <div class="control">
+                            <div class="switch"><input type="checkbox" data-checked="bench"/><div class="knob"/></div>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Debug hotkeys</div>
+                            <div class="desc">Right Ctrl + F5 clones, F7 freeze the gaze, F8 overlay, F10 screenshot, F11 outer only.</div>
+                        </div>
+                        <div class="control">
+                            <div class="switch"><input type="checkbox" data-checked="debug_keys"/><div class="knob"/></div>
+                        </div>
+                    </div>
+                    <div class="note"><span class="note-quiet">Everything else: edit qvfr.ini (the comments explain each key).</span></div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ============================================================ Resolution -->
+        <div data-if="page == 1">
+            <div class="phead"><h1>Resolution</h1><button class="ghost" data-event-click="reset_defaults()">Reset to the defaults</button></div>
+            <p class="lead">How much the game renders, per eye. Sizes apply at the next game start.</p>
+            <div class="confirm" data-if="ask_reset">
+                <span class="ctext">Are you sure you want to reset all settings to the defaults? The VR API stays as it is.</span>
+                <button class="primary" data-event-click="confirm_reset()">Yes, reset</button>
+                <button class="ghost" data-event-click="cancel_reset()">Cancel</button>
+            </div>
+
+            <div class="card">
+                <div class="chead"><span class="ctitle">Quad View preview</span><span class="icon"></span></div>
+                <div class="cbody">
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Render resolution per eye</div>
+                            <div class="desc" data-if="from_log">The resolution set in SteamVR, from the log of {{ log_when }}. 100% focus resolution = this density, and the headset gets an image of this size. Type another one to see what it would give; the real one is set in SteamVR.</div>
+                            <div class="desc" data-if="grid_known &amp;&amp; !from_log">Typed in; the log of {{ log_when }} says {{ log_grid_text }}. <button class="link" data-event-click="use_log_res()">Use the value from the log</button></div>
+                            <div class="desc" data-if="!grid_known">Not in a log yet: start the game once with the mod, or type the resolution per eye set in SteamVR.</div>
+                        </div>
+                        <div class="control">
+                            <input type="text" class="numin" maxlength="5" data-attr-value="manual_w" data-event-blur="res_apply('w')" data-event-change="res_enter('w')"/><span class="times">x</span><input type="text" class="numin" maxlength="5" data-attr-value="manual_h" data-event-blur="res_apply('h')" data-event-change="res_enter('h')"/>
+                        </div>
+                    </div>
+                    <div class="prow">
+                        <span class="ptitle">Left eye, to scale</span>
+                        <div class="seg small">
+                            <button data-class-on="pv_dfr" data-event-click="pv(true)">With eye tracking</button>
+                            <button data-class-on="!pv_dfr" data-event-click="pv(false)">Without eye tracking</button>
+                        </div>
+                    </div>
+                    <div class="preview">
+                        <div class="canvas" data-style-height="canvas_h" data-style-decorator="outer_lines">
+                            <div class="clabel">OUTER {{ outer_density }}<span class="lpx">{{ outer_size }} px</span></div>
+                            <div class="fov-focus" data-style-left="focus_left" data-style-top="focus_top" data-style-width="focus_w"
+                                 data-style-height="focus_h" data-style-decorator="focus_lines">
+                                <div class="flabel">FOCUS {{ focus_pct }}<span class="lpx">{{ focus_size }} px</span></div>
+                                <div class="fov-sharp" data-style-left="sharp_inset" data-style-top="sharp_inset"
+                                     data-style-width="sharp_size" data-style-height="sharp_size" data-style-decorator="focus_lines"/>
+                            </div>
+                            <div class="gaze"><div class="gaze-dot"/></div>
+                        </div>
+                        <div class="legend">
+                            <div class="big"><span class="num">{{ mpx }}</span><span class="unit">Mpx rendered per eye</span></div>
+                            <div class="bigsub" data-if="saves">{{ share }}% of a full render at the render resolution: {{ fewer }}× fewer pixels</div>
+                            <div class="bigsub" data-if="!saves">{{ share }}% of a full render at the render resolution: no saving with these sizes</div>
+                            <div class="bar"><div class="bar-outer" data-style-width="bar_outer"/><div class="bar-focus" data-style-width="bar_focus"/></div>
+                            <div class="barkey">
+                                <span class="bkg"><span class="sw outer"/><span class="bk">Outer {{ outer_mpx }} Mpx</span></span>
+                                <span class="bkg"><span class="sw focus"/><span class="bk">Focus {{ focus_mpx }} Mpx</span></span>
+                                <span class="bkg"><span class="sw full"/><span class="bk">Full render {{ full_mpx }} Mpx</span></span>
+                            </div>
+                            <div class="key">
+                                <div class="kr"><span class="sw outer"/><div class="kt"><span class="kb">Outer</span>: the whole view at {{ outer_density }} density, enlarged to the render resolution for the headset. The grid spacing shows the pixel density: denser = sharper. The sizes on the image are what the game renders per eye.</div></div>
+                                <div class="kr"><span class="sw blend"/><div class="kt"><span class="kb">Blend</span>: the focus fading into the outer view, {{ smoothen }}% of the focus area on each side (Transition thickness).</div></div>
+                                <div class="kr"><span class="sw sharp"/><div class="kt" data-if="!sharp_none"><span class="kb">Sharp</span>: the fully sharp centre at {{ focus_pct }} density, {{ sharp_area }} of the view (the focus area is {{ focus_area }}).</div><div class="kt" data-if="sharp_none"><span class="kb">Sharp</span>: none. With Transition thickness at {{ smoothen }}% the whole focus area ({{ focus_area }} of the view) is a blend; lower it for a fully sharp centre.</div></div>
+                                <div class="kr"><span class="sw gz"><span class="gaze-dot"/></span><div class="kt" data-if="pv_dfr"><span class="kb">Your gaze</span>, here looking straight ahead; the focus follows it<span data-if="shifted">, shifted by Focus position</span>.</div><div class="kt" data-if="!pv_dfr"><span class="kb">The middle of the view</span>: the focus stays there<span data-if="shifted">, shifted by Focus position</span>.</div></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="chead"><span class="ctitle">Preset</span><span class="icon"></span></div>
+                <div class="cbody">
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Quality and performance <span class="tag" data-if="rs_preset">Game restart needed</span></div>
+                            <div class="desc">Sets the focus size and the peripheral resolution. Balanced is the recommended start.</div>
+                        </div>
+                        <div class="control">
+                            <div class="seg">
+                                <button data-class-on="preset == 0 &amp;&amp; !custom" data-event-click="set_preset(0)">Quality</button>
+                                <button data-class-on="preset == 1 &amp;&amp; !custom" data-event-click="set_preset(1)">Balanced</button>
+                                <button data-class-on="preset == 2 &amp;&amp; !custom" data-event-click="set_preset(2)">Performance</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="note" data-if="custom">
+                        <span class="note-text">Custom: {{ preset_name }} with your changes</span>
+                        <button class="primary" data-event-click="back_to_preset()">Back to the preset</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="chead"><span class="ctitle">Resolution</span><span class="icon"></span></div>
+                <div class="cbody">
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Focus resolution <span class="tag" data-if="rs_focus_mult">Game restart needed</span></div>
+                            <div class="desc">Pixel density of the sharp area, in % of the SteamVR resolution. 100% is the sharpest; more only smooths edges.</div>
+                        </div>
+                        <div class="control">
+                            <div class="slider"><div class="rail"><div class="fill" data-style-width="((focus_mult - 50) / 150 * 100) + '%'"/></div><input type="range" min="50" max="200" step="5" data-value="focus_mult"/></div>
+                            <div class="value"><span class="num">{{ focus_mult }}</span><span class="unit">%</span></div>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Peripheral resolution <span class="tag" data-if="rs_peripheral">Game restart needed</span></div>
+                            <div class="desc">Pixel density of the whole field of view. The biggest lever for performance.</div>
+                        </div>
+                        <div class="control">
+                            <div class="slider"><div class="rail"><div class="fill" data-style-width="((peripheral - 10) / 90 * 100) + '%'"/></div><input type="range" min="10" max="100" step="1" data-value="peripheral"/></div>
+                            <div class="value"><span class="num">{{ peripheral }}</span><span class="unit">%</span><div class="from" data-if="!peripheral_given">preset</div></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="chead"><span class="ctitle">Focus area</span><span class="icon"></span></div>
+                <div class="cbody">
+                    <div class="cintro">The focus area is the part of the image rendered at the focus resolution, around where you look. The rest of the view (outer) is rendered at the peripheral resolution.</div>
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Width <span class="tag" data-if="rs_focus_x">Game restart needed</span></div>
+                            <div class="desc">How wide the sharp area around your gaze is, in % of the field of view. Larger: more of the image is sharp, but it costs more.</div>
+                        </div>
+                        <div class="control">
+                            <div class="slider"><div class="rail"><div class="fill" data-style-width="((focus_x - 10) / 80 * 100) + '%'"/></div><input type="range" min="10" max="90" step="1" data-value="focus_x"/></div>
+                            <div class="value"><span class="num">{{ focus_x }}</span><span class="unit">%</span><div class="from" data-if="!focus_x_given">preset</div></div>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Height <span class="tag" data-if="rs_focus_y">Game restart needed</span></div>
+                            <div class="desc">How tall the sharp area around your gaze is, in % of the field of view. Larger: more of the image is sharp, but it costs more.</div>
+                        </div>
+                        <div class="control">
+                            <div class="slider"><div class="rail"><div class="fill" data-style-width="((focus_y - 10) / 80 * 100) + '%'"/></div><input type="range" min="10" max="90" step="1" data-value="focus_y"/></div>
+                            <div class="value"><span class="num">{{ focus_y }}</span><span class="unit">%</span><div class="from" data-if="!focus_y_given">preset</div></div>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Width without eye tracking <span class="tag" data-if="rs_fixed_x">Game restart needed</span></div>
+                            <div class="desc">How wide the sharp area is when it stays in the middle of the view: headsets without eye tracking, 'Enable eye tracking' off, or eye tracking lost. Usually larger, since you can look away from it.</div>
+                        </div>
+                        <div class="control">
+                            <div class="slider"><div class="rail"><div class="fill" data-style-width="((fixed_x - 10) / 80 * 100) + '%'"/></div><input type="range" min="10" max="90" step="1" data-value="fixed_x"/></div>
+                            <div class="value"><span class="num">{{ fixed_x }}</span><span class="unit">%</span><div class="from" data-if="!fixed_x_given">preset</div></div>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Height without eye tracking <span class="tag" data-if="rs_fixed_y">Game restart needed</span></div>
+                            <div class="desc">How tall the sharp area is when it stays in the middle of the view: headsets without eye tracking, 'Enable eye tracking' off, or eye tracking lost. Usually larger, since you can look away from it.</div>
+                        </div>
+                        <div class="control">
+                            <div class="slider"><div class="rail"><div class="fill" data-style-width="((fixed_y - 10) / 80 * 100) + '%'"/></div><input type="range" min="10" max="90" step="1" data-value="fixed_y"/></div>
+                            <div class="value"><span class="num">{{ fixed_y }}</span><span class="unit">%</span><div class="from" data-if="!fixed_y_given">preset</div></div>
+                        </div>
+                    </div>
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">Transition thickness</div>
+                            <div class="desc">Soft blend from the focus area into the rest of the image, in % of the focus area on each side. 0 = a hard edge; 50% = the whole focus area is a blend, with no fully sharp centre.</div>
+                        </div>
+                        <div class="control">
+                            <div class="slider"><div class="rail"><div class="fill" data-style-width="(smoothen / 50 * 100) + '%'"/></div><input type="range" min="0" max="50" step="1" data-value="smoothen"/></div>
+                            <div class="value"><span class="num">{{ smoothen }}</span><span class="unit">%</span></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+        </div>
+
+        <!-- ============================================================ Status -->
+        <div data-if="page == 2">
+            <h1>Status</h1>
+            <p class="lead" data-if="!log_found">No log yet: start the game once with the mod.</p>
+            <div data-if="log_found">
+                <p class="lead">Last game start: {{ log_when }}. The whole log is on the Log page.</p>
+
+                <div class="card">
+                    <div class="chead"><span class="ctitle">Problems</span><span class="icon"></span></div>
+                    <div class="cbody">
+                        <div class="row" data-if="findings.size == 0"><div class="label"><div class="name good">None found.</div></div></div>
+                        <div class="row" data-for="f : findings">
+                            <span class="badge warn" data-if="f.warn">Warning</span><span class="badge" data-if="!f.warn">Note</span>
+                            <div class="label"><div class="ftext">{{ f.text }}</div></div>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="chead"><span class="ctitle">What the mod detected</span><span class="icon"></span></div>
+                    <div class="cbody">
+                        <div class="row" data-if="!detected_written">
+                            <div class="label">
+                                <div class="desc" data-if="game">Written about 20 s after the game shows its first VR frame.</div>
+                                <div class="desc" data-if="!game">The game ended before the mod wrote it (about 20 s after the first VR frame).</div>
+                            </div>
+                        </div>
+                        <div class="row kv" data-for="d : detected"><div class="k">{{ d.key }}</div><div class="v">{{ d.value }}</div></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ============================================================ Files -->
+        <div data-if="page == 3">
+            <h1>Files</h1>
+            <p class="lead">The mod's files in the game folder. After Steam verifies the game files, Repair turns the mod on again.</p>
+
+            <div class="card">
+                <div class="chead"><span class="ctitle">Mod files</span><span class="icon"></span></div>
+                <div class="cbody">
+                    <div class="row frow" data-for="r : file_rows">
+                        <span class="mark" data-class-ok="r.cls == 'ok'" data-class-info="r.cls == 'info'" data-class-warn="r.cls == 'warn'" data-class-err="r.cls == 'err'">{{ r.mark }}</span>
+                        <div class="fitem">{{ r.item }}</div>
+                        <div class="fdetail">{{ r.detail }}</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="actions">
+                <button class="ghost" data-event-click="check_files()">Check again</button>
+                <button class="primary" data-class-off="!can_repair" data-event-click="ask('repair')">Repair (turn the mod on)</button>
+                <button class="ghost" data-class-off="!can_valve" data-event-click="ask('valve')">Turn the mod off</button>
+            </div>
+            <div class="banner" data-if="game">Close the game to repair or turn the mod off.</div>
+            <div class="confirm" data-if="confirm != ''">
+                <span class="ctext" data-if="confirm == 'repair'">Put the mod's openvr_api.dll into the game's x64 folder?</span>
+                <span class="ctext" data-if="confirm == 'valve'">Put the original Valve openvr_api.dll back? The mod is off until Repair.</span>
+                <button class="primary" data-event-click="answer(true)">Yes</button>
+                <button class="ghost" data-event-click="answer(false)">Cancel</button>
+            </div>
+            <p class="msg" data-if="files_msg != ''">{{ files_msg }}</p>
+            <p class="foot">Uninstall: turn the mod off, then delete x64\qvfr (or verify the game files in Steam and delete it).</p>
+        </div>
+
+        <!-- ============================================================ Log -->
+        <div data-if="page == 4">
+            <h1>Log</h1>
+            <p class="lead" data-if="!log_found">No log yet: start the game once with the mod.</p>
+            <div data-if="log_found">
+                <div class="toolbar">
+                    <span class="lead-inline">{{ log_name }} <span class="quiet" data-if="log_cut">· the last {{ log_shown }} of {{ log_total }} lines</span></span>
+                    <button class="ghost" data-event-click="open_log()">Open the log</button>
+                    <button class="ghost" data-event-click="open_logs()">Open the logs folder</button>
+                </div>
+                <div id="logbox">
+                    <div class="lline" data-for="l : log_lines" data-class-warn="l.cls == 'warn'" data-class-note="l.cls == 'note'">{{ l.text }}</div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</rml>

@@ -57,4 +57,6 @@ add_custom_command(TARGET qvfr_proxy POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OPENVR_0912_DLL} $<TARGET_FILE_DIR:qvfr_proxy>/qvfr/openvr/openvr_api.dll
   COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_SOURCE_DIR}/XR_APILAYER_AMS2QVFR_eye_gaze.json
           $<TARGET_FILE_DIR:qvfr_proxy>/qvfr/XR_APILAYER_AMS2QVFR_eye_gaze.json
+  # Spare copy for the settings GUI's Repair (after Steam's file verification restored the Valve DLL).
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:qvfr_proxy> $<TARGET_FILE_DIR:qvfr_proxy>/qvfr/proxy/openvr_api.dll
   VERBATIM)
