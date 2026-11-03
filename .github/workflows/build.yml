@@ -64,7 +64,7 @@ jobs:
         run: |
           if ($env:TAG -ne "v$env:VERSION") { throw "Tag $env:TAG does not match the project version $env:VERSION (CMakeLists.txt)." }
           $notes = @"
-          AMS2 QVFR $env:VERSION: quad views foveated rendering for Automobilista 2 in VR.
+          AMS2 QVFR $($env:VERSION): quad views foveated rendering for Automobilista 2 in VR.
 
           **Install:** download ``ams2-qvfr-$env:VERSION.zip``, back up ``x64\openvr_api.dll`` of the game and extract the zip into
           the folder with ``AMS2.exe``. Settings: ``x64\qvfr\qvfr_config.exe``. Details, requirements and compatibility notes are
