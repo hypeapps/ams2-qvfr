@@ -84,6 +84,9 @@ Choose it in the GUI (**Settings → VR API**) or with `[runtime] path` in `qvfr
 ## Compatibility notes
 
 - **Pimax:** turn off **Foveated rendering** in Pimax Play for AMS2 (its LibMagic does not work with AMS2; the log warns).
+- **Pimax's SteamVR driver and eye tracking:** with Pimax's own SteamVR driver, eye tracking works only on the OpenXR
+  path. On the OpenVR path the driver gives the game a wrong gaze and the sharp area does not follow your eyes; the mod
+  warns at the game start. Choose **OpenXR** in VR API, or use the CustomHeadsetOpenVR driver, which works on both paths.
 - **OpenXR Toolkit:** on the OpenXR path, turn off Eye tracking, Foveated rendering and upscaling for AMS2. If the game
   still closes at start with the OpenComposite error `XR_ERROR_ACTIONSETS_ALREADY_ATTACHED` (seen with some Toolkit forks),
   disable the Toolkit for AMS2. On the OpenVR path the Toolkit does not work at all.

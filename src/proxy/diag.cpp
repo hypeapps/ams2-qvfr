@@ -196,8 +196,25 @@ void NoteOpenVrSystem(vr::IVRSystem* real) {
         real->GetStringTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, p, buf, sizeof(buf), &e);
         return e == vr::TrackedProp_Success ? std::string(buf) : std::string("?");
     };
+    const std::string driver = prop(vr::Prop_TrackingSystemName_String);
     Set("Headset", "\"" + prop(vr::Prop_ModelNumber_String) + "\" by \"" + prop(vr::Prop_ManufacturerName_String) +
-                       "\" (SteamVR driver \"" + prop(vr::Prop_TrackingSystemName_String) + "\")");
+                       "\" (SteamVR driver \"" + driver + "\")");
+
+    // Pimax's own SteamVR driver gives a wrong gaze to OpenVR apps: GetEyeTrackedFoveationCenter lands far outside the
+    // image (its gaze origin is not head-relative and its forward is +Z; checked 2026-11-03, Dream Air). Its OpenXR gaze
+    // is usable. Not for headsets that say they have no eye tracking (Prop_SupportsXrEyeGazeInteraction_Bool, 2.x id).
+    const Config& c = Cfg();
+    if (driver == "aapvr" && c.quadMode == QuadMode::Quad && c.followGaze && c.gazeRead) {
+        constexpr auto kSupportsXrEyeGaze = (vr::ETrackedDeviceProperty)6009;
+        vr::TrackedPropertyError e = vr::TrackedProp_Success;
+        const bool eye = real->GetBoolTrackedDeviceProperty(vr::k_unTrackedDeviceIndex_Hmd, kSupportsXrEyeGaze, &e);
+        if (eye || e != vr::TrackedProp_Success)
+            Report(Level::Serious, "pimax-openvr-gaze",
+                   "Eye tracking does not work with Pimax's SteamVR driver on the OpenVR path: it gives the game a wrong "
+                   "gaze, so the sharp area does not follow your eyes. Set the VR API to OpenXR in the mod's settings "
+                   "(path=openxr in [runtime]) or use the CustomHeadsetOpenVR driver. To drop eye tracking instead, turn "
+                   "it off in the settings (follow_gaze=0).");
+    }
 }
 
 void CheckModule(const std::wstring& fileNameLower) {
