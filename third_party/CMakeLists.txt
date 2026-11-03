@@ -8,6 +8,7 @@ set(OPENVR_SDK_DLL ${CMAKE_CURRENT_SOURCE_DIR}/openvr-2.15.6/bin/win64/openvr_ap
 add_library(openvr_0912 INTERFACE)
 target_include_directories(openvr_0912 INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/openvr-0.9.12/headers)
 set(OPENVR_0912_DLL ${CMAKE_CURRENT_SOURCE_DIR}/openvr-0.9.12/bin/win64/openvr_api.dll CACHE INTERNAL "")
+set(OPENCOMPOSITE_DLL ${CMAKE_CURRENT_SOURCE_DIR}/opencomposite-1.0.1539/bin/win64/openvr_api.dll CACHE INTERNAL "")
 
 # MinHook 1.3.4 (BSD-2-Clause), built from source as a static library.
 add_library(minhook STATIC

@@ -55,6 +55,8 @@ set_target_properties(qvfr_proxy PROPERTIES
 )
 add_custom_command(TARGET qvfr_proxy POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OPENVR_0912_DLL} $<TARGET_FILE_DIR:qvfr_proxy>/qvfr/openvr/openvr_api.dll
+  # The pinned OpenComposite, the backend of [runtime] path=openxr (GPLv3, shipped unmodified with its licenses).
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OPENCOMPOSITE_DLL} $<TARGET_FILE_DIR:qvfr_proxy>/qvfr/opencomposite/openvr_api.dll
   COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_SOURCE_DIR}/XR_APILAYER_AMS2QVFR_eye_gaze.json
           $<TARGET_FILE_DIR:qvfr_proxy>/qvfr/XR_APILAYER_AMS2QVFR_eye_gaze.json
   # Spare copy for the settings GUI's Repair (after Steam's file verification restored the Valve DLL).
