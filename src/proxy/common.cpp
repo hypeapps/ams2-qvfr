@@ -395,6 +395,29 @@ Config ReadConfig(const fs::path& ini) {
             c.overlay, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey,
             c.gazeKeyMod, c.gazeKey, c.clones, c.clonesKeyMod, c.clonesKey, c.clonesViewportFix, c.clonesBindFix,
             c.shotClones, c.focusCull, c.cullKeyMod, c.cullKey, c.sunEffects, c.sunKeyMod, c.sunKey, c.taskProfile);
+    const std::string dlaa = IniString(ini, L"dlaa", L"mode", L"off");
+    c.dlaa = dlaa == "dlaa";
+    if (dlaa != "off" && dlaa != "dlaa") Log("Settings: unknown [dlaa] mode=\"%s\", using off", dlaa.c_str());
+    const std::string preset = IniString(ini, L"dlaa", L"preset", L"default");
+    if (preset == "default") {
+        c.dlaaPreset = 0;
+    } else if (preset.size() == 1 && preset[0] >= 'a' && preset[0] <= 'o') {
+        c.dlaaPreset = preset[0] - 'a' + 1;  // NVSDK_NGX_DLSS_Hint_Render_Preset: A = 1 ... K = 11
+    } else {
+        Log("Settings: unknown [dlaa] preset=\"%s\", using default", preset.c_str());
+    }
+    c.dlaaJitterScaleX = IniFloat(ini, L"dlaa", L"jitter_scale_x", c.dlaaJitterScaleX);
+    c.dlaaJitterScaleY = IniFloat(ini, L"dlaa", L"jitter_scale_y", c.dlaaJitterScaleY);
+    c.dlaaMvJittered = IniInt(ini, L"dlaa", L"mv_jittered", 0) != 0;
+    c.dlaaAutoExposure = IniInt(ini, L"dlaa", L"auto_exposure", 1) != 0;
+    c.dlaaSkipLocks = IniInt(ini, L"dlaa", L"skip_locks", 1) != 0;
+    c.dlaaKeyMod = IniInt(ini, L"dlaa", L"modifier", c.dlaaKeyMod);
+    c.dlaaKey = IniInt(ini, L"dlaa", L"key", c.dlaaKey);
+    if (c.dlaa)
+        Log("Settings: [dlaa] mode=dlaa preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d auto_exposure=%d "
+            "skip_locks=%d modifier=0x%X key=0x%X",
+            preset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY, c.dlaaMvJittered, c.dlaaAutoExposure,
+            c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey);
     c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
     if (c.testFaultFrames > 0) Log("Settings: [test] fault_frames=%d (deliberate fault for testing)", c.testFaultFrames);
     return c;
@@ -470,6 +493,15 @@ bool ReloadConfig() {
              n.fixedSectionX != c.fixedSectionX || n.fixedSectionY != c.fixedSectionY,
          "[quad] *_section");
     need(n.probeFrames != c.probeFrames || n.probeEngine != c.probeEngine || n.probeD3D != c.probeD3D, "[quad] probe_*");
+    need(n.dlaa != c.dlaa, "[dlaa] mode");
+    c.dlaaPreset = n.dlaaPreset;
+    c.dlaaJitterScaleX = n.dlaaJitterScaleX;
+    c.dlaaJitterScaleY = n.dlaaJitterScaleY;
+    c.dlaaMvJittered = n.dlaaMvJittered;
+    c.dlaaAutoExposure = n.dlaaAutoExposure;
+    c.dlaaSkipLocks = n.dlaaSkipLocks;
+    c.dlaaKeyMod = n.dlaaKeyMod;
+    c.dlaaKey = n.dlaaKey;
     c.statsIntervalS = n.statsIntervalS;
     c.warningBox = n.warningBox;
     c.benchKeyMod = n.benchKeyMod;

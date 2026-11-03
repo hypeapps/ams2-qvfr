@@ -15,5 +15,10 @@ Vendored into the repo (no submodules), only the files we need. Downloaded 2026-
 | `fonts/inter/` | https://github.com/rsms/inter | v4.1, `extras/ttf/Inter-Regular.ttf`, `-Medium.ttf`, `-SemiBold.ttf` from `Inter-4.1.zip`; downloaded 2026-11-02 | SIL Open Font License 1.1 (`LICENSE.txt`) | text of the RmlUi GUI, embedded in the exe |
 | `fonts/tabler-icons/` | https://github.com/tabler/tabler-icons (npm `@tabler/icons-webfont`) | 3.49.0, `dist/fonts/tabler-icons.ttf` cut to the used glyphs as `tabler-icons-qvfr.ttf` (6 KB) with fontTools 4.55.3: `python -m fontTools.subset tabler-icons.ttf --unicodes=eb3f,eab1,ed30,f02a,ea9a,f22f,ea06,eb20,ed23,edef,eaa2,ea48,ec1c,ec90 --no-hinting --layout-features="" --notdef-outline` (toggle-right, gauge, aspect-ratio, focus-centered, eye, arrows-move, alert-triangle, settings, activity, files, file-text, bug, brand-github, brand-youtube); downloaded 2026-11-02 | MIT (`LICENSE`) | section and menu icons of the RmlUi GUI; a new icon means cutting the font again with its codepoint |
 
+Optional and not in git: `dlss-310.9.16/` (https://github.com/NVIDIA/DLSS, tag v310.9.16, NVIDIA RTX SDKs license in its
+`LICENSE.txt`): `include/` headers, `lib/nvsdk_ngx_s.lib` and `lib/nvsdk_ngx_s_dbg.lib`, `bin/nvngx_dlss.dll`. The license allows
+distribution only as object code inside an application, so the SDK stays local (`.gitignore`); with it the proxy builds the DLAA
+prototype (`[dlaa]`), without it the proxy builds without DLAA.
+
 `openvr-0.9.12/bin/win64/openvr_api.dll` has the same MD5 (`864be5a92276ce2b902b6f3a0f850703`)
 as the game's original `x64\openvr_api.dll`, so the game ships the unmodified Valve DLL.

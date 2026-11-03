@@ -133,6 +133,17 @@ struct Config {
     // Each shot also saves every focus clone as focus L left it (M7.4 diagnostics; the read-back stalls the game for
     // about 3 s).
     bool shotClones = false;
+    // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
+    // proxy built with the DLSS SDK)
+    bool dlaa = false;                // mode=dlaa (a change needs a restart)
+    int dlaaPreset = 0;               // DLSS render preset hint for DLAA: 0 = DLSS default, 10 = J, 11 = K, ...
+    float dlaaJitterScaleX = 0.5f;    // DLSS jitter in pixels = the engine's projection offset * scale
+    float dlaaJitterScaleY = -0.5f;
+    bool dlaaMvJittered = false;      // the engine's motion vectors include the jitter
+    bool dlaaAutoExposure = true;     // DLSS auto exposure (0 = exposure 1)
+    bool dlaaSkipLocks = true;        // skip the engine's TAA locks pass while DLAA replaces the resolve
+    int dlaaKeyMod = VK_RCONTROL;     // DLAA <-> the game's TAA (A/B comparison)
+    int dlaaKey = 0;                  // testers: VK_F4
     // [test] (not in the default ini; used by qvfr_proxy_smoke --fault)
     int testFaultFrames = 0;          // > 0: deliberate access violation in the diagnostics at this proxy frame
 };

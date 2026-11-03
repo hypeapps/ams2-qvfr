@@ -5,6 +5,9 @@
 /CLAUDE.md
 CLAUDE.local.md
 
+# NVIDIA DLSS SDK: its license allows distribution only as object code inside an application, so it stays local
+/third_party/dlss-*/
+
 # Build output
 /build/
 /out/

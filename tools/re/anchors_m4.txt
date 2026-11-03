@@ -30,3 +30,7 @@ cd1352 ExecCallB task executor, second path: mov rcx, rbx; call [rax+0x48] (task
 e216f0 SceneGather scene gather into a renderables set (rcx = set; stack arg 10 = -1 runs it inline, -2 on the last worker)
 e4d010 SceneProcess scene processor (rcx = processor, rdx = renderables set, r8 = view params, r9d = worker; -1 = inline)
 9c1970 MainQueueCopy copies the processed draw queue into the render context's queue (rdx = render context, rcx unused)
+16709e0 TaaResolve CTAAControl resolve (vtable slot 8; rcx = TAA control, rdx = source color, r9d = render context, stack arg 7 = view slot)
+16705a0 TaaLocks CTAAControl locks pass (vtable slot 7; same arguments as the resolve)
+1670a10 TaaResolveDeviceLoad TAA resolve: mov rcx, [rip+disp32] (the engine device global; disp32 at +3; jitter at device+0x1e50+context*8)
+15cb300 SetJitter engine device SetJitter (vtable +0x940; rcx = device, rdx = float2 offset, r8d = render context; stores at device+0x1e50+context*8)

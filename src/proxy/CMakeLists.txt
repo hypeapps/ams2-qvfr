@@ -51,6 +51,7 @@ add_library(qvfr_proxy SHARED
   modern_vr.cpp
   runtime.cpp
   diag.cpp
+  dlaa.cpp
   xr_layer.cpp
   sysinfo.cpp
   sun_fx.cpp
@@ -62,6 +63,22 @@ target_compile_definitions(qvfr_proxy PRIVATE VR_API_EXPORT)
 # so no mutex stays locked after a fault in our code. Directory scope: only this target is built here.
 string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 target_compile_options(qvfr_proxy PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/W4;/EHa>")
+# DLAA prototype: the NVIDIA DLSS SDK is optional and stays out of git (its license allows distribution only as object
+# code), so the proxy builds DLSS in only when the SDK is unpacked locally in third_party/.
+set(QVFR_DLSS_SDK ${PROJECT_SOURCE_DIR}/third_party/dlss-310.9.16)
+if(EXISTS ${QVFR_DLSS_SDK}/include/nvsdk_ngx.h AND EXISTS ${QVFR_DLSS_SDK}/lib/nvsdk_ngx_s.lib)
+  message(STATUS "DLSS SDK found (${QVFR_DLSS_SDK}): DLAA built into the proxy")
+  target_compile_definitions(qvfr_proxy PRIVATE QVFR_HAVE_DLSS)
+  target_include_directories(qvfr_proxy SYSTEM PRIVATE ${QVFR_DLSS_SDK}/include)
+  target_link_libraries(qvfr_proxy PRIVATE
+    $<IF:$<CONFIG:Debug>,${QVFR_DLSS_SDK}/lib/nvsdk_ngx_s_dbg.lib,${QVFR_DLSS_SDK}/lib/nvsdk_ngx_s.lib>)
+  add_custom_command(TARGET qvfr_proxy POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${QVFR_DLSS_SDK}/bin/nvngx_dlss.dll
+            $<TARGET_FILE_DIR:qvfr_proxy>/qvfr/nvngx_dlss.dll
+    VERBATIM)
+else()
+  message(STATUS "DLSS SDK not found in ${QVFR_DLSS_SDK}: the proxy builds without DLAA")
+endif()
 set_target_properties(qvfr_proxy PROPERTIES
   OUTPUT_NAME openvr_api
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin/$<CONFIG>/proxy

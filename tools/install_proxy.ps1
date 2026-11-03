@@ -10,6 +10,7 @@
     qvfr\XR_APILAYER_AMS2QVFR_eye_gaze.json     OpenXR layer manifest (points at ..\openvr_api.dll)
     qvfr\qvfr_config.exe                        settings GUI
     qvfr\proxy\openvr_api.dll                   spare copy of the proxy (the GUI's Repair puts it back in x64\)
+    qvfr\nvngx_dlss.dll                         NVIDIA DLSS ([dlaa] mode=dlaa), only from a build with the local DLSS SDK
     qvfr\qvfr.ini, qvfr\logs\, bench\, shots\   settings and output (created by the proxy)
 
   Install (default):
@@ -53,6 +54,7 @@ $ocDll = Join-Path $qvfr "opencomposite\openvr_api.dll"
 $manifest = Join-Path $qvfr $LayerManifest
 $gui = Join-Path $qvfr "qvfr_config.exe"
 $spare = Join-Path $qvfr "proxy\openvr_api.dll"
+$dlss = Join-Path $qvfr "nvngx_dlss.dll"
 $ini = Join-Path $qvfr "qvfr.ini"
 $backupDir = Join-Path $x64 "bckp_qvfr"
 $backup = Join-Path $backupDir "openvr_api.dll"
@@ -95,6 +97,7 @@ function Show-Status {
     "  qvfr\opencomposite\openvr_api  : " + (Describe $ocDll)
     "  qvfr\$LayerManifest : " + $(if (Test-Path $manifest) { "present" } else { "missing" })
     "  qvfr\qvfr_config.exe           : " + $(if (Test-Path $gui) { "present (MD5 $(Md5 $gui))" } else { "missing" })
+    "  qvfr\nvngx_dlss.dll            : " + $(if (Test-Path $dlss) { "present ($((Get-Item $dlss).Length) B)" } else { "missing" })
     "  qvfr\proxy\openvr_api.dll      : " + $(if (-not (Test-Path $spare)) { "missing" } elseif ((Md5 $spare) -eq (Md5 $dll)) { "same as x64\openvr_api.dll" } else { Describe $spare })
     "  qvfr\qvfr.ini [runtime]        : " + (IniPath)
     "  bckp_qvfr\openvr_api.dll       : " + (Describe $backup)
@@ -141,7 +144,7 @@ if ($Uninstall) {
         if ((Md5 $dll) -ne (Md5 $restore)) { throw "After restoring, x64\openvr_api.dll does not match $restore." }
         "Restored x64\openvr_api.dll from $restore ($(Describe $dll))."
     }
-    foreach ($f in @($pdb, $oldOrig, $valve, $ocDll, $manifest, $gui, $spare)) { if (Test-Path $f) { Remove-Item $f -Force } }
+    foreach ($f in @($pdb, $oldOrig, $valve, $ocDll, $manifest, $gui, $spare, $dlss)) { if (Test-Path $f) { Remove-Item $f -Force } }
     foreach ($d in @((Join-Path $qvfr "openvr"), (Join-Path $qvfr "opencomposite"), (Join-Path $qvfr "proxy"))) {
         if ((Test-Path $d) -and -not (Get-ChildItem $d -Force)) { Remove-Item $d -Force }
     }
@@ -157,6 +160,7 @@ $srcValve = Join-Path $build "qvfr\openvr\openvr_api.dll"
 $srcManifest = Join-Path $build "qvfr\$LayerManifest"
 $srcGui = Join-Path $build "qvfr\qvfr_config.exe"
 $srcSpare = Join-Path $build "qvfr\proxy\openvr_api.dll"
+$srcDlss = Join-Path $build "qvfr\nvngx_dlss.dll"
 if (-not (Test-Path $srcDll)) { throw "$srcDll not found. Run .\build.ps1 first" }
 if ((Md5 $srcValve) -ne $ValveMd5) { throw "$srcValve is not the official 0.9.12 DLL." }
 if (-not (Test-Path $srcManifest)) { throw "$srcManifest not found. Run .\build.ps1 first" }
@@ -189,6 +193,11 @@ Copy-Item $srcManifest $manifest -Force
 Copy-Item $srcGui $gui -Force
 New-Item -ItemType Directory -Force (Split-Path $spare) | Out-Null
 Copy-Item $srcSpare $spare -Force
+if (Test-Path $srcDlss) {
+    Copy-Item $srcDlss $dlss -Force
+    if ((Md5 $dlss) -ne (Md5 $srcDlss)) { throw "The nvngx_dlss.dll copy does not match the build." }
+    "NVIDIA DLSS copied to $dlss ([dlaa] mode=dlaa)."
+}
 if ($OpenComposite) {
     New-Item -ItemType Directory -Force (Split-Path $ocDll) | Out-Null
     Copy-Item $OpenComposite $ocDll -Force
