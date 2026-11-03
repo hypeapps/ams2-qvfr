@@ -150,6 +150,8 @@ h1 {
     color: #ffc2bc;
 }
 .banner-title { font-weight: 600; color: #ffffff; margin-right: 6dp; }
+/* Inside a card: the first thing in its body. */
+.banner.gaze-warn { margin: 12dp 0 4dp 0; font-size: 13.5dp; line-height: 19dp; }
 
 /* Card like the tiles of the game's Options menu: a lighter grey header strip with the title over a darker body,
    rounded corners, hairlines between the rows. */

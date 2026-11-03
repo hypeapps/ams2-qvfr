@@ -163,6 +163,7 @@ struct App {
     std::vector<LogLine> logLines;
     size_t logTotal = 0;     // lines in the whole log
     bool scrollLog = false;  // move the Log page to its end after the next layout
+    bool noGaze = false;     // the last game start logged the proxy's no-gaze note (eye tracking on, no valid gaze)
     FileState files;
     std::vector<FileRow> fileRows;
     std::string filesMsg;
@@ -216,9 +217,11 @@ void LoadLog() {
         g.manualH = (int)(g.logGridH = g.log.gridH);
     }
     g.findings.clear();
+    g.noGaze = false;
     for (const std::string& f : g.log.findings) {
         const bool warn = f.rfind("WARNING", 0) == 0;
         g.findings.push_back({warn, f.substr(warn ? 9 : 6)});
+        if (f.rfind("Note: No valid gaze", 0) == 0) g.noGaze = true;
     }
     g.detected.clear();
     for (const std::string& l : g.log.detected) {
@@ -573,6 +576,7 @@ void BindModel(Rml::Context* ctx) {
     // --- Status.
     c.BindFunc("log_found", [](Rml::Variant& v) { v = g.log.found; });
     c.BindFunc("detected_written", [](Rml::Variant& v) { v = g.log.detectedWritten; });
+    c.BindFunc("no_gaze", [](Rml::Variant& v) { v = g.noGaze; });
     c.Bind("findings", &g.findings);
     c.Bind("detected", &g.detected);
     c.BindEventCallback("open_log", [](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {

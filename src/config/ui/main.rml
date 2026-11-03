@@ -78,6 +78,12 @@
             <div class="card">
                 <div class="chead"><span class="ctitle">Eye tracking</span><span class="icon"></span></div>
                 <div class="cbody">
+                    <div class="banner gaze-warn" data-if="no_gaze &amp;&amp; follow">
+                        <span class="banner-title">No eye tracking at the last game start ({{ log_when }}).</span>
+                        The mod got no valid gaze, so the sharp area stayed straight ahead. Check that eye tracking is on
+                        and calibrated in your headset's software (for example Pimax Play) and that the headset is worn,
+                        then restart the game.
+                    </div>
                     <div class="row">
                         <div class="label">
                             <div class="name">Enable eye tracking</div>
@@ -226,7 +232,7 @@
                             <div class="name">Render resolution per eye</div>
                             <div class="desc" data-if="from_log">The resolution set in SteamVR, from the log of {{ log_when }}. 100% focus resolution = this density, and the headset gets an image of this size. Type another one to see what it would give; the real one is set in SteamVR.</div>
                             <div class="desc" data-if="grid_known &amp;&amp; !from_log">Typed in; the log of {{ log_when }} says {{ log_grid_text }}. <button class="link" data-event-click="use_log_res()">Use the value from the log</button></div>
-                            <div class="desc" data-if="!grid_known">Not in a log yet: start the game once with the mod, or type the resolution per eye set in SteamVR.</div>
+                            <div class="desc" data-if="!grid_known">Only for the preview below: it changes nothing in the headset. Type the resolution per eye set in SteamVR, or start the game once with the mod and it is read from the log.</div>
                         </div>
                         <div class="control">
                             <input type="text" class="numin" maxlength="5" data-attr-value="manual_w" data-event-blur="res_apply('w')" data-event-change="res_enter('w')"/><span class="times">x</span><input type="text" class="numin" maxlength="5" data-attr-value="manual_h" data-event-blur="res_apply('h')" data-event-change="res_enter('h')"/>
