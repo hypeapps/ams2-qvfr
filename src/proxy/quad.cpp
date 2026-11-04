@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -413,6 +414,40 @@ bool InSkipSet(uint8_t* task) {
 // For the stall watch: the last task run and the last one skipped while outer only is on.
 std::atomic<uint8_t*> g_lastRun{nullptr}, g_lastSkipped{nullptr};
 
+// Task CPU profile (M9 step 4, [debug] task_profile): the Execute time of every leaf task of the four eye groups, from
+// the builder's "add task" calls like the skip set. An immutable table per graph; counters are atomics, so the log
+// thread can read and reset them while the render thread runs tasks. CBeginEye and CEndEye include the proxy's work in
+// their detours (view swap, focus culling, copies).
+struct ProfTask {
+    int group = -1;
+    int order = 0;  // build order (its add-task call)
+    bool begin = false;  // the group's CBeginEye: its calls are the group's frames
+    char name[48] = "";
+    mutable std::atomic<uint64_t> ticks{0}, calls{0};
+    mutable std::atomic<uint64_t> gapTicks{0};  // render thread: from the end of its previous task to this one's start
+    mutable std::atomic<uint64_t> offThread{0};  // runs on another thread than the render thread
+};
+struct Profile {
+    std::vector<uintptr_t> tasks;  // sorted
+    std::vector<uint32_t> entry;   // entry of tasks[i]
+    std::unique_ptr<ProfTask[]> entries;
+    size_t n = 0;
+};
+std::atomic<const Profile*> g_profile{nullptr};
+std::vector<const Profile*> g_profRetired;
+std::atomic<bool> g_profOn{false};
+std::atomic<DWORD> g_renderTid{0};  // the thread that runs CBeginEye
+thread_local int64_t t_lastEnd = 0;  // end of the latest task this thread ran (with the profile on)
+int64_t g_qpcFreq = 0;
+
+const ProfTask* ProfFind(uint8_t* task) {
+    const Profile* p = g_profile.load(std::memory_order_acquire);
+    if (!p) return nullptr;
+    auto it = std::lower_bound(p->tasks.begin(), p->tasks.end(), (uintptr_t)task);
+    if (it == p->tasks.end() || *it != (uintptr_t)task) return nullptr;
+    return &p->entries[p->entry[it - p->tasks.begin()]];
+}
+
 void __fastcall RunTask(uint8_t* task) {
     if (g_skip.load(std::memory_order_relaxed)) {
         if (InSkipSet(task)) {
@@ -423,7 +458,26 @@ void __fastcall RunTask(uint8_t* task) {
         }
         g_lastRun.store(task, std::memory_order_relaxed);
     }
+    const bool profOn = g_profOn.load(std::memory_order_relaxed);
+    const ProfTask* prof = profOn ? ProfFind(task) : nullptr;
+    LARGE_INTEGER t0{}, t1{};
+    if (profOn) QueryPerformanceCounter(&t0);
     (*(ExecuteFn**)task)[kExecuteSlot](task);
+    if (profOn) {
+        QueryPerformanceCounter(&t1);
+        if (prof) {
+            prof->ticks.fetch_add((uint64_t)(t1.QuadPart - t0.QuadPart), std::memory_order_relaxed);
+            prof->calls.fetch_add(1, std::memory_order_relaxed);
+            if (GetCurrentThreadId() != g_renderTid.load(std::memory_order_relaxed)) {
+                prof->offThread.fetch_add(1, std::memory_order_relaxed);
+            } else if (t_lastEnd) {
+                // A gap longer than 20 ms is a frame break (menu, loading), not work between two tasks.
+                const int64_t gap = t0.QuadPart - t_lastEnd;
+                if (gap > 0 && gap < g_qpcFreq / 50) prof->gapTicks.fetch_add((uint64_t)gap, std::memory_order_relaxed);
+            }
+        }
+        t_lastEnd = t1.QuadPart;  // nested tasks first, then their group: the group's end wins
+    }
 }
 
 const Anchor kExecSites[] = {Anchor::ExecCallA, Anchor::ExecCallB};
@@ -520,7 +574,159 @@ void PublishSkipSet(const SkipSet* s) {
     if (const SkipSet* old = g_skipSet.exchange(s)) g_retired.push_back(old);  // a reader may still be in it
 }
 
-void ClearGroups() { PublishSkipSet(nullptr); }
+void PublishProfile(const Profile* p) {
+    if (const Profile* old = g_profile.exchange(p)) g_profRetired.push_back(old);  // a reader may still be in it
+}
+
+void ClearGroups() {
+    PublishSkipSet(nullptr);
+    PublishProfile(nullptr);
+}
+
+using TaskNameFn = const char*(__fastcall*)(void*);
+
+// The task's class name from vtable +0x30 (the executor calls it before Execute), under SEH.
+bool TaskClassName(void* task, char* out, size_t n) {
+    out[0] = 0;
+    __try {
+        const char* s = (*(TaskNameFn**)task)[0x30 / 8](task);
+        if (!s) return false;
+        size_t i = 0;
+        for (; i + 1 < n && s[i]; ++i) out[i] = s[i];
+        out[i] = 0;
+        return i > 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out[0] = 0;
+        return false;
+    }
+}
+
+// After a builder call: the leaf tasks of each eye group, from the groups its CBeginEye and CEndEye were added to and
+// the groups inside them. Outer L's CBeginEye sits in preMain, so outer L also gets the once-per-frame tasks; a task in
+// several closures goes to the most specific group (focus R, focus L, outer R, then outer L).
+void BuildProfileLocked() {
+    PublishProfile(nullptr);
+    if (!g_execPatched || !g_graph.ok) return;
+    auto groupOf = [](void* task) -> void* {
+        for (const AddCall& a : g_adds)
+            if (a.task == task) return a.group;
+        return nullptr;
+    };
+    std::unordered_set<void*> member[kGroups];
+    for (int g = 0; g < kGroups; ++g) {
+        std::unordered_set<void*>& m = member[g];
+        for (void* t : {g_graph.begin[g], g_graph.end[g]}) {
+            m.insert(t);
+            if (void* grp = groupOf(t)) m.insert(grp);
+        }
+        for (bool grew = true; grew;) {
+            grew = false;
+            for (const AddCall& a : g_adds)
+                if (m.count(a.group) && m.insert(a.task).second) grew = true;
+        }
+    }
+    auto* p = new Profile;
+    std::unordered_set<void*> taken;
+    struct Item {
+        void* task;
+        int group, order;
+    };
+    std::vector<Item> items;
+    const int pick[kGroups] = {FocusR, FocusL, OuterR, OuterL};
+    for (int g : pick)
+        for (size_t i = 0; i < g_adds.size(); ++i) {
+            void* t = g_adds[i].task;
+            if (!member[g].count(t) || taken.count(t)) continue;
+            uintptr_t vt = 0, slot = 0;
+            if (!hooks::TryRead(t, &vt, 8) || !hooks::TryRead((void*)(vt + kIsGroupSlot * 8), &slot, 8) ||
+                slot != hooks::ExeBase() + kLeafIsGroup)
+                continue;  // groups: their Execute runs the children, which are timed themselves
+            taken.insert(t);
+            items.push_back({t, g, (int)i});
+        }
+    // CBeginEye and CEndEye always belong to their own group (outer L's CBeginEye also sits in preMain's closure).
+    for (int g = 0; g < kGroups; ++g)
+        for (void* t : {g_graph.begin[g], g_graph.end[g]})
+            if (!taken.count(t)) {
+                taken.insert(t);
+                items.push_back({t, g, -1});
+            }
+    p->n = items.size();
+    p->entries = std::make_unique<ProfTask[]>(p->n);
+    size_t count[kGroups] = {};
+    for (size_t i = 0; i < p->n; ++i) {
+        ProfTask& e = p->entries[i];
+        e.group = items[i].group;
+        e.order = items[i].order;
+        e.begin = items[i].task == g_graph.begin[e.group];
+        if (!TaskClassName(items[i].task, e.name, sizeof(e.name)))
+            snprintf(e.name, sizeof(e.name), "task@%p", items[i].task);
+        ++count[e.group];
+    }
+    std::vector<uint32_t> idx(p->n);
+    for (uint32_t i = 0; i < p->n; ++i) idx[i] = i;
+    std::sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) { return items[a].task < items[b].task; });
+    for (uint32_t i : idx) {
+        p->tasks.push_back((uintptr_t)items[i].task);
+        p->entry.push_back(i);
+    }
+    Log("Quad: task profile: %zu leaf tasks (outer L %zu, outer R %zu, focus L %zu, focus R %zu)%s", p->n, count[OuterL],
+        count[OuterR], count[FocusL], count[FocusR], g_profOn ? "" : "; off ([debug] task_profile=0)");
+    PublishProfile(p);
+}
+
+// One line per eye group: per frame and task in build order its Execute time, "+" the render thread's gap before it
+// (from the end of the task it ran before; for CBeginEye that is the gap between groups) and "w" the share of its runs on
+// other threads; then the sums against the group's CPU (CBeginEye to CEndEye). Counters are reset.
+void LogProfileLocked(const Stats& s) {
+    const Profile* p = g_profile.load(std::memory_order_acquire);
+    if (!p) return;
+    if (!g_qpcFreq) return;
+    const double freq = (double)g_qpcFreq;
+    std::vector<uint32_t> order(p->n);
+    for (uint32_t i = 0; i < p->n; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        const ProfTask &x = p->entries[a], &y = p->entries[b];
+        return x.group != y.group ? x.group < y.group : x.order < y.order;
+    });
+    std::vector<uint64_t> ticks(p->n), calls(p->n), gaps(p->n), off(p->n);
+    for (uint32_t i = 0; i < p->n; ++i) {
+        ticks[i] = p->entries[i].ticks.exchange(0, std::memory_order_relaxed);
+        calls[i] = p->entries[i].calls.exchange(0, std::memory_order_relaxed);
+        gaps[i] = p->entries[i].gapTicks.exchange(0, std::memory_order_relaxed);
+        off[i] = p->entries[i].offThread.exchange(0, std::memory_order_relaxed);
+    }
+    if (!g_profOn) return;
+    for (int g = 0; g < kGroups; ++g) {
+        uint64_t frames = 0;
+        for (uint32_t i = 0; i < p->n; ++i)
+            if (p->entries[i].group == g && p->entries[i].begin) frames = calls[i];
+        if (!frames) continue;
+        std::string line;
+        double sum = 0, gapSum = 0, offSum = 0;
+        for (uint32_t i : order) {
+            const ProfTask& e = p->entries[i];
+            if (e.group != g || !calls[i]) continue;
+            const double ms = ticks[i] * 1000.0 / freq / frames;
+            const double gap = gaps[i] * 1000.0 / freq / frames;
+            sum += ms;
+            if (!e.begin) gapSum += gap;
+            if (off[i]) offSum += ms;
+            if (ms < 0.0005 && gap < 0.0005) continue;  // keeps the line short (outer L has about 70 tasks)
+            char item[128];
+            int k = snprintf(item, sizeof(item), "%s %.3f", e.name, ms);
+            if (gap >= 0.0005) k += snprintf(item + k, sizeof(item) - k, "+%.3f", gap);
+            if (calls[i] != frames) k += snprintf(item + k, sizeof(item) - k, " x%.2f", calls[i] / (double)frames);
+            if (off[i]) snprintf(item + k, sizeof(item) - k, " w%.0f%%", 100.0 * off[i] / calls[i]);
+            if (!line.empty()) line += ", ";
+            line += item;
+        }
+        const double group = s.full ? s.cpuMs[g] / s.full : 0;
+        Log("Quad task CPU per frame (%s, %llu frames; group %.3f ms = tasks %.3f + rest %.3f; gaps inside %.3f, tasks on "
+            "other threads %.3f): %s", kGroupNames[g], (unsigned long long)frames, group, sum, group - sum, gapSum,
+            offSum, line.c_str());
+    }
+}
 
 // After a builder call: every task the builder added to a focus group, and to the groups inside it (from the recorded
 // "add task" calls). The group of each eye group is the one its CBeginEye was added to; the four must differ, each
@@ -639,6 +845,8 @@ bool GroupsAliveLocked() {
 void FreeRetiredSets() {
     for (const SkipSet* s : g_retired) delete s;
     g_retired.clear();
+    for (const Profile* p : g_profRetired) delete p;
+    g_profRetired.clear();
 }
 
 // Stall watch (its own thread, never touches the render thread's state): when no frame starts for 3 s while outer only
@@ -1071,6 +1279,10 @@ void HandleToolsLocked() {
         g_clonesOn = !g_clonesOn;
         Log("Quad: clones %s (hotkey)", g_clonesOn ? "on" : "off");
     }
+    if (c.taskProfile != g_profOn.load()) {
+        g_profOn = c.taskProfile;
+        Log("Quad: task CPU profile %s (ini)", c.taskProfile ? "on" : "off");
+    }
     if (c.focusCull != g_cullCfg) {
         g_cullCfg = c.focusCull;
         g_cullOn = c.focusCull;
@@ -1361,6 +1573,7 @@ void* __fastcall D_Builder(void* a, void* b, void* c, void* d) {
             gr.end[2], gr.begin[3], gr.end[3],
             gr.ok ? "focus groups ready" : "UNEXPECTED graph: focus swaps off (the focus groups render the right eye)");
         BuildSkipSetLocked();
+        BuildProfileLocked();
         g_adds.clear();
         g_adds.shrink_to_fit();
     });
@@ -1437,6 +1650,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         std::lock_guard lock(g_m);
         int g = Find(g_graph.begin, task);
         if (g < 0) return;
+        g_renderTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
         if (g_swap.ctx) {  // the previous group did not end
             ++g_st.lateRestores;
             RestoreLocked();
@@ -1781,6 +1995,10 @@ void Install() {
     g_follow = g_followCfg = Cfg().followGaze;
     g_clonesOn = g_clonesCfg = Cfg().clones;
     g_cullOn = g_cullCfg = Cfg().focusCull;
+    LARGE_INTEGER qf{};
+    QueryPerformanceFrequency(&qf);
+    g_qpcFreq = qf.QuadPart;
+    g_profOn = Cfg().taskProfile;
     g_on = g_installed;
 }
 
@@ -2022,6 +2240,7 @@ void LogStats(bool totals) {
         if (!g_st.frames && !g_tot.frames) return;
         AddStats(g_tot, g_st);
         LogStatsLocked(totals ? g_tot : g_st, totals ? " (session total)" : "");
+        if (!totals) LogProfileLocked(g_st);
         g_st = Stats{};
         clones::LogStats(totals);
     });

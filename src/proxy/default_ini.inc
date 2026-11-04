@@ -105,6 +105,8 @@
     "focus_cull=1\n"
     "cull_modifier=0xA3\n"
     "cull_key=0\n"
+    "; 1 = the log gets the CPU time of every task of the four eye views once per stats interval.\n"
+    "task_profile=0\n"
     "; 1 = a viewport the game sets for a full-size target while its smaller copy is bound is scaled to the copy.\n"
     "clones_viewport_fix=1\n"
     "; 1 = a pass that binds a full-size target by its own D3D11 view while the copies are in gets the copy instead.\n"
