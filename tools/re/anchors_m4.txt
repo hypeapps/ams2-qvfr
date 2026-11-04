@@ -27,3 +27,6 @@ cd1352 ExecCallB task executor, second path: mov rcx, rbx; call [rax+0x48] (task
 15dc730 CreateRenderTarget engine device CreateRenderTarget (vtable +0x6a0; rcx = device, rdx = spec, returns the render target object)
 169c280 TextureDtor texture object destructor (vtable 0x21192f8; releases the D3D11 texture +0x58 and its views)
 164e760 RenderTargetDtor render target object destructor (vtable 0x21148f8; releases its view arrays and textures)
+e216f0 SceneGather scene gather into a renderables set (rcx = set; stack arg 10 = -1 runs it inline, -2 on the last worker)
+e4d010 SceneProcess scene processor (rcx = processor, rdx = renderables set, r8 = view params, r9d = worker; -1 = inline)
+9c1970 MainQueueCopy copies the processed draw queue into the render context's queue (rdx = render context, rcx unused)

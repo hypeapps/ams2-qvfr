@@ -17,6 +17,7 @@
 #include "clones.h"
 #include "common.h"
 #include "compose.h"
+#include "focus_cull.h"
 #include "focus_geometry.h"
 #include "gpu.h"
 #include "hooks.h"
@@ -35,7 +36,7 @@ constexpr size_t kCtxSlots = 0x27bc8;    // per view {camera, camera, main camer
 constexpr size_t kSlotSize = 0x18;
 constexpr size_t kCtxCamBlock = 0x190;   // per view camera data; the camera functor fills views 0..2 once per frame
 constexpr size_t kCamBlockSize = 0x1a0;
-constexpr size_t kCtxQuery = 0x70c;      // per view scene query (visibility list) index, stride 4
+constexpr size_t kCtxQuery = 0x70c;      // per view lighting environment index (CLightingEnvManager), stride 4
 constexpr int kFocusView = 2;            // the view number the focus groups run as
 constexpr size_t kAppType = 0x8;         // app singleton: type (5 or 7..9 with a VR device)
 constexpr size_t kAppVr = 0xe0;          // app singleton: engine VR device (_BVROpen)
@@ -44,7 +45,10 @@ constexpr size_t kVrEyeSize = 0x110;
 constexpr size_t kEyeTangents = 0x0;     // eye data: 4 floats {b, -t, -l, r} computed from the projection (0xd6bf30)
 constexpr size_t kEyeProj = 0x90;        // eye data: projection, row vectors, z forward (m20 = -OpenVR m02, m23 = 1)
 constexpr uintptr_t kCamVtable = 0x2115d30;  // camera class vtable (RVA); all view cameras have it
+constexpr size_t kCamView = 0x90;        // camera: view matrix, row vectors (+0x150 returns it times +0x110)
 constexpr size_t kCamProj = 0x110;       // camera: explicit projection (set through vtable +0x210, read by +0x138/+0x150)
+constexpr size_t kCamRotDirty = 0x400;   // camera: rebuild the rotation, the position (the view matrix is stale meanwhile)
+constexpr size_t kCamPosDirty = 0x401;
 constexpr size_t kCamProjDirty = 0x402;  // camera: 1 = rebuild the projection from FOV and aspect at the next update
 constexpr size_t kMatSize = 0x40;
 // Task system (M4.5, disassembly of 0xcd0cd0 and the executor 0xcd12a0): "add task" (rcx = group, rdx = task) puts
@@ -80,8 +84,9 @@ char g_dumpNames[kShotImages - kShotFixed][64];
 ID3D11Resource* g_dumpRes[kShotImages - kShotFixed] = {};  // not referenced: released no earlier than the next frame
 const char* g_shotNames[kShotImages] = {"outer_l", "outer_r", "focus_l", "focus_r", "composed_l", "composed_r"};
 int g_shotCount = kShotFixed;
-// The view whose camera, frustum and visibility list each group renders with; the focus groups replace only the
-// projection (camera and VR device eye data) with the focus window of that eye.
+// The view whose camera, frustum block and lighting environment each group renders with; the focus groups replace the
+// projection (camera and VR device eye data) with the focus window of that eye and, with focus culling (M9.3), the draw
+// queue with one culled for that window.
 constexpr int kSourceView[kGroups] = {1, 2, 1, 2};
 // Rectangles filled in by SetupLocked: the focus views against their window in the outer views and in the composed
 // eyes (only inside the blend band, where the composition must be the focus pixel for pixel), and the outer views
@@ -184,6 +189,8 @@ struct Run {
     bool eyeSwapped = false;  // VR device eye data of view 2 replaced
     bool projected = false;   // focus projection in the camera and in the eye data
     uint32_t x0 = 0, y0 = 0;  // with `projected`: the focus window it rendered (grid pixels), for the composition
+    bool culled = false;      // the draw queue was culled for the focus window (M9.3)
+    focus_cull::Result cull;
 };
 
 struct Stats {
@@ -197,6 +204,10 @@ struct Stats {
     uint64_t bySource[4] = {};   // frames with the focus groups by window source (live, held, fixed, frozen)
     uint64_t gazeLost = 0;       // the window went to the fixed center: no valid gaze for longer than gaze_hold_s
     double cpuMs[kGroups] = {};
+    // Focus culling (M9.3), sums over the frames with both focus groups culled.
+    uint64_t cullFrames = 0, cullOnFrames = 0;  // culled / with culling on and the focus projection in both groups
+    double cullMs[2] = {};                      // gather + processor + queue copy per focus group
+    double setEye = 0, setFocus[2] = {}, queueEye = 0, queueFocus[2] = {};
 };
 
 // Focus window for this VR session (M4.3, M7.2): the game gets the render size and the full projection (outer), the
@@ -267,6 +278,22 @@ bool g_outerKeyDown = false, g_overlayKeyDown = false, g_freezeKeyDown = false;
 bool g_clonesOn = true;
 bool g_clonesCfg = true;  // Cfg().clones last seen (a reload sets g_clonesOn)
 bool g_clonesKeyDown = false;
+// Focus culling (M9.3): setting and hotkey; checks that fail in a row turn it off until the next builder call, an engine
+// fault for the session.
+bool g_cullOn = true;
+bool g_cullCfg = true;
+bool g_cullKeyDown = false;
+struct Cull {
+    bool failed = false;  // off until the next builder call
+    int misses = 0;       // focus groups in a row without culling (checks failed)
+    bool missLogged = false;
+    bool logged = false;  // first culled frame of this graph logged
+};
+Cull g_cull;
+bool g_cullFault = false;
+constexpr int kCullMissLimit = 144;
+constexpr float kCullMargin = 0.05f;  // focus planes pushed out by this much NDC per edge
+alignas(16) uint8_t g_cullBlock[2][focus_cull::kBlockSize];  // the processor keeps a pointer until the next frame
 
 // Debug overlay and gaze (NDC per eye from GetEyeTrackedFoveationCenter, x right, y up).
 bool g_overlay = false;
@@ -767,10 +794,69 @@ float SharpInsetLocked() {
     return c.quadMarginPx + c.smoothen * std::max(0.0f, shown);
 }
 
-// Before a focus group: view 2 takes the source view's camera slot, frustum block and visibility list (focus L),
+void CullMissLocked(int group, const char* why) {
+    if (!g_cull.missLogged) {
+        g_cull.missLogged = true;
+        Log("Quad: %s without focus culling in frame %llu (%s); off after %d misses in a row", kGroupNames[group],
+            (unsigned long long)g_frameNo, why, kCullMissLimit);
+    }
+    if (++g_cull.misses >= kCullMissLimit) {
+        g_cull.failed = true;
+        Log("Quad: focus culling OFF until the next builder call (%s: %s); the focus groups draw the eye's set",
+            kGroupNames[group], why);
+    }
+}
+
+// Focus culling (M9.3), after the focus projection is in: the engine's gather and processor run again for a frustum
+// block with the focus window's side planes, and the draw queue the group reads gets their result. The block layout is
+// learned from the source eye's engine block every time, so a block that does not match the expected format is never
+// written. Near and far, the camera (distances and LOD) and the include and exclude flags stay the eye's.
+void CullLocked(uint8_t* ctx, int group, const uint8_t* cam, const uint8_t* srcEye, const uint8_t* focusEye, Run& run) {
+    if (!g_cullOn || g_cull.failed || g_cullFault || !focus_cull::Available()) return;
+    char why[256] = "";
+    if (cam[kCamRotDirty] || cam[kCamPosDirty]) {
+        CullMissLocked(group, "camera view matrix not up to date (flags +0x400/+0x401)");
+        return;
+    }
+    const float* view = (const float*)(cam + kCamView);
+    const uint8_t* eyeBlock = ctx + kCtxCamBlock + kFocusView * kCamBlockSize;  // the source view's after the swap
+    focus_cull::Layout lay;
+    if (!focus_cull::Learn(eyeBlock, view, (const float*)(srcEye + kEyeProj), lay, why, sizeof(why))) {
+        CullMissLocked(group, why);
+        return;
+    }
+    uint8_t* blk = g_cullBlock[group - FocusL];
+    focus_cull::Build(eyeBlock, lay, view, (const float*)(focusEye + kEyeProj), kCullMargin, blk);
+    focus_cull::Result res;
+    bool fault = false;
+    if (!focus_cull::Run(ctx, blk, res, fault, why, sizeof(why))) {
+        if (res.notYet) return;
+        if (fault) {
+            g_cullFault = true;
+            Log("Quad: ERROR: focus culling stopped for this session (%s, frame %llu): %s", kGroupNames[group],
+                (unsigned long long)g_frameNo, why);
+        } else {
+            CullMissLocked(group, why);
+        }
+        return;
+    }
+    g_cull.misses = 0;
+    run.culled = true;
+    run.cull = res;
+    if (!g_cull.logged) {
+        g_cull.logged = true;
+        Log("Quad: %s culled for the focus window (frame %llu, %.3f ms): renderables %u -> %u, draw queue %u -> %u; "
+            "block planes left/right/bottom/top %d %d %d %d, masks 0x%08X/0x%08X, margin %.2f NDC",
+            kGroupNames[group], (unsigned long long)g_frameNo, res.ms, res.setEye, res.setFocus, res.queueEye,
+            res.queueFocus, lay.side[0], lay.side[1], lay.side[2], lay.side[3], lay.maskSet, lay.maskClear, kCullMargin);
+    }
+}
+
+// Before a focus group: view 2 takes the source view's camera slot, frustum block and lighting environment (focus L),
 // and the camera and the VR device eye data of view 2 get the focus window of the group's eye. The deferred lighting
 // reads the eye tangents straight from the VR device by view - 1 (0x9ce0e8), the passes read the projection from the
-// camera (+0x138, +0x150). The frustum block stays the eye's (built from FOV, a superset of the focus window).
+// camera (+0x138, +0x150). The frustum block stays the eye's (built from FOV, a superset of the focus window); focus
+// culling gives the group a draw queue culled for its window.
 void SwapInLocked(uint8_t* ctx, int group, int src, Run& run) {
     Swap& s = g_swap;
     memcpy(s.slot, ctx + kCtxSlots + kFocusView * kSlotSize, kSlotSize);
@@ -835,6 +921,7 @@ void SwapInLocked(uint8_t* ctx, int group, int src, Run& run) {
             memcpy(s.camProj, cam + kCamProj, kMatSize);
             s.cam = cam;
             memcpy(cam + kCamProj, data + kEyeProj, kMatSize);
+            CullLocked(ctx, group, cam, srcEye, data, run);
         }
     }
     if (!proj) memcpy(data, srcEye, kVrEyeSize);
@@ -896,7 +983,21 @@ void FinishFrameLocked() {
     }
     if (g_run[FocusL].swapped) ++g_st.swaps;
     if (g_run[FocusL].eyeSwapped) ++g_st.eyeSwaps;
-    if (g_run[FocusL].projected && g_run[FocusR].projected) ++g_st.projected;
+    if (g_run[FocusL].projected && g_run[FocusR].projected) {
+        ++g_st.projected;
+        if (g_cullOn && !g_cullFault) ++g_st.cullOnFrames;
+    }
+    if (full && g_run[FocusL].culled && g_run[FocusR].culled) {
+        ++g_st.cullFrames;
+        g_st.setEye += g_run[FocusL].cull.setEye;
+        g_st.queueEye += g_run[FocusL].cull.queueEye;
+        for (int i = 0; i < 2; ++i) {
+            const focus_cull::Result& c = g_run[FocusL + i].cull;
+            g_st.cullMs[i] += c.ms;
+            g_st.setFocus[i] += c.setFocus;
+            g_st.queueFocus[i] += c.queueFocus;
+        }
+    }
     // Expected: outer L writes into the left Submit texture, the other groups into the right one. Only frames
     // after the first Submit count (track loading runs the eye groups without Submit and without the D3D11 hook).
     // With clones (M7.3, M7.4) a group writes the clone of its Submit texture.
@@ -969,6 +1070,17 @@ void HandleToolsLocked() {
     if (Pressed(c.clonesKeyMod, c.clonesKey, g_clonesKeyDown)) {
         g_clonesOn = !g_clonesOn;
         Log("Quad: clones %s (hotkey)", g_clonesOn ? "on" : "off");
+    }
+    if (c.focusCull != g_cullCfg) {
+        g_cullCfg = c.focusCull;
+        g_cullOn = c.focusCull;
+        Log("Quad: focus culling %s (ini)", g_cullOn ? "on" : "off");
+    }
+    if (Pressed(c.cullKeyMod, c.cullKey, g_cullKeyDown)) {
+        g_cullOn = !g_cullOn;
+        Log("Quad: focus culling %s (hotkey)%s", g_cullOn ? "on" : "off",
+            g_cullFault ? "; STOPPED for this session after an engine fault" : g_cull.failed ? "; off after failed checks "
+            "until the next track load" : "");
     }
     if (Pressed(c.freezeKeyMod, c.freezeKey, g_freezeKeyDown)) {
         g_gazeFrozen = !g_gazeFrozen;
@@ -1220,6 +1332,7 @@ void* __fastcall D_Builder(void* a, void* b, void* c, void* d) {
         g_focus.projFailed = false;
         g_focus.projMisses = 0;
         g_focus.missLogged = false;
+        g_cull = Cull{};
         if (g_autoOuter[0]) {
             Log("Quad: new graph: watchdog outer only cleared (%s)", g_autoOuter);
             g_autoOuter[0] = 0;
@@ -1442,6 +1555,14 @@ void LogStatsLocked(const Stats& s, const char* what) {
         what, (unsigned long long)n[SrcLive], 100 * n[SrcLive] / all, (unsigned long long)n[SrcHeld],
         100 * n[SrcHeld] / all, (unsigned long long)n[SrcFixed], 100 * n[SrcFixed] / all,
         (unsigned long long)n[SrcFrozen], 100 * n[SrcFrozen] / all, (unsigned long long)s.gazeLost);
+    const double c = s.cullFrames ? (double)s.cullFrames : 1;
+    Log("Quad focus culling%s: %s; frames culled %llu of %llu with it on; per focus group on the render thread (inside "
+        "its CPU above) L %.3f ms, R %.3f ms; renderables eye %.0f -> focus L %.0f, R %.0f; draw queue eye %.0f -> "
+        "focus L %.0f, R %.0f",
+        what, g_cullFault ? "STOPPED after an engine fault" : g_cull.failed ? "OFF after failed checks" :
+              g_cullOn ? "on" : "off", (unsigned long long)s.cullFrames, (unsigned long long)s.cullOnFrames,
+        s.cullMs[0] / c, s.cullMs[1] / c, s.setEye / c, s.setFocus[0] / c, s.setFocus[1] / c, s.queueEye / c,
+        s.queueFocus[0] / c, s.queueFocus[1] / c);
 }
 
 void AddStats(Stats& a, const Stats& b) {
@@ -1463,6 +1584,15 @@ void AddStats(Stats& a, const Stats& b) {
     for (int s = 0; s < 4; ++s) a.bySource[s] += b.bySource[s];
     a.gazeLost += b.gazeLost;
     for (int g = 0; g < kGroups; ++g) a.cpuMs[g] += b.cpuMs[g];
+    a.cullFrames += b.cullFrames;
+    a.cullOnFrames += b.cullOnFrames;
+    a.setEye += b.setEye;
+    a.queueEye += b.queueEye;
+    for (int i = 0; i < 2; ++i) {
+        a.cullMs[i] += b.cullMs[i];
+        a.setFocus[i] += b.setFocus[i];
+        a.queueFocus[i] += b.queueFocus[i];
+    }
 }
 
 // Shot rectangles for the focus window of both eyes. Outer views cover the whole grid at the size outer L rendered at in
@@ -1644,10 +1774,13 @@ void Install() {
         if (g_execPatched) StartStallWatch();
         else if (g_patched)
             Log("Quad: no add-task hook; no quad <-> outer only switch");
+        Log("Quad: focus culling %s (scene gather, processor and queue copy %s)", Cfg().focusCull ? "on" : "off",
+            focus_cull::Available() ? "found" : "NOT FOUND: culling stays off");
     });
     g_overlay = g_overlayCfg = Cfg().overlay;
     g_follow = g_followCfg = Cfg().followGaze;
     g_clonesOn = g_clonesCfg = Cfg().clones;
+    g_cullOn = g_cullCfg = Cfg().focusCull;
     g_on = g_installed;
 }
 
@@ -1918,9 +2051,13 @@ std::string Describe() {
             snprintf(view, sizeof(view), "OUTER ONLY now (%s)", g_autoOuter[0] ? g_autoOuter : "hotkey");
         else
             snprintf(view, sizeof(view), "quad now");
-        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s, %s%s",
+        const char* cull = g_cullFault     ? "focus culling stopped after an engine fault"
+                           : g_cull.failed ? "focus culling off after failed checks"
+                           : g_cullOn      ? "focus culling on"
+                                           : "focus culling off";
+        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s, %s, %s%s",
                  g_installed ? "engine hooks on" : "engine hooks off", g_patched ? "on" : "off",
-                 g_graph.ok ? "running" : "not running", focus, view, clones::Describe().c_str(),
+                 g_graph.ok ? "running" : "not running", focus, view, cull, clones::Describe().c_str(),
                  g_fault ? ", stopped after an exception" : "");
     });
     return buf;
@@ -1977,6 +2114,7 @@ void Shutdown() {
         g_lastSubmit[0] = g_lastSubmit[1] = nullptr;
         for (bool& b : g_outLogged) b = false;
         g_focus = Focus{};
+        g_cull = Cull{};
         ReleaseCopies();
         compose::Release();
         g_rightLogged = g_cloneSubmitLogged = false;

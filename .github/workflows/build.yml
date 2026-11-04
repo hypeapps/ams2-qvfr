@@ -31,7 +31,7 @@ jobs:
                  -RedirectStandardOutput selftest.txt
           Get-Content selftest.txt
           if ($p.ExitCode -ne 0) { throw "qvfr_config --selftest: exit $($p.ExitCode)" }
-          foreach ($t in '--focus-geometry', '--xr-layer') {
+          foreach ($t in '--focus-geometry', '--focus-cull', '--xr-layer') {
             & build/bin/Release/qvfr_proxy_smoke.exe $t
             if ($LASTEXITCODE -ne 0) { throw "qvfr_proxy_smoke $($t): exit $LASTEXITCODE" }
           }
