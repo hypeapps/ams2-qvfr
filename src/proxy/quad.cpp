@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -17,6 +18,7 @@
 #include "clones.h"
 #include "common.h"
 #include "compose.h"
+#include "focus_cull.h"
 #include "focus_geometry.h"
 #include "gpu.h"
 #include "hooks.h"
@@ -35,7 +37,7 @@ constexpr size_t kCtxSlots = 0x27bc8;    // per view {camera, camera, main camer
 constexpr size_t kSlotSize = 0x18;
 constexpr size_t kCtxCamBlock = 0x190;   // per view camera data; the camera functor fills views 0..2 once per frame
 constexpr size_t kCamBlockSize = 0x1a0;
-constexpr size_t kCtxQuery = 0x70c;      // per view scene query (visibility list) index, stride 4
+constexpr size_t kCtxQuery = 0x70c;      // per view lighting environment index (CLightingEnvManager), stride 4
 constexpr int kFocusView = 2;            // the view number the focus groups run as
 constexpr size_t kAppType = 0x8;         // app singleton: type (5 or 7..9 with a VR device)
 constexpr size_t kAppVr = 0xe0;          // app singleton: engine VR device (_BVROpen)
@@ -44,7 +46,10 @@ constexpr size_t kVrEyeSize = 0x110;
 constexpr size_t kEyeTangents = 0x0;     // eye data: 4 floats {b, -t, -l, r} computed from the projection (0xd6bf30)
 constexpr size_t kEyeProj = 0x90;        // eye data: projection, row vectors, z forward (m20 = -OpenVR m02, m23 = 1)
 constexpr uintptr_t kCamVtable = 0x2115d30;  // camera class vtable (RVA); all view cameras have it
+constexpr size_t kCamView = 0x90;        // camera: view matrix, row vectors (+0x150 returns it times +0x110)
 constexpr size_t kCamProj = 0x110;       // camera: explicit projection (set through vtable +0x210, read by +0x138/+0x150)
+constexpr size_t kCamRotDirty = 0x400;   // camera: rebuild the rotation, the position (the view matrix is stale meanwhile)
+constexpr size_t kCamPosDirty = 0x401;
 constexpr size_t kCamProjDirty = 0x402;  // camera: 1 = rebuild the projection from FOV and aspect at the next update
 constexpr size_t kMatSize = 0x40;
 // Task system (M4.5, disassembly of 0xcd0cd0 and the executor 0xcd12a0): "add task" (rcx = group, rdx = task) puts
@@ -80,8 +85,9 @@ char g_dumpNames[kShotImages - kShotFixed][64];
 ID3D11Resource* g_dumpRes[kShotImages - kShotFixed] = {};  // not referenced: released no earlier than the next frame
 const char* g_shotNames[kShotImages] = {"outer_l", "outer_r", "focus_l", "focus_r", "composed_l", "composed_r"};
 int g_shotCount = kShotFixed;
-// The view whose camera, frustum and visibility list each group renders with; the focus groups replace only the
-// projection (camera and VR device eye data) with the focus window of that eye.
+// The view whose camera, frustum block and lighting environment each group renders with; the focus groups replace the
+// projection (camera and VR device eye data) with the focus window of that eye and, with focus culling (M9.3), the draw
+// queue with one culled for that window.
 constexpr int kSourceView[kGroups] = {1, 2, 1, 2};
 // Rectangles filled in by SetupLocked: the focus views against their window in the outer views and in the composed
 // eyes (only inside the blend band, where the composition must be the focus pixel for pixel), and the outer views
@@ -184,6 +190,8 @@ struct Run {
     bool eyeSwapped = false;  // VR device eye data of view 2 replaced
     bool projected = false;   // focus projection in the camera and in the eye data
     uint32_t x0 = 0, y0 = 0;  // with `projected`: the focus window it rendered (grid pixels), for the composition
+    bool culled = false;      // the draw queue was culled for the focus window (M9.3)
+    focus_cull::Result cull;
 };
 
 struct Stats {
@@ -197,6 +205,10 @@ struct Stats {
     uint64_t bySource[4] = {};   // frames with the focus groups by window source (live, held, fixed, frozen)
     uint64_t gazeLost = 0;       // the window went to the fixed center: no valid gaze for longer than gaze_hold_s
     double cpuMs[kGroups] = {};
+    // Focus culling (M9.3), sums over the frames with both focus groups culled.
+    uint64_t cullFrames = 0, cullOnFrames = 0;  // culled / with culling on and the focus projection in both groups
+    double cullMs[2] = {};                      // gather + processor + queue copy per focus group
+    double setEye = 0, setFocus[2] = {}, queueEye = 0, queueFocus[2] = {};
 };
 
 // Focus window for this VR session (M4.3, M7.2): the game gets the render size and the full projection (outer), the
@@ -267,6 +279,22 @@ bool g_outerKeyDown = false, g_overlayKeyDown = false, g_freezeKeyDown = false;
 bool g_clonesOn = true;
 bool g_clonesCfg = true;  // Cfg().clones last seen (a reload sets g_clonesOn)
 bool g_clonesKeyDown = false;
+// Focus culling (M9.3): setting and hotkey; checks that fail in a row turn it off until the next builder call, an engine
+// fault for the session.
+bool g_cullOn = true;
+bool g_cullCfg = true;
+bool g_cullKeyDown = false;
+struct Cull {
+    bool failed = false;  // off until the next builder call
+    int misses = 0;       // focus groups in a row without culling (checks failed)
+    bool missLogged = false;
+    bool logged = false;  // first culled frame of this graph logged
+};
+Cull g_cull;
+bool g_cullFault = false;
+constexpr int kCullMissLimit = 144;
+constexpr float kCullMargin = 0.05f;  // focus planes pushed out by this much NDC per edge
+alignas(16) uint8_t g_cullBlock[2][focus_cull::kBlockSize];  // the processor keeps a pointer until the next frame
 
 // Debug overlay and gaze (NDC per eye from GetEyeTrackedFoveationCenter, x right, y up).
 bool g_overlay = false;
@@ -386,6 +414,40 @@ bool InSkipSet(uint8_t* task) {
 // For the stall watch: the last task run and the last one skipped while outer only is on.
 std::atomic<uint8_t*> g_lastRun{nullptr}, g_lastSkipped{nullptr};
 
+// Task CPU profile (M9 step 4, [debug] task_profile): the Execute time of every leaf task of the four eye groups, from
+// the builder's "add task" calls like the skip set. An immutable table per graph; counters are atomics, so the log
+// thread can read and reset them while the render thread runs tasks. CBeginEye and CEndEye include the proxy's work in
+// their detours (view swap, focus culling, copies).
+struct ProfTask {
+    int group = -1;
+    int order = 0;  // build order (its add-task call)
+    bool begin = false;  // the group's CBeginEye: its calls are the group's frames
+    char name[48] = "";
+    mutable std::atomic<uint64_t> ticks{0}, calls{0};
+    mutable std::atomic<uint64_t> gapTicks{0};  // render thread: from the end of its previous task to this one's start
+    mutable std::atomic<uint64_t> offThread{0};  // runs on another thread than the render thread
+};
+struct Profile {
+    std::vector<uintptr_t> tasks;  // sorted
+    std::vector<uint32_t> entry;   // entry of tasks[i]
+    std::unique_ptr<ProfTask[]> entries;
+    size_t n = 0;
+};
+std::atomic<const Profile*> g_profile{nullptr};
+std::vector<const Profile*> g_profRetired;
+std::atomic<bool> g_profOn{false};
+std::atomic<DWORD> g_renderTid{0};  // the thread that runs CBeginEye
+thread_local int64_t t_lastEnd = 0;  // end of the latest task this thread ran (with the profile on)
+int64_t g_qpcFreq = 0;
+
+const ProfTask* ProfFind(uint8_t* task) {
+    const Profile* p = g_profile.load(std::memory_order_acquire);
+    if (!p) return nullptr;
+    auto it = std::lower_bound(p->tasks.begin(), p->tasks.end(), (uintptr_t)task);
+    if (it == p->tasks.end() || *it != (uintptr_t)task) return nullptr;
+    return &p->entries[p->entry[it - p->tasks.begin()]];
+}
+
 void __fastcall RunTask(uint8_t* task) {
     if (g_skip.load(std::memory_order_relaxed)) {
         if (InSkipSet(task)) {
@@ -396,7 +458,26 @@ void __fastcall RunTask(uint8_t* task) {
         }
         g_lastRun.store(task, std::memory_order_relaxed);
     }
+    const bool profOn = g_profOn.load(std::memory_order_relaxed);
+    const ProfTask* prof = profOn ? ProfFind(task) : nullptr;
+    LARGE_INTEGER t0{}, t1{};
+    if (profOn) QueryPerformanceCounter(&t0);
     (*(ExecuteFn**)task)[kExecuteSlot](task);
+    if (profOn) {
+        QueryPerformanceCounter(&t1);
+        if (prof) {
+            prof->ticks.fetch_add((uint64_t)(t1.QuadPart - t0.QuadPart), std::memory_order_relaxed);
+            prof->calls.fetch_add(1, std::memory_order_relaxed);
+            if (GetCurrentThreadId() != g_renderTid.load(std::memory_order_relaxed)) {
+                prof->offThread.fetch_add(1, std::memory_order_relaxed);
+            } else if (t_lastEnd) {
+                // A gap longer than 20 ms is a frame break (menu, loading), not work between two tasks.
+                const int64_t gap = t0.QuadPart - t_lastEnd;
+                if (gap > 0 && gap < g_qpcFreq / 50) prof->gapTicks.fetch_add((uint64_t)gap, std::memory_order_relaxed);
+            }
+        }
+        t_lastEnd = t1.QuadPart;  // nested tasks first, then their group: the group's end wins
+    }
 }
 
 const Anchor kExecSites[] = {Anchor::ExecCallA, Anchor::ExecCallB};
@@ -493,7 +574,159 @@ void PublishSkipSet(const SkipSet* s) {
     if (const SkipSet* old = g_skipSet.exchange(s)) g_retired.push_back(old);  // a reader may still be in it
 }
 
-void ClearGroups() { PublishSkipSet(nullptr); }
+void PublishProfile(const Profile* p) {
+    if (const Profile* old = g_profile.exchange(p)) g_profRetired.push_back(old);  // a reader may still be in it
+}
+
+void ClearGroups() {
+    PublishSkipSet(nullptr);
+    PublishProfile(nullptr);
+}
+
+using TaskNameFn = const char*(__fastcall*)(void*);
+
+// The task's class name from vtable +0x30 (the executor calls it before Execute), under SEH.
+bool TaskClassName(void* task, char* out, size_t n) {
+    out[0] = 0;
+    __try {
+        const char* s = (*(TaskNameFn**)task)[0x30 / 8](task);
+        if (!s) return false;
+        size_t i = 0;
+        for (; i + 1 < n && s[i]; ++i) out[i] = s[i];
+        out[i] = 0;
+        return i > 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        out[0] = 0;
+        return false;
+    }
+}
+
+// After a builder call: the leaf tasks of each eye group, from the groups its CBeginEye and CEndEye were added to and
+// the groups inside them. Outer L's CBeginEye sits in preMain, so outer L also gets the once-per-frame tasks; a task in
+// several closures goes to the most specific group (focus R, focus L, outer R, then outer L).
+void BuildProfileLocked() {
+    PublishProfile(nullptr);
+    if (!g_execPatched || !g_graph.ok) return;
+    auto groupOf = [](void* task) -> void* {
+        for (const AddCall& a : g_adds)
+            if (a.task == task) return a.group;
+        return nullptr;
+    };
+    std::unordered_set<void*> member[kGroups];
+    for (int g = 0; g < kGroups; ++g) {
+        std::unordered_set<void*>& m = member[g];
+        for (void* t : {g_graph.begin[g], g_graph.end[g]}) {
+            m.insert(t);
+            if (void* grp = groupOf(t)) m.insert(grp);
+        }
+        for (bool grew = true; grew;) {
+            grew = false;
+            for (const AddCall& a : g_adds)
+                if (m.count(a.group) && m.insert(a.task).second) grew = true;
+        }
+    }
+    auto* p = new Profile;
+    std::unordered_set<void*> taken;
+    struct Item {
+        void* task;
+        int group, order;
+    };
+    std::vector<Item> items;
+    const int pick[kGroups] = {FocusR, FocusL, OuterR, OuterL};
+    for (int g : pick)
+        for (size_t i = 0; i < g_adds.size(); ++i) {
+            void* t = g_adds[i].task;
+            if (!member[g].count(t) || taken.count(t)) continue;
+            uintptr_t vt = 0, slot = 0;
+            if (!hooks::TryRead(t, &vt, 8) || !hooks::TryRead((void*)(vt + kIsGroupSlot * 8), &slot, 8) ||
+                slot != hooks::ExeBase() + kLeafIsGroup)
+                continue;  // groups: their Execute runs the children, which are timed themselves
+            taken.insert(t);
+            items.push_back({t, g, (int)i});
+        }
+    // CBeginEye and CEndEye always belong to their own group (outer L's CBeginEye also sits in preMain's closure).
+    for (int g = 0; g < kGroups; ++g)
+        for (void* t : {g_graph.begin[g], g_graph.end[g]})
+            if (!taken.count(t)) {
+                taken.insert(t);
+                items.push_back({t, g, -1});
+            }
+    p->n = items.size();
+    p->entries = std::make_unique<ProfTask[]>(p->n);
+    size_t count[kGroups] = {};
+    for (size_t i = 0; i < p->n; ++i) {
+        ProfTask& e = p->entries[i];
+        e.group = items[i].group;
+        e.order = items[i].order;
+        e.begin = items[i].task == g_graph.begin[e.group];
+        if (!TaskClassName(items[i].task, e.name, sizeof(e.name)))
+            snprintf(e.name, sizeof(e.name), "task@%p", items[i].task);
+        ++count[e.group];
+    }
+    std::vector<uint32_t> idx(p->n);
+    for (uint32_t i = 0; i < p->n; ++i) idx[i] = i;
+    std::sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) { return items[a].task < items[b].task; });
+    for (uint32_t i : idx) {
+        p->tasks.push_back((uintptr_t)items[i].task);
+        p->entry.push_back(i);
+    }
+    Log("Quad: task profile: %zu leaf tasks (outer L %zu, outer R %zu, focus L %zu, focus R %zu)%s", p->n, count[OuterL],
+        count[OuterR], count[FocusL], count[FocusR], g_profOn ? "" : "; off ([debug] task_profile=0)");
+    PublishProfile(p);
+}
+
+// One line per eye group: per frame and task in build order its Execute time, "+" the render thread's gap before it
+// (from the end of the task it ran before; for CBeginEye that is the gap between groups) and "w" the share of its runs on
+// other threads; then the sums against the group's CPU (CBeginEye to CEndEye). Counters are reset.
+void LogProfileLocked(const Stats& s) {
+    const Profile* p = g_profile.load(std::memory_order_acquire);
+    if (!p) return;
+    if (!g_qpcFreq) return;
+    const double freq = (double)g_qpcFreq;
+    std::vector<uint32_t> order(p->n);
+    for (uint32_t i = 0; i < p->n; ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+        const ProfTask &x = p->entries[a], &y = p->entries[b];
+        return x.group != y.group ? x.group < y.group : x.order < y.order;
+    });
+    std::vector<uint64_t> ticks(p->n), calls(p->n), gaps(p->n), off(p->n);
+    for (uint32_t i = 0; i < p->n; ++i) {
+        ticks[i] = p->entries[i].ticks.exchange(0, std::memory_order_relaxed);
+        calls[i] = p->entries[i].calls.exchange(0, std::memory_order_relaxed);
+        gaps[i] = p->entries[i].gapTicks.exchange(0, std::memory_order_relaxed);
+        off[i] = p->entries[i].offThread.exchange(0, std::memory_order_relaxed);
+    }
+    if (!g_profOn) return;
+    for (int g = 0; g < kGroups; ++g) {
+        uint64_t frames = 0;
+        for (uint32_t i = 0; i < p->n; ++i)
+            if (p->entries[i].group == g && p->entries[i].begin) frames = calls[i];
+        if (!frames) continue;
+        std::string line;
+        double sum = 0, gapSum = 0, offSum = 0;
+        for (uint32_t i : order) {
+            const ProfTask& e = p->entries[i];
+            if (e.group != g || !calls[i]) continue;
+            const double ms = ticks[i] * 1000.0 / freq / frames;
+            const double gap = gaps[i] * 1000.0 / freq / frames;
+            sum += ms;
+            if (!e.begin) gapSum += gap;
+            if (off[i]) offSum += ms;
+            if (ms < 0.0005 && gap < 0.0005) continue;  // keeps the line short (outer L has about 70 tasks)
+            char item[128];
+            int k = snprintf(item, sizeof(item), "%s %.3f", e.name, ms);
+            if (gap >= 0.0005) k += snprintf(item + k, sizeof(item) - k, "+%.3f", gap);
+            if (calls[i] != frames) k += snprintf(item + k, sizeof(item) - k, " x%.2f", calls[i] / (double)frames);
+            if (off[i]) snprintf(item + k, sizeof(item) - k, " w%.0f%%", 100.0 * off[i] / calls[i]);
+            if (!line.empty()) line += ", ";
+            line += item;
+        }
+        const double group = s.full ? s.cpuMs[g] / s.full : 0;
+        Log("Quad task CPU per frame (%s, %llu frames; group %.3f ms = tasks %.3f + rest %.3f; gaps inside %.3f, tasks on "
+            "other threads %.3f): %s", kGroupNames[g], (unsigned long long)frames, group, sum, group - sum, gapSum,
+            offSum, line.c_str());
+    }
+}
 
 // After a builder call: every task the builder added to a focus group, and to the groups inside it (from the recorded
 // "add task" calls). The group of each eye group is the one its CBeginEye was added to; the four must differ, each
@@ -612,6 +845,8 @@ bool GroupsAliveLocked() {
 void FreeRetiredSets() {
     for (const SkipSet* s : g_retired) delete s;
     g_retired.clear();
+    for (const Profile* p : g_profRetired) delete p;
+    g_profRetired.clear();
 }
 
 // Stall watch (its own thread, never touches the render thread's state): when no frame starts for 3 s while outer only
@@ -767,10 +1002,69 @@ float SharpInsetLocked() {
     return c.quadMarginPx + c.smoothen * std::max(0.0f, shown);
 }
 
-// Before a focus group: view 2 takes the source view's camera slot, frustum block and visibility list (focus L),
+void CullMissLocked(int group, const char* why) {
+    if (!g_cull.missLogged) {
+        g_cull.missLogged = true;
+        Log("Quad: %s without focus culling in frame %llu (%s); off after %d misses in a row", kGroupNames[group],
+            (unsigned long long)g_frameNo, why, kCullMissLimit);
+    }
+    if (++g_cull.misses >= kCullMissLimit) {
+        g_cull.failed = true;
+        Log("Quad: focus culling OFF until the next builder call (%s: %s); the focus groups draw the eye's set",
+            kGroupNames[group], why);
+    }
+}
+
+// Focus culling (M9.3), after the focus projection is in: the engine's gather and processor run again for a frustum
+// block with the focus window's side planes, and the draw queue the group reads gets their result. The block layout is
+// learned from the source eye's engine block every time, so a block that does not match the expected format is never
+// written. Near and far, the camera (distances and LOD) and the include and exclude flags stay the eye's.
+void CullLocked(uint8_t* ctx, int group, const uint8_t* cam, const uint8_t* srcEye, const uint8_t* focusEye, Run& run) {
+    if (!g_cullOn || g_cull.failed || g_cullFault || !focus_cull::Available()) return;
+    char why[256] = "";
+    if (cam[kCamRotDirty] || cam[kCamPosDirty]) {
+        CullMissLocked(group, "camera view matrix not up to date (flags +0x400/+0x401)");
+        return;
+    }
+    const float* view = (const float*)(cam + kCamView);
+    const uint8_t* eyeBlock = ctx + kCtxCamBlock + kFocusView * kCamBlockSize;  // the source view's after the swap
+    focus_cull::Layout lay;
+    if (!focus_cull::Learn(eyeBlock, view, (const float*)(srcEye + kEyeProj), lay, why, sizeof(why))) {
+        CullMissLocked(group, why);
+        return;
+    }
+    uint8_t* blk = g_cullBlock[group - FocusL];
+    focus_cull::Build(eyeBlock, lay, view, (const float*)(focusEye + kEyeProj), kCullMargin, blk);
+    focus_cull::Result res;
+    bool fault = false;
+    if (!focus_cull::Run(ctx, blk, res, fault, why, sizeof(why))) {
+        if (res.notYet) return;
+        if (fault) {
+            g_cullFault = true;
+            Log("Quad: ERROR: focus culling stopped for this session (%s, frame %llu): %s", kGroupNames[group],
+                (unsigned long long)g_frameNo, why);
+        } else {
+            CullMissLocked(group, why);
+        }
+        return;
+    }
+    g_cull.misses = 0;
+    run.culled = true;
+    run.cull = res;
+    if (!g_cull.logged) {
+        g_cull.logged = true;
+        Log("Quad: %s culled for the focus window (frame %llu, %.3f ms): renderables %u -> %u, draw queue %u -> %u; "
+            "block planes left/right/bottom/top %d %d %d %d, masks 0x%08X/0x%08X, margin %.2f NDC",
+            kGroupNames[group], (unsigned long long)g_frameNo, res.ms, res.setEye, res.setFocus, res.queueEye,
+            res.queueFocus, lay.side[0], lay.side[1], lay.side[2], lay.side[3], lay.maskSet, lay.maskClear, kCullMargin);
+    }
+}
+
+// Before a focus group: view 2 takes the source view's camera slot, frustum block and lighting environment (focus L),
 // and the camera and the VR device eye data of view 2 get the focus window of the group's eye. The deferred lighting
 // reads the eye tangents straight from the VR device by view - 1 (0x9ce0e8), the passes read the projection from the
-// camera (+0x138, +0x150). The frustum block stays the eye's (built from FOV, a superset of the focus window).
+// camera (+0x138, +0x150). The frustum block stays the eye's (built from FOV, a superset of the focus window); focus
+// culling gives the group a draw queue culled for its window.
 void SwapInLocked(uint8_t* ctx, int group, int src, Run& run) {
     Swap& s = g_swap;
     memcpy(s.slot, ctx + kCtxSlots + kFocusView * kSlotSize, kSlotSize);
@@ -835,6 +1129,7 @@ void SwapInLocked(uint8_t* ctx, int group, int src, Run& run) {
             memcpy(s.camProj, cam + kCamProj, kMatSize);
             s.cam = cam;
             memcpy(cam + kCamProj, data + kEyeProj, kMatSize);
+            CullLocked(ctx, group, cam, srcEye, data, run);
         }
     }
     if (!proj) memcpy(data, srcEye, kVrEyeSize);
@@ -896,7 +1191,21 @@ void FinishFrameLocked() {
     }
     if (g_run[FocusL].swapped) ++g_st.swaps;
     if (g_run[FocusL].eyeSwapped) ++g_st.eyeSwaps;
-    if (g_run[FocusL].projected && g_run[FocusR].projected) ++g_st.projected;
+    if (g_run[FocusL].projected && g_run[FocusR].projected) {
+        ++g_st.projected;
+        if (g_cullOn && !g_cullFault) ++g_st.cullOnFrames;
+    }
+    if (full && g_run[FocusL].culled && g_run[FocusR].culled) {
+        ++g_st.cullFrames;
+        g_st.setEye += g_run[FocusL].cull.setEye;
+        g_st.queueEye += g_run[FocusL].cull.queueEye;
+        for (int i = 0; i < 2; ++i) {
+            const focus_cull::Result& c = g_run[FocusL + i].cull;
+            g_st.cullMs[i] += c.ms;
+            g_st.setFocus[i] += c.setFocus;
+            g_st.queueFocus[i] += c.queueFocus;
+        }
+    }
     // Expected: outer L writes into the left Submit texture, the other groups into the right one. Only frames
     // after the first Submit count (track loading runs the eye groups without Submit and without the D3D11 hook).
     // With clones (M7.3, M7.4) a group writes the clone of its Submit texture.
@@ -969,6 +1278,21 @@ void HandleToolsLocked() {
     if (Pressed(c.clonesKeyMod, c.clonesKey, g_clonesKeyDown)) {
         g_clonesOn = !g_clonesOn;
         Log("Quad: clones %s (hotkey)", g_clonesOn ? "on" : "off");
+    }
+    if (c.taskProfile != g_profOn.load()) {
+        g_profOn = c.taskProfile;
+        Log("Quad: task CPU profile %s (ini)", c.taskProfile ? "on" : "off");
+    }
+    if (c.focusCull != g_cullCfg) {
+        g_cullCfg = c.focusCull;
+        g_cullOn = c.focusCull;
+        Log("Quad: focus culling %s (ini)", g_cullOn ? "on" : "off");
+    }
+    if (Pressed(c.cullKeyMod, c.cullKey, g_cullKeyDown)) {
+        g_cullOn = !g_cullOn;
+        Log("Quad: focus culling %s (hotkey)%s", g_cullOn ? "on" : "off",
+            g_cullFault ? "; STOPPED for this session after an engine fault" : g_cull.failed ? "; off after failed checks "
+            "until the next track load" : "");
     }
     if (Pressed(c.freezeKeyMod, c.freezeKey, g_freezeKeyDown)) {
         g_gazeFrozen = !g_gazeFrozen;
@@ -1220,6 +1544,7 @@ void* __fastcall D_Builder(void* a, void* b, void* c, void* d) {
         g_focus.projFailed = false;
         g_focus.projMisses = 0;
         g_focus.missLogged = false;
+        g_cull = Cull{};
         if (g_autoOuter[0]) {
             Log("Quad: new graph: watchdog outer only cleared (%s)", g_autoOuter);
             g_autoOuter[0] = 0;
@@ -1248,6 +1573,7 @@ void* __fastcall D_Builder(void* a, void* b, void* c, void* d) {
             gr.end[2], gr.begin[3], gr.end[3],
             gr.ok ? "focus groups ready" : "UNEXPECTED graph: focus swaps off (the focus groups render the right eye)");
         BuildSkipSetLocked();
+        BuildProfileLocked();
         g_adds.clear();
         g_adds.shrink_to_fit();
     });
@@ -1324,6 +1650,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         std::lock_guard lock(g_m);
         int g = Find(g_graph.begin, task);
         if (g < 0) return;
+        g_renderTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
         if (g_swap.ctx) {  // the previous group did not end
             ++g_st.lateRestores;
             RestoreLocked();
@@ -1442,6 +1769,14 @@ void LogStatsLocked(const Stats& s, const char* what) {
         what, (unsigned long long)n[SrcLive], 100 * n[SrcLive] / all, (unsigned long long)n[SrcHeld],
         100 * n[SrcHeld] / all, (unsigned long long)n[SrcFixed], 100 * n[SrcFixed] / all,
         (unsigned long long)n[SrcFrozen], 100 * n[SrcFrozen] / all, (unsigned long long)s.gazeLost);
+    const double c = s.cullFrames ? (double)s.cullFrames : 1;
+    Log("Quad focus culling%s: %s; frames culled %llu of %llu with it on; per focus group on the render thread (inside "
+        "its CPU above) L %.3f ms, R %.3f ms; renderables eye %.0f -> focus L %.0f, R %.0f; draw queue eye %.0f -> "
+        "focus L %.0f, R %.0f",
+        what, g_cullFault ? "STOPPED after an engine fault" : g_cull.failed ? "OFF after failed checks" :
+              g_cullOn ? "on" : "off", (unsigned long long)s.cullFrames, (unsigned long long)s.cullOnFrames,
+        s.cullMs[0] / c, s.cullMs[1] / c, s.setEye / c, s.setFocus[0] / c, s.setFocus[1] / c, s.queueEye / c,
+        s.queueFocus[0] / c, s.queueFocus[1] / c);
 }
 
 void AddStats(Stats& a, const Stats& b) {
@@ -1463,6 +1798,15 @@ void AddStats(Stats& a, const Stats& b) {
     for (int s = 0; s < 4; ++s) a.bySource[s] += b.bySource[s];
     a.gazeLost += b.gazeLost;
     for (int g = 0; g < kGroups; ++g) a.cpuMs[g] += b.cpuMs[g];
+    a.cullFrames += b.cullFrames;
+    a.cullOnFrames += b.cullOnFrames;
+    a.setEye += b.setEye;
+    a.queueEye += b.queueEye;
+    for (int i = 0; i < 2; ++i) {
+        a.cullMs[i] += b.cullMs[i];
+        a.setFocus[i] += b.setFocus[i];
+        a.queueFocus[i] += b.queueFocus[i];
+    }
 }
 
 // Shot rectangles for the focus window of both eyes. Outer views cover the whole grid at the size outer L rendered at in
@@ -1644,10 +1988,17 @@ void Install() {
         if (g_execPatched) StartStallWatch();
         else if (g_patched)
             Log("Quad: no add-task hook; no quad <-> outer only switch");
+        Log("Quad: focus culling %s (scene gather, processor and queue copy %s)", Cfg().focusCull ? "on" : "off",
+            focus_cull::Available() ? "found" : "NOT FOUND: culling stays off");
     });
     g_overlay = g_overlayCfg = Cfg().overlay;
     g_follow = g_followCfg = Cfg().followGaze;
     g_clonesOn = g_clonesCfg = Cfg().clones;
+    g_cullOn = g_cullCfg = Cfg().focusCull;
+    LARGE_INTEGER qf{};
+    QueryPerformanceFrequency(&qf);
+    g_qpcFreq = qf.QuadPart;
+    g_profOn = Cfg().taskProfile;
     g_on = g_installed;
 }
 
@@ -1889,6 +2240,7 @@ void LogStats(bool totals) {
         if (!g_st.frames && !g_tot.frames) return;
         AddStats(g_tot, g_st);
         LogStatsLocked(totals ? g_tot : g_st, totals ? " (session total)" : "");
+        if (!totals) LogProfileLocked(g_st);
         g_st = Stats{};
         clones::LogStats(totals);
     });
@@ -1918,9 +2270,13 @@ std::string Describe() {
             snprintf(view, sizeof(view), "OUTER ONLY now (%s)", g_autoOuter[0] ? g_autoOuter : "hotkey");
         else
             snprintf(view, sizeof(view), "quad now");
-        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s, %s%s",
+        const char* cull = g_cullFault     ? "focus culling stopped after an engine fault"
+                           : g_cull.failed ? "focus culling off after failed checks"
+                           : g_cullOn      ? "focus culling on"
+                                           : "focus culling off";
+        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s, %s, %s%s",
                  g_installed ? "engine hooks on" : "engine hooks off", g_patched ? "on" : "off",
-                 g_graph.ok ? "running" : "not running", focus, view, clones::Describe().c_str(),
+                 g_graph.ok ? "running" : "not running", focus, view, cull, clones::Describe().c_str(),
                  g_fault ? ", stopped after an exception" : "");
     });
     return buf;
@@ -1977,6 +2333,7 @@ void Shutdown() {
         g_lastSubmit[0] = g_lastSubmit[1] = nullptr;
         for (bool& b : g_outLogged) b = false;
         g_focus = Focus{};
+        g_cull = Cull{};
         ReleaseCopies();
         compose::Release();
         g_rightLogged = g_cloneSubmitLogged = false;

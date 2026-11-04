@@ -115,6 +115,12 @@ struct Config {
     bool clones = true;
     int clonesKeyMod = VK_RCONTROL;
     int clonesKey = 0;                // testers: VK_F5
+    // Focus culling (M9.3): the focus groups draw a scene set culled for the focus window; the hotkey switches.
+    bool focusCull = true;
+    int cullKeyMod = VK_RCONTROL;
+    int cullKey = 0;                  // testers: VK_F4
+    // Execute time of every task of the eye groups, one log line per group with the stats (M9 step 4 diagnostics).
+    bool taskProfile = false;
     // A viewport the engine sets for an original while a smaller clone is bound is scaled to the clone (M7.4).
     bool clonesViewportFix = true;
     // In an eye group with clones every bind, clear and copy of a cloned original goes to its clone, and in the other

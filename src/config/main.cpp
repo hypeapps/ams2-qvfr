@@ -431,8 +431,10 @@ void BindModel(Rml::Context* ctx) {
     toggle("warning_box", [] { return g.s.warningBox; }, [](bool on) { Set("log", "warning_box", on ? "1" : "0"); });
     toggle("csv", [] { return g.s.csvAlways; }, [](bool on) { Set("timing", "csv_always", on ? "1" : "0"); });
     toggle("bench", [] { return g.s.benchKey != 0; }, [](bool on) { Set("benchmark", "key", on ? "0x78" : "0"); });
-    toggle("debug_keys", [] { return g.s.overlayKey || g.s.freezeKey || g.s.outerKey || g.s.clonesKey || g.s.shotKey; },
+    toggle("debug_keys",
+           [] { return g.s.overlayKey || g.s.freezeKey || g.s.outerKey || g.s.clonesKey || g.s.shotKey || g.s.cullKey; },
            [](bool on) {
+               g.ini.Set("debug", "cull_key", on ? "0x73" : "0");
                g.ini.Set("debug", "clones_key", on ? "0x74" : "0");
                g.ini.Set("debug", "freeze_key", on ? "0x76" : "0");
                g.ini.Set("debug", "overlay_key", on ? "0x77" : "0");

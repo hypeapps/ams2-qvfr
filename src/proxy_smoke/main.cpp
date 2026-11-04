@@ -24,6 +24,7 @@
 //                                     synthetic textures (pixels by region, also with the window in grid corners,
 //                                     pipeline state restored)
 //   --focus-geometry                  without SteamVR: focus window placement for a gaze point (Dream Air frusta)
+//   --focus-cull                      without SteamVR: focus culling's frustum block math on a synthetic engine block
 //   --clones                          without SteamVR and without the proxy DLL: the proxy's clones module on fake engine
 //                                     objects (learning, clones in the sets' sizes, swap of fields, sizes and bound
 //                                     views, viewports, restore, leaks, destroy; focus or outer smaller)
@@ -41,6 +42,7 @@
 
 #include <openvr.h>  // 0.9.12; functions are taken through GetProcAddress
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -56,6 +58,7 @@
 #include "clones.h"
 #include "common.h"
 #include "compose.h"
+#include "focus_cull.h"
 #include "focus_geometry.h"
 #include "hooks.h"
 #include "shots.h"
@@ -742,6 +745,148 @@ int RunGeometry() {
     return bad ? 8 : 0;
 }
 
+// Focus culling math (M9.3) on a synthetic engine frustum block: a rotated eye camera, a symmetric FOV block in a
+// shuffled plane and corner order (the engine's order is learned in the game), the eye's asymmetric projection and a
+// focus window. Learn must find the sides, Build must keep the window (and the margin) and drop the rest of the eye.
+int RunFocusCull() {
+    int bad = 0;
+    auto expect = [&](bool ok, const char* what) {
+        if (!ok) {
+            ++bad;
+            printf("Focus cull: WRONG %s\n", what);
+        }
+    };
+    using V3 = std::array<double, 3>;
+    auto norm = [](V3 v) {
+        double l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+        return V3{v[0] / l, v[1] / l, v[2] / l};
+    };
+    auto cross = [](V3 a, V3 b) { return V3{a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]}; };
+    // Camera: forward, up and right in world space, position e. View (row vectors): rows of the rotation are the
+    // world axes' view coordinates, so V[i][j] = axis_j[i]; row 3 = -e * R.
+    const V3 fwd = norm({0.45, -0.18, 0.87});
+    const V3 right = norm(cross({0.1, 1, 0.05}, fwd));
+    const V3 up = cross(fwd, right);
+    const V3 eye = {12.3, 1.2, -45.6};
+    const V3 axis[3] = {right, up, fwd};
+    float view[16] = {};
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j) view[i * 4 + j] = (float)axis[j][i];
+    for (int j = 0; j < 3; ++j) view[12 + j] = (float)-(eye[0] * axis[j][0] + eye[1] * axis[j][1] + eye[2] * axis[j][2]);
+    view[15] = 1;
+    const double nearZ = 0.015, farZ = 1000;
+    // Projection for view tangents x/z in [l, r], y/z in [t, b] (the engine's eye data convention).
+    auto proj = [&](double l, double r, double t, double b, float* m) {
+        memset(m, 0, 64);
+        m[0] = (float)(2 / (r - l));
+        m[5] = (float)(2 / (b - t));
+        m[8] = (float)(-(r + l) / (r - l));
+        m[9] = (float)(-(b + t) / (b - t));
+        m[10] = (float)(farZ / (farZ - nearZ));
+        m[11] = 1;
+        m[14] = (float)(-nearZ * farZ / (farZ - nearZ));
+    };
+    // World point from view tangents at depth z.
+    auto at = [&](double tx, double ty, double z) {
+        V3 p;
+        for (int c = 0; c < 3; ++c) p[c] = eye[c] + tx * z * right[c] + ty * z * up[c] + z * fwd[c];
+        return p;
+    };
+    struct P4 {
+        double n[3], d;
+    };
+    // Inward plane through the eye and the edge x/z = tan (sign +1: inside is x/z >= tan) or y/z.
+    auto side = [&](int ax, double tan, double sign) {
+        const V3& a = axis[ax];
+        V3 n;
+        for (int c = 0; c < 3; ++c) n[c] = sign * (a[c] - tan * fwd[c]);
+        n = norm(n);
+        P4 p{{n[0], n[1], n[2]}, -(n[0] * eye[0] + n[1] * eye[1] + n[2] * eye[2])};
+        return p;
+    };
+    const double hx = 1.45, hy = 1.12;  // the engine's symmetric FOV block, a superset of the eye
+    P4 planes[6];
+    // Shuffled order: right, left, near, far, bottom (y/z <= hy), top (y/z >= -hy).
+    planes[0] = side(0, hx, -1);
+    planes[1] = side(0, -hx, 1);
+    {
+        V3 pn = at(0, 0, nearZ), pf = at(0, 0, farZ);
+        planes[2] = {{fwd[0], fwd[1], fwd[2]}, -(fwd[0] * pn[0] + fwd[1] * pn[1] + fwd[2] * pn[2])};
+        planes[3] = {{-fwd[0], -fwd[1], -fwd[2]}, fwd[0] * pf[0] + fwd[1] * pf[1] + fwd[2] * pf[2]};
+    }
+    planes[4] = side(1, hy, -1);
+    planes[5] = side(1, -hy, 1);
+    alignas(16) uint8_t block[qvfr::focus_cull::kBlockSize] = {};
+    float* f = (float*)block;
+    for (int i = 0; i < 6; ++i) {
+        for (int c = 0; c < 3; ++c) {
+            f[4 * i + c] = (float)planes[i].n[c];
+            uint32_t m = planes[i].n[c] >= 0 ? 0xFFFFFFFFu : 0u, nm = ~m;
+            memcpy(&f[0x18 + 8 * i + c], &m, 4);
+            memcpy(&f[0x18 + 8 * i + 4 + c], &nm, 4);
+        }
+        f[4 * i + 3] = (float)planes[i].d;
+    }
+    // Corners in a shuffled order: (x side, y side, depth) per corner.
+    const int cx[8] = {1, 0, 0, 1, 1, 0, 1, 0}, cy[8] = {5, 5, 4, 4, 5, 4, 4, 5}, cz[8] = {3, 2, 3, 2, 2, 2, 3, 3};
+    for (int j = 0; j < 8; ++j) {
+        const double tx = cx[j] == 0 ? hx : -hx, ty = cy[j] == 4 ? hy : -hy, z = cz[j] == 2 ? nearZ : farZ;
+        V3 p = at(tx, ty, z);
+        for (int c = 0; c < 3; ++c) f[0x48 + 4 * j + c] = (float)p[c];
+        f[0x48 + 4 * j + 3] = 1;
+    }
+    float eyeProj[16], focusProj[16];
+    const double l = -1.37856, r = 1.15212, t = -1.05537, b = 1.05537;  // Dream Air left eye
+    proj(l, r, t, b, eyeProj);
+    const double fl = -0.42, fr = 0.21, ft = -0.33, fb = 0.27;  // focus window (view tangents)
+    proj(fl, fr, ft, fb, focusProj);
+    qvfr::focus_cull::Layout lay;
+    char why[256] = "";
+    const bool learned = qvfr::focus_cull::Learn(block, view, eyeProj, lay, why, sizeof(why));
+    expect(learned, why);
+    if (!learned) {
+        printf("Focus cull check FAILED: %d wrong\n", bad);
+        return 9;
+    }
+    // Edge order left, right, bottom, top: x/z >= l, x/z <= r, y/z >= t, y/z <= b.
+    expect(lay.side[0] == 1 && lay.side[1] == 0 && lay.side[2] == 5 && lay.side[3] == 4, "side planes found");
+    expect(lay.maskSet == 0xFFFFFFFFu && lay.maskClear == 0, "mask bits");
+    alignas(16) uint8_t out[qvfr::focus_cull::kBlockSize];
+    const float margin = 0.05f;
+    qvfr::focus_cull::Build(block, lay, view, focusProj, margin, out);
+    const float* o = (const float*)out;
+    expect(!memcmp(o + 8, f + 8, 32), "near and far kept");
+    auto inside = [&](const V3& p, int& plane) {
+        for (int i = 0; i < 6; ++i)
+            if (o[4 * i] * p[0] + o[4 * i + 1] * p[1] + o[4 * i + 2] * p[2] + o[4 * i + 3] < -1e-4) {
+                plane = i;
+                return false;
+            }
+        return true;
+    };
+    // Points by NDC of the focus window: inside up to the margin, outside beyond it.
+    auto ndc = [&](double x, double y, double z) {
+        const double tx = (fl + fr) / 2 + x * (fr - fl) / 2, ty = (ft + fb) / 2 + y * (fb - ft) / 2;
+        return at(tx, ty, z);
+    };
+    int pl = -1;
+    expect(inside(ndc(0, 0, 20), pl), "window center inside");
+    for (double z : {0.5, 20.0, 900.0})
+        for (int k = 0; k < 4; ++k) {
+            const double sx = k == 0 ? -1 : k == 1 ? 1 : 0, sy = k == 2 ? -1 : k == 3 ? 1 : 0;
+            expect(inside(ndc(sx * 1.03, sy * 1.03, z), pl), "point inside the margin kept");
+            expect(!inside(ndc(sx * 1.1, sy * 1.1, z), pl) && pl == lay.side[k], "point beyond the margin dropped by its edge");
+        }
+    V3 rest = at(l * 0.9, b * 0.9, 20);  // in the eye, far from the window
+    expect(!inside(rest, pl), "rest of the eye dropped");
+    // The result is a well-formed block again: corners on their planes, masks by sign.
+    qvfr::focus_cull::Layout again;
+    expect(qvfr::focus_cull::Learn(out, view, focusProj, again, why, sizeof(why)), why);
+    printf("Focus cull check %s: %d wrong; sides L/R/B/T in block planes %d %d %d %d\n", bad ? "FAILED" : "OK", bad,
+           lay.side[0], lay.side[1], lay.side[2], lay.side[3]);
+    return bad ? 9 : 0;
+}
+
 // A fake engine object: bytes with typed fields at the engine's offsets.
 struct FakeObj {
     uint64_t q[0x108 / 8] = {};
@@ -1142,6 +1287,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--shots")) shotsTest = true;
         else if (!strcmp(argv[i], "--quad-compose")) composeTest = true;
         else if (!strcmp(argv[i], "--focus-geometry")) return RunGeometry();
+        else if (!strcmp(argv[i], "--focus-cull")) return RunFocusCull();
         else if (!strcmp(argv[i], "--clones")) clonesTest = true;
         else if (!strcmp(argv[i], "--xr-layer")) xrLayerTest = true;
         else if (!strcmp(argv[i], "--openxr-path")) openxrPathTest = true;

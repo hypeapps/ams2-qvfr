@@ -72,6 +72,7 @@ Settings Read(const IniFile& ini) {
     s.freezeKey = ParseInt(ini.GetOr("debug", "freeze_key", ""), 0);
     s.outerKey = ParseInt(ini.GetOr("debug", "outer_key", ""), 0);
     s.clonesKey = ParseInt(ini.GetOr("debug", "clones_key", ""), 0);
+    s.cullKey = ParseInt(ini.GetOr("debug", "cull_key", ""), 0);
     s.shotKey = ParseInt(ini.GetOr("quad", "shot_key", ""), 0);
     return s;
 }
