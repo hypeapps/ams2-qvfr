@@ -24,7 +24,6 @@
 
 #include "dlaa_cockpit_cs.h"  // kDlaaCockpitCS (fxc from shaders/dlaa.hlsl)
 #include "dlaa_mask_cs.h"     // kDlaaMaskCS
-#include "dlaa_stencil_cs.h"  // kDlaaStencilCS
 #endif
 
 namespace qvfr::dlaa {
@@ -64,14 +63,7 @@ bool g_viewLogged[kViews] = {};  // first DLSS evaluation of the view logged
 bool g_keyDown = false;
 bool g_expKeyDown = false;
 bool g_presetKeyDown = false;
-bool g_cockpitKeyDown = false;
-bool g_stencilKeyDown = false;
-std::atomic<bool> g_stencilView{false};  // testers: false colors of the stencil instead of the image
-std::atomic<int> g_cockpit{-1};  // displays/cockpit from the game's TAA: -1 = the ini setting, 0..2 = hotkey
-int CockpitTaaNow() {
-    const int v = g_cockpit.load();
-    return v < 0 ? Cfg().dlaaCockpitTaa : v;
-}
+int CockpitTaaNow() { return Cfg().dlaaCockpitTaa; }  // displays/cockpit from the game's TAA (ini, read live)
 const char* CockpitText(int mode) {
     return mode == 0 ? "nothing" : mode == 1 ? "displays and mirrors" : "displays, mirrors and the player's car";
 }
@@ -244,7 +236,6 @@ ID3D11ComputeShader* g_maskCs = nullptr;
 ID3D11ComputeShader* g_cockpitCs = nullptr;
 ID3D11Buffer* g_cockpitCb = nullptr;
 uint32_t g_cockpitCbBits = 0;
-ID3D11ComputeShader* g_stencilCs = nullptr;
 uint64_t g_cockpitEvals = 0;
 ID3D11Buffer* g_maskCb = nullptr;
 float g_maskCbValue = -1;
@@ -280,7 +271,6 @@ void DropNgxLocked() {
     SafeRelease(g_cockpitCs);
     SafeRelease(g_cockpitCb);
     g_cockpitCbBits = 0;
-    SafeRelease(g_stencilCs);
     SafeRelease(g_maskCs);
     SafeRelease(g_maskCb);
     g_maskCbValue = -1;
@@ -439,15 +429,6 @@ bool EnsureCockpitShader() {
     return true;
 }
 
-bool EnsureStencilShader() {
-    if (g_stencilCs) return true;
-    if (FAILED(g_dev->CreateComputeShader(kDlaaStencilCS, sizeof(kDlaaStencilCS), nullptr, &g_stencilCs))) {
-        g_stencilCs = nullptr;
-        return false;
-    }
-    return true;
-}
-
 bool EnsureMaskShader() {
     if (g_maskCs && g_maskCb) return true;
     if (g_maskFailed) return false;
@@ -577,14 +558,6 @@ struct LumStats {
     }
 };
 
-void StencilColor(uint32_t v, float rgb[3]) {
-    const float k[3] = {0.6180339f, 0.3819660f, 0.7548777f};
-    for (int i = 0; i < 3; ++i) {
-        const float x = (float)v * k[i];
-        rgb[i] = 0.15f + 0.85f * (x - std::floor(x));
-    }
-}
-
 void MeasureShot(ID3D11DeviceContext* c, int view, const char* mode, ID3D11Texture2D* sIn, ID3D11Texture2D* sSt,
                  ID3D11Texture2D* sOut) {
     if (!sIn || !sOut) return;
@@ -672,7 +645,7 @@ void MeasureShot(ID3D11DeviceContext* c, int view, const char* mode, ID3D11Textu
     else
         Log("DLAA shot %s (%s): no stencil statistics (format %d)", kViewName[view], mode, (int)ds.Format);
     if (stencilOk) {
-        // The most common full stencil values, with their false color in the stencil view (right Ctrl + End).
+        // The most common full stencil values (high byte = class: 0x86 the player's car, 0x88 displays and mirrors).
         std::vector<uint32_t> order;
         for (uint32_t v = 0; v < 65536; ++v)
             if (valCount[v]) order.push_back(v);
@@ -680,11 +653,9 @@ void MeasureShot(ID3D11DeviceContext* c, int view, const char* mode, ID3D11Textu
         std::string list;
         for (size_t i = 0; i < order.size() && i < 16; ++i) {
             const uint32_t v = order[i];
-            float rgb[3];
-            StencilColor(v, rgb);
-            char buf[128];
-            snprintf(buf, sizeof(buf), "%s0x%04X %.2f%% (input %.3f, color %.2f %.2f %.2f)", i ? "; " : "", v,
-                     100.0 * (double)valCount[v] / px, valLum[v] / (double)valCount[v], rgb[0], rgb[1], rgb[2]);
+            char buf[96];
+            snprintf(buf, sizeof(buf), "%s0x%04X %.2f%% (input %.3f)", i ? "; " : "", v,
+                     100.0 * (double)valCount[v] / px, valLum[v] / (double)valCount[v]);
             list += buf;
         }
         Log("DLAA shot %s: %zu stencil values, the most common: %s", kViewName[view], order.size(), list.c_str());
@@ -891,7 +862,6 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
         // Cockpit from the game's TAA: its result (now in the target) is copied aside before DLSS overwrites anything.
         ID3D11ShaderResourceView* taaSrv = nullptr;
         ID3D11UnorderedAccessView* outUav = nullptr;
-        const bool stencilView = g_stencilView.load() && stencil && EnsureStencilShader() && UavFor(out);
         if (afterDraw) {
             D3D11_TEXTURE2D_DESC sd{};
             if (stencil) stencil->GetDesc(&sd);
@@ -986,19 +956,6 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
                 c->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
                 c->CSSetShader(nullptr, nullptr, 0);
                 ++g_cockpitEvals;
-            }
-            if (stencilView && NVSDK_NGX_SUCCEED(r)) {
-                ID3D11UnorderedAccessView* uav = UavFor(out);
-                ID3D11ShaderResourceView* in2[2] = {srv[4], srv[1]};
-                c->CSSetShader(g_stencilCs, nullptr, 0);
-                c->CSSetShaderResources(0, 2, in2);
-                c->CSSetUnorderedAccessViews(0, 1, &uav, nullptr);
-                c->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
-                ID3D11ShaderResourceView* noSrv[2] = {};
-                ID3D11UnorderedAccessView* noUav = nullptr;
-                c->CSSetShaderResources(0, 2, noSrv);
-                c->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
-                c->CSSetShader(nullptr, nullptr, 0);
             }
         });
         t_inside = false;
@@ -1158,7 +1115,7 @@ void __fastcall D_SetJitter(void* dev, const float* offset, uint32_t ctx) {
             g_jitCounter = counter;
             g_jitCtx = ctx;
         }
-        if (g_setLogs < 40) {
+        if (g_setLogs < 8) {  // one frame's worth: which tasks set and clear the offset
             ++g_setLogs;
             Log("DLAA: SetJitter #%d: context %u, (%.4f, %.4f), frame counter %u, from AMS2AVX.exe+0x%llX", g_setLogs, ctx,
                 v[0], v[1], counter, (unsigned long long)((uintptr_t)ret - hooks::ExeBase()));
@@ -1256,14 +1213,6 @@ void OnFrameStart() {
         if (Pressed(c.dlaaExpKeyMod, c.dlaaExpKey, g_expKeyDown)) {
             g_expStep = (g_expStep.load() + 1) % kExpStepCount;
             Log("DLAA: exposure hotkey: %s%s", ExposureText().c_str(), g_expStep.load() == 0 ? " (the ini settings)" : "");
-        }
-        if (Pressed(c.dlaaCockpitKeyMod, c.dlaaCockpitKey, g_cockpitKeyDown)) {
-            g_cockpit = (CockpitTaaNow() + 1) % 3;
-            Log("DLAA: cockpit hotkey: the game's TAA for %s", CockpitText(g_cockpit.load()));
-        }
-        if (Pressed(c.dlaaStencilKeyMod, c.dlaaStencilKey, g_stencilKeyDown)) {
-            g_stencilView = !g_stencilView.load();
-            Log("DLAA: stencil view %s", g_stencilView.load() ? "on (false colors of the stencil values)" : "off");
         }
         if (Pressed(c.dlaaPresetKeyMod, c.dlaaPresetKey, g_presetKeyDown)) {
             g_presetStep = (g_presetStep.load() + 1) % kPresetStepCount;

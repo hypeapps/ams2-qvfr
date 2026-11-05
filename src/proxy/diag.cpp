@@ -184,7 +184,9 @@ void CheckStartup() {
             if (c.taaViews)
                 Report(Level::Info, "taa",
                        "Temporal anti-aliasing (TAA) is on in the game. The focus views get their own TAA history and "
-                       "matching TAA constants ([debug] taa_views=1, new); MSAA remains the most tested setting.");
+                       "matching TAA constants ([debug] taa_views=1)%s MSAA remains the most tested setting.",
+                       c.dlaa ? "; [dlaa] mode=dlaa replaces the game's TAA with NVIDIA DLAA."
+                              : "; [dlaa] mode=dlaa can replace it with NVIDIA DLAA (RTX).");
             else
                 Report(Level::Serious, "taa",
                        "Temporal anti-aliasing (TAA) is on in the game with [debug] taa_views=0: the focus area can smear "

@@ -404,7 +404,7 @@ Config ReadConfig(const fs::path& ini) {
     const std::string dlaa = IniString(ini, L"dlaa", L"mode", L"off");
     c.dlaa = dlaa == "dlaa";
     if (dlaa != "off" && dlaa != "dlaa") Log("Settings: unknown [dlaa] mode=\"%s\", using off", dlaa.c_str());
-    const std::string preset = IniString(ini, L"dlaa", L"preset", L"default");
+    const std::string preset = IniString(ini, L"dlaa", L"preset", L"k");  // K: NVIDIA's DLAA default, set explicitly
     if (preset == "default") {
         c.dlaaPreset = 0;
     } else if (preset.size() == 1 && preset[0] >= 'a' && preset[0] <= 'o') {
@@ -426,19 +426,15 @@ Config ReadConfig(const fs::path& ini) {
     c.dlaaExpKeyMod = IniInt(ini, L"dlaa", L"exposure_modifier", c.dlaaExpKeyMod);
     c.dlaaExpKey = IniInt(ini, L"dlaa", L"exposure_key", c.dlaaExpKey);
     c.dlaaCockpitTaa = std::clamp(IniInt(ini, L"dlaa", L"cockpit_taa", c.dlaaCockpitTaa), 0, 2);
-    c.dlaaCockpitKeyMod = IniInt(ini, L"dlaa", L"cockpit_modifier", c.dlaaCockpitKeyMod);
-    c.dlaaCockpitKey = IniInt(ini, L"dlaa", L"cockpit_key", c.dlaaCockpitKey);
-    c.dlaaStencilKeyMod = IniInt(ini, L"dlaa", L"stencil_modifier", c.dlaaStencilKeyMod);
-    c.dlaaStencilKey = IniInt(ini, L"dlaa", L"stencil_key", c.dlaaStencilKey);
     c.dlaaPresetKeyMod = IniInt(ini, L"dlaa", L"preset_modifier", c.dlaaPresetKeyMod);
     c.dlaaPresetKey = IniInt(ini, L"dlaa", L"preset_key", c.dlaaPresetKey);
     if (c.dlaa)
         Log("Settings: [dlaa] mode=dlaa preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d auto_exposure=%d "
             "exposure=%.4f exposure_scale=%.4f bias_mask=%.2f skip_locks=%d modifier=0x%X key=0x%X exposure_key=0x%X "
-            "preset_key=0x%X cockpit_taa=%d cockpit_key=0x%X",
+            "preset_key=0x%X cockpit_taa=%d",
             preset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY, c.dlaaMvJittered, c.dlaaAutoExposure,
             c.dlaaExposure, c.dlaaExposureScale, c.dlaaBiasMask, c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey,
-            c.dlaaExpKey, c.dlaaPresetKey, c.dlaaCockpitTaa, c.dlaaCockpitKey);
+            c.dlaaExpKey, c.dlaaPresetKey, c.dlaaCockpitTaa);
     c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
     if (c.testFaultFrames > 0) Log("Settings: [test] fault_frames=%d (deliberate fault for testing)", c.testFaultFrames);
     return c;
@@ -529,10 +525,6 @@ bool ReloadConfig() {
     c.dlaaExpKey = n.dlaaExpKey;
     c.dlaaExposureScale = n.dlaaExposureScale;
     c.dlaaCockpitTaa = n.dlaaCockpitTaa;
-    c.dlaaCockpitKeyMod = n.dlaaCockpitKeyMod;
-    c.dlaaCockpitKey = n.dlaaCockpitKey;
-    c.dlaaStencilKeyMod = n.dlaaStencilKeyMod;
-    c.dlaaStencilKey = n.dlaaStencilKey;
     c.dlaaPresetKeyMod = n.dlaaPresetKeyMod;
     c.dlaaPresetKey = n.dlaaPresetKey;
     c.statsIntervalS = n.statsIntervalS;

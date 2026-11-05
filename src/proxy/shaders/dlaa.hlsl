@@ -20,7 +20,7 @@ void CSMask(uint3 id : SV_DispatchThreadID) {
 }
 
 // Displays and mirrors from the game's TAA ([dlaa] cockpit_taa): after DLSS, the pixels whose stencil high byte has one of
-// `bits` take the game's TAA result, which handles changing digits without trails. Stencil view (dlaa-plan D4, test 7):
+// `bits` take the game's TAA result, which handles changing digits without trails. Stencil values seen in the game:
 // 0x08 (bit 0x800) = displays and mirrors (DDU, timer, rear-view mirror), 0x02 (bit 0x200) = the rest of the player's car.
 cbuffer CockpitParams : register(b1) {
     uint bits;
@@ -36,22 +36,4 @@ void CSCockpit(uint3 id : SV_DispatchThreadID) {
     if (id.x >= w || id.y >= h) return;
     uint s = (uint)(normalStencil.Load(int3(id.xy, 0)).w * 65535.0) >> 8;
     if (s & bits) outColor[id.xy] = taaColor.Load(int3(id.xy, 0)).rgb;
-}
-
-// Stencil view ([dlaa] stencil_key, testers): every pixel in a false color of its full 16-bit stencil value (the color
-// formula is repeated in dlaa.cpp, StencilColor), scaled by the pixel's brightness so that the game's exposure keeps it
-// visible. Shows which stencil value the cockpit displays have.
-float3 StencilColor(uint v) {
-    return 0.15 + 0.85 * frac(float3(v * 0.6180339, v * 0.3819660, v * 0.7548777));
-}
-
-[numthreads(8, 8, 1)]
-void CSStencilView(uint3 id : SV_DispatchThreadID) {
-    uint w, h;
-    outColor.GetDimensions(w, h);
-    if (id.x >= w || id.y >= h) return;
-    uint v = (uint)(normalStencil.Load(int3(id.xy, 0)).w * 65535.0);
-    float3 c = taaColor.Load(int3(id.xy, 0)).rgb;
-    float l = dot(c, float3(0.2126, 0.7152, 0.0722));
-    outColor[id.xy] = StencilColor(v) * (l + 0.02);
 }

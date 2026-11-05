@@ -158,10 +158,6 @@ struct Config {
     // From the game's TAA instead of DLSS: 0 nothing, 1 displays and mirrors (stencil bit 0x800), 2 also the rest of the
     // player's car (bit 0x200). DLSS smears changing digits (dlaa-plan D4, tests 2-7).
     int dlaaCockpitTaa = 1;
-    int dlaaCockpitKeyMod = VK_RCONTROL;  // cockpit from the game's TAA on/off (testers)
-    int dlaaCockpitKey = 0;               // testers: VK_INSERT
-    int dlaaStencilKeyMod = VK_RCONTROL;  // stencil view on/off (testers: which stencil value the displays have)
-    int dlaaStencilKey = 0;               // testers: VK_END
     int dlaaPresetKeyMod = VK_RCONTROL;  // DLSS preset steps: ini, J, K, M, L (testers)
     int dlaaPresetKey = 0;               // testers: VK_HOME
     // [test] (not in the default ini; used by qvfr_proxy_smoke --fault)
