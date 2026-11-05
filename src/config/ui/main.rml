@@ -27,7 +27,7 @@
         <div class="game" data-class-on="game">
             <span class="dot"/><span class="gtext" data-if="game">Game running</span><span class="gtext" data-if="!game">Game not running</span>
         </div>
-        <div class="ver">Version 0.2.0</div>
+        <div class="ver">Version 0.3.0</div>
     </div>
 
     <div id="main">
