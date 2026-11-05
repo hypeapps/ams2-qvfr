@@ -17,6 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The DLSS SDK stays out of git (NVIDIA RTX SDKs license); with it the proxy gets DLAA and the zip nvngx_dlss.dll.
+      - name: NVIDIA DLSS SDK (pinned files from NVIDIA/DLSS v310.9.16)
+        shell: pwsh
+        run: ./tools/fetch_dlss_sdk.ps1
+
       - name: Build (Release)
         shell: pwsh
         run: ./build.ps1 -Config Release
@@ -70,7 +75,9 @@ jobs:
           the folder with ``AMS2.exe``. Settings: ``x64\qvfr\qvfr_config.exe``. Details, requirements and compatibility notes are
           in the [README](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:TAG/README.md).
 
-          Licensed under the PolyForm Noncommercial License 1.0.0. The zip includes OpenComposite 1.0.1539 (GPLv3, unmodified);
-          see [THIRD_PARTY.md](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:TAG/THIRD_PARTY.md) for its source.
+          Licensed under the PolyForm Noncommercial License 1.0.0. The zip includes OpenComposite 1.0.1539 (GPLv3, unmodified)
+          and NVIDIA DLSS 310.9.16 (``x64\qvfr\nvngx_dlss.dll``, NVIDIA RTX SDKs License, unmodified) for the optional DLAA;
+          see [THIRD_PARTY.md](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:TAG/THIRD_PARTY.md) for their licenses and
+          OpenComposite's source.
           "@
           gh release create $env:TAG $env:ZIP --title "AMS2 QVFR $env:VERSION" --notes $notes

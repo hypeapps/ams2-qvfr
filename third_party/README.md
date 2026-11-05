@@ -17,8 +17,10 @@ Vendored into the repo (no submodules), only the files we need. Downloaded 2026-
 
 Optional and not in git: `dlss-310.9.16/` (https://github.com/NVIDIA/DLSS, tag v310.9.16, NVIDIA RTX SDKs license in its
 `LICENSE.txt`): `include/` headers, `lib/nvsdk_ngx_s.lib` and `lib/nvsdk_ngx_s_dbg.lib`, `bin/nvngx_dlss.dll`. The license allows
-distribution only as object code inside an application, so the SDK stays local (`.gitignore`); with it the proxy builds the DLAA
-prototype (`[dlaa]`), without it the proxy builds without DLAA.
+distribution only as object code inside an application, so the SDK stays out of git (`.gitignore`); with it the proxy builds
+DLAA (`[dlaa]`), without it the proxy builds without DLAA. `tools/fetch_dlss_sdk.ps1` downloads exactly these files from the
+NVIDIA repository and checks their pinned SHA256 (CI runs it before the build; `tools/package.ps1` needs the DLL and puts it
+into the release zip with the license).
 
 `openvr-0.9.12/bin/win64/openvr_api.dll` has the same MD5 (`864be5a92276ce2b902b6f3a0f850703`)
 as the game's original `x64\openvr_api.dll`, so the game ships the unmodified Valve DLL.
