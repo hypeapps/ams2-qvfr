@@ -33,6 +33,15 @@ void EndGroup();
 // From quad's OMSetRenderTargets detour, after the real call: the bound render target 0 (only compared).
 void OnSetTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv);
 
+// DLAA (dlaa.h) in quad mode: one hook per D3D11 function, so DLAA's check of each DrawIndexed runs from this module's
+// hook, before anything else. replace(c, count) true = DLSS replaced the draw (not forwarded); inside() true = a draw
+// of DLSS itself (forwarded untouched); after(c) runs after each forwarded DrawIndexed. False: this module's draw hooks
+// are not in place.
+using DrawReplaceFn = bool (*)(ID3D11DeviceContext* c, UINT count);
+using InsideFn = bool (*)();
+using AfterFn = void (*)(ID3D11DeviceContext* c);
+bool SetDrawReplace(DrawReplaceFn replace, InsideFn inside, AfterFn after);
+
 std::string Describe();      // one part of the summary line
 void LogStats(bool totals);  // a stats line, with the session totals at the end
 void Shutdown();             // VR_Shutdown: D3D11 objects released (hooks stay)

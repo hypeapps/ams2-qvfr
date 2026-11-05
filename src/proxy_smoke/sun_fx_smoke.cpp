@@ -252,6 +252,34 @@ int RunSunFx() {
     const bool offOk = check(out[2], outerExpect, errOff);
     const qvfr::sunfx::TestState st2 = qvfr::sunfx::TestGet();
     const bool offCountsOk = st2.replays == st.replays && st2.skipped == st.skipped;
+
+    // DLAA in quad mode: a replaced DrawIndexed does not reach D3D11; a draw of DLSS itself passes untouched.
+    static int s_replaceCalls = 0;
+    static bool s_inside = false;
+    const bool replaceSet = qvfr::sunfx::SetDrawReplace(
+        [](ID3D11DeviceContext*, UINT count) {
+            ++s_replaceCalls;
+            return count == 3;
+        },
+        [] { return s_inside; }, nullptr);
+    auto drawInto0 = [&] {
+        const float zero[4] = {0, 0, 0, 0};
+        bind(outRtv[0]);
+        ctx->ClearRenderTargetView(outRtv[0], zero);
+        ctx->OMSetBlendState(additive, nullptr, 0xFFFFFFFF);
+        ctx->PSSetShader(flare, nullptr, 0);
+        ctx->DrawIndexed(3, 0, 0);
+        ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    };
+    auto zeroExpect = [](float, float, float e[3]) { e[0] = e[1] = e[2] = 0; };
+    float errReplaced = 0, errInside = 0;
+    drawInto0();
+    const bool replacedOk = check(out[0], zeroExpect, errReplaced) && s_replaceCalls == 1;
+    s_inside = true;
+    drawInto0();
+    const bool insideOk = !check(out[0], zeroExpect, errInside) && s_replaceCalls == 1;
+    qvfr::sunfx::SetDrawReplace(nullptr, nullptr, nullptr);
+    const bool replaceOk = replaceSet && replacedOk && insideOk;
     qvfr::sunfx::Shutdown();
 
     int warnings = 0;
@@ -276,11 +304,15 @@ int RunSunFx() {
     }
     ctx->Release();
     dev->Release();
-    const bool ok = outerOk && focusDrawOk && focusAnchorOk && countsOk && offOk && offCountsOk && !warnings;
+    const bool ok =
+        outerOk && focusDrawOk && focusAnchorOk && countsOk && offOk && offCountsOk && replaceOk && !warnings;
     printf("Sun effects check %s: outer max error %.4f, focus with effect draws %.4f, focus at the anchor %.4f, module "
            "off %.4f; outer draws repeated %llu, focus draws skipped %llu, passes at an effect draw %llu, at the anchor "
-           "%llu, missed %llu, faults %llu; module off counts unchanged %d; debug layer %s, %d warnings\n",
+           "%llu, missed %llu, faults %llu; module off counts unchanged %d; DLAA draw replace: replaced draw left the "
+           "target empty %d (max %.4f), DLSS's own draw went through %d (max %.4f), callback calls %d; debug layer %s, "
+           "%d warnings\n",
            ok ? "OK" : "FAILED", errOuter, errFocusDraw, errFocusAnchor, errOff, st.replays, st.skipped, st.composites,
-           st.anchorComposites, st.missed, st.faults, offCountsOk, debugLayer ? "on" : "not installed", warnings);
+           st.anchorComposites, st.missed, st.faults, offCountsOk, replacedOk, errReplaced, insideOk, errInside,
+           s_replaceCalls, debugLayer ? "on" : "not installed", warnings);
     return ok ? 0 : 7;
 }

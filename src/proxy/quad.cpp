@@ -18,6 +18,7 @@
 #include "clones.h"
 #include "common.h"
 #include "compose.h"
+#include "dlaa.h"
 #include "focus_cull.h"
 #include "focus_geometry.h"
 #include "gpu.h"
@@ -1688,6 +1689,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         r.t0 = NowMs();
         g_began |= 1u << g;
         gpu::Begin((gpu::Phase)g);  // the groups and the GPU phases have the same order
+        dlaa::BeginGroup(g);        // its own DLSS history per eye group
         if (!g_graph.ok) return;
         // The groups run in build order; a task without its predecessors in this frame is a stale address (the race
         // graph is gone and the menu reuses the memory).
@@ -1724,6 +1726,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
 
 void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
     sunfx::EndGroup();  // before CEndEye's copies and the desktop mirror
+    dlaa::EndGroup();
     t_inEndEye = true;
     t_endRes = nullptr;
     void* r = o_endExec(task, b, c, d);
@@ -2077,6 +2080,7 @@ void OnFrameStart() {
         clones::OnFrameStart(gpu::Context(), g_clonesOn && g_focus.on);
         sunfx::OnFrameStart(gpu::Context(), g_sunOn && g_focus.on && !g_frameSkip);
         taaviews::OnFrameStart(g_taaOn && !g_frameSkip, g_shotFrame);
+        dlaa::SetShotFrame(g_shotFrame);
     });
 }
 

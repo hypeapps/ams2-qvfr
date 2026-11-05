@@ -2,6 +2,7 @@
 
 #include "presets.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -414,15 +415,30 @@ Config ReadConfig(const fs::path& ini) {
     c.dlaaJitterScaleX = IniFloat(ini, L"dlaa", L"jitter_scale_x", c.dlaaJitterScaleX);
     c.dlaaJitterScaleY = IniFloat(ini, L"dlaa", L"jitter_scale_y", c.dlaaJitterScaleY);
     c.dlaaMvJittered = IniInt(ini, L"dlaa", L"mv_jittered", 0) != 0;
-    c.dlaaAutoExposure = IniInt(ini, L"dlaa", L"auto_exposure", 1) != 0;
+    c.dlaaAutoExposure = IniInt(ini, L"dlaa", L"auto_exposure", c.dlaaAutoExposure ? 1 : 0) != 0;
     c.dlaaSkipLocks = IniInt(ini, L"dlaa", L"skip_locks", 1) != 0;
+    c.dlaaExposure = IniFloat(ini, L"dlaa", L"exposure", c.dlaaExposure);
+    c.dlaaExposureScale = IniFloat(ini, L"dlaa", L"exposure_scale", c.dlaaExposureScale);
+    if (c.dlaaExposureScale <= 0) c.dlaaExposureScale = 1.0f;
+    c.dlaaBiasMask = std::clamp(IniFloat(ini, L"dlaa", L"bias_mask", c.dlaaBiasMask), 0.0f, 1.0f);
     c.dlaaKeyMod = IniInt(ini, L"dlaa", L"modifier", c.dlaaKeyMod);
     c.dlaaKey = IniInt(ini, L"dlaa", L"key", c.dlaaKey);
+    c.dlaaExpKeyMod = IniInt(ini, L"dlaa", L"exposure_modifier", c.dlaaExpKeyMod);
+    c.dlaaExpKey = IniInt(ini, L"dlaa", L"exposure_key", c.dlaaExpKey);
+    c.dlaaCockpitTaa = std::clamp(IniInt(ini, L"dlaa", L"cockpit_taa", c.dlaaCockpitTaa), 0, 2);
+    c.dlaaCockpitKeyMod = IniInt(ini, L"dlaa", L"cockpit_modifier", c.dlaaCockpitKeyMod);
+    c.dlaaCockpitKey = IniInt(ini, L"dlaa", L"cockpit_key", c.dlaaCockpitKey);
+    c.dlaaStencilKeyMod = IniInt(ini, L"dlaa", L"stencil_modifier", c.dlaaStencilKeyMod);
+    c.dlaaStencilKey = IniInt(ini, L"dlaa", L"stencil_key", c.dlaaStencilKey);
+    c.dlaaPresetKeyMod = IniInt(ini, L"dlaa", L"preset_modifier", c.dlaaPresetKeyMod);
+    c.dlaaPresetKey = IniInt(ini, L"dlaa", L"preset_key", c.dlaaPresetKey);
     if (c.dlaa)
         Log("Settings: [dlaa] mode=dlaa preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d auto_exposure=%d "
-            "skip_locks=%d modifier=0x%X key=0x%X",
+            "exposure=%.4f exposure_scale=%.4f bias_mask=%.2f skip_locks=%d modifier=0x%X key=0x%X exposure_key=0x%X "
+            "preset_key=0x%X cockpit_taa=%d cockpit_key=0x%X",
             preset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY, c.dlaaMvJittered, c.dlaaAutoExposure,
-            c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey);
+            c.dlaaExposure, c.dlaaExposureScale, c.dlaaBiasMask, c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey,
+            c.dlaaExpKey, c.dlaaPresetKey, c.dlaaCockpitTaa, c.dlaaCockpitKey);
     c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
     if (c.testFaultFrames > 0) Log("Settings: [test] fault_frames=%d (deliberate fault for testing)", c.testFaultFrames);
     return c;
@@ -505,8 +521,20 @@ bool ReloadConfig() {
     c.dlaaMvJittered = n.dlaaMvJittered;
     c.dlaaAutoExposure = n.dlaaAutoExposure;
     c.dlaaSkipLocks = n.dlaaSkipLocks;
+    c.dlaaExposure = n.dlaaExposure;
+    c.dlaaBiasMask = n.dlaaBiasMask;
     c.dlaaKeyMod = n.dlaaKeyMod;
     c.dlaaKey = n.dlaaKey;
+    c.dlaaExpKeyMod = n.dlaaExpKeyMod;
+    c.dlaaExpKey = n.dlaaExpKey;
+    c.dlaaExposureScale = n.dlaaExposureScale;
+    c.dlaaCockpitTaa = n.dlaaCockpitTaa;
+    c.dlaaCockpitKeyMod = n.dlaaCockpitKeyMod;
+    c.dlaaCockpitKey = n.dlaaCockpitKey;
+    c.dlaaStencilKeyMod = n.dlaaStencilKeyMod;
+    c.dlaaStencilKey = n.dlaaStencilKey;
+    c.dlaaPresetKeyMod = n.dlaaPresetKeyMod;
+    c.dlaaPresetKey = n.dlaaPresetKey;
     c.statsIntervalS = n.statsIntervalS;
     c.warningBox = n.warningBox;
     c.benchKeyMod = n.benchKeyMod;
