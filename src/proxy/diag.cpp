@@ -180,10 +180,16 @@ void CheckStartup() {
         Set("Game settings", "graphicsconfigopenvrdx11.xml not found or without anti-aliasing settings");
     } else {
         Set("Game settings", "antialias=" + aa + " (MSAA), temporalantialiasenabled=" + taa + (taa == "1" ? " (TAA ON)" : ""));
-        if (taa == "1" && c.quadMode == QuadMode::Quad)
-            Report(Level::Serious, "taa",
-                   "Temporal anti-aliasing (TAA) is on in the game. The mod is made for MSAA: with TAA the focus area can "
-                   "smear or flicker. Turn TAA off in the game's graphics options and use MSAA.");
+        if (taa == "1" && c.quadMode == QuadMode::Quad) {
+            if (c.taaViews)
+                Report(Level::Info, "taa",
+                       "Temporal anti-aliasing (TAA) is on in the game. The focus views get their own TAA history and "
+                       "matching TAA constants ([debug] taa_views=1, new); MSAA remains the most tested setting.");
+            else
+                Report(Level::Serious, "taa",
+                       "Temporal anti-aliasing (TAA) is on in the game with [debug] taa_views=0: the focus area can smear "
+                       "or flicker. Set taa_views=1, or turn TAA off in the game's graphics options and use MSAA.");
+        }
     }
     ShowPendingBox();
 }

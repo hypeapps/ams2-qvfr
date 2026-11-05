@@ -74,6 +74,7 @@ Settings Read(const IniFile& ini) {
     s.clonesKey = ParseInt(ini.GetOr("debug", "clones_key", ""), 0);
     s.cullKey = ParseInt(ini.GetOr("debug", "cull_key", ""), 0);
     s.sunKey = ParseInt(ini.GetOr("debug", "sun_effects_key", ""), 0);
+    s.taaKey = ParseInt(ini.GetOr("debug", "taa_views_key", ""), 0);
     s.shotKey = ParseInt(ini.GetOr("quad", "shot_key", ""), 0);
     return s;
 }

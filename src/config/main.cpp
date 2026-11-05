@@ -434,9 +434,10 @@ void BindModel(Rml::Context* ctx) {
     toggle("debug_keys",
            [] {
                return g.s.overlayKey || g.s.freezeKey || g.s.outerKey || g.s.clonesKey || g.s.shotKey || g.s.cullKey ||
-                      g.s.sunKey;
+                      g.s.sunKey || g.s.taaKey;
            },
            [](bool on) {
+               g.ini.Set("debug", "taa_views_key", on ? "0x71" : "0");
                g.ini.Set("debug", "sun_effects_key", on ? "0x72" : "0");
                g.ini.Set("debug", "cull_key", on ? "0x73" : "0");
                g.ini.Set("debug", "clones_key", on ? "0x74" : "0");

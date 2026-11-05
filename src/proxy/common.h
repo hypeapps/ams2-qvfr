@@ -123,6 +123,10 @@ struct Config {
     bool sunEffects = true;
     int sunKeyMod = VK_RCONTROL;
     int sunKey = 0;                   // testers: VK_F3
+    // Own TAA history of the focus views (taa_views.h, dlaa-plan D2); the hotkey switches.
+    bool taaViews = true;
+    int taaViewsKeyMod = VK_RCONTROL;
+    int taaViewsKey = 0;              // testers: VK_F2
     // Execute time of every task of the eye groups, one log line per group with the stats (M9 step 4 diagnostics).
     bool taskProfile = false;
     // A viewport the engine sets for an original while a smaller clone is bound is scaled to the clone (M7.4).

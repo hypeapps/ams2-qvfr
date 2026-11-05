@@ -55,6 +55,7 @@ add_library(qvfr_proxy SHARED
   xr_layer.cpp
   sysinfo.cpp
   sun_fx.cpp
+  taa_views.cpp
   common.cpp
 )
 target_link_libraries(qvfr_proxy PRIVATE qvfr_shaders openvr_0912 openxr_headers minhook bcrypt version psapi shell32 ole32 windowscodecs)

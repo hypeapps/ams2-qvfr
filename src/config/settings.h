@@ -30,7 +30,8 @@ struct Settings {
     // Testers
     bool csvAlways = false;
     int benchKey = 0;
-    int overlayKey = 0, freezeKey = 0, outerKey = 0, clonesKey = 0, shotKey = 0, cullKey = 0, sunKey = 0;
+    int overlayKey = 0, freezeKey = 0, outerKey = 0, clonesKey = 0, shotKey = 0, cullKey = 0, sunKey = 0,
+        taaKey = 0;
 
     bool Custom() const { return givenPeripheral || givenFocusX || givenFocusY || givenFixedX || givenFixedY; }
 };

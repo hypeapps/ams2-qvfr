@@ -24,6 +24,7 @@
 #include "hooks.h"
 #include "shots.h"
 #include "sun_fx.h"
+#include "taa_views.h"
 
 namespace qvfr::quad {
 
@@ -289,6 +290,10 @@ bool g_cullKeyDown = false;
 bool g_sunOn = true;
 bool g_sunCfg = true;
 bool g_sunKeyDown = false;
+// Own TAA state of the focus views (taa_views.h): setting and hotkey.
+bool g_taaOn = true;
+bool g_taaCfg = true;
+bool g_taaKeyDown = false;
 struct Cull {
     bool failed = false;  // off until the next builder call
     int misses = 0;       // focus groups in a row without culling (checks failed)
@@ -1308,6 +1313,15 @@ void HandleToolsLocked() {
         g_sunOn = !g_sunOn;
         Log("Quad: sun effects from outer %s (hotkey)", g_sunOn ? "on" : "off");
     }
+    if (c.taaViews != g_taaCfg) {
+        g_taaCfg = c.taaViews;
+        g_taaOn = c.taaViews;
+        Log("Quad: own TAA state of the focus views %s (ini)", g_taaOn ? "on" : "off");
+    }
+    if (Pressed(c.taaViewsKeyMod, c.taaViewsKey, g_taaKeyDown)) {
+        g_taaOn = !g_taaOn;
+        Log("Quad: own TAA state of the focus views %s (hotkey)", g_taaOn ? "on" : "off");
+    }
     if (Pressed(c.freezeKeyMod, c.freezeKey, g_freezeKeyDown)) {
         g_gazeFrozen = !g_gazeFrozen;
         Log("Quad: gaze %s (hotkey), NDC L (%.3f, %.3f) R (%.3f, %.3f)%s", g_gazeFrozen ? "FROZEN" : "live",
@@ -1682,6 +1696,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         if (g < FocusL) {
             clones::BeginGroup(gpu::Context(), clones::Outer);
             sunfx::BeginGroup(g, 0, 0, 1, 1);
+            taaviews::BeginGroup(g);  // outer: only the shot-frame dump
             return;
         }
         if (g_firstFocusMs < 0) {
@@ -1694,6 +1709,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         if (!ctx || view != kFocusView) return;
         SwapInLocked(ctx, g, kSourceView[g], r);
         clones::BeginGroup(gpu::Context(), clones::Focus);
+        taaviews::BeginGroup(g);
         // The focus window as a part of outer (which covers the whole grid); without the focus projection the
         // group renders outer's view.
         const focus::Geometry& geo = g_focus.geo;
@@ -1721,6 +1737,7 @@ void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
         if (g < 0) return;
         if (g_swap.ctx && g_swap.group == g) RestoreLocked();
         clones::EndGroup(gpu::Context());  // no-op without its BeginGroup
+        taaviews::EndGroup();              // no-op without its BeginGroup
         if (g_fault.load(std::memory_order_relaxed)) return;
         Run& run = g_run[g];
         run.t1 = NowMs();
@@ -1772,6 +1789,7 @@ void STDMETHODCALLTYPE D_OMSetRenderTargets(ID3D11DeviceContext* c, UINT n, ID3D
     o_omSetRt(c, n, rtv, dsv);
     clones::OnOMSetRenderTargets(c, n, rtv, dsv, caller);
     sunfx::OnSetTargets(c, n, rtv);
+    taaviews::OnSetTargets(c, n, rtv);
 }
 
 void LogStatsLocked(const Stats& s, const char* what) {
@@ -2009,6 +2027,8 @@ void Install() {
         if (g_patched) clones::InstallEngineHooks();
         // Sun effects: the shader creation hook must be in place before the game makes its effect shaders.
         if (g_patched) sunfx::Install();
+        // TAA views: the target helper hook must be in place before the game makes its TAA (track load).
+        if (g_patched) taaviews::Install();
         // Quad <-> outer only needs the focus tasks from the builder's "add task" calls and the executor patch.
         if (g_patched && hooks::Create(Anchor::TaskGroupAddTask, (void*)D_AddTask, (void**)&o_addTask))
             g_execPatched = PatchExecutor();
@@ -2023,6 +2043,7 @@ void Install() {
     g_clonesOn = g_clonesCfg = Cfg().clones;
     g_cullOn = g_cullCfg = Cfg().focusCull;
     g_sunOn = g_sunCfg = Cfg().sunEffects;
+    g_taaOn = g_taaCfg = Cfg().taaViews;
     LARGE_INTEGER qf{};
     QueryPerformanceFrequency(&qf);
     g_qpcFreq = qf.QuadPart;
@@ -2045,6 +2066,7 @@ void OnFrameStart() {
             if (g_skipSet.load() && !GroupsAliveLocked()) ClearGroups();
             clones::OnFrameStart(gpu::Context(), false);  // a swap left over goes back
             sunfx::OnFrameStart(gpu::Context(), false);
+            taaviews::OnFrameStart(false, false);
             return;
         }
         FinishFrameLocked();
@@ -2054,6 +2076,7 @@ void OnFrameStart() {
         HandleShotLocked();
         clones::OnFrameStart(gpu::Context(), g_clonesOn && g_focus.on);
         sunfx::OnFrameStart(gpu::Context(), g_sunOn && g_focus.on && !g_frameSkip);
+        taaviews::OnFrameStart(g_taaOn && !g_frameSkip, g_shotFrame);
     });
 }
 
@@ -2274,12 +2297,13 @@ void LogStats(bool totals) {
         g_st = Stats{};
         clones::LogStats(totals);
         sunfx::LogStats(totals);
+        taaviews::LogStats(totals);
     });
 }
 
 std::string Describe() {
     if (Cfg().quadMode != QuadMode::Quad) return "Quad: off";
-    char buf[1024] = "Quad: (error)";
+    char buf[1536] = "Quad: (error)";
     Guard("Describe", [&] {
         std::lock_guard lock(g_m);
         char focus[512] = "no focus window (the game renders at the SteamVR size)";
@@ -2305,10 +2329,11 @@ std::string Describe() {
                            : g_cull.failed ? "focus culling off after failed checks"
                            : g_cullOn      ? "focus culling on"
                                            : "focus culling off";
-        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s, %s, %s, %s%s",
+        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s, %s, %s, %s, %s%s",
                  g_installed ? "engine hooks on" : "engine hooks off", g_patched ? "on" : "off",
                  g_graph.ok ? "running" : "not running", focus, view, cull, clones::Describe().c_str(),
-                 sunfx::Describe().c_str(), g_fault ? ", stopped after an exception" : "");
+                 sunfx::Describe().c_str(), taaviews::Describe().c_str(),
+                 g_fault ? ", stopped after an exception" : "");
     });
     return buf;
 }
@@ -2340,6 +2365,7 @@ void Shutdown() {
         RestoreLocked();
         clones::Shutdown();
         sunfx::Shutdown();
+        taaviews::Shutdown();
         shots::Cancel();
         g_shotFrame = false;
         g_skip = false;

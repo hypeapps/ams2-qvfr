@@ -65,6 +65,7 @@
 #include "compose.h"
 
 int RunSunFx();  // sun_fx_smoke.cpp
+int RunTaaFix();  // taa_fix_smoke.cpp
 #include "focus_cull.h"
 #include "focus_geometry.h"
 #include "hooks.h"
@@ -1324,6 +1325,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--focus-cull")) return RunFocusCull();
         else if (!strcmp(argv[i], "--clones")) clonesTest = true;
         else if (!strcmp(argv[i], "--sun-fx")) sunFxTest = true;
+        else if (!strcmp(argv[i], "--taa-fix")) return RunTaaFix();
         else if (!strcmp(argv[i], "--xr-layer")) xrLayerTest = true;
         else if (!strcmp(argv[i], "--openxr-path")) openxrPathTest = true;
         else if (!strcmp(argv[i], "--openxr")) openxr = true;

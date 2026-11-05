@@ -203,7 +203,7 @@
                     <div class="row">
                         <div class="label">
                             <div class="name">Debug hotkeys</div>
-                            <div class="desc">Right Ctrl + F3 sun effects, F5 clones, F7 freeze the gaze, F8 overlay, F10 screenshot, F11 outer only.</div>
+                            <div class="desc">Right Ctrl + F2 focus TAA history, F3 sun effects, F4 focus culling, F5 clones, F7 freeze the gaze, F8 overlay, F10 screenshot, F11 outer only.</div>
                         </div>
                         <div class="control">
                             <div class="switch"><input type="checkbox" data-checked="debug_keys"/><div class="knob"/></div>

@@ -383,6 +383,9 @@ Config ReadConfig(const fs::path& ini) {
     c.sunEffects = IniInt(ini, L"debug", L"sun_effects", 1) != 0;
     c.sunKeyMod = IniInt(ini, L"debug", L"sun_effects_modifier", c.sunKeyMod);
     c.sunKey = IniInt(ini, L"debug", L"sun_effects_key", c.sunKey);
+    c.taaViews = IniInt(ini, L"debug", L"taa_views", 1) != 0;
+    c.taaViewsKeyMod = IniInt(ini, L"debug", L"taa_views_modifier", c.taaViewsKeyMod);
+    c.taaViewsKey = IniInt(ini, L"debug", L"taa_views_key", c.taaViewsKey);
     c.taskProfile = IniInt(ini, L"debug", L"task_profile", 0) != 0;
     c.clonesViewportFix = IniInt(ini, L"debug", L"clones_viewport_fix", 1) != 0;
     c.clonesBindFix = IniInt(ini, L"debug", L"clones_bind_fix", 1) != 0;
@@ -391,10 +394,12 @@ Config ReadConfig(const fs::path& ini) {
         Log("Settings: [debug] overlay=%d overlay_modifier=0x%X overlay_key=0x%X freeze_modifier=0x%X freeze_key=0x%X "
             "outer_modifier=0x%X outer_key=0x%X gaze_modifier=0x%X gaze_key=0x%X clones=%d clones_modifier=0x%X "
             "clones_key=0x%X clones_viewport_fix=%d clones_bind_fix=%d shot_clones=%d focus_cull=%d cull_modifier=0x%X "
-            "cull_key=0x%X sun_effects=%d sun_effects_modifier=0x%X sun_effects_key=0x%X task_profile=%d",
+            "cull_key=0x%X sun_effects=%d sun_effects_modifier=0x%X sun_effects_key=0x%X taa_views=%d "
+            "taa_views_modifier=0x%X taa_views_key=0x%X task_profile=%d",
             c.overlay, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey,
             c.gazeKeyMod, c.gazeKey, c.clones, c.clonesKeyMod, c.clonesKey, c.clonesViewportFix, c.clonesBindFix,
-            c.shotClones, c.focusCull, c.cullKeyMod, c.cullKey, c.sunEffects, c.sunKeyMod, c.sunKey, c.taskProfile);
+            c.shotClones, c.focusCull, c.cullKeyMod, c.cullKey, c.sunEffects, c.sunKeyMod, c.sunKey, c.taaViews,
+            c.taaViewsKeyMod, c.taaViewsKey, c.taskProfile);
     const std::string dlaa = IniString(ini, L"dlaa", L"mode", L"off");
     c.dlaa = dlaa == "dlaa";
     if (dlaa != "off" && dlaa != "dlaa") Log("Settings: unknown [dlaa] mode=\"%s\", using off", dlaa.c_str());
@@ -548,20 +553,23 @@ bool ReloadConfig() {
     c.sunEffects = n.sunEffects;
     c.sunKeyMod = n.sunKeyMod;
     c.sunKey = n.sunKey;
+    c.taaViews = n.taaViews;
+    c.taaViewsKeyMod = n.taaViewsKeyMod;
+    c.taaViewsKey = n.taaViewsKey;
     c.taskProfile = n.taskProfile;
     Log("Settings reloaded (live): stats_interval_s=%d | benchmark modifier=0x%X key=0x%X delay_s=%.1f duration_s=%.1f "
         "freeze_pose=%d beep=%d | gaze read=%d | quad focus_offset=(%.3f, %.3f) fixed_offset=(%.3f, %.3f) "
         "smoothen_focus_view_edges=%.3f%s follow_gaze=%d gaze_hold_s=%.2f compose=%d margin_px=%d shot_modifier=0x%X "
         "shot_key=0x%X shot_auto_s=%.1f | debug overlay=%d clones=%d clones_viewport_fix=%d clones_bind_fix=%d "
-        "shot_clones=%d focus_cull=%d sun_effects=%d task_profile=%d keys 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, "
-        "0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X%s%s",
+        "shot_clones=%d focus_cull=%d sun_effects=%d taa_views=%d task_profile=%d keys 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, "
+        "0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X%s%s",
         c.statsIntervalS, c.benchKeyMod, c.benchKey, c.benchDelayS, c.benchDurationS, c.benchFreezePose, c.benchBeep,
         c.gazeRead, c.focusOffsetX, c.focusOffsetY, c.fixedOffsetX, c.fixedOffsetY, c.smoothen,
         c.legacyEdge ? " (pre-M7 feather_px instead)" : "", c.followGaze, c.gazeHoldS, c.quadCompose, c.quadMarginPx,
         c.shotKeyMod, c.shotKey, c.shotAutoS, c.overlay, c.clones, c.clonesViewportFix, c.clonesBindFix, c.shotClones,
-        c.focusCull, c.sunEffects, c.taskProfile, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey,
+        c.focusCull, c.sunEffects, c.taaViews, c.taskProfile, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey,
         c.outerKeyMod, c.outerKey, c.gazeKeyMod, c.gazeKey, c.clonesKeyMod, c.clonesKey, c.cullKeyMod, c.cullKey,
-        c.sunKeyMod, c.sunKey,
+        c.sunKeyMod, c.sunKey, c.taaViewsKeyMod, c.taaViewsKey,
         restart.empty() ? "" : "; CHANGED BUT NEEDS A GAME RESTART: ", restart.c_str());
     return true;
 }

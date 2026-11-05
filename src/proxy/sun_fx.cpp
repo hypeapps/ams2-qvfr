@@ -11,6 +11,7 @@
 #include "hooks.h"
 #include "sun_fx_ps.h"  // kSunFxPS (fxc from shaders/sun_fx.hlsl)
 #include "sun_fx_vs.h"  // kSunFxVS
+#include "taa_views.h"
 
 namespace qvfr::sunfx {
 
@@ -573,18 +574,22 @@ void STDMETHODCALLTYPE D_PSSetShader(ID3D11DeviceContext* c, ID3D11PixelShader* 
 }
 
 void STDMETHODCALLTYPE D_DrawIndexed(ID3D11DeviceContext* c, UINT count, UINT start, INT base) {
+    const bool taaFix = taaviews::OnDraw(c, true, count);
     int g = -1;
     Action a = Forward;
     if (Active(c, g))
         Protect("DrawIndexed", [&] { a = OnDraw(c, g, [&] { o_drawIndexed(c, count, start, base); }); });
     if (a == Forward) o_drawIndexed(c, count, start, base);
+    if (taaFix) taaviews::AfterDraw(c);
 }
 
 void STDMETHODCALLTYPE D_Draw(ID3D11DeviceContext* c, UINT count, UINT start) {
+    const bool taaFix = taaviews::OnDraw(c, false, count);
     int g = -1;
     Action a = Forward;
     if (Active(c, g)) Protect("Draw", [&] { a = OnDraw(c, g, [&] { o_draw(c, count, start); }); });
     if (a == Forward) o_draw(c, count, start);
+    if (taaFix) taaviews::AfterDraw(c);
 }
 
 bool HookAll(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
