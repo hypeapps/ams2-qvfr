@@ -6,7 +6,8 @@ The game renders each eye in two parts: the whole field of view at a lower pixel
 smaller area at full density (the *focus* view). With eye tracking the focus follows your gaze; without it, it stays in
 the middle of the view. The mod puts both together for each eye before the image goes to the headset. You get a sharp
 image where you look and render far fewer pixels, so you have headroom for higher settings or a steadier frame rate.
-MSAA keeps working.
+MSAA keeps working, and so does the game's TAA. On NVIDIA RTX graphics cards the mod can also replace the game's TAA with
+NVIDIA DLAA (experimental).
 
 ## Install
 
@@ -41,7 +42,8 @@ let Steam verify the game files and delete `x64\qvfr`.
 You can customize settings using the GUI: `x64\qvfr\qvfr_config.exe`
 
 - **Settings:** quad views on/off, VR API, eye tracking (with the time the focus waits when the tracker loses your eyes,
-  and a switch that shows your gaze and the focus edges in the game), focus position, debug options.
+  and a switch that shows your gaze and the focus edges in the game), anti-aliasing ([NVIDIA DLAA](#nvidia-dlaa-experimental)),
+  focus position, debug options.
 - **Resolution:** a to-scale preview of the left eye with the pixels the game renders, the presets and every size.
 - **Status:** problems found at the last game start and what the mod detected (headset, runtime, eye tracking…).
 - **Files:** checks the mod's files, repairs or turns off the mod. **Log:** the last log.
@@ -60,8 +62,8 @@ in the GUI they are percentages (multiplier × 100):
 | Enable eye tracking | `follow_gaze` | on |
 
 - **Right Ctrl + F6** turns eye tracking on or off while you play (can be turned off in the GUI).
-- Serious problems found at game start (TAA on, Pimax foveated rendering on, unsupported game build) also show in a
-  Windows message box; the game keeps running.
+- Serious problems found at game start (Pimax foveated rendering on, unsupported game build) also show in a Windows
+  message box; the game keeps running.
 
 ## VR API: OpenXR or OpenVR
 
@@ -75,12 +77,33 @@ the next game start.
 - **OpenVR:** the game talks to SteamVR through the Valve DLL in `x64\qvfr\openvr\`. Eye tracking: what SteamVR
   gives games (tested with the Pimax Dream Air).
 
+## NVIDIA DLAA (experimental)
+
+NVIDIA DLSS without upscaling (DLAA) replaces the game's temporal anti-aliasing (TAA): calmer edges and a sharper image
+than the game's TAA. The mod gives DLSS the game's own motion vectors (including the cars and
+wheels), depth and camera jitter, and runs it for each of the four views. NVIDIA DLSS (`nvngx_dlss.dll`) comes with the
+mod in `x64\qvfr\`.
+
+- **Requirements:** an NVIDIA RTX graphics card, and in the game's graphics options **TAA on and MSAA off**. Without them
+  the game's own anti-aliasing stays.
+- **Turn it on:** `qvfr_config.exe` → **Settings** → **Anti-aliasing** → **NVIDIA DLAA**, then restart the game. Off by
+  default.
+- **DLSS preset:** the DLSS model (J, K, L, M; K is NVIDIA's default for DLAA).
+- **DLSS exposure:** fixed (default 0.002) keeps the brightness of lights and reflections; auto lets DLSS measure it,
+  which dims them, most at night. Lower fixed values keep brighter highlights.
+- Dashboard displays and mirrors keep the game's TAA, because DLSS leaves trails behind changing digits
+  (`[dlaa] cockpit_taa` in `qvfr.ini`: 0 = DLSS everywhere, 2 = also the rest of your car).
+- With **Debug hotkeys** on: right Ctrl + F1 switches between DLAA and the game's TAA, F12 steps through exposures and
+  Home through the presets while you drive.
+- The **Status** page shows whether DLAA ran at the last game start, and if not, why.
+
 ## Requirements
 
 - Automobilista 2 on Steam, in VR (DirectX 11), Windows 10 or 11, 64-bit.
 - An OpenXR runtime (SteamVR, Pimax Play, Meta, Varjo Base…) for the default OpenXR path, or SteamVR for the OpenVR path.
 - Eye tracking is optional. Without it you get fixed foveated rendering (the focus stays in the middle).
-- MSAA in the game. Temporal anti-aliasing (TAA) is not supported: with TAA the focus area can smear or flicker.
+- MSAA or TAA in the game (MSAA is the most tested). With TAA the focus views keep their own TAA history.
+- For NVIDIA DLAA: an NVIDIA RTX graphics card and TAA on in the game.
 
 ## Compatibility notes
 
@@ -107,7 +130,7 @@ Turn these on in the GUI (**Settings → Debug**):
 - **Frame timing CSV for the whole session:** the same timings for the whole drive in `x64\qvfr\bench\`.
 - **Show the gaze in the game** (Eye tracking): a white ring where you look, the focus edges in red (blend starts) and
   green (fully sharp).
-- **Debug hotkeys:** right Ctrl + F3 sun effects from outer (crepuscular rays and lens flares), F5 clones, F7 freeze the gaze, F8 overlay, F10 screenshot of the views, F11 outer only.
+- **Debug hotkeys:** right Ctrl + F2 the focus views' own TAA history, F3 sun effects from outer (crepuscular rays and lens flares), F4 focus culling, F5 clones, F7 freeze the gaze, F8 overlay, F10 screenshot of the views, F11 outer only, F1 NVIDIA DLAA or the game's TAA, F12 DLSS exposure steps, Home DLSS preset steps.
 
 ### Issue reporting
 
@@ -122,6 +145,8 @@ Report a problem by opening an issue on GitHub: https://github.com/hypeapps/ams2
 AMS2 QVFR is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE.md): free to use, change and share for
 any noncommercial purpose. Third-party software and its licenses: [THIRD_PARTY.md](THIRD_PARTY.md). OpenComposite is
 included unmodified under the GPLv3; its source code is linked there and in `x64\qvfr\opencomposite\SOURCE.txt`.
+NVIDIA DLSS is included unmodified under the NVIDIA RTX SDKs License (`x64\qvfr\licenses\nvidia-rtx-sdks-LICENSE.txt`).
+NVIDIA and DLSS are trademarks of NVIDIA Corporation; this mod is not sponsored or endorsed by NVIDIA.
 
 Thanks to Matthieu Bucchianeri for Quad-Views-Foveated, whose settings and focus edge the mod follows, and to the
 OpenComposite project.
@@ -131,9 +156,11 @@ that this is possible today.
 
 ## Building from source
 
-Windows, Visual Studio with the MSVC x64 tools, CMake 3.28 or newer and Ninja. All dependencies are in `third_party/`.
+Windows, Visual Studio with the MSVC x64 tools, CMake 3.28 or newer and Ninja. All dependencies are in `third_party/`,
+except the NVIDIA DLSS SDK, which `tools\fetch_dlss_sdk.ps1` downloads from NVIDIA (the release zip needs it).
 
 ```
+.\tools\fetch_dlss_sdk.ps1   # the NVIDIA DLSS SDK files for DLAA (without them the proxy has no DLAA)
 .\build.ps1                  # Release; .\build.ps1 -Config Debug for a debug build
 .\tools\package.ps1          # the release zip in dist\
 .\tools\install_proxy.ps1    # developer install into the Steam game folder (backs up the original DLL)
