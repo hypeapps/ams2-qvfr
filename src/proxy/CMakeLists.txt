@@ -14,8 +14,20 @@ add_custom_command(
   DEPENDS ${QVFR_COMPOSE_HLSL}
   COMMENT "fxc compose.hlsl"
   VERBATIM)
+set(QVFR_SUNFX_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sun_fx.hlsl)
+add_custom_command(
+  OUTPUT ${QVFR_SHADER_OUT}/sun_fx_vs.h ${QVFR_SHADER_OUT}/sun_fx_ps.h
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${QVFR_SHADER_OUT}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T vs_5_0 /E VSMain /Vn kSunFxVS
+          /Fh ${QVFR_SHADER_OUT}/sun_fx_vs.h ${QVFR_SUNFX_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T ps_5_0 /E PSMain /Vn kSunFxPS
+          /Fh ${QVFR_SHADER_OUT}/sun_fx_ps.h ${QVFR_SUNFX_HLSL}
+  DEPENDS ${QVFR_SUNFX_HLSL}
+  COMMENT "fxc sun_fx.hlsl"
+  VERBATIM)
 # Linking this target gives the include directory and builds the headers first (proxy and smoke test).
-add_library(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT}/compose_vs.h ${QVFR_SHADER_OUT}/compose_ps.h)
+add_library(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT}/compose_vs.h ${QVFR_SHADER_OUT}/compose_ps.h
+            ${QVFR_SHADER_OUT}/sun_fx_vs.h ${QVFR_SHADER_OUT}/sun_fx_ps.h)
 target_include_directories(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT})
 
 enable_language(ASM_MASM)  # export thunks (generated/thunks.asm)
@@ -41,6 +53,7 @@ add_library(qvfr_proxy SHARED
   diag.cpp
   xr_layer.cpp
   sysinfo.cpp
+  sun_fx.cpp
   common.cpp
 )
 target_link_libraries(qvfr_proxy PRIVATE qvfr_shaders openvr_0912 openxr_headers minhook bcrypt version psapi shell32 ole32 windowscodecs)

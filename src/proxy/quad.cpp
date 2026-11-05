@@ -23,6 +23,7 @@
 #include "gpu.h"
 #include "hooks.h"
 #include "shots.h"
+#include "sun_fx.h"
 
 namespace qvfr::quad {
 
@@ -284,6 +285,10 @@ bool g_clonesKeyDown = false;
 bool g_cullOn = true;
 bool g_cullCfg = true;
 bool g_cullKeyDown = false;
+// Crepuscular rays and lens flares of the focus views from outer (sun_fx.h): setting and hotkey.
+bool g_sunOn = true;
+bool g_sunCfg = true;
+bool g_sunKeyDown = false;
 struct Cull {
     bool failed = false;  // off until the next builder call
     int misses = 0;       // focus groups in a row without culling (checks failed)
@@ -1294,6 +1299,15 @@ void HandleToolsLocked() {
             g_cullFault ? "; STOPPED for this session after an engine fault" : g_cull.failed ? "; off after failed checks "
             "until the next track load" : "");
     }
+    if (c.sunEffects != g_sunCfg) {
+        g_sunCfg = c.sunEffects;
+        g_sunOn = c.sunEffects;
+        Log("Quad: sun effects from outer %s (ini)", g_sunOn ? "on" : "off");
+    }
+    if (Pressed(c.sunKeyMod, c.sunKey, g_sunKeyDown)) {
+        g_sunOn = !g_sunOn;
+        Log("Quad: sun effects from outer %s (hotkey)", g_sunOn ? "on" : "off");
+    }
     if (Pressed(c.freezeKeyMod, c.freezeKey, g_freezeKeyDown)) {
         g_gazeFrozen = !g_gazeFrozen;
         Log("Quad: gaze %s (hotkey), NDC L (%.3f, %.3f) R (%.3f, %.3f)%s", g_gazeFrozen ? "FROZEN" : "live",
@@ -1667,6 +1681,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         if ((g_ended & before) != before) return;
         if (g < FocusL) {
             clones::BeginGroup(gpu::Context(), clones::Outer);
+            sunfx::BeginGroup(g, 0, 0, 1, 1);
             return;
         }
         if (g_firstFocusMs < 0) {
@@ -1679,11 +1694,20 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         if (!ctx || view != kFocusView) return;
         SwapInLocked(ctx, g, kSourceView[g], r);
         clones::BeginGroup(gpu::Context(), clones::Focus);
+        // The focus window as a part of outer (which covers the whole grid); without the focus projection the
+        // group renders outer's view.
+        const focus::Geometry& geo = g_focus.geo;
+        if (r.projected && geo.gridW && geo.gridH)
+            sunfx::BeginGroup(g, (float)r.x0 / geo.gridW, (float)r.y0 / geo.gridH, (float)geo.focusW / geo.gridW,
+                              (float)geo.focusH / geo.gridH);
+        else
+            sunfx::BeginGroup(g, 0, 0, 1, 1);
     });
     return o_beginExec(task, b, c, d);
 }
 
 void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
+    sunfx::EndGroup();  // before CEndEye's copies and the desktop mirror
     t_inEndEye = true;
     t_endRes = nullptr;
     void* r = o_endExec(task, b, c, d);
@@ -1747,6 +1771,7 @@ void STDMETHODCALLTYPE D_OMSetRenderTargets(ID3D11DeviceContext* c, UINT n, ID3D
         rtv[0]->GetResource(&t_endRes);
     o_omSetRt(c, n, rtv, dsv);
     clones::OnOMSetRenderTargets(c, n, rtv, dsv, caller);
+    sunfx::OnSetTargets(c, n, rtv);
 }
 
 void LogStatsLocked(const Stats& s, const char* what) {
@@ -1982,6 +2007,8 @@ void Install() {
         g_patched = WritePatch(true);
         // Clones (M7.3): the factory hooks must be in place before the engine creates its render target pool.
         if (g_patched) clones::InstallEngineHooks();
+        // Sun effects: the shader creation hook must be in place before the game makes its effect shaders.
+        if (g_patched) sunfx::Install();
         // Quad <-> outer only needs the focus tasks from the builder's "add task" calls and the executor patch.
         if (g_patched && hooks::Create(Anchor::TaskGroupAddTask, (void*)D_AddTask, (void**)&o_addTask))
             g_execPatched = PatchExecutor();
@@ -1995,6 +2022,7 @@ void Install() {
     g_follow = g_followCfg = Cfg().followGaze;
     g_clonesOn = g_clonesCfg = Cfg().clones;
     g_cullOn = g_cullCfg = Cfg().focusCull;
+    g_sunOn = g_sunCfg = Cfg().sunEffects;
     LARGE_INTEGER qf{};
     QueryPerformanceFrequency(&qf);
     g_qpcFreq = qf.QuadPart;
@@ -2016,6 +2044,7 @@ void OnFrameStart() {
             // Outer only after the fault, but never with stale group addresses (the menu reuses their memory).
             if (g_skipSet.load() && !GroupsAliveLocked()) ClearGroups();
             clones::OnFrameStart(gpu::Context(), false);  // a swap left over goes back
+            sunfx::OnFrameStart(gpu::Context(), false);
             return;
         }
         FinishFrameLocked();
@@ -2024,6 +2053,7 @@ void OnFrameStart() {
         HandleToolsLocked();
         HandleShotLocked();
         clones::OnFrameStart(gpu::Context(), g_clonesOn && g_focus.on);
+        sunfx::OnFrameStart(gpu::Context(), g_sunOn && g_focus.on && !g_frameSkip);
     });
 }
 
@@ -2243,6 +2273,7 @@ void LogStats(bool totals) {
         if (!totals) LogProfileLocked(g_st);
         g_st = Stats{};
         clones::LogStats(totals);
+        sunfx::LogStats(totals);
     });
 }
 
@@ -2274,10 +2305,10 @@ std::string Describe() {
                            : g_cull.failed ? "focus culling off after failed checks"
                            : g_cullOn      ? "focus culling on"
                                            : "focus culling off";
-        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s, %s, %s%s",
+        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s, %s, %s, %s%s",
                  g_installed ? "engine hooks on" : "engine hooks off", g_patched ? "on" : "off",
                  g_graph.ok ? "running" : "not running", focus, view, cull, clones::Describe().c_str(),
-                 g_fault ? ", stopped after an exception" : "");
+                 sunfx::Describe().c_str(), g_fault ? ", stopped after an exception" : "");
     });
     return buf;
 }
@@ -2308,6 +2339,7 @@ void Shutdown() {
         std::lock_guard lock(g_m);
         RestoreLocked();
         clones::Shutdown();
+        sunfx::Shutdown();
         shots::Cancel();
         g_shotFrame = false;
         g_skip = false;

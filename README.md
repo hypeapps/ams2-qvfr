@@ -107,7 +107,7 @@ Turn these on in the GUI (**Settings → Debug**):
 - **Frame timing CSV for the whole session:** the same timings for the whole drive in `x64\qvfr\bench\`.
 - **Show the gaze in the game** (Eye tracking): a white ring where you look, the focus edges in red (blend starts) and
   green (fully sharp).
-- **Debug hotkeys:** right Ctrl + F5 clones, F7 freeze the gaze, F8 overlay, F10 screenshot of the views, F11 outer only.
+- **Debug hotkeys:** right Ctrl + F3 sun effects from outer (crepuscular rays and lens flares), F5 clones, F7 freeze the gaze, F8 overlay, F10 screenshot of the views, F11 outer only.
 
 ### Issue reporting
 
