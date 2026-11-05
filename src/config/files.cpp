@@ -85,7 +85,7 @@ bool GameRunning() {
     return found;
 }
 
-FileState CheckFiles(const fs::path& modDir, bool openxrPath) {
+FileState CheckFiles(const fs::path& modDir, bool openxrPath, bool dlaa) {
     FileState st;
     st.x64 = modDir.parent_path();
     std::error_code ec;
@@ -132,6 +132,10 @@ FileState CheckFiles(const fs::path& modDir, bool openxrPath) {
     add(manifest ? Status::Ok : openxrPath ? Status::Error : Status::Info, "x64\\qvfr\\XR_APILAYER_AMS2QVFR_eye_gaze.json",
         manifest ? "OpenXR layer manifest (eye tracking on path=openxr)"
                  : openxrPath ? "missing: no eye tracking on path=openxr" : "missing (needed only for path=openxr)");
+    st.dlss = fs::exists(modDir / L"nvngx_dlss.dll", ec);
+    add(st.dlss ? Status::Ok : dlaa ? Status::Error : Status::Info, "x64\\qvfr\\nvngx_dlss.dll",
+        st.dlss ? "NVIDIA DLSS (NVIDIA DLAA)" : dlaa ? "missing: NVIDIA DLAA cannot start, the game's TAA stays"
+                                                    : "missing (needed only for NVIDIA DLAA)");
     return st;
 }
 
