@@ -27,10 +27,16 @@ struct Settings {
     int gazeKey = 0x75, gazeMod = 0xA3;
     bool warningBox = true;
     bool overlay = false;  // [debug] overlay: the gaze and the blend edges drawn in the game
+    // [dlaa] (docs/dlaa.md): NVIDIA DLAA instead of the game's TAA
+    bool dlaa = false;               // mode=dlaa (restart)
+    std::string dlaaPreset = "k";    // j, k, l, m ("default" reads as k, NVIDIA's DLAA default)
+    bool dlaaAutoExposure = false;
+    float dlaaExposure = 0.002f;     // fixed DLSS exposure with auto off
     // Testers
     bool csvAlways = false;
     int benchKey = 0;
-    int overlayKey = 0, freezeKey = 0, outerKey = 0, clonesKey = 0, shotKey = 0, cullKey = 0, sunKey = 0;
+    int overlayKey = 0, freezeKey = 0, outerKey = 0, clonesKey = 0, shotKey = 0, cullKey = 0, sunKey = 0,
+        taaKey = 0, dlaaKey = 0, dlaaExpKey = 0, dlaaPresetKey = 0;
 
     bool Custom() const { return givenPeripheral || givenFocusX || givenFocusY || givenFixedX || givenFixedY; }
 };

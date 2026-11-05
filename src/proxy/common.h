@@ -123,6 +123,10 @@ struct Config {
     bool sunEffects = true;
     int sunKeyMod = VK_RCONTROL;
     int sunKey = 0;                   // testers: VK_F3
+    // Own TAA history of the focus views (taa_views.h, dlaa-plan D2); the hotkey switches.
+    bool taaViews = true;
+    int taaViewsKeyMod = VK_RCONTROL;
+    int taaViewsKey = 0;              // testers: VK_F2
     // Execute time of every task of the eye groups, one log line per group with the stats (M9 step 4 diagnostics).
     bool taskProfile = false;
     // A viewport the engine sets for an original while a smaller clone is bound is scaled to the clone (M7.4).
@@ -133,6 +137,29 @@ struct Config {
     // Each shot also saves every focus clone as focus L left it (M7.4 diagnostics; the read-back stalls the game for
     // about 3 s).
     bool shotClones = false;
+    // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
+    // proxy built with the DLSS SDK)
+    bool dlaa = false;                // mode=dlaa (a change needs a restart)
+    int dlaaPreset = 0;               // DLSS render preset hint for DLAA: 0 = DLSS default, 10 = J, 11 = K, ...
+    float dlaaJitterScaleX = 0.5f;    // DLSS jitter in pixels = the engine's projection offset * scale
+    float dlaaJitterScaleY = -0.5f;
+    bool dlaaMvJittered = false;      // the engine's motion vectors include the jitter
+    // DLSS exposure: auto dims the lights (dlaa-plan D4, tests 3-5); a fixed 0.002 keeps them (the game's TAA also
+    // scales its color by 0.002).
+    bool dlaaAutoExposure = false;    // DLSS auto exposure (0 = dlaaExposure)
+    float dlaaExposure = 0.002f;      // with auto exposure off: fixed DLSS exposure (0 = DLSS default 1)
+    float dlaaExposureScale = 1.0f;   // DLSS exposure scale (multiplies the auto or fixed exposure)
+    float dlaaBiasMask = 0.0f;        // DLSS bias-current-color mask value at stencil bit 0x200 pixels (0 = no mask)
+    bool dlaaSkipLocks = true;        // skip the engine's TAA locks pass while DLAA replaces the resolve
+    int dlaaKeyMod = VK_RCONTROL;     // DLAA <-> the game's TAA (A/B comparison)
+    int dlaaKey = 0;                  // testers: VK_F1 (F4 is focus culling in quad mode)
+    int dlaaExpKeyMod = VK_RCONTROL;  // DLSS exposure steps (testers, dlaa.cpp kExpSteps)
+    int dlaaExpKey = 0;               // testers: VK_F12
+    // From the game's TAA instead of DLSS: 0 nothing, 1 displays and mirrors (stencil bit 0x800), 2 also the rest of the
+    // player's car (bit 0x200). DLSS smears changing digits (dlaa-plan D4, tests 2-7).
+    int dlaaCockpitTaa = 1;
+    int dlaaPresetKeyMod = VK_RCONTROL;  // DLSS preset steps: ini, J, K, M, L (testers)
+    int dlaaPresetKey = 0;               // testers: VK_HOME
     // [test] (not in the default ini; used by qvfr_proxy_smoke --fault)
     int testFaultFrames = 0;          // > 0: deliberate access violation in the diagnostics at this proxy frame
 };

@@ -18,6 +18,8 @@
 //                                     counted). No Draw: an empty Draw costs several ms in the NVIDIA driver.
 //   --quad                            [quad] mode=quad; after VR_Shutdown checks that nothing was hooked or patched
 //                                     (this exe is not the supported AMS2AVX.exe)
+//   --dlaa                            [dlaa] mode=dlaa; after VR_Shutdown checks that DLAA stayed off on this exe
+//                                     (no engine or draw hooks, no faults)
 //   --shots                           without SteamVR and without the proxy DLL: the proxy's shot module on synthetic
 //                                     textures (staging copies, PNG files, pixel differences)
 //   --quad-compose                    without SteamVR and without the proxy DLL: the proxy's composition module on
@@ -63,6 +65,7 @@
 #include "compose.h"
 
 int RunSunFx();  // sun_fx_smoke.cpp
+int RunTaaFix();  // taa_fix_smoke.cpp
 #include "focus_cull.h"
 #include "focus_geometry.h"
 #include "hooks.h"
@@ -290,6 +293,30 @@ int CheckQuad(const fs::path& logDir) {
            ok ? "OK" : "FAILED", settings, notSupported, hooked, faults, size, resized, preset, exeWarning, boxOff,
            detected, detectedGame, log.filename().c_str());
     return ok ? 0 : 5;
+}
+
+int CheckDlaa(const fs::path& logDir) {
+    fs::path log = NewestLog(logDir);
+    std::ifstream in(log);
+    if (!in) {
+        printf("DLAA check FAILED: no proxy log in %ls\n", logDir.c_str());
+        return 6;
+    }
+    bool settings = false, off = false, hooked = false, faults = false;
+    std::string line;
+    while (std::getline(in, line)) {
+        settings |= line.find("Settings: [dlaa] mode=dlaa") != std::string::npos;
+        // A proxy without the DLSS SDK says so instead of checking the exe.
+        off |= line.find("DLAA: exe not supported") != std::string::npos ||
+               line.find("DLAA: this proxy was built without the NVIDIA DLSS SDK") != std::string::npos;
+        hooked |= line.find("DLAA: engine hooks installed") != std::string::npos ||
+                  line.find("DLAA: D3D11 draw hooks") != std::string::npos;
+        faults |= line.find("in DLAA") != std::string::npos;
+    }
+    bool ok = settings && off && !hooked && !faults;
+    printf("DLAA check %s: settings %d, off on this exe %d, hooks %d, faults %d (%ls)\n", ok ? "OK" : "FAILED",
+           settings, off, hooked, faults, log.filename().c_str());
+    return ok ? 0 : 6;
 }
 
 // PNG width and height from the IHDR chunk.
@@ -1274,6 +1301,7 @@ int main(int argc, char** argv) {
     bool trace = false;
     bool probe = false;
     bool quad = false;
+    bool dlaa = false;
     bool shotsTest = false;
     bool composeTest = false;
     bool clonesTest = false;
@@ -1290,12 +1318,14 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--trace")) trace = true;
         else if (!strcmp(argv[i], "--probe")) probe = true;
         else if (!strcmp(argv[i], "--quad")) quad = true;
+        else if (!strcmp(argv[i], "--dlaa")) dlaa = true;
         else if (!strcmp(argv[i], "--shots")) shotsTest = true;
         else if (!strcmp(argv[i], "--quad-compose")) composeTest = true;
         else if (!strcmp(argv[i], "--focus-geometry")) return RunGeometry();
         else if (!strcmp(argv[i], "--focus-cull")) return RunFocusCull();
         else if (!strcmp(argv[i], "--clones")) clonesTest = true;
         else if (!strcmp(argv[i], "--sun-fx")) sunFxTest = true;
+        else if (!strcmp(argv[i], "--taa-fix")) return RunTaaFix();
         else if (!strcmp(argv[i], "--xr-layer")) xrLayerTest = true;
         else if (!strcmp(argv[i], "--openxr-path")) openxrPathTest = true;
         else if (!strcmp(argv[i], "--openxr")) openxr = true;
@@ -1325,6 +1355,7 @@ int main(int argc, char** argv) {
         if (trace) fputs("[trace]\ncallers=1\ndepth=12\n", f);
         if (probe) fputs("[quad]\nmode=probe\nprobe_frames=2\n", f);
         if (quad) fputs("[quad]\nmode=quad\n", f);
+        if (dlaa) fputs("[dlaa]\nmode=dlaa\n", f);
         if (openxr)
             fprintf(f, "[runtime]\npath=openxr\nopenxr_layer=%d\n", noLayer ? 0 : 1);
         else
@@ -1391,6 +1422,7 @@ int main(int argc, char** argv) {
         if (trace && rc == 0) rc = CheckTrace(home / L"logs");
         if (probe && rc == 0) rc = CheckProbe(home / L"logs");
         if (quad && rc == 0) rc = CheckQuad(home / L"logs");
+        if (dlaa && rc == 0) rc = CheckDlaa(home / L"logs");
     }
     printf("Proxy log: %ls\n", (home / L"logs").c_str());
     return rc;

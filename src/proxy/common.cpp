@@ -2,6 +2,7 @@
 
 #include "presets.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdarg>
 #include <cstdio>
@@ -383,6 +384,9 @@ Config ReadConfig(const fs::path& ini) {
     c.sunEffects = IniInt(ini, L"debug", L"sun_effects", 1) != 0;
     c.sunKeyMod = IniInt(ini, L"debug", L"sun_effects_modifier", c.sunKeyMod);
     c.sunKey = IniInt(ini, L"debug", L"sun_effects_key", c.sunKey);
+    c.taaViews = IniInt(ini, L"debug", L"taa_views", 1) != 0;
+    c.taaViewsKeyMod = IniInt(ini, L"debug", L"taa_views_modifier", c.taaViewsKeyMod);
+    c.taaViewsKey = IniInt(ini, L"debug", L"taa_views_key", c.taaViewsKey);
     c.taskProfile = IniInt(ini, L"debug", L"task_profile", 0) != 0;
     c.clonesViewportFix = IniInt(ini, L"debug", L"clones_viewport_fix", 1) != 0;
     c.clonesBindFix = IniInt(ini, L"debug", L"clones_bind_fix", 1) != 0;
@@ -391,10 +395,46 @@ Config ReadConfig(const fs::path& ini) {
         Log("Settings: [debug] overlay=%d overlay_modifier=0x%X overlay_key=0x%X freeze_modifier=0x%X freeze_key=0x%X "
             "outer_modifier=0x%X outer_key=0x%X gaze_modifier=0x%X gaze_key=0x%X clones=%d clones_modifier=0x%X "
             "clones_key=0x%X clones_viewport_fix=%d clones_bind_fix=%d shot_clones=%d focus_cull=%d cull_modifier=0x%X "
-            "cull_key=0x%X sun_effects=%d sun_effects_modifier=0x%X sun_effects_key=0x%X task_profile=%d",
+            "cull_key=0x%X sun_effects=%d sun_effects_modifier=0x%X sun_effects_key=0x%X taa_views=%d "
+            "taa_views_modifier=0x%X taa_views_key=0x%X task_profile=%d",
             c.overlay, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey,
             c.gazeKeyMod, c.gazeKey, c.clones, c.clonesKeyMod, c.clonesKey, c.clonesViewportFix, c.clonesBindFix,
-            c.shotClones, c.focusCull, c.cullKeyMod, c.cullKey, c.sunEffects, c.sunKeyMod, c.sunKey, c.taskProfile);
+            c.shotClones, c.focusCull, c.cullKeyMod, c.cullKey, c.sunEffects, c.sunKeyMod, c.sunKey, c.taaViews,
+            c.taaViewsKeyMod, c.taaViewsKey, c.taskProfile);
+    const std::string dlaa = IniString(ini, L"dlaa", L"mode", L"off");
+    c.dlaa = dlaa == "dlaa";
+    if (dlaa != "off" && dlaa != "dlaa") Log("Settings: unknown [dlaa] mode=\"%s\", using off", dlaa.c_str());
+    const std::string preset = IniString(ini, L"dlaa", L"preset", L"k");  // K: NVIDIA's DLAA default, set explicitly
+    if (preset == "default") {
+        c.dlaaPreset = 0;
+    } else if (preset.size() == 1 && preset[0] >= 'a' && preset[0] <= 'o') {
+        c.dlaaPreset = preset[0] - 'a' + 1;  // NVSDK_NGX_DLSS_Hint_Render_Preset: A = 1 ... K = 11
+    } else {
+        Log("Settings: unknown [dlaa] preset=\"%s\", using default", preset.c_str());
+    }
+    c.dlaaJitterScaleX = IniFloat(ini, L"dlaa", L"jitter_scale_x", c.dlaaJitterScaleX);
+    c.dlaaJitterScaleY = IniFloat(ini, L"dlaa", L"jitter_scale_y", c.dlaaJitterScaleY);
+    c.dlaaMvJittered = IniInt(ini, L"dlaa", L"mv_jittered", 0) != 0;
+    c.dlaaAutoExposure = IniInt(ini, L"dlaa", L"auto_exposure", c.dlaaAutoExposure ? 1 : 0) != 0;
+    c.dlaaSkipLocks = IniInt(ini, L"dlaa", L"skip_locks", 1) != 0;
+    c.dlaaExposure = IniFloat(ini, L"dlaa", L"exposure", c.dlaaExposure);
+    c.dlaaExposureScale = IniFloat(ini, L"dlaa", L"exposure_scale", c.dlaaExposureScale);
+    if (c.dlaaExposureScale <= 0) c.dlaaExposureScale = 1.0f;
+    c.dlaaBiasMask = std::clamp(IniFloat(ini, L"dlaa", L"bias_mask", c.dlaaBiasMask), 0.0f, 1.0f);
+    c.dlaaKeyMod = IniInt(ini, L"dlaa", L"modifier", c.dlaaKeyMod);
+    c.dlaaKey = IniInt(ini, L"dlaa", L"key", c.dlaaKey);
+    c.dlaaExpKeyMod = IniInt(ini, L"dlaa", L"exposure_modifier", c.dlaaExpKeyMod);
+    c.dlaaExpKey = IniInt(ini, L"dlaa", L"exposure_key", c.dlaaExpKey);
+    c.dlaaCockpitTaa = std::clamp(IniInt(ini, L"dlaa", L"cockpit_taa", c.dlaaCockpitTaa), 0, 2);
+    c.dlaaPresetKeyMod = IniInt(ini, L"dlaa", L"preset_modifier", c.dlaaPresetKeyMod);
+    c.dlaaPresetKey = IniInt(ini, L"dlaa", L"preset_key", c.dlaaPresetKey);
+    if (c.dlaa)
+        Log("Settings: [dlaa] mode=dlaa preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d auto_exposure=%d "
+            "exposure=%.4f exposure_scale=%.4f bias_mask=%.2f skip_locks=%d modifier=0x%X key=0x%X exposure_key=0x%X "
+            "preset_key=0x%X cockpit_taa=%d",
+            preset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY, c.dlaaMvJittered, c.dlaaAutoExposure,
+            c.dlaaExposure, c.dlaaExposureScale, c.dlaaBiasMask, c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey,
+            c.dlaaExpKey, c.dlaaPresetKey, c.dlaaCockpitTaa);
     c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
     if (c.testFaultFrames > 0) Log("Settings: [test] fault_frames=%d (deliberate fault for testing)", c.testFaultFrames);
     return c;
@@ -470,6 +510,23 @@ bool ReloadConfig() {
              n.fixedSectionX != c.fixedSectionX || n.fixedSectionY != c.fixedSectionY,
          "[quad] *_section");
     need(n.probeFrames != c.probeFrames || n.probeEngine != c.probeEngine || n.probeD3D != c.probeD3D, "[quad] probe_*");
+    need(n.dlaa != c.dlaa, "[dlaa] mode");
+    c.dlaaPreset = n.dlaaPreset;
+    c.dlaaJitterScaleX = n.dlaaJitterScaleX;
+    c.dlaaJitterScaleY = n.dlaaJitterScaleY;
+    c.dlaaMvJittered = n.dlaaMvJittered;
+    c.dlaaAutoExposure = n.dlaaAutoExposure;
+    c.dlaaSkipLocks = n.dlaaSkipLocks;
+    c.dlaaExposure = n.dlaaExposure;
+    c.dlaaBiasMask = n.dlaaBiasMask;
+    c.dlaaKeyMod = n.dlaaKeyMod;
+    c.dlaaKey = n.dlaaKey;
+    c.dlaaExpKeyMod = n.dlaaExpKeyMod;
+    c.dlaaExpKey = n.dlaaExpKey;
+    c.dlaaExposureScale = n.dlaaExposureScale;
+    c.dlaaCockpitTaa = n.dlaaCockpitTaa;
+    c.dlaaPresetKeyMod = n.dlaaPresetKeyMod;
+    c.dlaaPresetKey = n.dlaaPresetKey;
     c.statsIntervalS = n.statsIntervalS;
     c.warningBox = n.warningBox;
     c.benchKeyMod = n.benchKeyMod;
@@ -516,20 +573,23 @@ bool ReloadConfig() {
     c.sunEffects = n.sunEffects;
     c.sunKeyMod = n.sunKeyMod;
     c.sunKey = n.sunKey;
+    c.taaViews = n.taaViews;
+    c.taaViewsKeyMod = n.taaViewsKeyMod;
+    c.taaViewsKey = n.taaViewsKey;
     c.taskProfile = n.taskProfile;
     Log("Settings reloaded (live): stats_interval_s=%d | benchmark modifier=0x%X key=0x%X delay_s=%.1f duration_s=%.1f "
         "freeze_pose=%d beep=%d | gaze read=%d | quad focus_offset=(%.3f, %.3f) fixed_offset=(%.3f, %.3f) "
         "smoothen_focus_view_edges=%.3f%s follow_gaze=%d gaze_hold_s=%.2f compose=%d margin_px=%d shot_modifier=0x%X "
         "shot_key=0x%X shot_auto_s=%.1f | debug overlay=%d clones=%d clones_viewport_fix=%d clones_bind_fix=%d "
-        "shot_clones=%d focus_cull=%d sun_effects=%d task_profile=%d keys 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, "
-        "0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X%s%s",
+        "shot_clones=%d focus_cull=%d sun_effects=%d taa_views=%d task_profile=%d keys 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, "
+        "0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X%s%s",
         c.statsIntervalS, c.benchKeyMod, c.benchKey, c.benchDelayS, c.benchDurationS, c.benchFreezePose, c.benchBeep,
         c.gazeRead, c.focusOffsetX, c.focusOffsetY, c.fixedOffsetX, c.fixedOffsetY, c.smoothen,
         c.legacyEdge ? " (pre-M7 feather_px instead)" : "", c.followGaze, c.gazeHoldS, c.quadCompose, c.quadMarginPx,
         c.shotKeyMod, c.shotKey, c.shotAutoS, c.overlay, c.clones, c.clonesViewportFix, c.clonesBindFix, c.shotClones,
-        c.focusCull, c.sunEffects, c.taskProfile, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey,
+        c.focusCull, c.sunEffects, c.taaViews, c.taskProfile, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey,
         c.outerKeyMod, c.outerKey, c.gazeKeyMod, c.gazeKey, c.clonesKeyMod, c.clonesKey, c.cullKeyMod, c.cullKey,
-        c.sunKeyMod, c.sunKey,
+        c.sunKeyMod, c.sunKey, c.taaViewsKeyMod, c.taaViewsKey,
         restart.empty() ? "" : "; CHANGED BUT NEEDS A GAME RESTART: ", restart.c_str());
     return true;
 }

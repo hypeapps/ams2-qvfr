@@ -55,6 +55,15 @@ int RunSelfTest(const fs::path& dir) {
     Expect(Near(s.peripheral, 0.5f) && Near(s.focusX, 0.35f) && Near(s.fixedY, 0.45f) && Near(s.focusMultiplier, 1.0f),
           "default ini: balanced values");
     Expect(s.gazeKey == 0x75 && s.benchKey == 0 && s.outerKey == 0 && s.warningBox, "default ini: player hotkeys");
+    Expect(!s.dlaa && s.dlaaPreset == "k" && !s.dlaaAutoExposure && Near(s.dlaaExposure, 0.002f) && s.dlaaKey == 0 &&
+               s.dlaaPresetKey == 0,
+           "default ini: DLAA off, fixed exposure 0.002, no DLAA hotkeys");
+    {
+        IniFile d = ini;
+        d.Set("dlaa", "mode", "dlaa");
+        const auto ch = ChangedRestartKeys(ini, d);
+        Expect(Read(d).dlaa && ch.size() == 1 && ch[0] == "NVIDIA DLAA on/off", "DLAA on needs a restart");
+    }
 
     Expect(ini.Set("quad", "peripheral_multiplier", Num(0.4f)), "set an empty key");
     s = Read(ini);
@@ -112,6 +121,16 @@ int RunSelfTest(const fs::path& dir) {
     Write(dir / L"x64" / L"openvr_api.dll", "MZ...ams2-qvfr openvr_api.dll proxy, build A");
     FileState f = CheckFiles(mod, false);
     Expect(f.gameFolder && f.spare && f.gameDll == GameDll::ProxyOther, "files: an older proxy in x64");
+    auto dlssRow = [](const FileState& st) {
+        for (const Check& c : st.checks)
+            if (c.item == "x64\\qvfr\\nvngx_dlss.dll") return c.status;
+        return Status::Ok;
+    };
+    Expect(!f.dlss && dlssRow(f) == Status::Info && dlssRow(CheckFiles(mod, false, true)) == Status::Error,
+           "files: nvngx_dlss.dll missing is a note without DLAA, an error with it");
+    Write(mod / L"nvngx_dlss.dll", "MZ dlss");
+    f = CheckFiles(mod, false, true);
+    Expect(f.dlss && dlssRow(f) == Status::Ok, "files: nvngx_dlss.dll present");
     Write(dir / L"x64" / L"openvr_api.dll", "MZ... OpenComposite ...");
     Expect(CheckFiles(mod, false).gameDll == GameDll::OpenComposite, "files: OpenComposite in x64");
     if (GameRunning()) {

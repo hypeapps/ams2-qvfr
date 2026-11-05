@@ -10,6 +10,7 @@
 
 #include "callers.h"
 #include "common.h"
+#include "dlaa.h"
 #include "experiment.h"
 #include "frame.h"
 #include "gpu.h"
@@ -80,6 +81,7 @@ void LogCallStats(bool totals) {
     callers::LogStats(totals);
     probe::LogStats(totals);
     quad::LogStats(totals);
+    dlaa::LogStats(totals);
 }
 
 namespace {
@@ -221,6 +223,7 @@ public:
         frame::OnWaitGetPosesBegin();
         probe::OnFrameStart();
         quad::OnFrameStart();
+        dlaa::OnFrameStart();
         double t0 = NowMs();
         vr::EVRCompositorError err = CompositorWrapBase::WaitGetPoses(render, nRender, game, nGame);
         double t1 = NowMs();

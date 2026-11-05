@@ -27,7 +27,7 @@
         <div class="game" data-class-on="game">
             <span class="dot"/><span class="gtext" data-if="game">Game running</span><span class="gtext" data-if="!game">Game not running</span>
         </div>
-        <div class="ver">Version 0.3.0</div>
+        <div class="ver">Version 0.4.0</div>
     </div>
 
     <div id="main">
@@ -116,6 +116,66 @@
             </div>
 
             <div class="card">
+                <div class="chead"><span class="ctitle">Anti-aliasing</span><span class="icon"></span></div>
+                <div class="cbody">
+                    <div class="banner gaze-warn" data-if="dlaa &amp;&amp; !dlss_dll">
+                        <span class="banner-title">nvngx_dlss.dll is missing in x64\qvfr.</span>
+                        NVIDIA DLAA cannot start without it, so the game's own TAA stays. Unpack the mod's zip again.
+                    </div>
+                    <div class="banner gaze-warn" data-if="dlaa &amp;&amp; (game_taa_off || game_msaa_on)">
+                        <span class="banner-title">TAA was off or MSAA on in the game at its last start ({{ log_when }}).</span>
+                        NVIDIA DLAA replaces the game's TAA: in the game's graphics options turn TAA on and MSAA off.
+                    </div>
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">NVIDIA DLAA <span class="tag" data-if="rs_dlaa">Game restart needed</span></div>
+                            <div class="desc">NVIDIA DLSS without upscaling replaces the game's TAA. NVIDIA RTX graphics cards only. Needs TAA on in the game.</div>
+                        </div>
+                        <div class="control">
+                            <div class="switch"><input type="checkbox" data-checked="dlaa"/><div class="knob"/></div>
+                        </div>
+                    </div>
+                    <div class="row" data-if="dlaa">
+                        <div class="label">
+                            <div class="name">DLSS preset</div>
+                            <div class="desc">The DLSS model. With Debug hotkeys on, right Ctrl + Home cycles through the presets during the game.</div>
+                        </div>
+                        <div class="control">
+                            <div class="seg">
+                                <button data-class-on="dlaa_preset == 'j'" data-event-click="dlaa_preset = 'j'">J</button>
+                                <button data-class-on="dlaa_preset == 'k'" data-event-click="dlaa_preset = 'k'">K</button>
+                                <button data-class-on="dlaa_preset == 'l'" data-event-click="dlaa_preset = 'l'">L</button>
+                                <button data-class-on="dlaa_preset == 'm'" data-event-click="dlaa_preset = 'm'">M</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="row" data-if="dlaa">
+                        <div class="label">
+                            <div class="name">DLSS exposure</div>
+                            <div class="desc" data-if="!dlaa_auto_exp">A fixed value (below) keeps the brightness of lights and reflections.</div>
+                            <div class="desc" data-if="dlaa_auto_exp">DLSS measures the exposure itself. It dims lights and reflections, most at night.</div>
+                        </div>
+                        <div class="control">
+                            <div class="seg">
+                                <button data-class-on="!dlaa_auto_exp" data-event-click="dlaa_auto_exp = false">Fixed</button>
+                                <button data-class-on="dlaa_auto_exp" data-event-click="dlaa_auto_exp = true">Auto</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="row" data-if="dlaa &amp;&amp; !dlaa_auto_exp">
+                        <div class="label">
+                            <div class="name">Fixed exposure</div>
+                            <div class="desc">The exposure DLSS assumes for the game's image, which is in large HDR units. It sets how DLSS treats bright pixels: lower keeps more of the brightness of lights and reflections, higher dims them. 0.002 is the scale the game's TAA uses.</div>
+                        </div>
+                        <div class="control">
+                            <div class="slider"><div class="rail"><div class="fill" data-style-width="(dlaa_exp_step / dlaa_exp_max * 100) + '%'"/></div><input type="range" min="0" max="11" step="1" data-value="dlaa_exp_step"/></div>
+                            <div class="value"><span class="num">{{ dlaa_exp_text }}</span></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
                 <div class="chead"><span class="ctitle">Focus position</span><span class="icon"></span></div>
                 <div class="cbody">
                     <div class="row">
@@ -176,7 +236,7 @@
                     <div class="row">
                         <div class="label">
                             <div class="name">Show serious problems at game start</div>
-                            <div class="desc">For example TAA on, Pimax LibMagic loaded or an unsupported game build. They are always in the log too.</div>
+                            <div class="desc">For example Pimax LibMagic loaded or an unsupported game build. They are always in the log too.</div>
                         </div>
                         <div class="control">
                             <div class="switch"><input type="checkbox" data-checked="warning_box"/><div class="knob"/></div>
@@ -203,7 +263,7 @@
                     <div class="row">
                         <div class="label">
                             <div class="name">Debug hotkeys</div>
-                            <div class="desc">Right Ctrl + F3 sun effects, F5 clones, F7 freeze the gaze, F8 overlay, F10 screenshot, F11 outer only.</div>
+                            <div class="desc">Right Ctrl + F2 focus TAA history, F3 sun effects, F4 focus culling, F5 clones, F7 freeze the gaze, F8 overlay, F10 screenshot, F11 outer only, F1 DLAA or the game's TAA, F12 DLSS exposure steps, Home DLSS preset steps.</div>
                         </div>
                         <div class="control">
                             <div class="switch"><input type="checkbox" data-checked="debug_keys"/><div class="knob"/></div>

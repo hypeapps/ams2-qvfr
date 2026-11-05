@@ -11,6 +11,7 @@
 #include "hooks.h"
 #include "sun_fx_ps.h"  // kSunFxPS (fxc from shaders/sun_fx.hlsl)
 #include "sun_fx_vs.h"  // kSunFxVS
+#include "taa_views.h"
 
 namespace qvfr::sunfx {
 
@@ -47,6 +48,9 @@ DrawIndexedFn o_drawIndexed = nullptr;
 DrawFn o_draw = nullptr;
 void* g_target[4] = {};  // hooked functions: CreatePixelShader, PSSetShader, DrawIndexed, Draw
 bool g_installed = false;
+std::atomic<DrawReplaceFn> g_drawReplace{nullptr};  // DLAA in quad mode (SetDrawReplace)
+std::atomic<InsideFn> g_drawInside{nullptr};
+std::atomic<AfterFn> g_drawAfter{nullptr};
 
 // Effect shader objects: open addressing, written under g_tableM, read without a lock (kind before pointer). Entries
 // stay; a shader object made at a recorded address from other bytecode sets the entry's kind to none.
@@ -573,18 +577,33 @@ void STDMETHODCALLTYPE D_PSSetShader(ID3D11DeviceContext* c, ID3D11PixelShader* 
 }
 
 void STDMETHODCALLTYPE D_DrawIndexed(ID3D11DeviceContext* c, UINT count, UINT start, INT base) {
+    if (const InsideFn inside = g_drawInside.load(std::memory_order_relaxed); inside && inside()) {
+        o_drawIndexed(c, count, start, base);
+        return;
+    }
+    if (const DrawReplaceFn replace = g_drawReplace.load(std::memory_order_relaxed); replace && replace(c, count))
+        return;  // DLSS replaced the game's TAA resolve
+    const bool taaFix = taaviews::OnDraw(c, true, count);
     int g = -1;
     Action a = Forward;
     if (Active(c, g))
         Protect("DrawIndexed", [&] { a = OnDraw(c, g, [&] { o_drawIndexed(c, count, start, base); }); });
     if (a == Forward) o_drawIndexed(c, count, start, base);
+    if (taaFix) taaviews::AfterDraw(c);
+    if (const AfterFn after = g_drawAfter.load(std::memory_order_relaxed)) after(c);
 }
 
 void STDMETHODCALLTYPE D_Draw(ID3D11DeviceContext* c, UINT count, UINT start) {
+    if (const InsideFn inside = g_drawInside.load(std::memory_order_relaxed); inside && inside()) {
+        o_draw(c, count, start);
+        return;
+    }
+    const bool taaFix = taaviews::OnDraw(c, false, count);
     int g = -1;
     Action a = Forward;
     if (Active(c, g)) Protect("Draw", [&] { a = OnDraw(c, g, [&] { o_draw(c, count, start); }); });
     if (a == Forward) o_draw(c, count, start);
+    if (taaFix) taaviews::AfterDraw(c);
 }
 
 bool HookAll(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
@@ -664,6 +683,14 @@ bool Install() {
     });
     g_installed = ok;
     return ok;
+}
+
+bool SetDrawReplace(DrawReplaceFn replace, InsideFn inside, AfterFn after) {
+    if (!g_installed) return false;
+    g_drawAfter = after;
+    g_drawInside = inside;
+    g_drawReplace = replace;
+    return true;
 }
 
 void OnFrameStart(ID3D11DeviceContext* ctx, bool enabled) {

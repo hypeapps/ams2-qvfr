@@ -24,10 +24,11 @@ struct FileState {
     bool gameFolder = false;            // ..\AMS2AVX.exe exists
     GameDll gameDll = GameDll::Missing; // x64\openvr_api.dll
     bool spare = false;                 // x64\qvfr\proxy\openvr_api.dll
+    bool dlss = false;                  // x64\qvfr\nvngx_dlss.dll (NVIDIA DLSS for [dlaa] mode=dlaa)
     std::vector<Check> checks;
 };
 
-FileState CheckFiles(const std::filesystem::path& modDir, bool openxrPath);
+FileState CheckFiles(const std::filesystem::path& modDir, bool openxrPath, bool dlaa = false);
 
 // Both refuse while the game runs (the DLL is loaded). They return a message for the GUI.
 // Puts the spare proxy into x64; a DLL there that is neither the Valve one nor a proxy goes to x64\qvfr\backup\ first.

@@ -252,7 +252,7 @@ void LoadLog() {
 }
 
 void CheckNow() {
-    g.files = CheckFiles(g.home, g.s.openxr);
+    g.files = CheckFiles(g.home, g.s.openxr, g.s.dlaa);
     g.fileRows.clear();
     for (const Check& c : g.files.checks) {
         const char* cls = c.status == Status::Ok ? "ok" : c.status == Status::Info ? "info" : c.status == Status::Warning ? "warn" : "err";
@@ -434,9 +434,13 @@ void BindModel(Rml::Context* ctx) {
     toggle("debug_keys",
            [] {
                return g.s.overlayKey || g.s.freezeKey || g.s.outerKey || g.s.clonesKey || g.s.shotKey || g.s.cullKey ||
-                      g.s.sunKey;
+                      g.s.sunKey || g.s.taaKey || g.s.dlaaKey || g.s.dlaaExpKey || g.s.dlaaPresetKey;
            },
            [](bool on) {
+               g.ini.Set("dlaa", "key", on ? "0x70" : "0");
+               g.ini.Set("dlaa", "exposure_key", on ? "0x7B" : "0");
+               g.ini.Set("dlaa", "preset_key", on ? "0x24" : "0");
+               g.ini.Set("debug", "taa_views_key", on ? "0x71" : "0");
                g.ini.Set("debug", "sun_effects_key", on ? "0x72" : "0");
                g.ini.Set("debug", "cull_key", on ? "0x73" : "0");
                g.ini.Set("debug", "clones_key", on ? "0x74" : "0");
@@ -457,6 +461,59 @@ void BindModel(Rml::Context* ctx) {
                    const Rml::String p = v.Get<Rml::String>();
                    if ((p == "openxr") != g.s.openxr) Set("runtime", "path", p);
                });
+    // --- Anti-aliasing: NVIDIA DLAA ([dlaa], docs/dlaa.md). The DLL row on the Files page depends on the mode.
+    toggle("dlaa", [] { return g.s.dlaa; }, [](bool on) {
+        Set("dlaa", "mode", on ? "dlaa" : "off");
+        CheckNow();
+    });
+    rs("rs_dlaa", [](const Settings& a, const Settings& b) { return a.dlaa != b.dlaa; });
+    c.BindFunc("dlaa_preset", [](Rml::Variant& v) { v = Rml::String(g.s.dlaaPreset); },
+               [](const Rml::Variant& v) {
+                   const Rml::String p = v.Get<Rml::String>();
+                   if (p != g.s.dlaaPreset) Set("dlaa", "preset", p);
+               });
+    c.BindFunc("dlaa_auto_exp", [](Rml::Variant& v) { v = g.s.dlaaAutoExposure; },
+               [](const Rml::Variant& v) {
+                   if (v.Get<bool>() != g.s.dlaaAutoExposure) Set("dlaa", "auto_exposure", v.Get<bool>() ? "1" : "0");
+               });
+    // The fixed exposure on a log scale: slider steps over kExposures (0.002 = the scale the game's TAA applies).
+    static constexpr float kExposures[] = {0.0005f, 0.00075f, 0.001f, 0.0015f, 0.002f, 0.003f, 0.004f,
+                                           0.005f,  0.0075f,  0.01f,  0.015f,  0.02f};
+    static constexpr int kExposureSteps = (int)std::size(kExposures);
+    auto expStep = [] {
+        int best = 0;
+        for (int i = 1; i < kExposureSteps; ++i)
+            if (std::fabs(std::log(kExposures[i] / g.s.dlaaExposure)) < std::fabs(std::log(kExposures[best] / g.s.dlaaExposure)))
+                best = i;
+        return best;
+    };
+    c.BindFunc("dlaa_exp_step", [expStep](Rml::Variant& v) { v = g.s.dlaaExposure > 0 ? expStep() : 4; },
+               [expStep](const Rml::Variant& v) {
+                   // Only a step other than the one shown (the slider reports its value when the page binds it).
+                   const int i = std::clamp((int)std::lround(VarFloat(v)), 0, kExposureSteps - 1);
+                   const int shown = g.s.dlaaExposure > 0 ? expStep() : 4;
+                   if (i != shown) Set("dlaa", "exposure", Fmt("%g", kExposures[i]));
+               });
+    c.BindFunc("dlaa_exp_max", [](Rml::Variant& v) { v = kExposureSteps - 1; });
+    c.BindFunc("dlaa_exp_text", [](Rml::Variant& v) {
+        v = g.s.dlaaExposure > 0 ? Fmt("%g", g.s.dlaaExposure) : Rml::String("1 (DLSS default)");
+    });
+    c.BindFunc("dlss_dll", [](Rml::Variant& v) { v = g.files.dlss; });
+    // From the newest log's Detected block: the game's anti-aliasing options and the DLAA state at that start.
+    auto detected = [](const char* key) -> std::string {
+        for (const KeyValue& kv : g.detected)
+            if (kv.key == key) return kv.value;
+        return {};
+    };
+    c.BindFunc("game_taa_off", [detected](Rml::Variant& v) {
+        v = detected("Game settings").find("temporalantialiasenabled=0") != std::string::npos;
+    });
+    c.BindFunc("game_msaa_on", [detected](Rml::Variant& v) {
+        const std::string s = detected("Game settings");
+        const size_t p = s.find("antialias=");
+        v = p != std::string::npos && p + 10 < s.size() && s[p + 10] != '0';
+    });
+
     c.BindFunc("preset", [](Rml::Variant& v) { v = g.s.preset; });
     c.BindFunc("preset_name", [](Rml::Variant& v) { v = Rml::String(g.s.presetText); });
     c.BindFunc("custom", [](Rml::Variant& v) { v = g.s.Custom(); });

@@ -16,6 +16,7 @@
 
 #include "common.h"
 #include "diag.h"
+#include "dlaa.h"
 #include "experiment.h"
 #include "gpu.h"
 #include "modern_vr.h"
@@ -480,6 +481,7 @@ void FinishRun(bool aborted) {
     lines.push_back(buf);
     lines.push_back(experiment::Describe());
     lines.push_back(quad::Describe());
+    if (Cfg().dlaa) lines.push_back(dlaa::Describe());
     if (r.frames) {
         lines.push_back(StatLine("GPU total (total_gpu)", r.totalGpu, budget));
         lines.push_back(StatLine("Game GPU before Submit", r.preGpu, budget));
