@@ -2,10 +2,11 @@
 # --xr-layer and --openxr-path test the OpenXR path (xr_smoke.cpp).
 # --shots, --quad-compose, --focus-geometry, --focus-cull and --clones test the proxy's shot, composition, focus geometry,
 # focus culling and clones modules directly, so their sources are compiled in here as well.
-add_executable(qvfr_proxy_smoke main.cpp xr_smoke.cpp ../proxy/shots.cpp ../proxy/compose.cpp ../proxy/focus_geometry.cpp ../proxy/focus_cull.cpp
-               ../proxy/common.cpp ../proxy/clones.cpp ../proxy/hooks.cpp ../proxy/sysinfo.cpp ../proxy/diag.cpp)
+add_executable(qvfr_proxy_smoke main.cpp xr_smoke.cpp sun_fx_smoke.cpp ../proxy/shots.cpp ../proxy/compose.cpp ../proxy/focus_geometry.cpp
+               ../proxy/focus_cull.cpp ../proxy/common.cpp ../proxy/clones.cpp ../proxy/hooks.cpp ../proxy/sysinfo.cpp ../proxy/diag.cpp
+               ../proxy/sun_fx.cpp ../proxy/gpu.cpp)
 target_include_directories(qvfr_proxy_smoke PRIVATE ../proxy)
-target_link_libraries(qvfr_proxy_smoke PRIVATE qvfr_shaders openvr_0912 openxr_headers minhook d3d11 windowscodecs ole32 shell32 bcrypt
-                      version psapi)
+target_link_libraries(qvfr_proxy_smoke PRIVATE qvfr_shaders openvr_0912 openxr_headers minhook d3d11 d3dcompiler windowscodecs ole32 shell32
+                      bcrypt version psapi)
 target_compile_options(qvfr_proxy_smoke PRIVATE /W4)
 add_dependencies(qvfr_proxy_smoke qvfr_proxy)

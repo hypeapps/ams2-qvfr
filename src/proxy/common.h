@@ -119,6 +119,10 @@ struct Config {
     bool focusCull = true;
     int cullKeyMod = VK_RCONTROL;
     int cullKey = 0;                  // testers: VK_F4
+    // Crepuscular rays and lens flares of the focus views taken from outer (sun_fx.h); the hotkey switches.
+    bool sunEffects = true;
+    int sunKeyMod = VK_RCONTROL;
+    int sunKey = 0;                   // testers: VK_F3
     // Execute time of every task of the eye groups, one log line per group with the stats (M9 step 4 diagnostics).
     bool taskProfile = false;
     // A viewport the engine sets for an original while a smaller clone is bound is scaled to the clone (M7.4).
