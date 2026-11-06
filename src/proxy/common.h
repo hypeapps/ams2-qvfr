@@ -140,9 +140,21 @@ struct Config {
     // NVIDIA Multi-View Rendering, gate B6 (mvr_vs.h): the game's vertex shaders patched and made through NVAPI, MVR
     // off. Not in the default ini (development); a change needs a restart.
     bool mvrVsPatch = false;
-    // Gate B7 (mvr_pass.h): with mvr_vs_patch, each shot also runs outer L's G-buffer pass once more with MVR into
-    // two-slice copies of its targets (view 1 = focus L in the corner of slice 1). Not in the default ini.
-    bool mvrGbufferTest = false;
+    // Gate B8 (mvr_pass.h): with mvr_vs_patch, outer's G-buffer pass of each eye draws focus too (MVR, view 1) and
+    // the focus groups skip theirs. Not in the default ini; a change needs a restart. The hotkey switches (live).
+    bool mvrGbuffer = false;
+    int mvrKeyMod = VK_RCONTROL;
+    int mvrKey = 0;                   // testers: VK_END
+    // Live: view 1's matrix moves outer's TAA jitter to focus's own (else focus gets outer's, scaled; gate B7).
+    bool mvrJitterFix = true;
+    // Live hotkey (mvr_modifier + mvr_mode_key, read from mvr_late_key when absent; testers: VK_NEXT), diagnosis of
+    // the B8 flicker: the focus groups run their own G-buffer pass and get outer's on top of it afterwards.
+    int mvrModeKey = 0;
+    // Live: the stash's depth made conservative for focus's later LESS_EQUAL passes (forward, velocity): the farthest of
+    // its 3 x 3 neighbourhood (dilate), plus mvr_depth_slope pixels' worth of its local slope, plus this many float steps.
+    int mvrDepthBias = 32;
+    float mvrDepthSlope = 0.0f;
+    bool mvrDepthDilate = true;
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
     bool dlaa = false;                // mode=dlaa (a change needs a restart)

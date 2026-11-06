@@ -52,6 +52,11 @@ void OnOMSetRenderTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView
                           ID3D11DepthStencilView* dsv, void* caller);
 // The engine's texture behind a clone, or `res` itself (a group's output may be the clone of a Submit texture).
 void* Original(void* res);
+// Render thread (MVR gate B8): the clone of the engine's texture `res` in `set` (not referenced; valid until the next
+// frame start), null when it has none or the clones are not ready.
+ID3D11Texture2D* CloneOf(ID3D11Resource* res, Set set);
+// Render thread: a group of `set` runs now with its clones in the engine objects.
+bool SwappedIn(Set set);
 // For a shot: up to `max` clones of `set` (not referenced; valid until the next frame start) with a label each
 // ("<set>_NN_<w>x<h>_f<format>_<role>", NN as in the list order of the log). Returns the count.
 int ListForShot(Set set, ID3D11Resource** out, char (*labels)[64], int max);

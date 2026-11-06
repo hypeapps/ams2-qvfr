@@ -1824,6 +1824,26 @@ void* Original(void* res) {
     return out;
 }
 
+ID3D11Texture2D* CloneOf(ID3D11Resource* res, Set set) {
+    ID3D11Texture2D* out = nullptr;
+    if (!res) return out;
+    Protect("CloneOf", [&] {
+        std::lock_guard lock(g_cm);
+        if (g_failed || g_phase != Ready || g_dirty) return;
+        if (auto it = g_byRes.find(res); it != g_byRes.end()) out = g_tex[it->second].clone[set];
+    });
+    return out;
+}
+
+bool SwappedIn(Set set) {
+    bool out = false;
+    Protect("SwappedIn", [&] {
+        std::lock_guard lock(g_cm);
+        out = g_swapped && g_inGroup && g_cur == set;
+    });
+    return out;
+}
+
 int ListForShot(Set set, ID3D11Resource** out, char (*labels)[64], int max) {
     int n = 0;
     Protect("ListForShot", [&] {

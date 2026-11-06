@@ -292,6 +292,9 @@ bool g_clonesKeyDown = false;
 bool g_cullOn = true;
 bool g_cullCfg = true;
 bool g_cullKeyDown = false;
+bool g_mvrOn = true;  // MVR gate B8 (the hotkey switches; mvr_gbuffer=1 installs it)
+bool g_mvrKeyDown = false;
+bool g_mvrModeKeyDown = false;
 // Crepuscular rays and lens flares of the focus views from outer (sun_fx.h): setting and hotkey.
 bool g_sunOn = true;
 bool g_sunCfg = true;
@@ -477,7 +480,11 @@ void __fastcall RunTask(uint8_t* task) {
     const bool profOn = g_profOn.load(std::memory_order_relaxed);
     const bool mvr = mvrpass::On();
     const ProfTask* prof = profOn || mvr ? ProfFind(task) : nullptr;
-    if (mvr) mvrpass::BeforeTask(task, prof ? prof->group : -1);  // gate B7: may run the task once more first
+    // MVR gate B8: a focus group's G-buffer tasks are skipped when outer's pass drew its G-buffer.
+    if (mvr && mvrpass::BeforeTask(task, prof ? prof->group : -1)) {
+        (*(ExecuteFn**)task)[kFinishSlot](task);
+        return;
+    }
     LARGE_INTEGER t0{}, t1{};
     if (profOn) QueryPerformanceCounter(&t0);
     (*(ExecuteFn**)task)[kExecuteSlot](task);
@@ -1159,19 +1166,19 @@ void SwapInLocked(uint8_t* ctx, int group, int src, Run& run) {
     run.projected = proj;
 }
 
-// MVR gate B7: this frame's focus window of the left eye as the map from outer L's clip space that FocusEyeData puts
-// into the focus projection.
-void MvrWindowLocked() {
+// MVR gate B8: this frame's focus window of eye i as the map from outer's clip space that FocusEyeData puts into the
+// focus projection.
+void MvrWindowLocked(int i) {
     if (!mvrpass::On()) return;
     const bool valid = g_focus.on && !g_focus.projFailed;
-    const focus::Eye& e = WindowEyeLocked(0);
+    const focus::Eye& e = WindowEyeLocked(i);
     if (!valid || e.fr == e.fl || e.fb == e.ft) {
-        mvrpass::SetWindow(false, 1, 0, 1, 0);
+        mvrpass::SetWindow(i, false, 1, 0, 1, 0, 0, 0);
         return;
     }
     const double sx = (e.r - e.l) / (double)(e.fr - e.fl), ox = ((e.r + e.l) - (e.fr + e.fl)) / (double)(e.fr - e.fl);
     const double sy = (e.b - e.t) / (double)(e.fb - e.ft), oy = ((e.b + e.t) - (e.fb + e.ft)) / (double)(e.fb - e.ft);
-    mvrpass::SetWindow(true, sx, ox, sy, oy);
+    mvrpass::SetWindow(i, true, sx, ox, sy, oy, g_focus.gameW, g_focus.gameH);
 }
 
 void RestoreLocked() {
@@ -1327,6 +1334,18 @@ void HandleToolsLocked() {
         Log("Quad: focus culling %s (hotkey)%s", g_cullOn ? "on" : "off",
             g_cullFault ? "; STOPPED for this session after an engine fault" : g_cull.failed ? "; off after failed checks "
             "until the next track load" : "");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrKey, g_mvrKeyDown)) {
+        g_mvrOn = !g_mvrOn;
+        Log("Quad: MVR G-buffer %s (hotkey)", g_mvrOn ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrModeKey, g_mvrModeKeyDown)) {
+        using M = mvrpass::Mode;
+        const M now = mvrpass::GetMode();
+        const M next = now == M::Skip ? M::SkipRaw : now == M::SkipRaw ? M::NoDepth
+                       : now == M::NoDepth ? M::OuterOnly : M::Skip;
+        mvrpass::SetMode(next);
+        Log("Quad: MVR G-buffer mode %s (hotkey)", mvrpass::ModeName(next));
     }
     if (c.sunEffects != g_sunCfg) {
         g_sunCfg = c.sunEffects;
@@ -1728,7 +1747,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         // graph is gone and the menu reuses the memory).
         const unsigned before = (1u << g) - 1;
         if ((g_ended & before) != before) return;
-        if (g == OuterL) MvrWindowLocked();
+        if (g < FocusL) MvrWindowLocked(g);
         if (g < FocusL) {
             clones::BeginGroup(gpu::Context(), clones::Outer);
             sunfx::BeginGroup(g, 0, 0, 1, 1);
@@ -1744,7 +1763,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         int view = *(int*)((uint8_t*)task + kTaskView);
         if (!ctx || view != kFocusView) return;
         SwapInLocked(ctx, g, kSourceView[g], r);
-        if (g == FocusL) mvrpass::FocusProjected(r.projected);
+        mvrpass::FocusGroup(g - FocusL, r.projected);
         clones::BeginGroup(gpu::Context(), clones::Focus);
         taaviews::BeginGroup(g);
         // The focus window as a part of outer (which covers the whole grid); without the focus projection the
@@ -1822,7 +1841,7 @@ void STDMETHODCALLTYPE D_OMSetRenderTargets(ID3D11DeviceContext* c, UINT n, ID3D
         rtv = trtv;
         dsv = tdsv;
     }
-    // MVR gate B7: during its run the pass binds two-slice copies.
+    // MVR gate B8: outer's G-buffer pass binds two-slice copies.
     ID3D11RenderTargetView* mrtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
     ID3D11DepthStencilView* mdsv = nullptr;
     if (n <= D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT && mvrpass::MapTargets(c, n, rtv, dsv, mrtv, &mdsv)) {
@@ -1835,7 +1854,6 @@ void STDMETHODCALLTYPE D_OMSetRenderTargets(ID3D11DeviceContext* c, UINT n, ID3D
     clones::OnOMSetRenderTargets(c, n, rtv, dsv, caller);
     sunfx::OnSetTargets(c, n, rtv);
     taaviews::OnSetTargets(c, n, rtv);
-    mvrpass::OnSetTargets(c, n, rtv, dsv);
 }
 
 void LogStatsLocked(const Stats& s, const char* what) {
@@ -2081,12 +2099,15 @@ void Install() {
         if (g_patched && hooks::Create(Anchor::TaskGroupAddTask, (void*)D_AddTask, (void**)&o_addTask))
             g_execPatched = PatchExecutor();
         if (g_execPatched) StartStallWatch();
-        // MVR gate B7: needs the patched VS (mvr_vs) and the executor thunk (it runs a task once more).
-        if (Cfg().mvrGbufferTest && g_execPatched && Cfg().mvrVsPatch) mvrpass::Install();
-        else if (Cfg().mvrGbufferTest)
-            Log("MVR G-buffer test: off (needs [debug] mvr_vs_patch=1 and the executor patch)");
         else if (g_patched)
             Log("Quad: no add-task hook; no quad <-> outer only switch");
+        // MVR gate B8: needs the patched VS (mvr_vs) and the executor thunk (it skips the focus groups' pass).
+        if (Cfg().mvrGbuffer && g_execPatched && Cfg().mvrVsPatch) {
+            mvrpass::SetJitterSource(&dlaa::FrameJitter);
+            mvrpass::Install();
+        }
+        else if (Cfg().mvrGbuffer)
+            Log("MVR G-buffer: off (needs [debug] mvr_vs_patch=1 and the executor patch)");
         Log("Quad: focus culling %s (scene gather, processor and queue copy %s)", Cfg().focusCull ? "on" : "off",
             focus_cull::Available() ? "found" : "NOT FOUND: culling stays off");
     });
@@ -2125,7 +2146,7 @@ void OnFrameStart() {
         ++g_frameNo;
         g_frameT0 = NowMs();
         HandleToolsLocked();
-        mvrpass::OnFrameStart();  // ends the test of the previous shot frame
+        mvrpass::OnFrameStart(g_mvrOn);  // reports the comparison of the previous shot frame
         HandleShotLocked();
         clones::OnFrameStart(gpu::Context(), g_clonesOn && g_focus.on);
         sunfx::OnFrameStart(gpu::Context(), g_sunOn && g_focus.on && !g_frameSkip);

@@ -414,7 +414,10 @@ void StartCountdown(const char* why) {
     Beeps({{880, 120}});
 }
 
+void PeriodicStats(const char* forced);
+
 void StartRun(uint32_t newestIndex) {
+    PeriodicStats("before the benchmark");  // the counters start with the recording
     g_runDir = BenchDir() / Widen(LocalTimeStamp() + experiment::RunSuffix() + quad::RunSuffix());
     std::error_code ec;
     fs::create_directories(g_runDir, ec);
@@ -448,6 +451,7 @@ void StartRun(uint32_t newestIndex) {
 }
 
 void FinishRun(bool aborted) {
+    PeriodicStats(aborted ? "benchmark window (aborted)" : "benchmark window");
     g_frozen = false;
     g_frozenPose.bPoseIsValid = false;
     g_bench = Bench::Idle;
@@ -602,14 +606,18 @@ void EndGazeValue(double now) {
     }
 }
 
-void PeriodicStats() {
+// Every stats_interval_s, and forced around a benchmark recording: at its start (the counters start from zero) and at
+// its end ("benchmark window": the quad task profile, MVR and the other modules' stats cover exactly the recording).
+// The interval waits while a recording runs.
+void PeriodicStats(const char* forced = nullptr) {
     int interval = Cfg().statsIntervalS;
     double now = NowMs();
     if (g_lastStatsMs == 0) g_lastStatsMs = now;
-    if (interval <= 0 || now - g_lastStatsMs < interval * 1000.0) return;
+    if (!forced && (g_bench == Bench::Running || interval <= 0 || now - g_lastStatsMs < interval * 1000.0)) return;
     double sec = (now - g_lastStatsMs) / 1000.0;
     g_lastStatsMs = now;
-    Log("Stats %.0f s: %llu frames (%.1f/s), %llu Submit, %zu/%zu distinct textures (L/R)", sec,
+    Log("Stats %.0f s%s%s: %llu frames (%.1f/s), %llu Submit, %zu/%zu distinct textures (L/R)", sec,
+        forced ? ", " : "", forced ? forced : "",
         (unsigned long long)g_statsFrames, g_statsFrames / sec, (unsigned long long)g_submitsInInterval,
         g_handles[0].size(), g_handles[1].size());
     if (g_gazeCalls) {

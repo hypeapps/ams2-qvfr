@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -65,7 +66,7 @@ struct ShaderInfo {
     bool patched;
     char sum[40];
 };
-std::mutex g_sm;
+std::shared_mutex g_sm;  // shared for the lookups (gate B8: every VSSetShader of an MVR pass)
 std::unordered_map<void*, ShaderInfo> g_shaders;
 
 std::string NvErr(NvAPI_Status s) {
@@ -233,7 +234,7 @@ HRESULT STDMETHODCALLTYPE D_CreateVertexShader(ID3D11Device* dev, const void* co
     if (SUCCEEDED(hr) && out && *out && code && len) {
         ShaderInfo info{patched, {}};
         SumText(code, len, info.sum);
-        std::lock_guard lock(g_sm);
+        std::unique_lock lock(g_sm);
         g_shaders[*out] = info;
     }
     return hr;
@@ -333,7 +334,7 @@ void OnFrameStart(ID3D11DeviceContext* ctx) {
 bool IsPatched(ID3D11VertexShader* vs, char* sum) {
     if (sum) sum[0] = 0;
     if (!vs) return false;
-    std::lock_guard lock(g_sm);
+    std::shared_lock lock(g_sm);
     auto it = g_shaders.find(vs);
     if (it == g_shaders.end()) return false;
     if (sum) memcpy(sum, it->second.sum, sizeof(it->second.sum));

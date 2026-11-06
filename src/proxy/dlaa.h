@@ -23,6 +23,9 @@ void BeginGroup(int group);
 void EndGroup();
 // Quad frame start: true in a shot frame (right Ctrl + F10); each view's TAA resolve is then measured once (log).
 void SetShotFrame(bool shot);
+// Any thread (MVR gate B8): the projection offset the render tasks set in the engine's current frame (SetJitter hook,
+// size-independent: the jitter is offset / render size in NDC). False: not set in this frame or no hook.
+bool FrameJitter(float out[2]);
 void LogStats(bool totals);
 std::string Describe();  // one line for summary.txt
 void Shutdown();         // VR_Shutdown: DLSS features and NGX released

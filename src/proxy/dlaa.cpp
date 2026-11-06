@@ -1123,6 +1123,17 @@ void __fastcall D_SetJitter(void* dev, const float* offset, uint32_t ctx) {
     });
 }
 
+bool FrameJitterRead(float out[2]) {
+    void* dev = nullptr;
+    uint32_t counter = 0;
+    if (!g_devGlobal || !hooks::TryRead(g_devGlobal, &dev, sizeof(dev)) || !dev ||
+        !hooks::TryRead((const uint8_t*)dev + kFrameCounterOffset, &counter, sizeof(counter)) || counter != g_jitCounter)
+        return false;
+    out[0] = g_jit[0];
+    out[1] = g_jit[1];
+    return true;
+}
+
 void __fastcall D_Locks(void* taa, void* src, void* normal, uint32_t ctx, void* camera, uint64_t a6, int view) {
     if (Wanted() && Cfg().dlaaSkipLocks && !CockpitTaaNow() && g_evals.load() &&
         g_frame.load() <= g_lastOkFrame.load() + 1) {
@@ -1256,6 +1267,13 @@ void LogStats(bool totals) {
     }
     Log("DLAA%s: DLSS evaluations per view: %s; outside the eye groups %llu in the session",
         totals ? " (session total)" : "", views.c_str(), (unsigned long long)g_viewEvals[0].load());
+}
+
+bool FrameJitter(float out[2]) {
+    bool ok = false;
+    if (!g_installed || !o_setJitter) return ok;
+    Protect("FrameJitter", [&] { ok = FrameJitterRead(out); });
+    return ok;
 }
 
 void SetShotFrame(bool shot) {

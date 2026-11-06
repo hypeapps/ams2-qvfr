@@ -1,17 +1,24 @@
-// NVIDIA Multi-View Rendering in the game, gate B7 (docs/mvr.md): outer L's G-buffer pass through MVR, as a test.
+// NVIDIA Multi-View Rendering of the G-buffer in the game, gate B8 (docs/mvr.md).
 //
-// With [debug] mvr_gbuffer_test=1 (needs mvr_vs_patch=1), in every shot frame the engine's run of outer L's
-// CPhase1Render goes through Multi-View Rendering: every render target and depth target the pass binds or clears goes
-// to a two-slice copy (Texture2DArray, views on both slices), MVR is on with 2 views, and before every draw with a
-// patched VS its constant buffer slot 3 holds view 1's matrix M and clip planes (the game's binding goes back after
-// the draw). View 1 is focus L: its projection (the focus window of the left eye, as the focus group renders it) in
-// the top-left corner of slice 1 at focus L's render size, cut by the window's clip planes. Draws with a VS the patch
-// did not make go with one view. After the pass slice 0 is copied into the game's targets and the game's views are
-// bound again, so the frame goes on as without MVR. The task runs once: it replays software command buffers, and a
-// replay releases a reference of its buffer (running it twice crashed the game in the first B7 build).
-//
-// The shot gets per target: the game's target after the copy back, slices 0 and 1 of the copy, and focus L's own after
-// its CPhase1Render. Pairs: slice 0 vs the game's (the copy back) and focus L vs the corner of slice 1.
+// With [debug] mvr_gbuffer=1 (needs mvr_vs_patch=1 and the executor patch), each frame the engine's run of the G-buffer
+// pass (CPhase1Render) of outer L and of outer R also draws that eye's focus:
+// - every render target and depth target the pass binds or clears goes to a two-slice copy (Texture2DArray, views on
+//   both slices); MVR is on with 2 views and VS constant buffer slot 3 holds view 1's matrix M and clip planes;
+// - view 1 is the eye's focus: its projection (the focus window, with focus's own TAA jitter instead of outer's) in
+//   the top-left corner of slice 1 at the focus clones' size, cut by the window's clip planes;
+// - a VS the patch did not make draws with one view (VSSetShader hook); a game call that clears VS slot 3 gets the
+//   module's buffer back (VSSetConstantBuffers hooks). No per-draw hook.
+// The MVR part ends at the pass's first bind without an outer-size target (the sun masks at 1/4 size, which read the
+// linear depth) or with the task: MVR off, slice 0 copied into the game's targets, the corner of slice 1 into the
+// eye's stash in the focus clones' formats (colors by copy, the depth by a short pass with SV_Depth). The rest of the
+// task draws the masks into the game's targets without MVR; they are stashed too.
+// The focus group of that eye then skips its CPhase1BuildCommandThread and CPhase1Render (Finish only, as in outer
+// only mode: the pair builds and replays the group's own command buffers, so the replay count stays balanced) and gets
+// the stash in its clones instead: the G-buffer as copied, the masks as outer's read in the focus window (the sun
+// effects of the focus views come from outer anyway, sun_fx.h). Each task runs at most once per frame (a replay
+// releases a reference of its buffer; running one twice crashed the game in the first B7 build).
+// Without clones ready, the focus projection or the eye's stash of this frame, the focus group runs its own pass.
+// In a shot frame the focus groups run their own pass and the shot compares focus L's with the stash.
 #pragma once
 
 #include <d3d11.h>
@@ -23,57 +30,71 @@
 
 namespace qvfr::mvrpass {
 
+using JitterFn = bool (*)(float out[2]);
+// The engine's TAA projection offset of the current frame (dlaa::FrameJitter); without it view 1 keeps outer's jitter.
+void SetJitterSource(JitterFn fn);
 // VR_Init in quad mode, once per process, with the VS patch installed and the executor patched. False: off.
 bool Install();
-// First Submit: hooks on the instanced and indirect draws of the immediate context (the plain draws come from sun_fx).
+// First Submit: the module's D3D11 hooks on the immediate context (VSSetShader, VSSetConstantBuffers(1), the
+// instanced and indirect draws; the plain draws come from sun_fx).
 void InstallD3DHooks(ID3D11DeviceContext* imm);
 bool On();  // installed and not stopped (cheap)
 
-// Render thread, every frame start before the shot is prepared: ends the test of the previous frame (its log line,
-// the copies released).
-void OnFrameStart();
-// A shot starts in this frame: the test's image names go to names[base..], its pairs to pairs[0..]. Returns the
-// number of images (0: no test in this shot, the reason is logged); *pairCount gets the number of pairs.
+// Render thread, every frame start before the shot is prepared: `enabled` = the setting and the hotkey. Reports the
+// shot comparison of the previous frame.
+void OnFrameStart(bool enabled);
+// A shot starts in this frame: the comparison's image names go to names[base..], its pairs to pairs[0..]. Returns the
+// number of images (0: none in this shot, the reason is logged); *pairCount gets the number of pairs.
 int PrepareShot(const char** names, int base, int max, shots::Pair* pairs, int maxPairs, int* pairCount);
-void CancelShot();  // the shot did not start: the test is dropped without a log line
-// Outer L's CBeginEye: the focus window of the left eye in this frame as a map from outer L's clip space,
-// focus = (sx x + ox w, sy y + oy w, z, w). valid = false: no focus projection in this frame (no test).
-void SetWindow(bool valid, double sx, double ox, double sy, double oy);
-// Focus L's CBeginEye: whether the group renders with the focus projection (else the comparison is meaningless).
-void FocusProjected(bool projected);
+void CancelShot();  // the shot did not start: the comparison is dropped without a log line
+// Outer L's (eye 0) and outer R's (eye 1) CBeginEye: the eye's focus window in this frame as a map from outer's clip
+// space, focus = (sx x + ox w, sy y + oy w, z, w). valid = false: no focus projection in this frame. w x h: outer's
+// target size (the game's render size; 0: not checked).
+void SetWindow(int eye, bool valid, double sx, double ox, double sy, double oy, uint32_t w, uint32_t h);
+// Focus L's (eye 0) and focus R's (eye 1) CBeginEye: whether the group renders the focus window.
+void FocusGroup(int eye, bool projected);
+// Skip (default): the focus groups skip their G-buffer pass and get the stash, its depth made conservative
+// ([debug] mvr_depth_dilate, mvr_depth_slope, mvr_depth_bias). Diagnosis modes (hotkey cycles): SkipRaw the same with
+// the depth as MVR drew it (it flickers); the others run focus's own pass and then: NoDepth the stash without its depth,
+// OuterOnly nothing, Overwrite the whole stash (tests).
+enum class Mode { Skip, SkipRaw, NoDepth, OuterOnly, Overwrite };
+void SetMode(Mode m);
+Mode GetMode();
+const char* ModeName(Mode m);
 
-// The executor thunk (quad's RunTask) around the engine's Execute of every task. group: the task's eye group
-// (0 outer L, 1 outer R, 2 focus L, 3 focus R, -1 none).
-void BeforeTask(uint8_t* task, int group);
-void AfterTask(uint8_t* task);
+// The executor thunk (quad's RunTask) before the engine's Execute of every task. group: the task's eye group
+// (0 outer L, 1 outer R, 2 focus L, 3 focus R, -1 none). True: do not execute it, call its Finish instead.
+bool BeforeTask(uint8_t* task, int group);
+void AfterTask(uint8_t* task);  // after the engine's Execute (not after a skipped one)
 
 // D3D11 detours of the immediate context, before the real call (after the clones' mapping): the targets to bind or
-// clear instead during the test run. MapTargets: false = bind as they are; rtvOut has room for n entries.
+// clear instead during the MVR part. MapTargets: false = bind as they are; rtvOut has room for n entries.
 bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv, ID3D11DepthStencilView* dsv,
                 ID3D11RenderTargetView** rtvOut, ID3D11DepthStencilView** dsvOut);
 ID3D11RenderTargetView* MapClear(ID3D11DeviceContext* c, ID3D11RenderTargetView* v);
 ID3D11DepthStencilView* MapClear(ID3D11DeviceContext* c, ID3D11DepthStencilView* v);
-// After the real OMSetRenderTargets with what was bound: the targets of the observed passes.
-void OnSetTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv, ID3D11DepthStencilView* dsv);
-// Draw detours, before the real draw: true = call AfterDraw after it.
+// Draw detours, before the real draw: true = call AfterDraw after it (draw counts in a shot frame only).
 bool BeforeDraw(ID3D11DeviceContext* c);
 void AfterDraw(ID3D11DeviceContext* c);
 
 std::string Describe();      // one part of the summary line
-void LogStats(bool totals);  // at the end of the session: tests run
-void Shutdown();             // VR_Shutdown: a test left over is dropped
+void LogStats(bool totals);  // a stats line per interval, the session totals at the end
+void Shutdown();             // VR_Shutdown: textures released
 
-// qvfr_proxy_smoke --mvr-pass: the test run on a fake task without the engine (no shot images).
-void TestSetup(ID3D11DeviceContext* ctx, const void* taskVtable);
-// Arms the test for the next BeforeTask of a task with that vtable in group 0: outer size w x h, focus size fw x fh.
-void TestArm(uint32_t w, uint32_t h, uint32_t fw, uint32_t fh, double sx, double ox, double sy, double oy);
-ID3D11Texture2D* TestArray(int k);  // the copy of target k (not referenced), null when none
+// qvfr_proxy_smoke --mvr-pass: fake tasks and fake clones on a test device (no shot images).
+using CloneFn = ID3D11Texture2D* (*)(ID3D11Resource* original);
+void TestSetup(ID3D11DeviceContext* ctx, const void* phase1Vtable, const void* buildVtable, CloneFn clone,
+               JitterFn jitter);
 struct TestState {
-    unsigned targets = 0, binds = 0, clears = 0, mapFailures = 0, patchedDraws = 0, plainDraws = 0, cbSwaps = 0;
-    unsigned copiedBack = 0, viewsFailures = 0;
-    bool ran = false, faulted = false;
+    unsigned passes = 0, focusSkipped = 0, fills = 0, binds = 0, clears = 0, mapFailures = 0, patchedSets = 0;
+    unsigned plainSets = 0, cbRebinds = 0, copiedBack = 0, stashed = 0, masks = 0, viewsFailures = 0, failures = 0;
+    bool stashValid = false, jitterKnown = false, faulted = false, lateStart = false;
+    float rows[2][4] = {};  // M's x and y rows of the last pass
 };
 TestState TestGet();
-void TestEnd();  // the report line and the copies released (as at the next frame start)
+ID3D11Texture2D* TestArray(int k);
+// Overrides mvr_depth_bias, mvr_depth_slope and mvr_depth_dilate (steps < 0: the settings).
+void TestDepthBias(int steps, float slope, bool dilate);  // the two-slice copy of target k (not referenced), null when none
+void TestEnd();                     // the next frame start (counters of the frame reset)
 
 }  // namespace qvfr::mvrpass
