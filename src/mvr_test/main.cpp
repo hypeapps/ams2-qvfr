@@ -175,6 +175,30 @@ std::string MvrVsSource(int views, bool viewportMask, bool viewId) {
 }
 
 // Pixel shader: R = view id * 64, G = 255 marks coverage.
+// Reference for the patch with clip distances: kPlainVs with the outputs and the buffer layout of PatchVsForMvr(clip),
+// i.e. view n = rows 8(n-1)..8(n-1)+3 and its clip planes = the next 4 rows of b2, both applied to view 0's position.
+std::string MvrClipVsSource(int views) {
+    std::string s =
+        "cbuffer Views : register(b0) { float4 Rows[16]; };\n"
+        "cbuffer Obj : register(b1) { float4 Offset; };\n"
+        "cbuffer Patch : register(b2) { float4 P[24]; };\n"
+        "float4 Xf(uint first, float4 p) { return float4(dot(P[first], p), dot(P[first+1], p),"
+        " dot(P[first+2], p), dot(P[first+3], p)); }\n"
+        "struct VSOut {\n  float4 pos0 : SV_Position;\n  float4 clip0 : SV_ClipDistance0;\n";
+    for (int v = 1; v < views; ++v) s += "  float4 pos" + std::to_string(v) + " : " + qvfr::dxbc::MvrPositionSemantic(v) + ";\n";
+    for (int v = 1; v < views; ++v) s += "  float4 clip" + std::to_string(v) + " : " + qvfr::dxbc::MvrClipSemantic(v) + ";\n";
+    s += "};\nVSOut main(float4 pos : POSITION) {\n  VSOut o; float4 p = pos + Offset;\n"
+         "  o.pos0 = float4(dot(Rows[0], p), dot(Rows[1], p), dot(Rows[2], p), dot(Rows[3], p));\n"
+         "  o.clip0 = float4(1, 1, 1, 1);\n";
+    for (int v = 1; v < views; ++v) {
+        const std::string n = std::to_string(v), first = std::to_string(8 * (v - 1));
+        s += "  o.pos" + n + " = Xf(" + first + ", o.pos0);\n";
+        s += "  o.clip" + n + " = Xf(" + first + " + 4, o.pos0);\n";
+    }
+    s += "  return o;\n}\n";
+    return s;
+}
+
 const char* kMvrPs =
     "struct PSIn { float4 pos : SV_Position; float4 vid : NV_VIEWID_VIEW_0_SEMANTIC; };\n"
     "float4 main(PSIn i) : SV_Target { return float4(i.vid.x * 64.0 / 255.0, 1, 0, 1); }\n";
@@ -284,13 +308,14 @@ bool CreateMvrShaders(Gpu& g, int views, bool viewportMask, ViewIdMode idMode, S
 // Which vertex shader a case uses: the HLSL MVR shader, or a single-view shader patched in DXBC (B4).
 enum class VsKind { Hlsl, PatchedPlain, PatchedBranchy };
 
-bool CreateVsEx(Gpu& g, const void* code, size_t size, ComPtr<ID3D11VertexShader>& vs) {
-    NV_CUSTOM_SEMANTIC sem;
-    SetSemantic(sem, NV_POSITION_SEMANTIC, "NV_POSITION");
+bool CreateVsEx(Gpu& g, const void* code, size_t size, ComPtr<ID3D11VertexShader>& vs, bool clip = false) {
+    NV_CUSTOM_SEMANTIC sem[2];
+    SetSemantic(sem[0], NV_POSITION_SEMANTIC, "NV_POSITION");
+    SetSemantic(sem[1], NV_CLIP_DISTANCE_0_SEMANTIC, "NV_CLIP_DISTANCE_0");
     NvAPI_D3D11_CREATE_VERTEX_SHADER_EX args = {};
     args.version = NVAPI_D3D11_CREATEVERTEXSHADEREX_VERSION;
-    args.NumCustomSemantics = 1;
-    args.pCustomSemantics = &sem;
+    args.NumCustomSemantics = clip ? 2 : 1;
+    args.pCustomSemantics = sem;
     const NvAPI_Status st = NvAPI_D3D11_CreateVertexShaderEx(g.dev.Get(), code, size, nullptr, &args, &vs);
     if (st != NVAPI_OK || !vs) {
         Log("  NvAPI_D3D11_CreateVertexShaderEx failed: %s\n", NvErr(st).c_str());
@@ -677,13 +702,16 @@ bool RunPatchChecks() {
     }
 
     // The patched output signature must declare the extra views as the compiler does for the HLSL MVR shader.
-    for (int views : {2, 4}) {
+    for (int run = 0; run < 4; ++run) {
+        const int views = run % 2 ? 4 : 2;
+        const bool clip = run >= 2;
         auto plain = Compile(kPlainVs, "vs_5_0", "plain_vs");
-        auto ref = Compile(MvrVsSource(views, false, false), "vs_5_0", "mvr_vs");
+        auto ref = Compile(clip ? MvrClipVsSource(views) : MvrVsSource(views, false, false), "vs_5_0", "mvr_vs");
         if (!plain || !ref) return false;
         qvfr::dxbc::MvrVsPatchOptions opt;
         opt.cbSlot = kPatchCbSlot;
         opt.extraViews = static_cast<uint32_t>(views - 1);
+        opt.clip = clip;
         std::vector<uint8_t> patched;
         std::string err;
         if (!qvfr::dxbc::PatchVsForMvr(plain->GetBufferPointer(), plain->GetBufferSize(), opt, patched, nullptr,
@@ -705,7 +733,8 @@ bool RunPatchChecks() {
             same = a[i].name == b[i].name && a[i].semanticIndex == b[i].semanticIndex &&
                    a[i].systemValue == b[i].systemValue && a[i].componentType == b[i].componentType &&
                    a[i].reg == b[i].reg && a[i].mask == b[i].mask && a[i].rwMask == b[i].rwMask;
-        Log("  output signature, %d views: %s\n", views, same ? "same as HLSL MVR shader" : "DIFFERENT");
+        Log("  output signature, %d views%s: %s\n", views, clip ? " with clip distances" : "",
+            same ? "same as HLSL MVR shader" : "DIFFERENT");
         if (!same) {
             for (const auto* list : {&a, &b}) {
                 Log("    %s:\n", list == &a ? "patched" : "HLSL");
@@ -718,7 +747,8 @@ bool RunPatchChecks() {
         if (views == 2 && g_verbose) {
             ComPtr<ID3DBlob> dis;
             if (SUCCEEDED(D3DDisassemble(patched.data(), patched.size(), 0, nullptr, &dis)))
-                Log("  patched plain VS, 2 views:\n%s\n", static_cast<const char*>(dis->GetBufferPointer()));
+                Log("  patched plain VS, 2 views%s:\n%s\n", clip ? ", clip" : "",
+                    static_cast<const char*>(dis->GetBufferPointer()));
             else
                 Log("  D3DDisassemble of the patched shader failed\n");
         }
@@ -727,16 +757,140 @@ bool RunPatchChecks() {
     return ok;
 }
 
+// Patch with clip distances (B5): the plain VS patched with clip against the HLSL reference with the same outputs.
+// Every extra view keeps only the top-left quarter of its visible rectangle (planes in its own clip space), view 0
+// stays whole. Both shaders must give the expected boxes and the same pixels.
+bool RunPatchedClipCase(bool debug, int views, int samples) {
+    Gpu g;
+    if (!CreateDevice(g, debug)) return false;
+    Log("\n[B5 patched VS with clip distances] views=%d samples=%d\n", views, samples);
+    auto plainCode = Compile(kPlainVs, "vs_5_0", "plain_vs");
+    auto refCode = Compile(MvrClipVsSource(views), "vs_5_0", "clip_ref_vs");
+    auto psCode = Compile(kRtIndexPs, "ps_5_0", "rt_ps");
+    if (!plainCode || !refCode || !psCode) return false;
+    qvfr::dxbc::MvrVsPatchOptions opt;
+    opt.cbSlot = kPatchCbSlot;
+    opt.extraViews = static_cast<uint32_t>(views - 1);
+    opt.clip = true;
+    std::vector<uint8_t> patched;
+    qvfr::dxbc::MvrVsPatchInfo info;
+    std::string err;
+    if (!qvfr::dxbc::PatchVsForMvr(plainCode->GetBufferPointer(), plainCode->GetBufferSize(), opt, patched, &info, &err)) {
+        Log("  patch failed: %s\n", err.c_str());
+        return false;
+    }
+    Log("  patch: clip o%u, view positions from o%u, view clips from o%u, %zu -> %zu bytes\n", info.clipReg,
+        info.viewPositionReg, info.viewClipReg, static_cast<size_t>(plainCode->GetBufferSize()), patched.size());
+    ComPtr<ID3D11VertexShader> vsPatched, vsRef;
+    ComPtr<ID3D11PixelShader> ps;
+    ComPtr<ID3D11InputLayout> layout;
+    if (!CreateVsEx(g, patched.data(), patched.size(), vsPatched, true)) return false;
+    if (!CreateVsEx(g, refCode->GetBufferPointer(), refCode->GetBufferSize(), vsRef, true)) return false;
+    g.dev->CreatePixelShader(psCode->GetBufferPointer(), psCode->GetBufferSize(), nullptr, &ps);
+    const D3D11_INPUT_ELEMENT_DESC ie = {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
+    g.dev->CreateInputLayout(&ie, 1, plainCode->GetBufferPointer(), plainCode->GetBufferSize(), &layout);
+
+    float rows[64];
+    for (int v = 0; v < 4; ++v) ViewRows(kViews[v], rows + 16 * v);
+    // Each extra view keeps the left and the top half of its visible rectangle: x_v <= cx * w and y_v >= cy * w, with
+    // (cx, cy) the center of the rectangle's visible NDC range in that view.
+    auto visible = [](const ViewXf& xf, float& cx, float& cy) {
+        const float xa = xf.ax * kRectX0 + xf.bx, xb = xf.ax * kRectX1 + xf.bx;
+        const float ya = xf.ay * kRectY0 + xf.by, yb = xf.ay * kRectY1 + xf.by;
+        cx = 0.5f * (std::max(-1.0f, std::min(xa, xb)) + std::min(1.0f, std::max(xa, xb)));
+        cy = 0.5f * (std::max(-1.0f, std::min(ya, yb)) + std::min(1.0f, std::max(ya, yb)));
+    };
+    float patch[24 * 4] = {};
+    for (int v = 1; v < views; ++v) {
+        float* m = patch + 32 * (v - 1);
+        ViewRows(kViews[v], m);
+        float* c = m + 16;
+        float cx, cy;
+        visible(kViews[v], cx, cy);
+        for (int k = 0; k < 4; ++k) {
+            c[k] = cx * m[12 + k] - m[k];      // cx * w - x >= 0
+            c[4 + k] = m[4 + k] - cy * m[12 + k];  // y - cy * w >= 0
+            c[8 + k] = m[12 + k];              // w >= 0
+            c[12 + k] = m[12 + k];
+        }
+    }
+    const float zero[4] = {};
+    auto viewCb = MakeBuffer(g, sizeof(rows), D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_IMMUTABLE, rows);
+    auto objCb = MakeBuffer(g, sizeof(zero), D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_IMMUTABLE, zero);
+    auto patchCb = MakeBuffer(g, sizeof(patch), D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_IMMUTABLE, patch);
+    const float quad[6][4] = {{kRectX0, kRectY0, 0.5f, 1}, {kRectX0, kRectY1, 0.5f, 1}, {kRectX1, kRectY0, 0.5f, 1},
+                              {kRectX1, kRectY0, 0.5f, 1}, {kRectX0, kRectY1, 0.5f, 1}, {kRectX1, kRectY1, 0.5f, 1}};
+    auto vb = MakeBuffer(g, sizeof(quad), D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_IMMUTABLE, quad);
+    auto rs = NoCull(g);
+
+    auto draw = [&](ID3D11VertexShader* vs, std::vector<std::vector<uint32_t>>& img) {
+        Target t;
+        if (!MakeTarget(g, kW, kH, views, samples, t)) return false;
+        const UINT stride = 16, offset = 0;
+        g.ctx->ClearState();
+        g.ctx->IASetInputLayout(layout.Get());
+        g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g.ctx->IASetVertexBuffers(0, 1, vb.GetAddressOf(), &stride, &offset);
+        ID3D11Buffer* cbs[3] = {viewCb.Get(), objCb.Get(), patchCb.Get()};
+        g.ctx->VSSetConstantBuffers(0, 3, cbs);
+        g.ctx->VSSetShader(vs, nullptr, 0);
+        g.ctx->PSSetShader(ps.Get(), nullptr, 0);
+        g.ctx->RSSetState(rs.Get());
+        const D3D11_VIEWPORT vp = {0, 0, kW, kH, 0, 1};
+        g.ctx->RSSetViewports(1, &vp);
+        g.ctx->OMSetRenderTargets(1, t.all.GetAddressOf(), nullptr);
+        const float clear[4] = {0, 0, 0, 0};
+        g.ctx->ClearRenderTargetView(t.all.Get(), clear);
+        if (SetMultiView(g, views, false, true) != NVAPI_OK) return false;
+        g.ctx->Draw(6, 0);
+        SetMultiView(g, 1, false, false);
+        img = Readback(g, t);
+        return true;
+    };
+    std::vector<std::vector<uint32_t>> img, refImg;
+    if (!draw(vsPatched.Get(), img) || !draw(vsRef.Get(), refImg)) {
+        Log("  RESULT: FAIL (setup)\n");
+        return false;
+    }
+    bool ok = true;
+    for (int v = 0; v < views; ++v) {
+        Box exp = ExpectedBox(kViews[v], kW, kH);
+        if (v > 0) {
+            float cx, cy;
+            visible(kViews[v], cx, cy);
+            exp.x1 = static_cast<int>(std::lround((cx + 1) * 0.5f * kW));
+            exp.y1 = static_cast<int>(std::lround((1 - cy) * 0.5f * kH));
+        }
+        std::set<int> ids;
+        const Box got = MeasureBox(img[v], kW, 0, kW, kH, ids);
+        const bool boxOk = Near(got, exp);
+        const bool idOk = exp.empty ? ids.empty() : (ids.size() == 1 && *ids.begin() == v);
+        Log("  view %d: expected [%d,%d)x[%d,%d)%s, got [%d,%d)x[%d,%d)%s -> %s\n", v, exp.x0, exp.x1, exp.y0, exp.y1,
+            exp.empty ? " (empty)" : "", got.x0, got.x1, got.y0, got.y1, got.empty ? " (empty)" : "",
+            boxOk && idOk ? "OK" : "WRONG");
+        ok = ok && boxOk && idOk;
+    }
+    size_t diff = 0, total = 0;
+    for (size_t s = 0; s < img.size(); ++s)
+        for (size_t i = 0; i < img[s].size(); ++i, ++total) diff += img[s][i] != refImg[s][i];
+    Log("  vs HLSL reference: %zu of %zu pixels differ -> %s\n", diff, total, diff == 0 ? "OK" : "WRONG");
+    ok = ok && diff == 0;
+    DrainDebugMessages(g);
+    Log("  RESULT: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 // Patches every *.dxbc vertex shader in a folder and creates the result; writes the disassembly of each patched
 // shader to outDir when given.
-int RunPatchDir(Gpu& g, const std::string& dir, uint32_t slot, const std::string& outDir) {
+int RunPatchDir(Gpu& g, const std::string& dir, uint32_t slot, const std::string& outDir, bool clip) {
     namespace fs = std::filesystem;
     std::vector<fs::path> files;
     for (const auto& e : fs::directory_iterator(dir))
         if (e.path().extension() == ".dxbc") files.push_back(e.path());
     std::sort(files.begin(), files.end());
     if (!outDir.empty()) fs::create_directories(outDir);
-    Log("\n[patch dir] %zu shaders in %s, constant buffer slot %u\n", files.size(), dir.c_str(), slot);
+    Log("\n[patch dir] %zu shaders in %s, constant buffer slot %u%s\n", files.size(), dir.c_str(), slot,
+        clip ? ", with clip distances" : "");
     int okCount = 0, skipped = 0;
     for (const auto& f : files) {
         std::ifstream in(f, std::ios::binary);
@@ -752,6 +906,7 @@ int RunPatchDir(Gpu& g, const std::string& dir, uint32_t slot, const std::string
         const bool origOk = SUCCEEDED(g.dev->CreateVertexShader(code.data(), code.size(), nullptr, &orig));
         qvfr::dxbc::MvrVsPatchOptions opt;
         opt.cbSlot = slot;
+        opt.clip = clip;
         std::vector<uint8_t> patched;
         qvfr::dxbc::MvrVsPatchInfo info;
         std::string err;
@@ -761,7 +916,7 @@ int RunPatchDir(Gpu& g, const std::string& dir, uint32_t slot, const std::string
             continue;
         }
         ComPtr<ID3D11VertexShader> vs;
-        const bool exOk = CreateVsEx(g, patched.data(), patched.size(), vs);
+        const bool exOk = CreateVsEx(g, patched.data(), patched.size(), vs, clip);
         ComPtr<ID3DBlob> dis;
         const bool disOk = SUCCEEDED(D3DDisassemble(patched.data(), patched.size(), 0, nullptr, &dis));
         if (disOk && !outDir.empty()) {
@@ -965,6 +1120,400 @@ bool RunPerf(Gpu& g, const PerfCfg& c, PerfResult& r) {
     return true;
 }
 
+// ---------------------------------------------------------------- B5: array views and per-view clipping
+//
+// MVR writes each view into its own slice of a render target array, so the game's targets would have to become
+// arrays: slice 0 for the game's view, slice 1 for focus. These checks answer what that takes in D3D11 on this driver:
+// whether the game's single-texture views can sit on slice 0 of an array, whether a shader declaring a plain
+// Texture2D / Texture2DMS reads one slice through an array view, and whether a view can be clipped to a sub-rectangle
+// of its slice (focus is smaller than outer, but all slices share one size and one viewport).
+
+const char* kFullTriVs =
+    "float4 main(uint id : SV_VertexID) : SV_Position {\n"
+    "  float2 uv = float2((id << 1) & 2, id & 2); return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); }\n";
+
+constexpr int kTexel = 4;  // the textures read by the checks are kTexel x kTexel
+
+// Draws one pixel with a pixel shader that declares `decl` at t0 and returns `fetch`, and reads the result.
+bool ReadTexel(Gpu& g, ID3D11ShaderResourceView* srv, const std::string& decl, const std::string& fetch, float out[4]) {
+    const std::string src = decl + " : register(t0);\nSamplerState s : register(s0);\n"
+                                   "float4 main(float4 p : SV_Position) : SV_Target { return " +
+                            fetch + "; }\n";
+    auto vsCode = Compile(kFullTriVs, "vs_5_0", "texel_vs");
+    auto psCode = Compile(src, "ps_5_0", "texel_ps");
+    if (!vsCode || !psCode) return false;
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    if (FAILED(g.dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &vs)) ||
+        FAILED(g.dev->CreatePixelShader(psCode->GetBufferPointer(), psCode->GetBufferSize(), nullptr, &ps)))
+        return false;
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = d.Height = 1;
+    d.MipLevels = d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+    d.SampleDesc.Count = 1;
+    d.BindFlags = D3D11_BIND_RENDER_TARGET;
+    ComPtr<ID3D11Texture2D> rt, staging;
+    ComPtr<ID3D11RenderTargetView> rtv;
+    if (FAILED(g.dev->CreateTexture2D(&d, nullptr, &rt)) || FAILED(g.dev->CreateRenderTargetView(rt.Get(), nullptr, &rtv)))
+        return false;
+    d.BindFlags = 0;
+    d.Usage = D3D11_USAGE_STAGING;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (FAILED(g.dev->CreateTexture2D(&d, nullptr, &staging))) return false;
+    D3D11_SAMPLER_DESC sd = {};
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    ComPtr<ID3D11SamplerState> smp;
+    g.dev->CreateSamplerState(&sd, &smp);
+
+    const float nan[4] = {-1, -1, -1, -1};
+    g.ctx->ClearState();
+    g.ctx->ClearRenderTargetView(rtv.Get(), nan);
+    g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.ctx->VSSetShader(vs.Get(), nullptr, 0);
+    g.ctx->PSSetShader(ps.Get(), nullptr, 0);
+    g.ctx->PSSetShaderResources(0, 1, &srv);
+    g.ctx->PSSetSamplers(0, 1, smp.GetAddressOf());
+    const D3D11_VIEWPORT vp = {0, 0, 1, 1, 0, 1};
+    g.ctx->RSSetViewports(1, &vp);
+    g.ctx->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+    g.ctx->Draw(3, 0);
+    g.ctx->ClearState();
+    g.ctx->CopyResource(staging.Get(), rt.Get());
+    D3D11_MAPPED_SUBRESOURCE m;
+    if (FAILED(g.ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
+    memcpy(out, m.pData, 16);
+    g.ctx->Unmap(staging.Get(), 0);
+    return true;
+}
+
+std::string Hr(HRESULT hr) {
+    char b[32];
+    snprintf(b, sizeof(b), SUCCEEDED(hr) ? "ok" : "failed 0x%08lX", static_cast<unsigned long>(hr));
+    return b;
+}
+
+// Which slice a texel value came from (slice s was cleared to kSliceValue[s] in the first channel), or -1.
+constexpr float kSliceValue[2] = {0.25f, 0.75f};
+int SliceOf(const float v[4]) {
+    for (int s = 0; s < 2; ++s)
+        if (std::fabs(v[0] - kSliceValue[s]) < 1e-3f) return s;
+    return -1;
+}
+
+// One texture with two slices (color or depth, 1x or 8x), each slice cleared to its own value.
+struct ArrayTex {
+    ComPtr<ID3D11Texture2D> tex;
+    DXGI_FORMAT viewFormat = DXGI_FORMAT_UNKNOWN;
+    bool depth = false;
+    int samples = 1;
+};
+
+bool MakeArrayTex(Gpu& g, bool depth, int samples, ArrayTex& t) {
+    t.depth = depth;
+    t.samples = samples;
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = d.Height = kTexel;
+    d.MipLevels = 1;
+    d.ArraySize = 2;
+    d.Format = depth ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_R16G16B16A16_FLOAT;
+    d.SampleDesc.Count = samples;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE | (depth ? D3D11_BIND_DEPTH_STENCIL : D3D11_BIND_RENDER_TARGET);
+    t.viewFormat = depth ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (FAILED(g.dev->CreateTexture2D(&d, nullptr, &t.tex))) return false;
+    for (UINT s = 0; s < 2; ++s) {
+        if (depth) {
+            D3D11_DEPTH_STENCIL_VIEW_DESC v = {};
+            v.Format = DXGI_FORMAT_D32_FLOAT;
+            v.ViewDimension = samples > 1 ? D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY : D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+            if (samples > 1) {
+                v.Texture2DMSArray.FirstArraySlice = s;
+                v.Texture2DMSArray.ArraySize = 1;
+            } else {
+                v.Texture2DArray.FirstArraySlice = s;
+                v.Texture2DArray.ArraySize = 1;
+            }
+            ComPtr<ID3D11DepthStencilView> dsv;
+            if (FAILED(g.dev->CreateDepthStencilView(t.tex.Get(), &v, &dsv))) return false;
+            g.ctx->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH, kSliceValue[s], 0);
+        } else {
+            D3D11_RENDER_TARGET_VIEW_DESC v = {};
+            v.Format = t.viewFormat;
+            v.ViewDimension = samples > 1 ? D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY : D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+            if (samples > 1) {
+                v.Texture2DMSArray.FirstArraySlice = s;
+                v.Texture2DMSArray.ArraySize = 1;
+            } else {
+                v.Texture2DArray.FirstArraySlice = s;
+                v.Texture2DArray.ArraySize = 1;
+            }
+            ComPtr<ID3D11RenderTargetView> rtv;
+            if (FAILED(g.dev->CreateRenderTargetView(t.tex.Get(), &v, &rtv))) return false;
+            const float c[4] = {kSliceValue[s], 0, 0, 1};
+            g.ctx->ClearRenderTargetView(rtv.Get(), c);
+        }
+    }
+    return true;
+}
+
+// SRV of the array: `single` = a plain Texture2D / Texture2DMS view (as the game creates them), else an array view of
+// one slice.
+HRESULT ArraySrv(Gpu& g, const ArrayTex& t, bool single, UINT slice, ComPtr<ID3D11ShaderResourceView>& srv) {
+    D3D11_SHADER_RESOURCE_VIEW_DESC v = {};
+    v.Format = t.viewFormat;
+    if (t.samples > 1) {
+        v.ViewDimension = single ? D3D11_SRV_DIMENSION_TEXTURE2DMS : D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY;
+        v.Texture2DMSArray.FirstArraySlice = slice;
+        v.Texture2DMSArray.ArraySize = 1;
+    } else if (single) {
+        v.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        v.Texture2D.MipLevels = 1;
+    } else {
+        v.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        v.Texture2DArray.MipLevels = 1;
+        v.Texture2DArray.FirstArraySlice = slice;
+        v.Texture2DArray.ArraySize = 1;
+    }
+    return g.dev->CreateShaderResourceView(t.tex.Get(), &v, &srv);
+}
+
+// Plain (non-array) RTV or DSV on the array, as the game creates them for its targets.
+HRESULT SingleTargetView(Gpu& g, const ArrayTex& t) {
+    if (t.depth) {
+        D3D11_DEPTH_STENCIL_VIEW_DESC v = {};
+        v.Format = DXGI_FORMAT_D32_FLOAT;
+        v.ViewDimension = t.samples > 1 ? D3D11_DSV_DIMENSION_TEXTURE2DMS : D3D11_DSV_DIMENSION_TEXTURE2D;
+        ComPtr<ID3D11DepthStencilView> dsv;
+        return g.dev->CreateDepthStencilView(t.tex.Get(), &v, &dsv);
+    }
+    D3D11_RENDER_TARGET_VIEW_DESC v = {};
+    v.Format = t.viewFormat;
+    v.ViewDimension = t.samples > 1 ? D3D11_RTV_DIMENSION_TEXTURE2DMS : D3D11_RTV_DIMENSION_TEXTURE2D;
+    ComPtr<ID3D11RenderTargetView> rtv;
+    return g.dev->CreateRenderTargetView(t.tex.Get(), &v, &rtv);
+}
+
+// Part 1: views of the game's kind on a two-slice array, and plain-texture shaders reading one slice of it.
+int RunArrayViewChecks(Gpu& g) {
+    int failed = 0;
+    Log("\nB5 array views (texture %d x %d, 2 slices; slice 0 = %.2f, slice 1 = %.2f):\n", kTexel, kTexel,
+        kSliceValue[0], kSliceValue[1]);
+    for (bool depth : {false, true})
+        for (int samples : {1, 8}) {
+            ArrayTex t;
+            const char* kind = depth ? "depth R32" : "color RGBA16F";
+            if (!MakeArrayTex(g, depth, samples, t)) {
+                Log("  %s %dx: cannot create the array\n", kind, samples);
+                ++failed;
+                continue;
+            }
+            const std::string tdecl = samples > 1 ? (depth ? "Texture2DMS<float>" : "Texture2DMS<float4>")
+                                                  : (depth ? "Texture2D<float>" : "Texture2D<float4>");
+            const std::string adecl = samples > 1 ? (depth ? "Texture2DMSArray<float>" : "Texture2DMSArray<float4>")
+                                                  : (depth ? "Texture2DArray<float>" : "Texture2DArray<float4>");
+            const std::string tload = samples > 1 ? "t.Load(int2(1, 1), 3)" : "t.Load(int3(1, 1, 0))";
+            const std::string aload = samples > 1 ? "t.Load(int3(1, 1, 0), 3)" : "t.Load(int4(1, 1, 0, 0))";
+            const std::string wrap = depth ? "float4(%s, 0, 0, 1)" : "%s";
+            auto fetch = [&](const std::string& f) {
+                char b[128];
+                snprintf(b, sizeof(b), wrap.c_str(), f.c_str());
+                return std::string(b);
+            };
+            Log("  %s %dx:\n", kind, samples);
+            Log("    plain %s view on the array: %s\n", depth ? "DSV" : "RTV", Hr(SingleTargetView(g, t)).c_str());
+            ComPtr<ID3D11ShaderResourceView> plain;
+            const HRESULT hr = ArraySrv(g, t, true, 0, plain);
+            Log("    plain SRV on the array: %s", Hr(hr).c_str());
+            float v[4] = {};
+            if (SUCCEEDED(hr) && ReadTexel(g, plain.Get(), tdecl + " t", fetch(tload), v))
+                Log(", %s shader reads %.3f (slice %d)", tdecl.c_str(), v[0], SliceOf(v));
+            Log("\n");
+            for (UINT slice = 0; slice < 2; ++slice) {
+                ComPtr<ID3D11ShaderResourceView> one;
+                if (FAILED(ArraySrv(g, t, false, slice, one))) {
+                    Log("    array SRV of slice %u: cannot create\n", slice);
+                    ++failed;
+                    continue;
+                }
+                float a[4] = {}, p[4] = {}, s[4] = {};
+                const bool okA = ReadTexel(g, one.Get(), adecl + " t", fetch(aload), a);
+                const bool okP = ReadTexel(g, one.Get(), tdecl + " t", fetch(tload), p);
+                Log("    array SRV of slice %u: %s shader reads %.3f (slice %d), %s shader reads %.3f (slice %d)", slice,
+                    adecl.c_str(), a[0], okA ? SliceOf(a) : -1, tdecl.c_str(), p[0], okP ? SliceOf(p) : -1);
+                if (samples == 1) {
+                    const bool okS = ReadTexel(g, one.Get(), tdecl + " t", fetch("t.SampleLevel(s, float2(0.4, 0.4), 0)"), s);
+                    Log(", SampleLevel %.3f (slice %d)", s[0], okS ? SliceOf(s) : -1);
+                }
+                Log("\n");
+                if (!okA || SliceOf(a) != static_cast<int>(slice)) ++failed;  // the control read must work
+            }
+            DrainDebugMessages(g);
+        }
+    return failed;
+}
+
+// Part 2: can a view be clipped to a part of its slice? Both views draw the same quad (view 1 position = view 0
+// position); the clip outputs keep x < 0 and y > 0, i.e. the top-left quarter of the slice.
+struct ClipCase {
+    const char* name;
+    bool works;                    // the outcome on driver 581.80 (several variants only probe what the driver rejects)
+    const char* vs;                // HLSL
+    std::vector<std::pair<NV_CUSTOM_SEMANTIC_TYPE, const char*>> semantics;
+    bool viewportMask;             // independentViewportMaskEnable, two viewports (full, top-left quarter)
+    Box expected[2];
+    int reg = -1;                  // >= 0: the second custom semantic gets RegisterSpecified with this register
+    uint32_t regMask = 0;
+};
+
+bool RunClipCase(const ClipCase& c, bool debug) {
+    Gpu g;
+    if (!CreateDevice(g, debug)) return false;
+    Log("  %s:", c.name);
+    auto vsCode = Compile(c.vs, "vs_5_0", "clip_vs");
+    auto psCode = Compile(kRtIndexPs, "ps_5_0", "clip_ps");
+    if (!vsCode || !psCode) return false;
+    std::vector<NV_CUSTOM_SEMANTIC> sem(c.semantics.size());
+    for (size_t i = 0; i < sem.size(); ++i) SetSemantic(sem[i], c.semantics[i].first, c.semantics[i].second);
+    if (c.reg >= 0 && sem.size() > 1) {
+        sem[1].RegisterSpecified = TRUE;
+        sem[1].RegisterNum = static_cast<NvU32>(c.reg);
+        sem[1].RegisterMask = c.regMask;
+    }
+    NvAPI_D3D11_CREATE_VERTEX_SHADER_EX args = {};
+    args.version = NVAPI_D3D11_CREATEVERTEXSHADEREX_VERSION;
+    args.NumCustomSemantics = static_cast<NvU32>(sem.size());
+    args.pCustomSemantics = sem.data();
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> ps;
+    ComPtr<ID3D11InputLayout> layout;
+    const NvAPI_Status st =
+        NvAPI_D3D11_CreateVertexShaderEx(g.dev.Get(), vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &args, &vs);
+    if (st != NVAPI_OK || !vs) {
+        Log(" CreateVertexShaderEx failed: %s\n", NvErr(st).c_str());
+        return false;
+    }
+    g.dev->CreatePixelShader(psCode->GetBufferPointer(), psCode->GetBufferSize(), nullptr, &ps);
+    const D3D11_INPUT_ELEMENT_DESC ie = {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
+    g.dev->CreateInputLayout(&ie, 1, vsCode->GetBufferPointer(), vsCode->GetBufferSize(), &layout);
+    // The B1 rectangle: clip [-0.5, 0.25]^2, so the viewport case shows which viewport each view used.
+    const float quad[6][4] = {{kRectX0, kRectY0, 0.5f, 1}, {kRectX0, kRectY1, 0.5f, 1}, {kRectX1, kRectY0, 0.5f, 1},
+                              {kRectX1, kRectY0, 0.5f, 1}, {kRectX0, kRectY1, 0.5f, 1}, {kRectX1, kRectY1, 0.5f, 1}};
+    auto vb = MakeBuffer(g, sizeof(quad), D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_IMMUTABLE, quad);
+    Target t;
+    if (!MakeTarget(g, kW, kH, 2, 1, t)) return false;
+    auto rs = NoCull(g);
+    const UINT stride = 16, offset = 0;
+    g.ctx->IASetInputLayout(layout.Get());
+    g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.ctx->IASetVertexBuffers(0, 1, vb.GetAddressOf(), &stride, &offset);
+    g.ctx->VSSetShader(vs.Get(), nullptr, 0);
+    g.ctx->PSSetShader(ps.Get(), nullptr, 0);
+    g.ctx->RSSetState(rs.Get());
+    const D3D11_VIEWPORT vps[2] = {{0, 0, kW, kH, 0, 1}, {0, 0, kW / 2, kH / 2, 0, 1}};
+    g.ctx->RSSetViewports(c.viewportMask ? 2 : 1, vps);
+    g.ctx->OMSetRenderTargets(1, t.all.GetAddressOf(), nullptr);
+    const float clear[4] = {0, 0, 0, 0};
+    g.ctx->ClearRenderTargetView(t.all.Get(), clear);
+    NvAPI_Status ms = SetMultiView(g, 2, c.viewportMask, true);
+    if (ms != NVAPI_OK) {
+        Log(" SetMultiViewMode failed: %s\n", NvErr(ms).c_str());
+        return false;
+    }
+    g.ctx->Draw(6, 0);
+    SetMultiView(g, 1, false, false);
+    const auto img = Readback(g, t);
+    bool ok = true;
+    for (int s = 0; s < 2; ++s) {
+        std::set<int> ids;
+        const Box b = MeasureBox(img[s], kW, 0, kW, kH, ids);
+        const bool match = Near(b, c.expected[s]);
+        ok = ok && match;
+        if (b.empty)
+            Log(" slice %d empty (expected [%d,%d)x[%d,%d))", s, c.expected[s].x0, c.expected[s].x1, c.expected[s].y0,
+                c.expected[s].y1);
+        else
+            Log(" slice %d [%d,%d)x[%d,%d) %s", s, b.x0, b.x1, b.y0, b.y1, match ? "ok" : "WRONG");
+    }
+    Log(" -> %s\n", ok ? "PASS" : "FAIL");
+    DrainDebugMessages(g);
+    return ok;
+}
+
+int RunClipChecks(bool debug) {
+    Log("\nB5 per-view clipping (2 views, slices of %d x %d, the B1 rectangle in both views):\n", kW, kH);
+    const Box full = ExpectedBox(kViews[0], kW, kH);
+    // The rectangle cut to x < 0 and y > 0 (top-left quarter of the target).
+    Box quarter = full;
+    quarter.x1 = kW / 2;
+    quarter.y1 = kH / 2;
+    // The rectangle in a viewport of half the size at the origin.
+    Box half = full;
+    half.x0 /= 2;
+    half.x1 /= 2;
+    half.y0 /= 2;
+    half.y1 /= 2;
+    const std::string head = "struct O { float4 p0 : SV_Position; ";
+    const std::string mainHead = "O main(float4 pos : POSITION) { O o; o.p0 = pos; o.p1 = pos; ";
+    const auto pos = std::make_pair(NV_POSITION_SEMANTIC, "NV_POSITION");
+    const std::string vsShared = head + "float2 c0 : SV_ClipDistance0; float4 p1 : NV_POSITION_VIEW_1_SEMANTIC; };\n" +
+                                 mainHead + "o.c0 = float2(-pos.x, pos.y); return o; }\n";
+    const std::string vsPerView1 = head + "float2 c0 : SV_ClipDistance0; float4 p1 : NV_POSITION_VIEW_1_SEMANTIC; "
+                                          "float2 c1 : NV_CLIP_DISTANCE_0_VIEW_1_SEMANTIC; };\n" +
+                                   mainHead + "o.c0 = float2(1, 1); o.c1 = float2(-pos.x, pos.y); return o; }\n";
+    const std::string vsPerView0 = head + "float2 c0 : SV_ClipDistance0; float4 p1 : NV_POSITION_VIEW_1_SEMANTIC; "
+                                          "float2 c1 : NV_CLIP_DISTANCE_0_VIEW_1_SEMANTIC; };\n" +
+                                   mainHead + "o.c0 = float2(-pos.x, pos.y); o.c1 = float2(1, 1); return o; }\n";
+    const std::string vsAltName = head + "float2 c0 : SV_ClipDistance0; float4 p1 : NV_POSITION_VIEW_1_SEMANTIC; "
+                                         "float2 c1 : NV_CLIP_DISTANCE_VIEW_1_SEMANTIC; };\n" +
+                                  mainHead + "o.c0 = float2(1, 1); o.c1 = float2(-pos.x, pos.y); return o; }\n";
+    const std::string vsMask = head + "uint m0 : NV_VIEWPORT_MASK_VIEW_0_SEMANTIC; float4 p1 : NV_POSITION_VIEW_1_SEMANTIC; "
+                                      "uint m1 : NV_VIEWPORT_MASK_VIEW_1_SEMANTIC; };\n" +
+                               mainHead + "o.m0 = 1; o.m1 = 2; return o; }\n";
+    // Clip distance variants: float4, without a view 0 output, cull distance.
+    const std::string vsF4 = head + "float4 c0 : SV_ClipDistance0; float4 p1 : NV_POSITION_VIEW_1_SEMANTIC; "
+                                    "float4 c1 : NV_CLIP_DISTANCE_0_VIEW_1_SEMANTIC; };\n" +
+                             mainHead + "o.c0 = 1; o.c1 = float4(-pos.x, pos.y, 1, 1); return o; }\n";
+    const std::string vsOnly1 = head + "float4 p1 : NV_POSITION_VIEW_1_SEMANTIC; "
+                                       "float4 c1 : NV_CLIP_DISTANCE_0_VIEW_1_SEMANTIC; };\n" +
+                                mainHead + "o.c1 = float4(-pos.x, pos.y, 1, 1); return o; }\n";
+    const std::string vsCull = head + "float4 c0 : SV_CullDistance0; float4 p1 : NV_POSITION_VIEW_1_SEMANTIC; "
+                                      "float4 c1 : NV_CULL_DISTANCE_0_VIEW_1_SEMANTIC; };\n" +
+                               mainHead + "o.c0 = 1; o.c1 = float4(-1, -1, -1, -1); return o; }\n";
+    Box none;  // cull distance < 0 at all vertices drops the whole rectangle
+    const auto clip0 = std::make_pair(NV_CLIP_DISTANCE_0_SEMANTIC, "NV_CLIP_DISTANCE_0");
+    const ClipCase cases[] = {
+        {"shared SV_ClipDistance (control)", true, vsShared.c_str(), {pos}, false, {quarter, quarter}},
+        // What works: float4 clip outputs, SV_ClipDistance0 for view 0 and NV_CLIP_DISTANCE_0_VIEW_n for the others.
+        {"view 1 clip, float4", true, vsF4.c_str(), {pos, clip0}, false, {full, quarter}},
+        {"view 1 cull, NV_CULL_DISTANCE_0", true, vsCull.c_str(),
+         {pos, {NV_CULL_DISTANCE_0_SEMANTIC, "NV_CULL_DISTANCE_0"}}, false, {full, none}},
+        // Rejected by CreateVertexShaderEx (NVAPI_ERROR): clip outputs narrower than float4, another name, an explicit
+        // register.
+        {"view 1 clip, float2", false, vsPerView1.c_str(), {pos, clip0}, false, {full, quarter}},
+        {"view 0 clip, float2", false, vsPerView0.c_str(), {pos, clip0}, false, {quarter, full}},
+        {"view 1 clip, name NV_CLIP_DISTANCE", false, vsAltName.c_str(),
+         {pos, {NV_CLIP_DISTANCE_0_SEMANTIC, "NV_CLIP_DISTANCE"}}, false, {full, quarter}},
+        {"view 1 clip, float4, register o3", false, vsF4.c_str(), {pos, clip0}, false, {full, quarter}, 3, 0xF},
+        // Accepted but without effect: no view 0 clip output (view 1 stays whole), viewport mask (as in B1 case 5).
+        {"view 1 clip only", false, vsOnly1.c_str(), {pos, clip0}, false, {full, quarter}},
+        {"viewport mask per view with slices", false, vsMask.c_str(),
+         {pos, {NV_VIEWPORT_MASK_SEMANTIC, "NV_VIEWPORT_MASK"}}, true, {full, half}},
+    };
+    // Not run: view 0 also as a custom output (NV_CLIP_DISTANCE_0_VIEW_0_SEMANTIC instead of SV_ClipDistance0) ends
+    // the process with 0xC0000409 inside the driver on 581.80.
+    int unexpected = 0;
+    for (const auto& c : cases) {
+        const bool ok = RunClipCase(c, debug);
+        if (ok != c.works) {
+            Log("    ^ unexpected on this driver (581.80: %s)\n", c.works ? "pass" : "fail");
+            ++unexpected;
+        }
+    }
+    return unexpected;
+}
+
 int ArgInt(int argc, char** argv, const char* name, int def) {
     for (int i = 1; i + 1 < argc; ++i)
         if (strcmp(argv[i], name) == 0) return atoi(argv[i + 1]);
@@ -989,7 +1538,8 @@ int main(int argc, char** argv) {
     if (HasArg(argc, argv, "--help")) {
         Log("qvfr_mvr_test [--debug] [--verbose] [--case N] [--include-hang] [--skip-perf] [--draws N] [--tris N]\n"
             "              [--frames N] [--width N] [--height N]\n"
-            "qvfr_mvr_test --patch-dir DIR [--patch-slot N] [--patch-out DIR] [--verbose]\n");
+            "qvfr_mvr_test --patch-dir DIR [--patch-slot N] [--patch-clip] [--patch-out DIR] [--verbose]\n"
+            "qvfr_mvr_test --views [--debug]   (B5: array views of the game's kind, per-view clipping)\n");
         return 0;
     }
     const bool debug = HasArg(argc, argv, "--debug");
@@ -1019,10 +1569,19 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    if (HasArg(argc, argv, "--views")) {
+        int failed = RunArrayViewChecks(g);
+        failed += RunClipChecks(debug);
+        Log("\nB5 checks: %d unexpected results (array SRV reads that miss their slice, clip cases that differ from "
+            "driver 581.80).\n",
+            failed);
+        return failed ? 1 : 0;
+    }
+
     const std::string patchDir = ArgStr(argc, argv, "--patch-dir");
     if (!patchDir.empty())
         return RunPatchDir(g, patchDir, static_cast<uint32_t>(ArgInt(argc, argv, "--patch-slot", 3)),
-                           ArgStr(argc, argv, "--patch-out"));
+                           ArgStr(argc, argv, "--patch-out"), HasArg(argc, argv, "--patch-clip"));
 
     // Correctness, simplest first. Every case gets a fresh device, so a GPU hang in one does not hide the others.
     const CaseCfg cases[] = {
@@ -1051,6 +1610,10 @@ int main(int argc, char** argv) {
     if (only < 0) {
         passed += RunPatchChecks() ? 1 : 0;
         ++run;
+        for (const auto& pc : {std::make_pair(2, 1), std::make_pair(4, 8)}) {
+            passed += RunPatchedClipCase(debug, pc.first, pc.second) ? 1 : 0;
+            ++run;
+        }
     }
     for (int i = 0; i < static_cast<int>(std::size(cases)); ++i) {
         if (only >= 0 && i != only) continue;

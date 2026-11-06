@@ -25,12 +25,15 @@ enum : uint32_t {
 };
 enum : uint32_t { kOperandTemp = 0, kOperandOutput = 2, kOperandImm32 = 4, kOperandImm64 = 5 };
 constexpr uint32_t kVertexShader = 1;
-constexpr uint32_t kNameUndefined = 0, kNamePosition = 1, kTypeFloat32 = 3;
+constexpr uint32_t kNameUndefined = 0, kNamePosition = 1, kNameClipDistance = 2, kNameCullDistance = 3;
+constexpr uint32_t kTypeFloat32 = 3;
+constexpr uint32_t kFloatOne = 0x3F800000;
 
 // Operand tokens used by the inserted code.
 constexpr uint32_t kDstOutputXyzw = 0x001020F2;  // o#.xyzw, 1D immediate index
 constexpr uint32_t kSrcTempXyzw = 0x00100E46;    // r#.xyzw
 constexpr uint32_t kSrcCbXyzw = 0x00208E46;      // cb#[#].xyzw, 2D immediate index
+constexpr uint32_t kSrcImm4 = 0x00004002;        // l(a, b, c, d), followed by 4 values
 constexpr uint32_t DstOutputComp(uint32_t c) { return 0x00102002 | ((1u << c) << 4); }  // o#.x / .y / .z / .w
 
 uint32_t Opcode(uint32_t tok) { return tok & 0x7FF; }
@@ -101,6 +104,7 @@ void SetErr(std::string* err, const std::string& msg) {
 }  // namespace
 
 std::string MvrPositionSemantic(uint32_t view) { return "NV_POSITION_VIEW_" + std::to_string(view) + "_SEMANTIC"; }
+std::string MvrClipSemantic(uint32_t view) { return "NV_CLIP_DISTANCE_0_VIEW_" + std::to_string(view) + "_SEMANTIC"; }
 
 bool PatchVsForMvr(const void* code, size_t size, const MvrVsPatchOptions& opt, std::vector<uint8_t>& out,
                    MvrVsPatchInfo* info, std::string* err) {
@@ -127,21 +131,34 @@ bool PatchVsForMvr(const void* code, size_t size, const MvrVsPatchOptions& opt, 
             inf.positionReg = e.reg;
         }
         if (e.name.rfind("NV_", 0) == 0) return SetErr(err, "shader already has NV outputs"), false;
+        if (opt.clip && (e.systemValue == kNameClipDistance || e.systemValue == kNameCullDistance))
+            return SetErr(err, "shader already has clip or cull distance outputs"), false;
         maxReg = std::max(maxReg, e.reg);
     }
     if (!havePos) return SetErr(err, "no SV_Position output"), false;
+    // New registers in the order the HLSL MVR shaders get them: view 0 outputs (clip distance) first, then per view.
     inf.firstNewOutputReg = maxReg + 1;
-    if (inf.firstNewOutputReg + opt.extraViews > 32) return SetErr(err, "no free output registers"), false;
-    for (uint32_t v = 1; v <= opt.extraViews; ++v) {
+    inf.clipReg = opt.clip ? inf.firstNewOutputReg : 0;
+    inf.viewPositionReg = inf.firstNewOutputReg + (opt.clip ? 1 : 0);
+    inf.viewClipReg = opt.clip ? inf.viewPositionReg + opt.extraViews : 0;
+    const uint32_t newRegs = opt.extraViews * (opt.clip ? 2 : 1) + (opt.clip ? 1 : 0);
+    if (inf.firstNewOutputReg + newRegs > 32) return SetErr(err, "no free output registers"), false;
+    auto addElement = [&](const std::string& name, uint32_t sv, uint32_t reg) {
         SigElement e;
-        e.name = MvrPositionSemantic(v);
-        e.systemValue = kNameUndefined;
+        e.name = name;
+        e.systemValue = sv;
         e.componentType = kTypeFloat32;
-        e.reg = inf.firstNewOutputReg + v - 1;
+        e.reg = reg;
         e.mask = 0xF;
         e.rwMask = 0;
         sig.push_back(e);
-    }
+    };
+    if (opt.clip) addElement("SV_ClipDistance", kNameClipDistance, inf.clipReg);
+    for (uint32_t v = 1; v <= opt.extraViews; ++v)
+        addElement(MvrPositionSemantic(v), kNameUndefined, inf.viewPositionReg + v - 1);
+    if (opt.clip)
+        for (uint32_t v = 1; v <= opt.extraViews; ++v)
+            addElement(MvrClipSemantic(v), kNameUndefined, inf.viewClipReg + v - 1);
 
     // Program tokens.
     if (shex->data.size() % 4 || shex->data.size() < 8) return SetErr(err, "bad program chunk size"), false;
@@ -181,16 +198,30 @@ bool PatchVsForMvr(const void* code, size_t size, const MvrVsPatchOptions& opt, 
     if (!haveTemps) inf.tempReg = 0;
     const size_t cbInsert = lastCb ? lastCb : globalFlagsEnd;
 
-    const uint32_t cbDecl[4] = {kOpDclConstantBuffer | (4u << 24), kSrcCbXyzw, opt.cbSlot, 4 * opt.extraViews};
+    const uint32_t rows = MvrVsPatchOptions::RowsPerView(opt.clip);
+    const uint32_t cbDecl[4] = {kOpDclConstantBuffer | (4u << 24), kSrcCbXyzw, opt.cbSlot, rows * opt.extraViews};
     std::vector<uint32_t> outDecls;
+    if (opt.clip)  // dcl_output_siv o#.xyzw, clip_distance
+        outDecls.insert(outDecls.end(), {kOpDclOutputSiv | (4u << 24), kDstOutputXyzw, inf.clipReg, kNameClipDistance});
     for (uint32_t v = 0; v < opt.extraViews; ++v)
-        outDecls.insert(outDecls.end(), {kOpDclOutput | (3u << 24), kDstOutputXyzw, inf.firstNewOutputReg + v});
+        outDecls.insert(outDecls.end(), {kOpDclOutput | (3u << 24), kDstOutputXyzw, inf.viewPositionReg + v});
+    if (opt.clip)
+        for (uint32_t v = 0; v < opt.extraViews; ++v)
+            outDecls.insert(outDecls.end(), {kOpDclOutput | (3u << 24), kDstOutputXyzw, inf.viewClipReg + v});
     std::vector<uint32_t> epilogue = {kOpMov | (5u << 24), kDstOutputXyzw, inf.positionReg, kSrcTempXyzw,
                                       inf.tempReg};
-    for (uint32_t v = 0; v < opt.extraViews; ++v)
+    if (opt.clip)  // view 0 keeps everything: mov o_clip.xyzw, l(1, 1, 1, 1)
+        epilogue.insert(epilogue.end(), {kOpMov | (8u << 24), kDstOutputXyzw, inf.clipReg, kSrcImm4, kFloatOne,
+                                         kFloatOne, kFloatOne, kFloatOne});
+    auto dp4Rows = [&](uint32_t dstReg, uint32_t firstRow) {
         for (uint32_t c = 0; c < 4; ++c)
-            epilogue.insert(epilogue.end(), {kOpDp4 | (8u << 24), DstOutputComp(c), inf.firstNewOutputReg + v,
-                                             kSrcCbXyzw, opt.cbSlot, 4 * v + c, kSrcTempXyzw, inf.tempReg});
+            epilogue.insert(epilogue.end(), {kOpDp4 | (8u << 24), DstOutputComp(c), dstReg, kSrcCbXyzw, opt.cbSlot,
+                                             firstRow + c, kSrcTempXyzw, inf.tempReg});
+    };
+    for (uint32_t v = 0; v < opt.extraViews; ++v) {
+        dp4Rows(inf.viewPositionReg + v, rows * v);
+        if (opt.clip) dp4Rows(inf.viewClipReg + v, rows * v + 4);
+    }
 
     // Pass 2: copy with insertions and operand rewrites.
     Walker w;
