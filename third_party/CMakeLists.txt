@@ -37,7 +37,8 @@ set(RMLUI_FONT_ENGINE "freetype" CACHE STRING "" FORCE)
 set(RMLUI_THIRDPARTY_CONTAINERS OFF CACHE BOOL "" FORCE)  # std containers: a settings window does not need the faster ones
 add_subdirectory(rmlui-6.3 EXCLUDE_FROM_ALL)
 
-# NVIDIA NVAPI R615 (MIT): headers and the static nvapi64.lib, for the Multi-View Rendering test (src/mvr_test).
+# NVIDIA NVAPI R615 (MIT): headers and the static nvapi64.lib, for the Multi-View Rendering test (src/mvr_test)
+# and the proxy's MVR vertex shader patch (src/proxy/mvr_vs.cpp; nvapi64.dll is loaded at run time).
 add_library(nvapi INTERFACE)
 target_include_directories(nvapi INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/nvapi-r615)
 target_link_libraries(nvapi INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/nvapi-r615/amd64/nvapi64.lib)

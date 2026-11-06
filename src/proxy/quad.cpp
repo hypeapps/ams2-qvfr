@@ -23,6 +23,7 @@
 #include "focus_geometry.h"
 #include "gpu.h"
 #include "hooks.h"
+#include "mvr_vs.h"
 #include "shots.h"
 #include "sun_fx.h"
 #include "taa_views.h"
@@ -2030,6 +2031,8 @@ void Install() {
         if (g_patched) clones::InstallEngineHooks();
         // Sun effects: the shader creation hook must be in place before the game makes its effect shaders.
         if (g_patched) sunfx::Install();
+        // MVR gate B6: the vertex shader hook must be in place before the game makes its scene shaders.
+        if (g_patched && Cfg().mvrVsPatch) mvrvs::Install();
         // TAA views: the target helper hook must be in place before the game makes its TAA (track load).
         if (g_patched) taaviews::Install();
         // Quad <-> outer only needs the focus tasks from the builder's "add task" calls and the executor patch.
@@ -2079,6 +2082,7 @@ void OnFrameStart() {
         HandleShotLocked();
         clones::OnFrameStart(gpu::Context(), g_clonesOn && g_focus.on);
         sunfx::OnFrameStart(gpu::Context(), g_sunOn && g_focus.on && !g_frameSkip);
+        mvrvs::OnFrameStart(gpu::Context());
         taaviews::OnFrameStart(g_taaOn && !g_frameSkip, g_shotFrame);
         dlaa::SetShotFrame(g_shotFrame);
     });
@@ -2301,6 +2305,7 @@ void LogStats(bool totals) {
         g_st = Stats{};
         clones::LogStats(totals);
         sunfx::LogStats(totals);
+        mvrvs::LogStats(totals);
         taaviews::LogStats(totals);
     });
 }
@@ -2333,10 +2338,10 @@ std::string Describe() {
                            : g_cull.failed ? "focus culling off after failed checks"
                            : g_cullOn      ? "focus culling on"
                                            : "focus culling off";
-        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s, %s, %s, %s, %s%s",
+        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s, %s, %s, %s, %s, %s%s",
                  g_installed ? "engine hooks on" : "engine hooks off", g_patched ? "on" : "off",
                  g_graph.ok ? "running" : "not running", focus, view, cull, clones::Describe().c_str(),
-                 sunfx::Describe().c_str(), taaviews::Describe().c_str(),
+                 sunfx::Describe().c_str(), taaviews::Describe().c_str(), mvrvs::Describe().c_str(),
                  g_fault ? ", stopped after an exception" : "");
     });
     return buf;

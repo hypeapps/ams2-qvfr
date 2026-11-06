@@ -137,6 +137,9 @@ struct Config {
     // Each shot also saves every focus clone as focus L left it (M7.4 diagnostics; the read-back stalls the game for
     // about 3 s).
     bool shotClones = false;
+    // NVIDIA Multi-View Rendering, gate B6 (mvr_vs.h): the game's vertex shaders patched and made through NVAPI, MVR
+    // off. Not in the default ini (development); a change needs a restart.
+    bool mvrVsPatch = false;
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
     bool dlaa = false;                // mode=dlaa (a change needs a restart)
