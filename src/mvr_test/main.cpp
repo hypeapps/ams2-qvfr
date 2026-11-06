@@ -8,6 +8,10 @@
 //
 // The performance case draws the same object list once per view (sequential passes, as the game does today) and once
 // with MVR, and reports the CPU time of the submission, the CPU time of the whole process and the GPU time.
+//
+// B4 cases take an ordinary single-view vertex shader, add the extra view positions with the DXBC patch
+// (src/dxbc/mvr_patch.h) and compare the image with the HLSL MVR shader pixel by pixel. --patch-dir runs the patch
+// over a folder of compiled vertex shaders (*.dxbc, e.g. dumped from a RenderDoc capture) and creates each result.
 
 #include <windows.h>
 #include <timeapi.h>
@@ -23,13 +27,20 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "dxbc.h"
+#include "mvr_patch.h"
+
 using Microsoft::WRL::ComPtr;
 
 namespace {
+
+bool g_verbose = false;
 
 void Log(const char* fmt, ...) {
     va_list ap;
@@ -179,6 +190,32 @@ const char* kRtIndexPs =
     "float4 main(float4 pos : SV_Position, uint rt : SV_RenderTargetArrayIndex) : SV_Target"
     " { return float4(rt * 64.0 / 255.0, 1, 0, 1); }\n";
 
+// B4: a single-view vertex shader shaped like the game's: more outputs, the position written in parts, read back
+// and written on two paths with their own ret.
+const char* kBranchyVs =
+    "cbuffer Views : register(b0) { float4 Rows[16]; };\n"
+    "cbuffer Obj : register(b1) { float4 Offset; };\n"
+    "struct VSOut { float4 pos : SV_Position; float4 col : COLOR0; float2 uv : TEXCOORD0; };\n"
+    "VSOut main(float4 pos : POSITION, uint id : SV_VertexID) {\n"
+    "  VSOut o; float4 p = pos + Offset;\n"
+    "  o.col = float4(id, 0, 0, 1); o.uv = p.xy;\n"
+    "  [branch] if (id == 5) {\n"
+    "    o.pos = float4(dot(Rows[0], p), dot(Rows[1], p), dot(Rows[2], p), dot(Rows[3], p));\n"
+    "    return o;\n"
+    "  }\n"
+    "  o.pos.xy = float2(dot(Rows[0], p), dot(Rows[1], p));\n"
+    "  o.uv += o.pos.xy;\n"
+    "  o.pos.zw = float2(dot(Rows[2], p), dot(Rows[3], p));\n"
+    "  return o;\n"
+    "}\n";
+const char* kBranchyRtIndexPs =
+    "struct PSIn { float4 pos : SV_Position; float4 col : COLOR0; float2 uv : TEXCOORD0;"
+    " uint rt : SV_RenderTargetArrayIndex; };\n"
+    "float4 main(PSIn i) : SV_Target { return float4(i.rt * 64.0 / 255.0, 1, 0, 1); }\n";
+
+// Constant buffer slot of the patch matrices in the B4 cases (the test shaders use b0 and b1).
+constexpr UINT kPatchCbSlot = 2;
+
 struct Shaders {
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> ps;
@@ -238,6 +275,53 @@ bool CreateMvrShaders(Gpu& g, int views, bool viewportMask, ViewIdMode idMode, S
         Log("  CreatePixelShader failed\n");
         return false;
     }
+    const D3D11_INPUT_ELEMENT_DESC ie = {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
+                                         D3D11_INPUT_PER_VERTEX_DATA, 0};
+    return SUCCEEDED(
+        g.dev->CreateInputLayout(&ie, 1, vsCode->GetBufferPointer(), vsCode->GetBufferSize(), &out.layout));
+}
+
+// Which vertex shader a case uses: the HLSL MVR shader, or a single-view shader patched in DXBC (B4).
+enum class VsKind { Hlsl, PatchedPlain, PatchedBranchy };
+
+bool CreateVsEx(Gpu& g, const void* code, size_t size, ComPtr<ID3D11VertexShader>& vs) {
+    NV_CUSTOM_SEMANTIC sem;
+    SetSemantic(sem, NV_POSITION_SEMANTIC, "NV_POSITION");
+    NvAPI_D3D11_CREATE_VERTEX_SHADER_EX args = {};
+    args.version = NVAPI_D3D11_CREATEVERTEXSHADEREX_VERSION;
+    args.NumCustomSemantics = 1;
+    args.pCustomSemantics = &sem;
+    const NvAPI_Status st = NvAPI_D3D11_CreateVertexShaderEx(g.dev.Get(), code, size, nullptr, &args, &vs);
+    if (st != NVAPI_OK || !vs) {
+        Log("  NvAPI_D3D11_CreateVertexShaderEx failed: %s\n", NvErr(st).c_str());
+        return false;
+    }
+    return true;
+}
+
+bool CreatePatchedShaders(Gpu& g, int views, VsKind kind, bool rtIndexPs, Shaders& out) {
+    auto vsCode = Compile(kind == VsKind::PatchedBranchy ? kBranchyVs : kPlainVs, "vs_5_0", "patched_vs");
+    auto psCode = Compile(kind == VsKind::PatchedBranchy ? kBranchyRtIndexPs
+                          : rtIndexPs                    ? kRtIndexPs
+                                                         : kPlainPs,
+                          "ps_5_0", "patched_ps");
+    if (!vsCode || !psCode) return false;
+    qvfr::dxbc::MvrVsPatchOptions opt;
+    opt.cbSlot = kPatchCbSlot;
+    opt.extraViews = static_cast<uint32_t>(views - 1);
+    std::vector<uint8_t> patched;
+    qvfr::dxbc::MvrVsPatchInfo info;
+    std::string err;
+    if (!qvfr::dxbc::PatchVsForMvr(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), opt, patched, &info, &err)) {
+        Log("  patch failed: %s\n", err.c_str());
+        return false;
+    }
+    Log("  patch: position o%u -> r%u (%u writes), %u epilogue(s), new outputs from o%u, %zu -> %zu bytes\n",
+        info.positionReg, info.tempReg, info.rewrittenOperands, info.returns, info.firstNewOutputReg,
+        static_cast<size_t>(vsCode->GetBufferSize()), patched.size());
+    if (!CreateVsEx(g, patched.data(), patched.size(), out.vs)) return false;
+    if (FAILED(g.dev->CreatePixelShader(psCode->GetBufferPointer(), psCode->GetBufferSize(), nullptr, &out.ps)))
+        return false;
     const D3D11_INPUT_ELEMENT_DESC ie = {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
                                          D3D11_INPUT_PER_VERTEX_DATA, 0};
     return SUCCEEDED(
@@ -436,37 +520,35 @@ struct CaseCfg {
     int samples;
     ViewIdMode idMode;
     bool enableMvr;  // false: MVR shaders, but multi-view mode stays off (only view 0 must appear)
+    VsKind vs = VsKind::Hlsl;
 };
 
-bool RunCase(Gpu& g, const CaseCfg& c) {
-    constexpr int kW = 256, kH = 256;
-    static const char* kIdNames[] = {"none",
-                                     "attribute, VS NV_POSITION+NV_VIEWID, PS NV_VIEWID",
-                                     "attribute, VS NV_POSITION+NV_VIEWID, plain PS",
-                                     "attribute, VS NV_POSITION+NV_VIEWID, PS NV_POSITION",
-                                     "attribute, VS NV_POSITION, PS NV_POSITION",
-                                     "attribute, VS NV_POSITION, plain PS",
-                                     "SV_RenderTargetArrayIndex in PS"};
-    Log("\n[%s] views=%d layout=%s samples=%d view id=%s mvr=%s\n", c.name, c.views,
-        c.viewportMask ? "viewports" : "array-slices", c.samples, kIdNames[static_cast<int>(c.idMode)],
-        c.enableMvr ? "on" : "off");
+constexpr int kW = 256, kH = 256;
+
+// Draws the rectangle with the case's shaders and returns one image per slice.
+bool DrawCase(Gpu& g, const CaseCfg& c, std::vector<std::vector<uint32_t>>& img, Target& t) {
     Shaders sh;
-    if (!CreateMvrShaders(g, c.views, c.viewportMask, c.idMode, sh)) {
+    const bool ok = c.vs == VsKind::Hlsl
+                        ? CreateMvrShaders(g, c.views, c.viewportMask, c.idMode, sh)
+                        : CreatePatchedShaders(g, c.views, c.vs, c.idMode == ViewIdMode::RtIndex, sh);
+    if (!ok) {
         DrainDebugMessages(g);
-        Log("  RESULT: FAIL (shader creation)\n");
+        Log("  shader creation failed\n");
         return false;
     }
-    Target t;
     if (!MakeTarget(g, c.viewportMask ? kW * c.views : kW, kH, c.viewportMask ? 1 : c.views, c.samples, t)) {
-        Log("  RESULT: FAIL (target creation)\n");
+        Log("  target creation failed\n");
         return false;
     }
     const float verts[6][4] = {{kRectX0, kRectY0, 0.5f, 1}, {kRectX0, kRectY1, 0.5f, 1}, {kRectX1, kRectY1, 0.5f, 1},
                                {kRectX0, kRectY0, 0.5f, 1}, {kRectX1, kRectY1, 0.5f, 1}, {kRectX1, kRectY0, 0.5f, 1}};
     auto vb = MakeBuffer(g, sizeof(verts), D3D11_BIND_VERTEX_BUFFER, D3D11_USAGE_IMMUTABLE, verts);
-    float rows[64] = {};  // Rows[v*4 + r] = row r of view v
+    // HLSL shaders: Rows[v*4 + r] = row r of view v. The patched shaders read only view 0 from there and get
+    // M_n = (view n) * (view 0)^-1 in the patch buffer; view 0 is the identity, so M_n is view n.
+    float rows[64] = {};
     for (int v = 0; v < 4; ++v) ViewRows(kViews[v], &rows[v * 16]);
     auto viewCb = MakeBuffer(g, sizeof(rows), D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_IMMUTABLE, rows);
+    auto patchCb = MakeBuffer(g, sizeof(rows) - 64, D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_IMMUTABLE, rows + 16);
     const float zero[4] = {};
     auto objCb = MakeBuffer(g, sizeof(zero), D3D11_BIND_CONSTANT_BUFFER, D3D11_USAGE_IMMUTABLE, zero);
     auto rs = NoCull(g);
@@ -476,8 +558,8 @@ bool RunCase(Gpu& g, const CaseCfg& c) {
     g.ctx->IASetInputLayout(sh.layout.Get());
     g.ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g.ctx->IASetVertexBuffers(0, 1, vb.GetAddressOf(), &stride, &offset);
-    ID3D11Buffer* cbs[2] = {viewCb.Get(), objCb.Get()};
-    g.ctx->VSSetConstantBuffers(0, 2, cbs);
+    ID3D11Buffer* cbs[3] = {viewCb.Get(), objCb.Get(), patchCb.Get()};
+    g.ctx->VSSetConstantBuffers(0, c.vs == VsKind::Hlsl ? 2 : kPatchCbSlot + 1, cbs);
     g.ctx->VSSetShader(sh.vs.Get(), nullptr, 0);
     g.ctx->PSSetShader(sh.ps.Get(), nullptr, 0);
     g.ctx->RSSetState(rs.Get());
@@ -497,8 +579,28 @@ bool RunCase(Gpu& g, const CaseCfg& c) {
     if (c.enableMvr) SetMultiView(g, 1, false, false);
     g.ctx->Flush();
     DrainDebugMessages(g);
+    img = Readback(g, t);
+    return true;
+}
 
-    auto img = Readback(g, t);
+bool RunCase(Gpu& g, const CaseCfg& c) {
+    static const char* kIdNames[] = {"none",
+                                     "attribute, VS NV_POSITION+NV_VIEWID, PS NV_VIEWID",
+                                     "attribute, VS NV_POSITION+NV_VIEWID, plain PS",
+                                     "attribute, VS NV_POSITION+NV_VIEWID, PS NV_POSITION",
+                                     "attribute, VS NV_POSITION, PS NV_POSITION",
+                                     "attribute, VS NV_POSITION, plain PS",
+                                     "SV_RenderTargetArrayIndex in PS"};
+    static const char* kVsNames[] = {"HLSL MVR", "patched plain", "patched branchy"};
+    Log("\n[%s] views=%d layout=%s samples=%d view id=%s mvr=%s vs=%s\n", c.name, c.views,
+        c.viewportMask ? "viewports" : "array-slices", c.samples, kIdNames[static_cast<int>(c.idMode)],
+        c.enableMvr ? "on" : "off", kVsNames[static_cast<int>(c.vs)]);
+    std::vector<std::vector<uint32_t>> img;
+    Target t;
+    if (!DrawCase(g, c, img, t)) {
+        Log("  RESULT: FAIL (setup)\n");
+        return false;
+    }
     bool ok = true;
     for (int v = 0; v < c.views; ++v) {
         std::set<int> ids;
@@ -517,8 +619,168 @@ bool RunCase(Gpu& g, const CaseCfg& c) {
         ok = ok && boxOk;
         ok = ok && idOk;
     }
+    if (c.vs != VsKind::Hlsl) {
+        // The patched shader must give exactly the image of the HLSL MVR shader with the same pixel shader output.
+        CaseCfg ref = c;
+        ref.vs = VsKind::Hlsl;
+        std::vector<std::vector<uint32_t>> refImg;
+        Target refT;
+        Log("  reference (HLSL MVR shader):\n");
+        if (!DrawCase(g, ref, refImg, refT)) {
+            Log("  RESULT: FAIL (reference)\n");
+            return false;
+        }
+        size_t diff = 0, total = 0;
+        for (size_t s = 0; s < img.size(); ++s)
+            for (size_t i = 0; i < img[s].size(); ++i, ++total) diff += img[s][i] != refImg[s][i];
+        Log("  vs HLSL MVR shader: %zu of %zu pixels differ -> %s\n", diff, total, diff == 0 ? "OK" : "WRONG");
+        ok = ok && diff == 0;
+    }
     Log("  RESULT: %s\n", ok ? "PASS" : "FAIL");
     return ok;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// B4: DXBC patch checks without drawing
+
+std::vector<uint8_t> BlobBytes(ID3DBlob* b) {
+    const auto* p = static_cast<const uint8_t*>(b->GetBufferPointer());
+    return std::vector<uint8_t>(p, p + b->GetBufferSize());
+}
+
+// Checksum and rebuild against compiler output, and the patched output signature against the HLSL MVR shader's.
+bool RunPatchChecks() {
+    Log("\n[DXBC patch checks]\n");
+    bool ok = true;
+    const struct {
+        const char* name;
+        std::string src;
+        const char* target;
+    } shaders[] = {{"plain VS", kPlainVs, "vs_5_0"},
+                   {"branchy VS", kBranchyVs, "vs_5_0"},
+                   {"MVR VS, 2 views", MvrVsSource(2, false, false), "vs_5_0"},
+                   {"MVR VS, 4 views", MvrVsSource(4, false, false), "vs_5_0"},
+                   {"plain VS (vs_4_0)", kPlainVs, "vs_4_0"},
+                   {"plain PS", kPlainPs, "ps_5_0"}};
+    for (const auto& s : shaders) {
+        auto code = Compile(s.src, s.target, s.name);
+        if (!code) return false;
+        const auto bytes = BlobBytes(code.Get());
+        const bool sumOk = qvfr::dxbc::ChecksumMatches(bytes.data(), bytes.size());
+        std::vector<qvfr::dxbc::Chunk> chunks;
+        std::string err;
+        const bool parsed = qvfr::dxbc::Parse(bytes.data(), bytes.size(), chunks, &err);
+        const bool rebuildOk = parsed && qvfr::dxbc::Build(chunks) == bytes;
+        Log("  %-20s %5zu bytes, %zu chunks: checksum %s, rebuild %s\n", s.name, bytes.size(), chunks.size(),
+            sumOk ? "OK" : "WRONG", rebuildOk ? "identical" : ("DIFFERENT " + err).c_str());
+        ok = ok && sumOk && rebuildOk;
+    }
+
+    // The patched output signature must declare the extra views as the compiler does for the HLSL MVR shader.
+    for (int views : {2, 4}) {
+        auto plain = Compile(kPlainVs, "vs_5_0", "plain_vs");
+        auto ref = Compile(MvrVsSource(views, false, false), "vs_5_0", "mvr_vs");
+        if (!plain || !ref) return false;
+        qvfr::dxbc::MvrVsPatchOptions opt;
+        opt.cbSlot = kPatchCbSlot;
+        opt.extraViews = static_cast<uint32_t>(views - 1);
+        std::vector<uint8_t> patched;
+        std::string err;
+        if (!qvfr::dxbc::PatchVsForMvr(plain->GetBufferPointer(), plain->GetBufferSize(), opt, patched, nullptr,
+                                       &err)) {
+            Log("  patch failed: %s\n", err.c_str());
+            return false;
+        }
+        auto sig = [](const void* p, size_t n) {
+            std::vector<qvfr::dxbc::Chunk> ch;
+            std::vector<qvfr::dxbc::SigElement> el;
+            qvfr::dxbc::Parse(p, n, ch, nullptr);
+            if (auto* o = qvfr::dxbc::Find(ch, qvfr::dxbc::FourCC('O', 'S', 'G', 'N')))
+                qvfr::dxbc::ReadSignature(*o, el, nullptr);
+            return el;
+        };
+        const auto a = sig(patched.data(), patched.size()), b = sig(ref->GetBufferPointer(), ref->GetBufferSize());
+        bool same = a.size() == b.size();
+        for (size_t i = 0; same && i < a.size(); ++i)
+            same = a[i].name == b[i].name && a[i].semanticIndex == b[i].semanticIndex &&
+                   a[i].systemValue == b[i].systemValue && a[i].componentType == b[i].componentType &&
+                   a[i].reg == b[i].reg && a[i].mask == b[i].mask && a[i].rwMask == b[i].rwMask;
+        Log("  output signature, %d views: %s\n", views, same ? "same as HLSL MVR shader" : "DIFFERENT");
+        if (!same) {
+            for (const auto* list : {&a, &b}) {
+                Log("    %s:\n", list == &a ? "patched" : "HLSL");
+                for (const auto& e : *list)
+                    Log("      %s%u sv=%u type=%u o%u mask=%x rw=%x\n", e.name.c_str(), e.semanticIndex, e.systemValue,
+                        e.componentType, e.reg, e.mask, e.rwMask);
+            }
+        }
+        ok = ok && same;
+        if (views == 2 && g_verbose) {
+            ComPtr<ID3DBlob> dis;
+            if (SUCCEEDED(D3DDisassemble(patched.data(), patched.size(), 0, nullptr, &dis)))
+                Log("  patched plain VS, 2 views:\n%s\n", static_cast<const char*>(dis->GetBufferPointer()));
+            else
+                Log("  D3DDisassemble of the patched shader failed\n");
+        }
+    }
+    Log("  RESULT: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+// Patches every *.dxbc vertex shader in a folder and creates the result; writes the disassembly of each patched
+// shader to outDir when given.
+int RunPatchDir(Gpu& g, const std::string& dir, uint32_t slot, const std::string& outDir) {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> files;
+    for (const auto& e : fs::directory_iterator(dir))
+        if (e.path().extension() == ".dxbc") files.push_back(e.path());
+    std::sort(files.begin(), files.end());
+    if (!outDir.empty()) fs::create_directories(outDir);
+    Log("\n[patch dir] %zu shaders in %s, constant buffer slot %u\n", files.size(), dir.c_str(), slot);
+    int okCount = 0, skipped = 0;
+    for (const auto& f : files) {
+        std::ifstream in(f, std::ios::binary);
+        std::vector<uint8_t> code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const std::string name = f.filename().string();
+        if (code.size() < 8 || (code[0] != 'D' || code[1] != 'X')) {
+            Log("  %s: not DXBC, skipped\n", name.c_str());
+            ++skipped;
+            continue;
+        }
+        const bool sumOk = qvfr::dxbc::ChecksumMatches(code.data(), code.size());
+        ComPtr<ID3D11VertexShader> orig;
+        const bool origOk = SUCCEEDED(g.dev->CreateVertexShader(code.data(), code.size(), nullptr, &orig));
+        qvfr::dxbc::MvrVsPatchOptions opt;
+        opt.cbSlot = slot;
+        std::vector<uint8_t> patched;
+        qvfr::dxbc::MvrVsPatchInfo info;
+        std::string err;
+        if (!qvfr::dxbc::PatchVsForMvr(code.data(), code.size(), opt, patched, &info, &err)) {
+            Log("  %s: checksum %s, original %s, PATCH FAILED: %s\n", name.c_str(), sumOk ? "ok" : "WRONG",
+                origOk ? "ok" : "REJECTED", err.c_str());
+            continue;
+        }
+        ComPtr<ID3D11VertexShader> vs;
+        const bool exOk = CreateVsEx(g, patched.data(), patched.size(), vs);
+        ComPtr<ID3DBlob> dis;
+        const bool disOk = SUCCEEDED(D3DDisassemble(patched.data(), patched.size(), 0, nullptr, &dis));
+        if (disOk && !outDir.empty()) {
+            std::ofstream o(fs::path(outDir) / (f.stem().string() + ".patched.txt"));
+            o.write(static_cast<const char*>(dis->GetBufferPointer()),
+                    static_cast<std::streamsize>(strnlen(static_cast<const char*>(dis->GetBufferPointer()),
+                                                         dis->GetBufferSize())));
+        }
+        const bool ok = sumOk && origOk && exOk && disOk;
+        okCount += ok;
+        if (!ok || g_verbose)
+            Log("  %s: checksum %s, original %s, patch o%u->r%u (%u writes, %u ret), CreateVertexShaderEx %s, "
+                "disassembly %s\n",
+                name.c_str(), sumOk ? "ok" : "WRONG", origOk ? "ok" : "REJECTED", info.positionReg, info.tempReg,
+                info.rewrittenOperands, info.returns, exOk ? "ok" : "FAILED", disOk ? "ok" : "FAILED");
+    }
+    DrainDebugMessages(g);
+    Log("  patched and created: %d of %zu (%d skipped)\n", okCount, files.size() - skipped, skipped);
+    return okCount == static_cast<int>(files.size()) - skipped ? 0 : 1;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -715,14 +977,23 @@ bool HasArg(int argc, char** argv, const char* name) {
     return false;
 }
 
+std::string ArgStr(int argc, char** argv, const char* name) {
+    for (int i = 1; i + 1 < argc; ++i)
+        if (strcmp(argv[i], name) == 0) return argv[i + 1];
+    return {};
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (HasArg(argc, argv, "--help")) {
-        Log("qvfr_mvr_test [--debug] [--skip-perf] [--draws N] [--tris N] [--frames N] [--width N] [--height N]\n");
+        Log("qvfr_mvr_test [--debug] [--verbose] [--case N] [--include-hang] [--skip-perf] [--draws N] [--tris N]\n"
+            "              [--frames N] [--width N] [--height N]\n"
+            "qvfr_mvr_test --patch-dir DIR [--patch-slot N] [--patch-out DIR] [--verbose]\n");
         return 0;
     }
     const bool debug = HasArg(argc, argv, "--debug");
+    g_verbose = HasArg(argc, argv, "--verbose");
     timeBeginPeriod(1);
 
     NvAPI_Status st = NvAPI_Initialize();
@@ -748,6 +1019,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    const std::string patchDir = ArgStr(argc, argv, "--patch-dir");
+    if (!patchDir.empty())
+        return RunPatchDir(g, patchDir, static_cast<uint32_t>(ArgInt(argc, argv, "--patch-slot", 3)),
+                           ArgStr(argc, argv, "--patch-out"));
+
     // Correctness, simplest first. Every case gets a fresh device, so a GPU hang in one does not hide the others.
     const CaseCfg cases[] = {
         {"MVR shader, mode off", 2, false, 1, ViewIdMode::None, false},
@@ -763,10 +1039,19 @@ int main(int argc, char** argv) {
         {"view id: render target index", 2, false, 1, ViewIdMode::RtIndex, true},
         {"view id: render target index, 4 views, MSAA 8x", 4, false, 8, ViewIdMode::RtIndex, true},
         {"view id: VS gen, PS gen (hangs)", 2, false, 1, ViewIdMode::AttrVsGenPsGen, true},
+        {"B4 patched VS, mode off", 2, false, 1, ViewIdMode::RtIndex, false, VsKind::PatchedPlain},
+        {"B4 patched VS, 2 views", 2, false, 1, ViewIdMode::RtIndex, true, VsKind::PatchedPlain},
+        {"B4 patched VS, 4 views, MSAA 8x", 4, false, 8, ViewIdMode::RtIndex, true, VsKind::PatchedPlain},
+        {"B4 patched branchy VS, 2 views", 2, false, 1, ViewIdMode::RtIndex, true, VsKind::PatchedBranchy},
+        {"B4 patched branchy VS, 4 views, MSAA 8x", 4, false, 8, ViewIdMode::RtIndex, true, VsKind::PatchedBranchy},
     };
     const int only = ArgInt(argc, argv, "--case", -1);
     const bool includeHang = HasArg(argc, argv, "--include-hang");
     int passed = 0, run = 0;
+    if (only < 0) {
+        passed += RunPatchChecks() ? 1 : 0;
+        ++run;
+    }
     for (int i = 0; i < static_cast<int>(std::size(cases)); ++i) {
         if (only >= 0 && i != only) continue;
         if (cases[i].idMode == ViewIdMode::AttrVsGenPsGen && !includeHang && only != i) continue;
