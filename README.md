@@ -88,7 +88,7 @@ mod in `x64\qvfr\`.
   the game's own anti-aliasing stays.
 - **Turn it on:** `qvfr_config.exe` → **Settings** → **Anti-aliasing** → **NVIDIA DLAA**, then restart the game. Off by
   default.
-- **DLSS preset:** the DLSS model (J, K, L, M; K is NVIDIA's default for DLAA).
+- **DLSS preset:** the DLSS model (J, K, L, M).
 - **DLSS exposure:** fixed (default 0.002) keeps the brightness of lights and reflections; auto lets DLSS measure it,
   which dims them, most at night. Lower fixed values keep brighter highlights.
 - Dashboard displays and mirrors keep the game's TAA, because DLSS leaves trails behind changing digits
