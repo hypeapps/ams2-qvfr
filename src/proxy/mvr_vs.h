@@ -26,6 +26,10 @@ bool Install();
 // that the game's device calls the hooked CreateVertexShader.
 void OnFrameStart(ID3D11DeviceContext* ctx);
 
+// Any thread: whether `vs` is a patched shader this module gave the game (false for null). `sum`: the DXBC checksum
+// of the shader the game asked for (patched or not, "" when this module did not see it), 40 bytes.
+bool IsPatched(ID3D11VertexShader* vs, char* sum = nullptr);
+
 std::string Describe();      // one part of the summary line
 void LogStats(bool totals);  // a stats line when something changed, and at the end with the refusal reasons
 

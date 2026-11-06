@@ -14,6 +14,7 @@
 
 #include "common.h"
 #include "hooks.h"
+#include "mvr_pass.h"
 
 #pragma intrinsic(_ReturnAddress)
 
@@ -1381,6 +1382,13 @@ void STDMETHODCALLTYPE D_OMSetRtUav(ID3D11DeviceContext* c, UINT nr, ID3D11Rende
         dsv = MapView(c, dsv, m, caller);
     }
     if (nu != D3D11_KEEP_UNORDERED_ACCESS_VIEWS) uav = MapViews(c, uav, nu, tuav, m, caller);
+    // MVR gate B7: its copies during the test run.
+    ID3D11RenderTargetView* mrtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    ID3D11DepthStencilView* mdsv = nullptr;
+    if (targets && nr <= D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT && mvrpass::MapTargets(c, nr, rtv, dsv, mrtv, &mdsv)) {
+        rtv = mrtv;
+        dsv = mdsv;
+    }
     if (Watching()) {
         if (targets) {
             ObserveViews(c, Write, m, rtv, nr, caller);
@@ -1437,11 +1445,13 @@ void STDMETHODCALLTYPE D_Resolve(ID3D11DeviceContext* c, ID3D11Resource* dst, UI
 void STDMETHODCALLTYPE D_ClearRtv(ID3D11DeviceContext* c, ID3D11RenderTargetView* v, const FLOAT col[4]) {
     v = MapView(c, v, "ClearRenderTargetView", _ReturnAddress());
     if (Watching()) ObserveViews(c, Write, "ClearRenderTargetView", &v, 1, _ReturnAddress());
+    v = mvrpass::MapClear(c, v);  // MVR gate B7: its copy during the test run
     o_clearRtv(c, v, col);
 }
 void STDMETHODCALLTYPE D_ClearDsv(ID3D11DeviceContext* c, ID3D11DepthStencilView* v, UINT f, FLOAT d, UINT8 s) {
     v = MapView(c, v, "ClearDepthStencilView", _ReturnAddress());
     if (Watching()) ObserveViews(c, Write, "ClearDepthStencilView", &v, 1, _ReturnAddress());
+    v = mvrpass::MapClear(c, v);
     o_clearDsv(c, v, f, d, s);
 }
 void STDMETHODCALLTYPE D_ClearUavU(ID3D11DeviceContext* c, ID3D11UnorderedAccessView* v, const UINT val[4]) {

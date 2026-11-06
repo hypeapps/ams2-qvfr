@@ -10,6 +10,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -58,6 +59,14 @@ struct DeviceInfo {
     bool mvr;
 };
 std::vector<DeviceInfo> g_devices;
+// Every shader made through the hook: patched or not, and its DXBC checksum (gate B7 counts the draws by it). A new
+// shader at the address of a released one replaces its entry.
+struct ShaderInfo {
+    bool patched;
+    char sum[40];
+};
+std::mutex g_sm;
+std::unordered_map<void*, ShaderInfo> g_shaders;
 
 std::string NvErr(NvAPI_Status s) {
     NvAPI_ShortString msg = {};
@@ -215,9 +224,19 @@ HRESULT STDMETHODCALLTYPE D_CreateVertexShader(ID3D11Device* dev, const void* co
     t_inside = true;
     Protect("CreateVertexShader", [&] { vs = MakePatched(dev, code, len, link, out, caller); });
     t_inside = false;
-    if (!vs) return o_createVs(dev, code, len, link, out);
-    *out = vs;
-    return S_OK;
+    const bool patched = vs != nullptr;
+    HRESULT hr = S_OK;
+    if (patched)
+        *out = vs;
+    else
+        hr = o_createVs(dev, code, len, link, out);
+    if (SUCCEEDED(hr) && out && *out && code && len) {
+        ShaderInfo info{patched, {}};
+        SumText(code, len, info.sum);
+        std::lock_guard lock(g_sm);
+        g_shaders[*out] = info;
+    }
+    return hr;
 }
 
 bool Hook(ID3D11Device* dev) {
@@ -309,6 +328,16 @@ void OnFrameStart(ID3D11DeviceContext* ctx) {
                 fn, g_target);
         dev->Release();
     });
+}
+
+bool IsPatched(ID3D11VertexShader* vs, char* sum) {
+    if (sum) sum[0] = 0;
+    if (!vs) return false;
+    std::lock_guard lock(g_sm);
+    auto it = g_shaders.find(vs);
+    if (it == g_shaders.end()) return false;
+    if (sum) memcpy(sum, it->second.sum, sizeof(it->second.sum));
+    return it->second.patched;
 }
 
 std::string Describe() {

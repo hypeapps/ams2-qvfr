@@ -392,16 +392,18 @@ Config ReadConfig(const fs::path& ini) {
     c.clonesBindFix = IniInt(ini, L"debug", L"clones_bind_fix", 1) != 0;
     c.shotClones = IniInt(ini, L"debug", L"shot_clones", 0) != 0;
     c.mvrVsPatch = IniInt(ini, L"debug", L"mvr_vs_patch", 0) != 0;
+    c.mvrGbufferTest = IniInt(ini, L"debug", L"mvr_gbuffer_test", 0) != 0;
     if (c.quadMode == QuadMode::Quad)
         Log("Settings: [debug] overlay=%d overlay_modifier=0x%X overlay_key=0x%X freeze_modifier=0x%X freeze_key=0x%X "
             "outer_modifier=0x%X outer_key=0x%X gaze_modifier=0x%X gaze_key=0x%X clones=%d clones_modifier=0x%X "
             "clones_key=0x%X clones_viewport_fix=%d clones_bind_fix=%d shot_clones=%d focus_cull=%d cull_modifier=0x%X "
             "cull_key=0x%X sun_effects=%d sun_effects_modifier=0x%X sun_effects_key=0x%X taa_views=%d "
-            "taa_views_modifier=0x%X taa_views_key=0x%X task_profile=%d mvr_vs_patch=%d",
+            "taa_views_modifier=0x%X taa_views_key=0x%X task_profile=%d mvr_vs_patch=%d "
+            "mvr_gbuffer_test=%d",
             c.overlay, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey,
             c.gazeKeyMod, c.gazeKey, c.clones, c.clonesKeyMod, c.clonesKey, c.clonesViewportFix, c.clonesBindFix,
             c.shotClones, c.focusCull, c.cullKeyMod, c.cullKey, c.sunEffects, c.sunKeyMod, c.sunKey, c.taaViews,
-            c.taaViewsKeyMod, c.taaViewsKey, c.taskProfile, c.mvrVsPatch);
+            c.taaViewsKeyMod, c.taaViewsKey, c.taskProfile, c.mvrVsPatch, c.mvrGbufferTest);
     const std::string dlaa = IniString(ini, L"dlaa", L"mode", L"off");
     c.dlaa = dlaa == "dlaa";
     if (dlaa != "off" && dlaa != "dlaa") Log("Settings: unknown [dlaa] mode=\"%s\", using off", dlaa.c_str());
@@ -513,6 +515,7 @@ bool ReloadConfig() {
     need(n.probeFrames != c.probeFrames || n.probeEngine != c.probeEngine || n.probeD3D != c.probeD3D, "[quad] probe_*");
     need(n.dlaa != c.dlaa, "[dlaa] mode");
     need(n.mvrVsPatch != c.mvrVsPatch, "[debug] mvr_vs_patch");
+    need(n.mvrGbufferTest != c.mvrGbufferTest, "[debug] mvr_gbuffer_test");
     c.dlaaPreset = n.dlaaPreset;
     c.dlaaJitterScaleX = n.dlaaJitterScaleX;
     c.dlaaJitterScaleY = n.dlaaJitterScaleY;

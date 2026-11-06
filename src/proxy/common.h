@@ -140,6 +140,9 @@ struct Config {
     // NVIDIA Multi-View Rendering, gate B6 (mvr_vs.h): the game's vertex shaders patched and made through NVAPI, MVR
     // off. Not in the default ini (development); a change needs a restart.
     bool mvrVsPatch = false;
+    // Gate B7 (mvr_pass.h): with mvr_vs_patch, each shot also runs outer L's G-buffer pass once more with MVR into
+    // two-slice copies of its targets (view 1 = focus L in the corner of slice 1). Not in the default ini.
+    bool mvrGbufferTest = false;
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
     bool dlaa = false;                // mode=dlaa (a change needs a restart)

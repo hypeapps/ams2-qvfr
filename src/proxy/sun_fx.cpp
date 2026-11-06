@@ -9,6 +9,7 @@
 #include "common.h"
 #include "gpu.h"
 #include "hooks.h"
+#include "mvr_pass.h"
 #include "sun_fx_ps.h"  // kSunFxPS (fxc from shaders/sun_fx.hlsl)
 #include "sun_fx_vs.h"  // kSunFxVS
 #include "taa_views.h"
@@ -584,11 +585,13 @@ void STDMETHODCALLTYPE D_DrawIndexed(ID3D11DeviceContext* c, UINT count, UINT st
     if (const DrawReplaceFn replace = g_drawReplace.load(std::memory_order_relaxed); replace && replace(c, count))
         return;  // DLSS replaced the game's TAA resolve
     const bool taaFix = taaviews::OnDraw(c, true, count);
+    const bool mvr = mvrpass::BeforeDraw(c);
     int g = -1;
     Action a = Forward;
     if (Active(c, g))
         Protect("DrawIndexed", [&] { a = OnDraw(c, g, [&] { o_drawIndexed(c, count, start, base); }); });
     if (a == Forward) o_drawIndexed(c, count, start, base);
+    if (mvr) mvrpass::AfterDraw(c);
     if (taaFix) taaviews::AfterDraw(c);
     if (const AfterFn after = g_drawAfter.load(std::memory_order_relaxed)) after(c);
 }
@@ -599,10 +602,12 @@ void STDMETHODCALLTYPE D_Draw(ID3D11DeviceContext* c, UINT count, UINT start) {
         return;
     }
     const bool taaFix = taaviews::OnDraw(c, false, count);
+    const bool mvr = mvrpass::BeforeDraw(c);
     int g = -1;
     Action a = Forward;
     if (Active(c, g)) Protect("Draw", [&] { a = OnDraw(c, g, [&] { o_draw(c, count, start); }); });
     if (a == Forward) o_draw(c, count, start);
+    if (mvr) mvrpass::AfterDraw(c);
     if (taaFix) taaviews::AfterDraw(c);
 }
 

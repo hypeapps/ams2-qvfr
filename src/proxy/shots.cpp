@@ -375,15 +375,15 @@ bool Begin(const char* const* names, int count, const Pair* pairs, int pairCount
 
 bool Active() { return g_active; }
 
-bool Grab(ID3D11DeviceContext* ctx, ID3D11Resource* src, int index) {
+bool Grab(ID3D11DeviceContext* ctx, ID3D11Resource* src, int index, UINT slice) {
     if (!g_active || !ctx || !src || index < 0 || index >= g_count || g_staging[index]) return false;
     ComPtr<ID3D11Texture2D> tex;
     if (FAILED(src->QueryInterface(IID_PPV_ARGS(&tex)))) return false;
     D3D11_TEXTURE2D_DESC d{};
     tex->GetDesc(&d);
-    if (d.SampleDesc.Count != 1 || !Supported(d.Format)) {
-        Log("Shot: %s: texture %u x %u format %d samples %u is not supported", g_names[index], d.Width, d.Height,
-            (int)d.Format, d.SampleDesc.Count);
+    if (d.SampleDesc.Count != 1 || !Supported(d.Format) || slice >= d.ArraySize) {
+        Log("Shot: %s: texture %u x %u format %d samples %u (slice %u of %u) is not supported", g_names[index], d.Width,
+            d.Height, (int)d.Format, d.SampleDesc.Count, slice, d.ArraySize);
         return false;
     }
     ComPtr<ID3D11Device> dev;
@@ -393,14 +393,23 @@ bool Grab(ID3D11DeviceContext* ctx, ID3D11Resource* src, int index) {
     s.BindFlags = 0;
     s.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     s.MiscFlags = 0;
+    const bool whole = d.ArraySize == 1;  // else one slice, mip 0
+    if (!whole) {
+        s.ArraySize = 1;
+        s.MipLevels = 1;
+    }
     HRESULT hr = dev ? dev->CreateTexture2D(&s, nullptr, &g_staging[index]) : E_FAIL;
     if (FAILED(hr)) {
         Log("Shot: %s: cannot create a staging texture %u x %u (0x%08lX)", g_names[index], d.Width, d.Height,
             (unsigned long)hr);
         return false;
     }
-    g_desc[index] = d;
-    ctx->CopyResource(g_staging[index].Get(), src);
+    g_desc[index] = s;
+    if (whole)
+        ctx->CopyResource(g_staging[index].Get(), src);
+    else
+        ctx->CopySubresourceRegion(g_staging[index].Get(), 0, 0, 0, 0, src, D3D11CalcSubresource(0, slice, d.MipLevels),
+                                   nullptr);
     return true;
 }
 

@@ -68,6 +68,7 @@ add_library(qvfr_proxy SHARED
   sysinfo.cpp
   sun_fx.cpp
   mvr_vs.cpp
+  mvr_pass.cpp
   taa_views.cpp
   common.cpp
 )

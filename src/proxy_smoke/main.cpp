@@ -36,6 +36,10 @@
 //   --mvr-vs                          without SteamVR and without the proxy DLL: the proxy's MVR vertex shader patch
 //                                     (hook, NVAPI creation, image unchanged with MVR off, view 1 with MVR on, refusal)
 //                                     on an NVIDIA D3D11 device (mvr_vs_smoke.cpp)
+//   --mvr-pass                        without SteamVR and without the proxy DLL: gate B7's test run (a fake task run
+//                                     once more with MVR into two-slice copies, view 1 = the focus window in the corner
+//                                     of slice 1 against the focus projection) on an NVIDIA D3D11 device
+//                                     (mvr_pass_smoke.cpp)
 //   --xr-layer                        without SteamVR: the proxy DLL as an OpenXR API layer between a fake loader and a
 //                                     fake runtime (extension, gaze set in attach and sync, own sync, gaze, 2 sessions)
 //   --openxr-path                     [runtime] path=openxr with the Valve DLL as the backend: loader environment,
@@ -69,6 +73,7 @@
 
 int RunSunFx();  // sun_fx_smoke.cpp
 int RunMvrVs();  // mvr_vs_smoke.cpp
+int RunMvrPass();  // mvr_pass_smoke.cpp
 int RunTaaFix();  // taa_fix_smoke.cpp
 #include "focus_cull.h"
 #include "focus_geometry.h"
@@ -1311,6 +1316,7 @@ int main(int argc, char** argv) {
     bool clonesTest = false;
     bool sunFxTest = false;
     bool mvrVsTest = false;
+    bool mvrPassTest = false;
     bool xrLayerTest = false;
     bool openxrPathTest = false;
     bool openxr = false;
@@ -1332,6 +1338,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--sun-fx")) sunFxTest = true;
         else if (!strcmp(argv[i], "--taa-fix")) return RunTaaFix();
         else if (!strcmp(argv[i], "--mvr-vs")) mvrVsTest = true;
+        else if (!strcmp(argv[i], "--mvr-pass")) mvrPassTest = true;
         else if (!strcmp(argv[i], "--xr-layer")) xrLayerTest = true;
         else if (!strcmp(argv[i], "--openxr-path")) openxrPathTest = true;
         else if (!strcmp(argv[i], "--openxr")) openxr = true;
@@ -1353,6 +1360,7 @@ int main(int argc, char** argv) {
     if (clonesTest) return RunClones();
     if (sunFxTest) return RunSunFx();
     if (mvrVsTest) return RunMvrVs();
+    if (mvrPassTest) return RunMvrPass();
     if (xrLayerTest) return RunXrLayer(ExeDir() / L"proxy" / L"openvr_api.dll", home);
     if (openxrPathTest) return RunOpenXrPath(ExeDir() / L"proxy" / L"openvr_api.dll", home);
     if (FILE* f = _wfopen((home / L"qvfr.ini").c_str(), L"wb")) {
