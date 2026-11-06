@@ -36,6 +36,9 @@ Analyzed binaries are data: run the scripts with `-I` and never execute anything
   from that dump with their use per frame phase, and draws whose viewport does not cover the target.
 - `renderdoc/rdc_shaders.py`: shaders (DXBC disassembly), constant buffer layouts and blend state of chosen events
   (`RDC_EIDS=a,b,c`); same environment as `rdc_dump.py`.
+- `renderdoc/rdc_scene_shaders.py`: every VS/HS/DS/GS/PS used by the draws of chosen passes (`RDC_RANGES`, `RDC_PASSES`
+  maps a label to a render target id), with signatures, constant buffer slots and variable offsets, resource slots and the
+  DXBC disassembly and bytecode (`.dxbc`), plus a per-draw shader list; same environment as `rdc_dump.py`.
 - `renderdoc/rdc_events.py`: every API call with its parameters in chosen event ranges (`RDC_RANGES=a-b;c-d`), for
   comparing what two passes bind and set; same environment as `rdc_dump.py`.
 
