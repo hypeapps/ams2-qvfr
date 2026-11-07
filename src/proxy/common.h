@@ -187,6 +187,11 @@ struct Config {
     // mvr_velocity_key; testers: VK_PAUSE) toggles it.
     bool mvrVelocity = true;
     int mvrVelocityKey = 0;
+    // Live (docs/mvr.md B11, mvr_pass.h): with mvr_velocity, the focus groups' velocity pass gets those vectors written
+    // into its target at its first draw and skips its draws (CPU). The hotkey (mvr_modifier + mvr_velocity_skip_key)
+    // toggles it.
+    bool mvrVelocitySkip = true;
+    int mvrVelocitySkipKey = 0;
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
     bool dlaa = false;                // mode=dlaa (a change needs a restart)

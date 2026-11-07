@@ -305,6 +305,8 @@ int g_mvrFwdDepthCfg = 3;  // Cfg().mvrForwardDepth last seen
 bool g_mvrFwdDepthKeyDown = false;
 bool g_mvrVelocityCfg = true;  // Cfg().mvrVelocity last seen (a reload sets it)
 bool g_mvrVelocityKeyDown = false;
+bool g_mvrVelSkipCfg = true;  // Cfg().mvrVelocitySkip last seen
+bool g_mvrVelSkipKeyDown = false;
 
 // mvr_motion's window source: mvr_pass's maps in uv.
 bool MotionWindows(int eye, mvrmotion::Map* cur, mvrmotion::Map* prev, bool* fromOuter) {
@@ -313,6 +315,17 @@ bool MotionWindows(int eye, mvrmotion::Map* cur, mvrmotion::Map* prev, bool* fro
     *cur = mvrmotion::FromClip(c[0], c[1], c[2], c[3]);
     *prev = mvrmotion::FromClip(p[0], p[1], p[2], p[3]);
     return true;
+}
+
+// mvr_pass's velocity fill (B11): mvr_motion writes into the focus velocity pass's target, except in a shot frame
+// (the shot compares mvr_motion's vectors with the velocity pass's).
+bool FillFocusMotion(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Texture2D* target,
+                     const char** why) {
+    if (g_shotFrame) {
+        *why = "shot frame";
+        return false;
+    }
+    return mvrmotion::FillFocus(c, eye, depth, target, dlaa::Frame(), why);
 }
 bool g_mvrMapKeyDown = false;
 bool g_mapFrame = false;  // a task map with PS resources in this frame (mvr_map_key)
@@ -1438,6 +1451,16 @@ void HandleToolsLocked() {
         mvrmotion::SetEnabled(!mvrmotion::Enabled());
         Log("Quad: MVR focus motion vectors from outer %s (hotkey)", mvrmotion::Enabled() ? "on" : "off");
     }
+    if (mvrpass::On() && c.mvrVelocitySkip != g_mvrVelSkipCfg) {
+        g_mvrVelSkipCfg = c.mvrVelocitySkip;
+        mvrpass::SetVelocitySkip(c.mvrVelocitySkip);
+        Log("Quad: MVR focus velocity pass skipped with outer's vectors %s (ini)", c.mvrVelocitySkip ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrVelocitySkipKey, g_mvrVelSkipKeyDown)) {
+        mvrpass::SetVelocitySkip(!mvrpass::GetVelocitySkip());
+        Log("Quad: MVR focus velocity pass skipped with outer's vectors %s (hotkey)",
+            mvrpass::GetVelocitySkip() ? "on" : "off");
+    }
     g_mapFrame = g_mapNext;
     g_mapNext = false;
     if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrMapKey, g_mvrMapKeyDown)) {
@@ -2436,6 +2459,8 @@ void Install() {
             g_mvrVelocityCfg = Cfg().mvrVelocity;
             mvrmotion::SetEnabled(Cfg().mvrVelocity);
             mvrmotion::SetWindowSource(&MotionWindows);
+            g_mvrVelSkipCfg = Cfg().mvrVelocitySkip;  // Install took the setting
+            mvrpass::SetVelocityFill(&FillFocusMotion);
         }
         else if (Cfg().mvrGbuffer)
             Log("MVR G-buffer: off (needs [debug] mvr_vs_patch=1 and the executor patch)");

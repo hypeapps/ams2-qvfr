@@ -588,6 +588,7 @@ void STDMETHODCALLTYPE D_DrawIndexed(ID3D11DeviceContext* c, UINT count, UINT st
         o_drawIndexed(c, count, start, base);
         return;
     }
+    if (mvrpass::SkipDraw(c)) return;  // B11: a focus velocity pass whose target got outer's vectors
     if (const DrawReplaceFn replace = g_drawReplace.load(std::memory_order_relaxed); replace && replace(c, count))
         return;  // DLSS replaced the game's TAA resolve
     const bool taaFix = taaviews::OnDraw(c, true, count);
@@ -607,6 +608,7 @@ void STDMETHODCALLTYPE D_Draw(ID3D11DeviceContext* c, UINT count, UINT start) {
         o_draw(c, count, start);
         return;
     }
+    if (mvrpass::SkipDraw(c)) return;  // B11
     const bool taaFix = taaviews::OnDraw(c, false, count);
     const bool mvr = mvrpass::BeforeDraw(c);
     int g = -1;

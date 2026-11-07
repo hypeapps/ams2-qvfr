@@ -14,7 +14,11 @@
 //   of the engine's motion vectors.
 // [debug] mvr_velocity (live, hotkey mvr_modifier + mvr_velocity_key) switches it. In a shot frame the module computes
 // its vectors also when they are not used and logs how they differ from the engine's.
-// All functions run on the render thread inside DLAA's evaluation (the CS state is DLAA's own context state).
+// B11 (docs/mvr.md): with [debug] mvr_velocity_skip, the focus group's velocity pass gets the same vectors written into
+// its target at its first draw (FillFocus, from mvr_pass) and skips its draws; the game's locks pass, the game's TAA
+// (cockpit_taa) and DLSS then all read them, and ForFocus leaves that view's vectors as they are.
+// All functions run on the render thread. StoreOuter and ForFocus run inside DLAA's evaluation (the CS state is DLAA's
+// own context state); FillFocus runs in the game's pass and puts back the CS state it changes.
 #pragma once
 
 #include <d3d11.h>
@@ -50,6 +54,12 @@ void StoreOuter(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* motion, ID3D11
 // engine's; the reason is counted). In a shot frame it also compares them with `motion` (log).
 ID3D11Texture2D* ForFocus(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Texture2D* motion, UINT w,
                           UINT h, uint64_t frame, bool shot);
+// The focus group's velocity pass of the eye, at its first draw (B11): `depth` = the focus view's linear depth (R32),
+// `target` = the velocity pass's target (R16G16, the same size). Writes this module's vectors into `target` when they
+// are on, the eye's focus image comes from outer in this frame and outer's copy is from `frame` (DLAA's counter).
+// False: nothing written (the velocity pass must draw); the reason goes to *why (static text).
+bool FillFocus(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Texture2D* target, uint64_t frame,
+               const char** why);
 
 std::string Describe();
 void LogStats(bool totals);

@@ -44,6 +44,36 @@ struct DepthView {
 struct Stats {
     uint64_t stored[2] = {}, used[2] = {};
     uint64_t notOuter[2] = {}, noStore[2] = {}, noWindow[2] = {}, failed[2] = {};
+    uint64_t filled[2] = {};  // B11: written into the velocity pass's target (included in used)
+};
+
+// The CS state Run changes, kept around FillFocus (the game's pass is running).
+struct CsSaved {
+    ID3D11ComputeShader* cs = nullptr;
+    ID3D11Buffer* cb = nullptr;
+    ID3D11ShaderResourceView* srv[3] = {};
+    ID3D11UnorderedAccessView* uav = nullptr;
+    void Save(ID3D11DeviceContext* c) {
+        c->CSGetShader(&cs, nullptr, nullptr);
+        c->CSGetConstantBuffers(0, 1, &cb);
+        c->CSGetShaderResources(0, 3, srv);
+        c->CSGetUnorderedAccessViews(0, 1, &uav);
+    }
+    void Restore(ID3D11DeviceContext* c) {
+        const UINT keep = (UINT)-1;
+        c->CSSetUnorderedAccessViews(0, 1, &uav, &keep);
+        c->CSSetShaderResources(0, 3, srv);
+        c->CSSetConstantBuffers(0, 1, &cb);
+        c->CSSetShader(cs, nullptr, 0);
+        auto rel = [](auto*& p) {
+            if (p) p->Release();
+            p = nullptr;
+        };
+        rel(cs);
+        rel(cb);
+        for (auto*& v : srv) rel(v);
+        rel(uav);
+    }
 };
 
 WindowFn g_src = nullptr;
@@ -55,6 +85,7 @@ bool g_csFailed = false;
 Tex g_store[2];  // outer's motion vectors per eye (R16G16_FLOAT, outer's size; only the window part is current)
 Tex g_storeDepth[2];  // outer's linear depth per eye (R32_FLOAT, the same part)
 uint64_t g_storeFrame[2] = {};
+uint64_t g_filledFrame[2] = {};  // B11: the frame whose vectors FillFocus wrote into the eye's velocity target
 Tex g_out[2];  // the result per focus view
 DepthView g_depth[4];
 int g_depthNext = 0;
@@ -285,6 +316,10 @@ ID3D11Texture2D* ForFocus(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* dept
         return nullptr;
     }
     const bool use = g_on && fromOuter;
+    if (use && g_filledFrame[eye] == frame) {  // B11: the engine's texture holds them already
+        ++g_st.used[eye];
+        return nullptr;
+    }
     if (!use && !shot) {
         ++g_st.notOuter[eye];
         return nullptr;
@@ -326,6 +361,73 @@ ID3D11Texture2D* ForFocus(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* dept
     return result;
 }
 
+bool FillFocus(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Texture2D* target, uint64_t frame,
+               const char** why) {
+    const char* no = nullptr;
+    [&] {
+        if (eye < 0 || eye > 1 || !depth || !target) {
+            no = "no depth or target";
+            return;
+        }
+        if (!g_on) {
+            no = "mvr_velocity off";
+            return;
+        }
+        Map cur, prev;
+        bool fromOuter = false;
+        if (!g_src || !g_src(eye, &cur, &prev, &fromOuter) || cur.su <= 0 || cur.sv <= 0) {
+            no = "no focus window";
+            return;
+        }
+        if (!fromOuter) {
+            no = "forward not from outer";
+            return;
+        }
+        if (g_storeFrame[eye] != frame || !g_store[eye].tex) {
+            no = "no outer copy in this frame (DLAA off?)";
+            return;
+        }
+        D3D11_TEXTURE2D_DESC td{}, dd{};
+        target->GetDesc(&td);
+        depth->GetDesc(&dd);
+        if ((td.Format != DXGI_FORMAT_R16G16_TYPELESS && td.Format != DXGI_FORMAT_R16G16_FLOAT) || td.ArraySize != 1 ||
+            td.MipLevels != 1 || td.SampleDesc.Count != 1) {
+            no = "the velocity target is not a plain R16G16 float texture";
+            return;
+        }
+        if (dd.Width != td.Width || dd.Height != td.Height ||
+            (dd.Format != DXGI_FORMAT_R32_TYPELESS && dd.Format != DXGI_FORMAT_R32_FLOAT)) {
+            no = "the linear depth differs in size or format";
+            return;
+        }
+        if (!EnsureDevice(c) || !EnsureTex(g_out[eye], td.Width, td.Height, true)) {
+            no = "device or texture";
+            return;
+        }
+        ID3D11ShaderResourceView* ds = DepthSrv(depth);
+        if (!ds) {
+            no = "depth view";
+            return;
+        }
+        CsSaved s;
+        s.Save(c);
+        Run(c, g_store[eye].srv.Get(), g_storeDepth[eye].srv.Get(), g_store[eye].w, g_store[eye].h, ds,
+            g_out[eye].uav.Get(), td.Width, td.Height, cur, prev, false);
+        s.Restore(c);
+        c->CopyResource(target, g_out[eye].tex.Get());
+        g_filledFrame[eye] = frame;
+        ++g_st.filled[eye];
+        if (!g_loggedUse[eye]) {
+            g_loggedUse[eye] = true;
+            Log("MVR motion: focus %s's velocity pass gets outer's motion vectors (%ux%u from outer %ux%u; window "
+                "u = %.5f u_o + %.5f, v = %.5f v_o + %.5f)",
+                kEye[eye], td.Width, td.Height, g_store[eye].w, g_store[eye].h, cur.su, cur.ou, cur.sv, cur.ov);
+        }
+    }();
+    if (why) *why = no;
+    return !no;
+}
+
 std::string Describe() {
     char buf[96];
     snprintf(buf, sizeof(buf), "MVR motion %s (used L %llu / R %llu)", g_on ? "on" : "off",
@@ -344,16 +446,19 @@ void LogStats(bool totals) {
             d.noStore[e] -= g_last.noStore[e];
             d.noWindow[e] -= g_last.noWindow[e];
             d.failed[e] -= g_last.failed[e];
+            d.filled[e] -= g_last.filled[e];
         }
     g_last = a;
     uint64_t any = 0;
     for (int e = 0; e < 2; ++e) any += d.stored[e] + d.used[e] + d.notOuter[e] + d.noStore[e] + d.noWindow[e] + d.failed[e];
     if (!any && !totals) return;
-    Log("MVR motion%s (%s): focus motion vectors from outer L %llu / R %llu (outer stored L %llu / R %llu); the "
+    Log("MVR motion%s (%s): focus motion vectors from outer L %llu / R %llu (written into the velocity pass's target "
+        "L %llu / R %llu; outer stored L %llu / R %llu); the "
         "engine's: forward not from outer L %llu / R %llu, no outer copy in this frame L %llu / R %llu, no window "
         "L %llu / R %llu, failed L %llu / R %llu",
         totals ? " (session total)" : "", g_on ? "on" : "off", (unsigned long long)d.used[0],
-        (unsigned long long)d.used[1], (unsigned long long)d.stored[0], (unsigned long long)d.stored[1],
+        (unsigned long long)d.used[1], (unsigned long long)d.filled[0], (unsigned long long)d.filled[1],
+        (unsigned long long)d.stored[0], (unsigned long long)d.stored[1],
         (unsigned long long)d.notOuter[0], (unsigned long long)d.notOuter[1], (unsigned long long)d.noStore[0],
         (unsigned long long)d.noStore[1], (unsigned long long)d.noWindow[0], (unsigned long long)d.noWindow[1],
         (unsigned long long)d.failed[0], (unsigned long long)d.failed[1]);
@@ -368,6 +473,7 @@ void Release() {
     for (Tex& t : g_out) t = Tex{};
     for (DepthView& v : g_depth) v = DepthView{};
     g_storeFrame[0] = g_storeFrame[1] = 0;
+    g_filledFrame[0] = g_filledFrame[1] = 0;
     g_dev = nullptr;
 }
 

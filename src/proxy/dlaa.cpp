@@ -1294,6 +1294,8 @@ bool FrameJitter(float out[2]) {
     return ok;
 }
 
+uint64_t Frame() { return g_frame.load(); }
+
 void SetShotFrame(bool shot) {
 #ifdef QVFR_HAVE_DLSS
     if (shot && !g_shot.load()) g_shotViews = 0;

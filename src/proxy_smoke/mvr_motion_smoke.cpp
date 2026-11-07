@@ -55,6 +55,37 @@ struct Clip {
     double sx, ox, sy, oy;
 };
 
+// B11's window source: this frame's and the last frame's map, the focus image from outer.
+qvfr::mvrmotion::Map g_cur, g_prev;
+bool FakeWindows(int, qvfr::mvrmotion::Map* cur, qvfr::mvrmotion::Map* prev, bool* fromOuter) {
+    *cur = g_cur;
+    *prev = g_prev;
+    *fromOuter = true;
+    return true;
+}
+
+std::vector<uint32_t> ReadTexels(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* src) {
+    D3D11_TEXTURE2D_DESC d{};
+    src->GetDesc(&d);
+    d.Usage = D3D11_USAGE_STAGING;
+    d.BindFlags = 0;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    d.MiscFlags = 0;
+    std::vector<uint32_t> px;
+    ID3D11Texture2D* st = nullptr;
+    if (FAILED(dev->CreateTexture2D(&d, nullptr, &st))) return px;
+    ctx->CopyResource(st, src);
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (SUCCEEDED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
+        px.resize((size_t)d.Width * d.Height);
+        for (UINT y = 0; y < d.Height; ++y)
+            memcpy(&px[(size_t)y * d.Width], (const uint8_t*)m.pData + (size_t)y * m.RowPitch, d.Width * 4);
+        ctx->Unmap(st, 0);
+    }
+    st->Release();
+    return px;
+}
+
 }  // namespace
 
 int RunMvrMotion() {
@@ -202,6 +233,81 @@ int RunMvrMotion() {
                "%.4f px (limit %.2f), disk %d px; the window's own move up to %.2f px: %s\n",
                nearest ? "nearest texel" : "depth-picked bilinear", inner, maxInner, tolInner, band, maxBand, tolBand,
                diskPx, maxWindow, ok ? "ok" : "FAIL");
+    }
+
+    // B11: FillFocus writes the same vectors into the game's (typeless) velocity target from outer's copy of the window
+    // (StoreOuter), puts back the CS state it changes, and ForFocus then leaves the view as it is.
+    {
+        g_cur = mc;
+        g_prev = mp;
+        qvfr::mvrmotion::SetWindowSource(&FakeWindows);
+        std::vector<uint32_t> ref;
+        if (ID3D11Texture2D* out = qvfr::mvrmotion::TestRun(ctx, outerTex, outerDepthTex, depthTex, mc, mp, kFW, kFH, false))
+            ref = ReadTexels(dev, ctx, out);
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = kFW;
+        td.Height = kFH;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R16G16_TYPELESS;
+        td.SampleDesc.Count = 1;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        ID3D11Texture2D* target = nullptr;
+        dev->CreateTexture2D(&td, nullptr, &target);
+        td.Format = DXGI_FORMAT_R32_FLOAT;
+        td.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        ID3D11Texture2D* uavTex = nullptr;
+        dev->CreateTexture2D(&td, nullptr, &uavTex);
+        ID3D11UnorderedAccessView* gameUav = nullptr;
+        ID3D11ShaderResourceView* gameSrv = nullptr;
+        ID3D11Buffer* gameCb = nullptr;
+        D3D11_BUFFER_DESC bd{16, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+        if (uavTex) dev->CreateUnorderedAccessView(uavTex, nullptr, &gameUav);
+        dev->CreateShaderResourceView(outerDepthTex, nullptr, &gameSrv);
+        dev->CreateBuffer(&bd, nullptr, &gameCb);
+        bool fillOk = false, refusedOk = false, stateOk = false, forFocusOk = false;
+        int same = -1;
+        if (target && gameUav && gameSrv && gameCb && !ref.empty()) {
+            // The game's CS state while its pass runs.
+            ctx->CSSetShaderResources(2, 1, &gameSrv);
+            ctx->CSSetConstantBuffers(0, 1, &gameCb);
+            ctx->CSSetUnorderedAccessViews(0, 1, &gameUav, nullptr);
+            qvfr::mvrmotion::StoreOuter(ctx, 0, outerTex, outerDepthTex, 7, false);
+            const char* why = "unset";
+            fillOk = qvfr::mvrmotion::FillFocus(ctx, 0, depthTex, target, 7, &why) && !why;
+            const char* why2 = nullptr;
+            refusedOk = !qvfr::mvrmotion::FillFocus(ctx, 0, depthTex, target, 8, &why2) && why2;  // no copy from frame 8
+            ID3D11ShaderResourceView* s[3] = {};
+            ID3D11Buffer* b = nullptr;
+            ID3D11UnorderedAccessView* u = nullptr;
+            ctx->CSGetShaderResources(0, 3, s);
+            ctx->CSGetConstantBuffers(0, 1, &b);
+            ctx->CSGetUnorderedAccessViews(0, 1, &u);
+            stateOk = !s[0] && !s[1] && s[2] == gameSrv && b == gameCb && u == gameUav;
+            for (auto* v : s)
+                if (v) v->Release();
+            if (b) b->Release();
+            if (u) u->Release();
+            ID3D11ShaderResourceView* none = nullptr;
+            ID3D11UnorderedAccessView* noUav = nullptr;
+            ctx->CSSetShaderResources(2, 1, &none);
+            ctx->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
+            const std::vector<uint32_t> got = ReadTexels(dev, ctx, target);
+            same = 0;
+            for (size_t i = 0; i < got.size() && i < ref.size(); ++i) same += got[i] == ref[i];
+            forFocusOk = !qvfr::mvrmotion::ForFocus(ctx, 0, depthTex, nullptr, kFW, kFH, 7, false);
+            printf("MVR motion fill (B11): written %s, refused without outer's copy of the frame %s (%s), CS state put "
+                   "back %s, target equals the compute pass %d / %u px, ForFocus leaves it %s\n",
+                   fillOk ? "ok" : "FAIL", refusedOk ? "ok" : "FAIL", why2 ? why2 : "-", stateOk ? "ok" : "FAIL", same,
+                   kFW * kFH, forFocusOk ? "ok" : "FAIL");
+        } else {
+            printf("MVR motion fill (B11): objects failed\n");
+        }
+        if (!fillOk || !refusedOk || !stateOk || !forFocusOk || same != (int)(kFW * kFH)) ++fails;
+        for (IUnknown* o : {(IUnknown*)target, (IUnknown*)uavTex, (IUnknown*)gameUav, (IUnknown*)gameSrv,
+                            (IUnknown*)gameCb})
+            if (o) o->Release();
+        qvfr::mvrmotion::SetWindowSource(nullptr);
     }
     UINT64 msgs = 0;
     if (info) {

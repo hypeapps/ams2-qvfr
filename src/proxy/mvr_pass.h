@@ -130,6 +130,19 @@ constexpr int kForwardDepthModes = 4;
 void SetForwardDepth(int mode);
 int GetForwardDepth();
 const char* ForwardDepthName(int mode);
+// B11 (docs/mvr.md), [debug] mvr_velocity_skip (live, hotkey mvr_modifier + mvr_velocity_skip_key), mode 3 only: at the
+// first draw of the focus group's velocity pass (the bind above) the fill source writes the focus view's motion vectors
+// from outer (mvr_motion, B10) into the pass's target, and the pass's draws are skipped (the engine's object loop
+// stays, its draw calls go). The camera motion pass at its start reads the linear depth: the fill gets it from the PS
+// shader resources of that draw (R32 at the target's size). When the source refuses (shot frame, DLAA off, the forward
+// not from outer, ...) the pass draws as before.
+using VelocityFillFn = bool (*)(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Texture2D* target,
+                                const char** why);
+void SetVelocityFill(VelocityFillFn fn);
+void SetVelocitySkip(bool on);
+bool GetVelocitySkip();
+// From every draw detour before the real draw: true = drop the draw (a velocity pass whose target got the vectors).
+bool SkipDraw(ID3D11DeviceContext* c);
 // Quad: the vtable of the focus groups' CPhase3BuildCommandThread (found by class name; 0: none).
 void SetPhase3BuildVtable(uintptr_t vt);
 // A focus group's CBeginEye, after its clones went in (the eye of the velocity pass's depth, above).
@@ -192,6 +205,7 @@ void TestEarlyMark(int eye);
 struct TestLiveState {
     unsigned passes = 0, ok = 0, focusSkipped = 0, buildSkipped = 0, otherClears = 0, otherClearMisses = 0;
     unsigned twinEntries = 0, velBinds = 0;  // focus clones noted for focus R's twins
+    unsigned velFilled = 0, velSkippedDraws = 0, velDrawn = 0;  // B11
     std::string why;  // the latest live pass's failure
 };
 TestLiveState TestLiveGet();

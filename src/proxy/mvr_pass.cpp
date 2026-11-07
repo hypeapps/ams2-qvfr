@@ -629,6 +629,9 @@ struct FwdStats {
     uint64_t passes[2] = {}, ok[2] = {}, skipped[2] = {}, buildSkipped[2] = {}, own[2] = {};
     uint64_t draws = 0, otherClears = 0, otherClearMisses = 0;
     uint64_t velBinds = 0;  // mode 3: velocity pass binds given the conservative depth
+    // B11: velocity passes that got outer's vectors and skipped their draws, passes that drew (with reasons).
+    uint64_t velFilled[2] = {}, velDrawn[2] = {}, velSkippedDraws = 0;
+    std::vector<Reason> velReasons;
     uint64_t liveTracks = 0, liveTrackFails = 0;  // live track maps read in the focus window for view 1
     double ms[2] = {};
     std::vector<Reason> reasons;
@@ -637,10 +640,20 @@ FwdStats g_fs, g_ftot;
 std::string g_lastFwdFail;
 struct TestLive {
     unsigned passes = 0, ok = 0, focusSkipped = 0, buildSkipped = 0, otherClears = 0, otherClearMisses = 0;
-    unsigned velBinds = 0;
+    unsigned velBinds = 0, velFilled = 0, velSkippedDraws = 0, velDrawn = 0;
     std::string why;
 };
 TestLive g_testLive;
+// B11 (mvr_pass.h): the focus velocity pass of the frame per eye, and the eye whose velocity pass is bound now.
+enum VelState { VelUndecided, VelFilled, VelDraws };
+struct VelSkip {
+    uint64_t frame = 0;
+    VelState state = VelUndecided;
+};
+VelSkip g_velSkip[2];
+std::atomic<int> g_velBound{-1};
+bool g_velSkipOn = true;  // [debug] mvr_velocity_skip and its hotkey
+VelocityFillFn g_velFill = nullptr;
 
 // Jitter diagnosis (B9c run 2: view 1 about 0.27 px off focus's own forward pass in x, the sign changing between
 // frames): in a forward test shot frame the game's camera constants at the first draw of each eye group's
@@ -2833,22 +2846,27 @@ void STDMETHODCALLTYPE D_VSSetCb1(ID3D11DeviceContext1* c, UINT start, UINT num,
 }
 
 void STDMETHODCALLTYPE D_DrawIndexedInstanced(ID3D11DeviceContext* c, UINT a, UINT b, UINT d, INT e, UINT f) {
+    if (SkipDraw(c)) return;
     BeforeDraw(c);
     o_dii(c, a, b, d, e, f);
 }
 void STDMETHODCALLTYPE D_DrawInstanced(ID3D11DeviceContext* c, UINT a, UINT b, UINT d, UINT e) {
+    if (SkipDraw(c)) return;
     BeforeDraw(c);
     o_di(c, a, b, d, e);
 }
 void STDMETHODCALLTYPE D_DrawAuto(ID3D11DeviceContext* c) {
+    if (SkipDraw(c)) return;
     BeforeDraw(c);
     o_da(c);
 }
 void STDMETHODCALLTYPE D_DrawIndexedInstancedIndirect(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT o) {
+    if (SkipDraw(c)) return;
     BeforeDraw(c);
     o_diii(c, b, o);
 }
 void STDMETHODCALLTYPE D_DrawInstancedIndirect(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT o) {
+    if (SkipDraw(c)) return;
     BeforeDraw(c);
     o_dii2(c, b, o);
 }
@@ -2887,6 +2905,7 @@ bool Install() {
         g_early = Cfg().mvrEarly;
         g_forwardOn = Cfg().mvrForward && g_phase3Vt;
         SetForwardDepth(Cfg().mvrForwardDepth);
+        g_velSkipOn = Cfg().mvrVelocitySkip;
         g_installed = true;
         Log("MVR G-buffer: on; outer L's and outer R's G-buffer pass draw the eye's focus too (MVR, view 1 in the "
             "corner of slice 1 of two-slice copies), the focus groups skip CPhase1BuildCommandThread and CPhase1Render "
@@ -2964,6 +2983,7 @@ void OnFrameStart(bool enabled) {
         t_fwdFocusTask = nullptr;
         g_probe = Probe{};
         g_curFocus = -1;
+        g_velBound.store(-1, std::memory_order_relaxed);
         const bool on = enabled && On();
         if (on != g_enabled)
             Log("MVR G-buffer: %s (frame %llu)", on ? "ON" : "OFF (the focus groups run their own pass)",
@@ -3448,6 +3468,7 @@ bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* r
         for (UINT i = 0; i < n && rtv; ++i) NoteWritten(rtv[i]);
         NoteWritten(dsv);
     }
+    if (!t_internal && c == Imm()) g_velBound.store(-1, std::memory_order_relaxed);
     // B9d mode 3: focus's velocity pass draws on the conservative copy of the forward depth.
     if (g_fwdDepth == 3 && g_forwardOn && !t_internal && c == Imm() && dsv && n && rtv && rtv[0] &&
         g_p.part == PartNone) {
@@ -3459,6 +3480,7 @@ bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* r
             ++g_fs.velBinds;
             ++g_ftot.velBinds;
             ++g_testLive.velBinds;
+            g_velBound.store(g_curFocus, std::memory_order_relaxed);  // B11: its draws go through VelocityDraw
             return true;
         }
     }
@@ -3615,6 +3637,105 @@ bool BeforeDraw(ID3D11DeviceContext* c) {
 
 void AfterDraw(ID3D11DeviceContext*) {}
 
+// B11: the linear depth among the PS shader resources of the velocity pass's first draw (its camera motion pass reads
+// it): an R32 float view of a plain w x h texture. Null when none or more than one distinct texture.
+static ComPtr<ID3D11Texture2D> LinearDepthOfDraw(ID3D11DeviceContext* c, UINT w, UINT h) {
+    ID3D11ShaderResourceView* srv[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
+    c->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, srv);
+    ComPtr<ID3D11Texture2D> found;
+    bool twice = false;
+    for (ID3D11ShaderResourceView* v : srv) {
+        if (!v) continue;
+        D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+        v->GetDesc(&vd);
+        ComPtr<ID3D11Resource> r;
+        v->GetResource(&r);
+        ComPtr<ID3D11Texture2D> t;
+        if (vd.Format == DXGI_FORMAT_R32_FLOAT && vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D && r &&
+            SUCCEEDED(r.As(&t))) {
+            D3D11_TEXTURE2D_DESC d{};
+            t->GetDesc(&d);
+            if (d.Width == w && d.Height == h && d.ArraySize == 1 && d.SampleDesc.Count == 1) {
+                if (found && found.Get() != t.Get()) twice = true;
+                found = t;
+            }
+        }
+        v->Release();
+    }
+    return twice ? nullptr : found;
+}
+
+// B11: a draw while the eye's velocity pass is bound. The first one of the frame decides: the fill source writes the
+// vectors into the bound target (then this and the pass's later draws are dropped) or the pass draws as before.
+static bool VelocityDraw(ID3D11DeviceContext* c, int e) {
+    VelSkip& v = g_velSkip[e];
+    if (v.frame != g_frame) {
+        v.frame = g_frame;
+        v.state = VelUndecided;
+    }
+    if (v.state == VelUndecided) {
+        v.state = VelDraws;
+        const char* why = nullptr;
+        if (!g_velSkipOn) {
+            why = "";  // off: no reason line
+        } else if (!g_velFill) {
+            why = "no fill source";
+        } else {
+            ComPtr<ID3D11RenderTargetView> rtv;
+            c->OMGetRenderTargets(1, &rtv, nullptr);
+            ComPtr<ID3D11Resource> r;
+            if (rtv) rtv->GetResource(&r);
+            ComPtr<ID3D11Texture2D> target;
+            if (r) r.As(&target);
+            if (!target) {
+                why = "no velocity target bound";
+            } else {
+                D3D11_TEXTURE2D_DESC td{};
+                target->GetDesc(&td);
+                const ComPtr<ID3D11Texture2D> depth = LinearDepthOfDraw(c, td.Width, td.Height);
+                if (!depth) {
+                    why = "no linear depth (R32 at the target's size) at the pass's first draw";
+                } else {
+                    Internal in;
+                    if (g_velFill(c, e, depth.Get(), target.Get(), &why)) v.state = VelFilled;
+                }
+            }
+        }
+        if (v.state == VelFilled) {
+            ++g_fs.velFilled[e];
+            ++g_ftot.velFilled[e];
+            ++g_testLive.velFilled;
+        } else {
+            ++g_fs.velDrawn[e];
+            ++g_ftot.velDrawn[e];
+            ++g_testLive.velDrawn;
+            if (why && *why) {
+                char b[200];
+                snprintf(b, sizeof(b), "%s %s", kEye[e], why);
+                AddReason(g_fs.velReasons, b);
+                AddReason(g_ftot.velReasons, b);
+            }
+        }
+    }
+    if (v.state != VelFilled) return false;
+    ++g_fs.velSkippedDraws;
+    ++g_ftot.velSkippedDraws;
+    ++g_testLive.velSkippedDraws;
+    return true;
+}
+
+bool SkipDraw(ID3D11DeviceContext* c) {
+    const int e = g_velBound.load(std::memory_order_relaxed);
+    if (e < 0 || e > 1 || t_internal || c != Imm()) return false;
+    bool skip = false;
+    Protect("SkipDraw", [&] { skip = VelocityDraw(c, e); });
+    return skip;
+}
+
+void SetVelocityFill(VelocityFillFn fn) { g_velFill = fn; }
+void SetVelocitySkip(bool on) { g_velSkipOn = on; }
+bool GetVelocitySkip() { return g_velSkipOn; }
+
 std::string Describe() {
     if (!g_installed) return "MVR G-buffer off";
     char buf[256];
@@ -3682,13 +3803,21 @@ void LogStats(bool totals) {
             fr += b;
         }
         auto fms = [&](int e) { return f.passes[e] ? f.ms[e] / f.passes[e] : 0.0; };
+        std::string vr;
+        for (const Reason& r : f.velReasons) {
+            char b[240];
+            snprintf(b, sizeof(b), "%s%s %llu", vr.empty() ? "" : "; ", r.text.c_str(), (unsigned long long)r.n);
+            vr += b;
+        }
         size_t twins = 0;
         for (ID3D11Resource* o : g_twinOrigs) twins += !g_cloneFn && clones::HasTwin(o);
         Log("MVR forward%s (%llu frames, %s, depth %d): outer passes L %llu / R %llu (into focus's clones L %llu / R %llu), "
             "task CPU per pass L %.3f / R %.3f ms, draws per pass %.0f; focus forward skipped L %llu / R %llu (builds "
             "%llu / %llu), own L %llu / R %llu; focus clones written from outer %zu, with focus R's twin %zu; "
             "other-size clears repeated %llu (shared "
-            "%llu); velocity pass binds on the conservative depth %llu; live track maps from outer %llu (failed %llu)%s%s",
+            "%llu); velocity pass binds on the conservative depth %llu; velocity passes with outer's vectors and no draws "
+            "(mvr_velocity_skip %s) L %llu / R %llu, draws skipped %llu, passes drawn L %llu / R %llu%s%s; live track "
+            "maps from outer %llu (failed %llu)%s%s",
             totals ? " (session)" : "", (unsigned long long)s.frames, g_forwardOn ? "on" : "off", g_fwdDepth,
             (unsigned long long)f.passes[0], (unsigned long long)f.passes[1], (unsigned long long)f.ok[0],
             (unsigned long long)f.ok[1], fms(0), fms(1),
@@ -3696,7 +3825,10 @@ void LogStats(bool totals) {
             (unsigned long long)f.skipped[0], (unsigned long long)f.skipped[1], (unsigned long long)f.buildSkipped[0],
             (unsigned long long)f.buildSkipped[1], (unsigned long long)f.own[0], (unsigned long long)f.own[1],
             g_twinOrigs.size(), twins, (unsigned long long)f.otherClears,
-            (unsigned long long)f.otherClearMisses, (unsigned long long)f.velBinds, (unsigned long long)f.liveTracks,
+            (unsigned long long)f.otherClearMisses, (unsigned long long)f.velBinds, g_velSkipOn ? "on" : "off",
+            (unsigned long long)f.velFilled[0], (unsigned long long)f.velFilled[1],
+            (unsigned long long)f.velSkippedDraws, (unsigned long long)f.velDrawn[0], (unsigned long long)f.velDrawn[1],
+            vr.empty() ? "" : " (", vr.empty() ? "" : (vr + ")").c_str(), (unsigned long long)f.liveTracks,
             (unsigned long long)f.liveTrackFails,
             fr.empty() ? "" : "; not from outer: ", fr.c_str());
     }
@@ -3796,6 +3928,9 @@ TestLiveState TestLiveGet() {
     t.otherClearMisses = s.otherClearMisses;
     t.twinEntries = (unsigned)g_twinOrigs.size();
     t.velBinds = s.velBinds;
+    t.velFilled = s.velFilled;
+    t.velSkippedDraws = s.velSkippedDraws;
+    t.velDrawn = s.velDrawn;
     t.why = s.why;
     return t;
 }

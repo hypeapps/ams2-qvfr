@@ -71,6 +71,7 @@ float4 VSOcc(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2(id & 1, id >> 1);
     return float4(lerp(-1.0, 0.0, uv.x), lerp(1.0, 0.0, uv.y), 0.05, 1);
 }
+float4 Zero(float4 p : SV_Position) : SV_Target { return 0; }
 )";
 
 constexpr UINT kW = 96, kH = 80, kFW = 64, kFH = 48;
@@ -126,7 +127,7 @@ struct Scene {
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
     ComPtr<ID3D11VertexShader> vs, vsOcc;
-    ComPtr<ID3D11PixelShader> fwd;
+    ComPtr<ID3D11PixelShader> fwd, zero;
     ComPtr<ID3D11DepthStencilState> ds;
     ComPtr<ID3D11RasterizerState> rs;
     ComPtr<ID3D11SamplerState> point;
@@ -226,6 +227,25 @@ bool MakeSet(Set& s, UINT w, UINT h, int k, const float proj[16]) {
 }
 
 bool g_halfDraw = true;  // the live mode's pass draws nothing into the 1/2 size target (as the game's, B9c run 2)
+
+// B11: the velocity fill source stands in for mvr_motion: it notes what it got and clears the target to a marker.
+const float kVelMark[4] = {0.25f, -0.5f, 0, 0};
+constexpr uint64_t kVelMarkBits = 0xB8003400;  // (0.25, -0.5) as R16G16_FLOAT
+struct FillCall {
+    int calls = 0, eye = -1;
+    ID3D11Texture2D *depth = nullptr, *target = nullptr;  // compared only
+    ID3D11RenderTargetView* rtv = nullptr;
+};
+FillCall g_fill;
+bool FakeFill(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Texture2D* target, const char** why) {
+    ++g_fill.calls;
+    g_fill.eye = eye;
+    g_fill.depth = depth;
+    g_fill.target = target;
+    if (g_fill.rtv) c->ClearRenderTargetView(g_fill.rtv, kVelMark);
+    *why = nullptr;
+    return true;
+}
 
 // The forward pass of one set into its targets (the game binds them inside the task).
 void DrawForward(const Set& s) {
@@ -415,9 +435,10 @@ int RunMvrForward() {
     qvfr::mvrvs::TestSetEnabled(true);
     qvfr::mvrps::TestSetEnabled(true);
     ComPtr<ID3DBlob> vsCode = Compile("VS", "vs_5_0"), occCode = Compile("VSOcc", "vs_5_0"),
-                     fwdCode = Compile("Fwd", "ps_5_0");
-    if (!vsCode || !occCode || !fwdCode) return 1;
+                     fwdCode = Compile("Fwd", "ps_5_0"), zeroCode = Compile("Zero", "ps_5_0");
+    if (!vsCode || !occCode || !fwdCode || !zeroCode) return 1;
     bool made =
+        SUCCEEDED(dev->CreatePixelShader(zeroCode->GetBufferPointer(), zeroCode->GetBufferSize(), nullptr, &g_s.zero)) &&
         SUCCEEDED(dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &g_s.vs)) &&
         SUCCEEDED(dev->CreateVertexShader(occCode->GetBufferPointer(), occCode->GetBufferSize(), nullptr, &g_s.vsOcc)) &&
         SUCCEEDED(dev->CreatePixelShader(fwdCode->GetBufferPointer(), fwdCode->GetBufferSize(), nullptr, &g_s.fwd));
@@ -605,6 +626,48 @@ int RunMvrForward() {
         plainOk = gr.Get() == (ID3D11Resource*)g_s.focus.depth.Get();
         ctx->OMSetRenderTargets(0, nullptr, nullptr);
     }
+    // B11: the velocity pass's first draw (the linear depth, R32 at the target's size, in PS t0) gets the fill and
+    // both draws are dropped; after a bind without the depth clone the next draw goes into the target (top left
+    // quarter, the PS gives 0 there).
+    int velQuarter = 0, velMarked = 0, velOther = 0;
+    if (velRtv) {
+        g_fill = FillCall{};
+        g_fill.rtv = velRtv.Get();
+        qvfr::mvrpass::SetVelocityFill(&FakeFill);
+        const float zero[4] = {0, 0, 0, 0};
+        ctx->ClearRenderTargetView(velRtv.Get(), zero);
+        ID3D11RenderTargetView* vr = velRtv.Get();
+        ctx->OMSetRenderTargets(1, &vr, g_s.focus.dsv.Get());
+        ID3D11ShaderResourceView* ld = g_s.focus.srv2.Get();
+        ctx->PSSetShaderResources(0, 1, &ld);
+        const D3D11_VIEWPORT vp{0, 0, (float)kFW, (float)kFH, 0, 1};
+        ctx->RSSetViewports(1, &vp);
+        ctx->IASetInputLayout(nullptr);
+        ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+        ctx->VSSetShader(g_s.vsOcc.Get(), nullptr, 0);
+        ctx->PSSetShader(g_s.zero.Get(), nullptr, 0);
+        ctx->OMSetDepthStencilState(nullptr, 0);
+        ctx->RSSetState(g_s.rs.Get());
+        ctx->Draw(4, 0);
+        ctx->Draw(4, 0);
+        ctx->OMSetRenderTargets(1, &vr, nullptr);
+        ctx->Draw(4, 0);
+        ID3D11ShaderResourceView* none = nullptr;
+        ctx->PSSetShaderResources(0, 1, &none);
+        ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        qvfr::mvrpass::SetVelocityFill(nullptr);
+        const std::vector<uint64_t> v = Read(velTex.Get());
+        for (UINT y = 0; y < kFH && v.size() == (size_t)kFW * kFH; ++y)
+            for (UINT x = 0; x < kFW; ++x) {
+                const uint64_t p = v[(size_t)y * kFW + x];
+                if (x < kFW / 2 && y < kFH / 2)
+                    velQuarter += p == 0;
+                else if (p == kVelMarkBits)
+                    ++velMarked;
+                else
+                    ++velOther;
+            }
+    }
     FakeTask build{g_vtBuild3};
     const int finishBefore = g_finish;
     const bool buildSkip = qvfr::mvrpass::BeforeTask((uint8_t*)&build, 2);
@@ -643,7 +706,12 @@ int RunMvrForward() {
                         lv.focusSkipped == 1 && lv.buildSkipped == 1 && lv.otherClears == 2 &&
                         lv.otherClearMisses == 0 && lC.size() == (size_t)lpx && lOuter == 0 && lCBig * 100 <= lpx &&
                         lD1 * 100 <= lpx && lHalf == 0 && lHalfD == 0 && lH.size() == (size_t)(kFW / 2) * (kFH / 2) &&
-                        lv.twinEntries == 4 && velOk && plainOk && lv.velBinds == 1;
+                        lv.twinEntries == 4 && velOk && plainOk && lv.velBinds == 2;
+    const int velPx = (int)(kFW * kFH);
+    const bool velSkipOk = g_fill.calls == 1 && g_fill.eye == 0 && g_fill.depth == g_s.focus.gt2.Get() &&
+                           g_fill.target == velTex.Get() && lv.velFilled == 1 && lv.velSkippedDraws == 2 &&
+                           lv.velDrawn == 0 && velQuarter == velPx / 4 && velMarked == velPx - velPx / 4 &&
+                           velOther == 0;
 
     int warnings = 0, expected = 0;
     if (info) {
@@ -672,7 +740,7 @@ int RunMvrForward() {
     const bool outerOk = outerC == 0 && outerD == 0 && outerH == 0 && gH.size() == refH.size();
     const bool focusOk = clonesChanged == 0 && covered > px / 3 && occluded > px / 8 && occOurs == occluded &&
                          cBig * 100 <= px && dOff * 100 <= px;
-    const bool ok = countsOk && outerOk && focusOk && liveOk && !warnings;
+    const bool ok = countsOk && outerOk && focusOk && liveOk && velSkipOk && !warnings;
     printf("MVR forward: %s; PS %s (globalTexture0 in t%u, globalTexture2 in t%u), VS %s; outer pass %s%s%s, stash %d "
            "targets, binds %u, copy-ins %u, map failures %u, draws %u (one view %u, patched PS %u, PS slot 3 rebinds "
            "%u, screen textures without a clone %u), copied back %u, SetMultiViewMode failures %u; paused %u times "
@@ -697,6 +765,12 @@ int RunMvrForward() {
            lHalf || lHalfD ? "WRONG" : "ok", lHalf, lHalfD, lv.otherClears, lv.otherClearMisses,
            buildSkip ? "skipped" : "RUN", liveFocusSkip ? "skipped" : "RUN", finishes, lv.twinEntries,
            velOk ? "yes" : "NO", lv.velBinds, plainOk ? "yes" : "NO", liveOk ? "OK" : "WRONG");
+    printf("  velocity pass with outer's vectors (B11): fill calls %d (eye %d, linear depth %s, target %s), passes "
+           "filled %u, draws skipped %u, passes drawn %u; target: drawn quarter %d / %d px, marker %d / %d px, other "
+           "%d px (%s)\n",
+           g_fill.calls, g_fill.eye, g_fill.depth == g_s.focus.gt2.Get() ? "ok" : "WRONG",
+           g_fill.target == velTex.Get() ? "ok" : "WRONG", lv.velFilled, lv.velSkippedDraws, lv.velDrawn, velQuarter,
+           velPx / 4, velMarked, velPx - velPx / 4, velOther, velSkipOk ? "OK" : "WRONG");
     printf("  debug layer %s, %d warnings, %d expected linkage reports\n", debugLayer ? "on" : "not installed", warnings,
            expected);
     return ok ? 0 : 1;
