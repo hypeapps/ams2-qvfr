@@ -36,6 +36,9 @@
 //   --mvr-vs                          without SteamVR and without the proxy DLL: the proxy's MVR vertex shader patch
 //                                     (hook, NVAPI creation, image unchanged with MVR off, view 1 with MVR on, refusal)
 //                                     on an NVIDIA D3D11 device (mvr_vs_smoke.cpp)
+//   --mvr-ps                          without SteamVR and without the proxy DLL: the proxy's MVR pixel shader patch
+//                                     (through the sun effects hook, kinds, image unchanged, refusal, layered GS count)
+//                                     on an NVIDIA D3D11 device (mvr_ps_smoke.cpp)
 //   --mvr-pass                        without SteamVR and without the proxy DLL: gate B7's test run (a fake task run
 //                                     once more with MVR into two-slice copies, view 1 = the focus window in the corner
 //                                     of slice 1 against the focus projection) on an NVIDIA D3D11 device
@@ -73,6 +76,7 @@
 
 int RunSunFx();  // sun_fx_smoke.cpp
 int RunMvrVs();  // mvr_vs_smoke.cpp
+int RunMvrPs();  // mvr_ps_smoke.cpp
 int RunMvrPass();  // mvr_pass_smoke.cpp
 int RunTaaFix();  // taa_fix_smoke.cpp
 #include "focus_cull.h"
@@ -1316,6 +1320,7 @@ int main(int argc, char** argv) {
     bool clonesTest = false;
     bool sunFxTest = false;
     bool mvrVsTest = false;
+    bool mvrPsTest = false;
     bool mvrPassTest = false;
     bool xrLayerTest = false;
     bool openxrPathTest = false;
@@ -1338,6 +1343,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--sun-fx")) sunFxTest = true;
         else if (!strcmp(argv[i], "--taa-fix")) return RunTaaFix();
         else if (!strcmp(argv[i], "--mvr-vs")) mvrVsTest = true;
+        else if (!strcmp(argv[i], "--mvr-ps")) mvrPsTest = true;
         else if (!strcmp(argv[i], "--mvr-pass")) mvrPassTest = true;
         else if (!strcmp(argv[i], "--xr-layer")) xrLayerTest = true;
         else if (!strcmp(argv[i], "--openxr-path")) openxrPathTest = true;
@@ -1360,6 +1366,7 @@ int main(int argc, char** argv) {
     if (clonesTest) return RunClones();
     if (sunFxTest) return RunSunFx();
     if (mvrVsTest) return RunMvrVs();
+    if (mvrPsTest) return RunMvrPs();
     if (mvrPassTest) return RunMvrPass();
     if (xrLayerTest) return RunXrLayer(ExeDir() / L"proxy" / L"openvr_api.dll", home);
     if (openxrPathTest) return RunOpenXrPath(ExeDir() / L"proxy" / L"openvr_api.dll", home);

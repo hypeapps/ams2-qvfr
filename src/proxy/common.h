@@ -140,6 +140,9 @@ struct Config {
     // NVIDIA Multi-View Rendering, gate B6 (mvr_vs.h): the game's vertex shaders patched and made through NVAPI, MVR
     // off. Not in the default ini (development); a change needs a restart.
     bool mvrVsPatch = false;
+    // Gate B9b (mvr_ps.h): with mvr_vs_patch, the game's pixel shaders that read screen inputs or screen textures are
+    // patched for an extra MVR view (view 0 draws as before). Not in the default ini; a change needs a restart.
+    bool mvrPsPatch = false;
     // Gate B8 (mvr_pass.h): with mvr_vs_patch, outer's G-buffer pass of each eye draws focus too (MVR, view 1) and
     // the focus groups skip theirs. Not in the default ini; a change needs a restart. The hotkey switches (live).
     bool mvrGbuffer = false;
@@ -155,6 +158,16 @@ struct Config {
     int mvrDepthBias = 32;
     float mvrDepthSlope = 0.0f;
     bool mvrDepthDilate = true;
+    // Live: MVR forward step 1 (docs/mvr.md B9a): focus L's SSAO and lights (1) or its SSAO only (2) run in outer L's
+    // group, before its CPhase3Render, and the focus group skips them; 0 off. Diagnosis of the flicker: 3 the swap and
+    // both CBeginEye only, 4 SSAO early and again in the focus group, 5 SSAO early and the G-buffer filled again in the
+    // focus group. The hotkey (mvr_modifier + mvr_early_key; testers: VK_HOME) cycles 0..5. mvr_map_key (testers:
+    // VK_INSERT): a task map of the next frame in the log.
+    int mvrEarly = 0;
+    int mvrEarlyKey = 0;
+    int mvrMapKey = 0;
+    // Live: a shot compares focus L's own G-buffer pass with outer's stash (B8); 0 = the shot shows the frame as it runs.
+    bool mvrShotCompare = true;
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
     bool dlaa = false;                // mode=dlaa (a change needs a restart)

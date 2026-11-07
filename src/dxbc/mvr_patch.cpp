@@ -21,7 +21,7 @@ enum : uint32_t {
     kOpDclOutputSiv = 0x67,
     kOpDclTemps = 0x68,
     kOpDclGlobalFlags = 0x6A,
-    kOpInterfaceCall = 0x89,
+    kOpInterfaceCall = 0x78,  // D3D11_SB_OPCODE_INTERFACE_CALL (0x89 is firstbit_shi)
 };
 enum : uint32_t { kOperandTemp = 0, kOperandOutput = 2, kOperandImm32 = 4, kOperandImm64 = 5 };
 constexpr uint32_t kVertexShader = 1;

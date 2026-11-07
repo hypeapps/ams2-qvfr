@@ -1,5 +1,7 @@
 #include "sun_fx.h"
 
+#include <intrin.h>
+
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -550,9 +552,13 @@ bool Active(ID3D11DeviceContext* c, int& g) {
 
 // ---------------------------------------------------------------- detours
 
+std::atomic<CreatePsFilterFn> g_createPsFilter{nullptr};
+
 HRESULT STDMETHODCALLTYPE D_CreatePixelShader(ID3D11Device* dev, const void* code, SIZE_T len,
                                               ID3D11ClassLinkage* link, ID3D11PixelShader** out) {
-    HRESULT hr = o_createPs(dev, code, len, link, out);
+    const CreatePsFilterFn filter = g_createPsFilter.load(std::memory_order_relaxed);
+    HRESULT hr = filter ? filter(dev, code, len, link, out, o_createPs, (uintptr_t)_ReturnAddress())
+                        : o_createPs(dev, code, len, link, out);
     if (SUCCEEDED(hr) && out && *out) {
         Protect("CreatePixelShader", [&] {
             const int k = Classify(code, len);
@@ -688,6 +694,12 @@ bool Install() {
     });
     g_installed = ok;
     return ok;
+}
+
+bool SetCreatePsFilter(CreatePsFilterFn create) {
+    if (!g_installed) return false;
+    g_createPsFilter = create;
+    return true;
 }
 
 bool SetDrawReplace(DrawReplaceFn replace, InsideFn inside, AfterFn after) {

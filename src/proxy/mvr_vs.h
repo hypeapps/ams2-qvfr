@@ -26,6 +26,10 @@ bool Install();
 // that the game's device calls the hooked CreateVertexShader.
 void OnFrameStart(ID3D11DeviceContext* ctx);
 
+// Any thread: whether the device has Multi-View support (NvAPI_D3D_QueryMultiViewSupport once per device, logged).
+// False before Install. Also used by mvr_ps.
+bool DeviceHasMvr(ID3D11Device* dev);
+
 // Any thread: whether `vs` is a patched shader this module gave the game (false for null). `sum`: the DXBC checksum
 // of the shader the game asked for (patched or not, "" when this module did not see it), 40 bytes.
 bool IsPatched(ID3D11VertexShader* vs, char* sum = nullptr);

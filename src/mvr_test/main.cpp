@@ -12,6 +12,8 @@
 // B4 cases take an ordinary single-view vertex shader, add the extra view positions with the DXBC patch
 // (src/dxbc/mvr_patch.h) and compare the image with the HLSL MVR shader pixel by pixel. --patch-dir runs the patch
 // over a folder of compiled vertex shaders (*.dxbc, e.g. dumped from a RenderDoc capture) and creates each result.
+//
+// B9b: --ps-patch and --ps-dir check the pixel shader patch (src/dxbc/mvr_ps_patch.h, ps_patch_test.cpp).
 
 #include <windows.h>
 #include <timeapi.h>
@@ -37,6 +39,9 @@
 #include "mvr_patch.h"
 
 using Microsoft::WRL::ComPtr;
+
+int RunPsPatchTests(bool debug);                                                     // ps_patch_test.cpp
+int RunPsPatchDir(const std::string& dir, const std::string& outDir, bool verbose);  // ps_patch_test.cpp
 
 namespace {
 
@@ -1539,7 +1544,9 @@ int main(int argc, char** argv) {
         Log("qvfr_mvr_test [--debug] [--verbose] [--case N] [--include-hang] [--skip-perf] [--draws N] [--tris N]\n"
             "              [--frames N] [--width N] [--height N]\n"
             "qvfr_mvr_test --patch-dir DIR [--patch-slot N] [--patch-clip] [--patch-out DIR] [--verbose]\n"
-            "qvfr_mvr_test --views [--debug]   (B5: array views of the game's kind, per-view clipping)\n");
+            "qvfr_mvr_test --views [--debug]   (B5: array views of the game's kind, per-view clipping)\n"
+            "qvfr_mvr_test --ps-patch [--debug]   (B9b: the pixel shader patch with MVR)\n"
+            "qvfr_mvr_test --ps-dir DIR [--ps-out DIR] [--verbose]   (B9b: the patch over ps_*.dxbc of a capture)\n");
         return 0;
     }
     const bool debug = HasArg(argc, argv, "--debug");
@@ -1577,6 +1584,10 @@ int main(int argc, char** argv) {
             failed);
         return failed ? 1 : 0;
     }
+
+    if (HasArg(argc, argv, "--ps-patch")) return RunPsPatchTests(debug);
+    const std::string psDir = ArgStr(argc, argv, "--ps-dir");
+    if (!psDir.empty()) return RunPsPatchDir(psDir, ArgStr(argc, argv, "--ps-out"), g_verbose);
 
     const std::string patchDir = ArgStr(argc, argv, "--patch-dir");
     if (!patchDir.empty())

@@ -57,6 +57,9 @@ void* Original(void* res);
 ID3D11Texture2D* CloneOf(ID3D11Resource* res, Set set);
 // Render thread: a group of `set` runs now with its clones in the engine objects.
 bool SwappedIn(Set set);
+// Render thread: the clones are made, wanted in this frame and their list unchanged (a group of a set with clones
+// would get them now). MVR forward step 1 swaps focus's in inside outer's group only then (not while learning).
+bool IsReady();
 // For a shot: up to `max` clones of `set` (not referenced; valid until the next frame start) with a label each
 // ("<set>_NN_<w>x<h>_f<format>_<role>", NN as in the list order of the log). Returns the count.
 int ListForShot(Set set, ID3D11Resource** out, char (*labels)[64], int max);

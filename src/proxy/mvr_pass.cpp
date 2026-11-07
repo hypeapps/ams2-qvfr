@@ -33,7 +33,14 @@ constexpr uintptr_t kPhase1Vtable = 0x204adc8;  // CPhase1Render (RVA)
 constexpr uintptr_t kPhase1Execute = 0x9c96c0;
 constexpr uintptr_t kBuildVtable = 0x204ae20;   // CPhase1BuildCommandThread
 constexpr uintptr_t kBuildExecute = 0x9c9310;
-constexpr uintptr_t kTaskFinish = 0xcde260;     // +0x38 of both
+constexpr uintptr_t kTaskFinish = 0xcde260;     // +0x38 of both (and of the tasks below)
+// MVR forward step 1 (B9a, Ghidra): the eye group's SSAO, lights and forward tasks.
+constexpr uintptr_t kSsaoVtable = 0x204c618;    // CSSAORender
+constexpr uintptr_t kSsaoExecute = 0x9d6580;
+constexpr uintptr_t kPhase2Vtable = 0x204bef8;  // CPhase2Render (deferred lights)
+constexpr uintptr_t kPhase2Execute = 0x9ce9c0;
+constexpr uintptr_t kPhase3Vtable = 0x204af30;  // CPhase3Render (opaque forward)
+constexpr uintptr_t kPhase3Execute = 0x9cac80;
 constexpr int kExecuteSlot = 0x48 / 8, kFinishSlot = 0x38 / 8;
 constexpr int kVtSlots = 16;
 constexpr int kOuterL = 0, kOuterR = 1, kFocusL = 2, kFocusR = 3;
@@ -52,6 +59,8 @@ bool g_installed = false;
 std::atomic<bool> g_on{false};
 std::atomic<bool> g_dead{false};
 uintptr_t g_phase1Vt = 0, g_buildVt = 0;  // absolute vtable addresses
+uintptr_t g_ssaoVt = 0, g_phase2Vt = 0, g_phase3Vt = 0;  // 0: their vtables did not match (no early step)
+int g_early = 0;  // [debug] mvr_early and its hotkey (mvr_pass.h)
 ID3D11DeviceContext* g_testCtx = nullptr;
 CloneFn g_cloneFn = nullptr;
 JitterFn g_jitterFn = nullptr;
@@ -431,6 +440,10 @@ struct FocusState {
     bool projected = false;
     uint64_t frame = 0;
     bool decided = false, skip = false;
+    bool early = false;  // decided in outer's group, which also ran the group's SSAO (B9a)
+    bool earlyLights = false;  // ... and its lights
+    bool ssaoAgain = false;    // diagnosis (mode 4): the focus group runs its SSAO too
+    bool refill = false;       // diagnosis (mode 5): the focus group gets the stash again at its G-buffer pass
 };
 FocusState g_focus[2];
 
@@ -446,6 +459,12 @@ struct Stats {
     uint64_t lateStarts = 0, waitBinds = 0, lateDraws = 0;
     uint64_t switches[2] = {};  // the focus group's choice (from outer / own pass) differs from the previous frame's
     uint64_t overwrites[2] = {};  // overwrite mode: own pass run, then the stash on top
+    // B9a: focus's SSAO and lights in outer's group (runs, CPU, engine faults, the focus group's tasks skipped).
+    uint64_t earlyRuns[2] = {}, earlyFaults = 0, earlySkipped[2] = {};
+    double earlyMs[2] = {};
+    uint64_t earlyWaits = 0, earlyWaited = 0;  // waits for the recording workers, of them non-zero
+    double earlyWaitMs = 0, earlyWaitMax = 0;
+    std::vector<Reason> earlyReasons;
     double passMs[2] = {};
     std::vector<Reason> reasons;
 };
@@ -1513,6 +1532,88 @@ void ReportShot() {
         sh.focusDone ? "yes" : "NO");
 }
 
+// ---------------------------------------------------------------- task map (shot frame)
+
+struct TaskMap {
+    bool on = false, detail = false;
+    char group[16] = "", name[48] = "";
+    unsigned draws = 0, binds = 0, clears = 0;
+    ID3D11Resource* seen[10] = {};  // only compared
+    int nseen = 0;
+    bool more = false;
+    std::string targets;
+    // detail: distinct (slot, resource) of the PS shader resources and constant buffers at the draws
+    std::vector<std::pair<UINT, void*>> srvs, cbs;
+    bool srvMore = false;
+};
+TaskMap g_map;
+
+// A short id of a resource for comparing map lines (low bits of its address), with "c" when it is a clone.
+std::string ResId(void* r) {
+    char b[24];
+    snprintf(b, sizeof(b), "@%05llx%s", (unsigned long long)(((uintptr_t)r >> 4) & 0xfffff),
+             clones::Original(r) != r ? "c" : "");
+    return b;
+}
+
+void MapDetail(ID3D11DeviceContext* c) {
+    constexpr UINT kSrvs = 32, kCbs = 14;
+    ID3D11ShaderResourceView* srv[kSrvs] = {};
+    c->PSGetShaderResources(0, kSrvs, srv);
+    for (UINT i = 0; i < kSrvs; ++i) {
+        if (!srv[i]) continue;
+        ComPtr<ID3D11Resource> r;
+        srv[i]->GetResource(&r);
+        srv[i]->Release();
+        const std::pair<UINT, void*> k{i, r.Get()};
+        if (std::find(g_map.srvs.begin(), g_map.srvs.end(), k) != g_map.srvs.end()) continue;
+        if (g_map.srvs.size() >= 96) {
+            g_map.srvMore = true;
+            continue;
+        }
+        g_map.srvs.push_back(k);
+    }
+    ID3D11Buffer* cb[kCbs] = {};
+    c->PSGetConstantBuffers(0, kCbs, cb);
+    for (UINT i = 0; i < kCbs; ++i) {
+        if (!cb[i]) continue;
+        const std::pair<UINT, void*> k{i, cb[i]};
+        cb[i]->Release();
+        if (std::find(g_map.cbs.begin(), g_map.cbs.end(), k) == g_map.cbs.end() && g_map.cbs.size() < 48)
+            g_map.cbs.push_back(k);
+    }
+}
+
+void MapNote(ID3D11View* v, const char* kind) {
+    if (!v) return;
+    ComPtr<ID3D11Resource> r;
+    v->GetResource(&r);
+    for (int i = 0; i < g_map.nseen; ++i)
+        if (g_map.seen[i] == r.Get()) return;
+    if (g_map.nseen == (int)std::size(g_map.seen)) {
+        g_map.more = true;
+        return;
+    }
+    g_map.seen[g_map.nseen++] = r.Get();
+    bool ok = false;
+    const D3D11_TEXTURE2D_DESC d = DescOf(r.Get(), &ok);
+    char b[96];
+    if (ok)
+        snprintf(b, sizeof(b), "%s%s %ux%u f%d x%u%s%s", g_map.targets.empty() ? "" : ", ", kind, d.Width, d.Height,
+                 (int)d.Format, d.SampleDesc.Count, d.ArraySize > 1 ? " array" : "",
+                 g_map.detail ? (" " + ResId(r.Get())).c_str() : "");
+    else
+        snprintf(b, sizeof(b), "%s%s (not 2D)", g_map.targets.empty() ? "" : ", ", kind);
+    g_map.targets += b;
+}
+
+void MapBind(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv, ID3D11DepthStencilView* dsv) {
+    if (!g_map.on || t_internal || c != Imm()) return;
+    ++g_map.binds;
+    for (UINT i = 0; i < n && rtv; ++i) MapNote(rtv[i], "rt");
+    MapNote(dsv, "ds");
+}
+
 // ---------------------------------------------------------------- D3D11 hooks
 
 using VSSetShaderFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11VertexShader*, ID3D11ClassInstance* const*,
@@ -1621,16 +1722,16 @@ void STDMETHODCALLTYPE D_DrawInstancedIndirect(ID3D11DeviceContext* c, ID3D11Buf
     o_dii2(c, b, o);
 }
 
-bool CheckVtable(uintptr_t base, uintptr_t vt, uintptr_t exec, const char* name) {
+bool CheckVtable(uintptr_t base, uintptr_t vt, uintptr_t exec, const char* name, bool fatal = true) {
     uintptr_t e = 0, f = 0;
     if (hooks::Readable((void*)(base + vt), kVtSlots * 8) &&
         hooks::TryRead((void*)(base + vt + kExecuteSlot * 8), &e, 8) &&
         hooks::TryRead((void*)(base + vt + kFinishSlot * 8), &f, 8) && e == base + exec && f == base + kTaskFinish)
         return true;
     Log("MVR G-buffer: %s vtable does not match (Execute at AMS2AVX.exe+0x%llX, Finish +0x%llX; expected +0x%llX, "
-        "+0x%llX); off",
+        "+0x%llX); %s",
         name, (unsigned long long)(e ? e - base : 0), (unsigned long long)(f ? f - base : 0), (unsigned long long)exec,
-        (unsigned long long)kTaskFinish);
+        (unsigned long long)kTaskFinish, fatal ? "off" : "no early SSAO and lights (mvr_early)");
     return false;
 }
 
@@ -1645,11 +1746,21 @@ bool Install() {
             return;
         g_phase1Vt = base + kPhase1Vtable;
         g_buildVt = base + kBuildVtable;
+        if (CheckVtable(base, kSsaoVtable, kSsaoExecute, "CSSAORender", false) &&
+            CheckVtable(base, kPhase2Vtable, kPhase2Execute, "CPhase2Render", false) &&
+            CheckVtable(base, kPhase3Vtable, kPhase3Execute, "CPhase3Render", false)) {
+            g_ssaoVt = base + kSsaoVtable;
+            g_phase2Vt = base + kPhase2Vtable;
+            g_phase3Vt = base + kPhase3Vtable;
+        }
+        g_early = Cfg().mvrEarly;
         g_installed = true;
         Log("MVR G-buffer: on; outer L's and outer R's G-buffer pass draw the eye's focus too (MVR, view 1 in the "
             "corner of slice 1 of two-slice copies), the focus groups skip CPhase1BuildCommandThread and CPhase1Render "
-            "and get it in their clones; jitter fix %s; hotkey 0x%X+0x%X",
-            Cfg().mvrJitterFix ? "on" : "off", Cfg().mvrKeyMod, Cfg().mvrKey);
+            "and get it in their clones; jitter fix %s; hotkey 0x%X+0x%X; early SSAO and lights of focus L (mvr_early) "
+            "%s, hotkey 0x%X+0x%X",
+            Cfg().mvrJitterFix ? "on" : "off", Cfg().mvrKeyMod, Cfg().mvrKey,
+            !g_ssaoVt ? "unavailable" : EarlyName(g_early), Cfg().mvrKeyMod, Cfg().mvrEarlyKey);
     });
     g_on = g_installed;
     return g_installed;
@@ -1714,7 +1825,7 @@ void OnFrameStart(bool enabled) {
             Log("MVR G-buffer: %s (frame %llu)", on ? "ON" : "OFF (the focus groups run their own pass)",
                 (unsigned long long)g_frame);
         g_enabled = on;
-        for (FocusState& f : g_focus) f.decided = f.skip = false;
+        for (FocusState& f : g_focus) f.decided = f.skip = f.early = f.earlyLights = f.ssaoAgain = f.refill = false;
         ++g_st.frames;
         ++g_tot.frames;
     });
@@ -1727,6 +1838,15 @@ int PrepareShot(const char** names, int base, int max, shots::Pair* pairs, int m
     Protect("PrepareShot", [&] {
         if (!g_enabled) {
             Log("MVR G-buffer: no comparison in this shot (off by the hotkey)");
+            return;
+        }
+        if (!Cfg().mvrShotCompare) {
+            Log("MVR G-buffer: no comparison in this shot (mvr_shot_compare=0: the shot shows the frame as it runs)");
+            return;
+        }
+        if (g_early) {  // the comparison needs focus's own G-buffer pass, the early tasks need it skipped
+            Log("MVR G-buffer: no comparison in this shot (mvr_early %s: the shot shows the early tasks)",
+                EarlyName(g_early));
             return;
         }
         if (max < kShotImages || maxPairs < kMaxTargets + kMaxMasks) {
@@ -1793,10 +1913,143 @@ void FocusGroup(int eye, bool projected) {
     g_focus[eye].frame = g_frame;
 }
 
+Kind KindOf(uint8_t* task) {
+    uintptr_t vt = 0;
+    if (!g_installed || !task || !hooks::TryRead(task, &vt, 8) || !vt) return Kind::Other;
+    if (vt == g_phase1Vt) return Kind::Phase1;
+    if (vt == g_buildVt) return Kind::Build;
+    if (vt == g_ssaoVt) return Kind::Ssao;
+    if (vt == g_phase2Vt) return Kind::Phase2;
+    if (vt == g_phase3Vt) return Kind::Phase3;
+    return Kind::Other;
+}
+
+void SetEarly(int mode) { g_early = mode >= 0 && mode < kEarlyModes ? mode : 0; }
+int GetEarly() { return g_early; }
+const char* EarlyName(int mode) {
+    switch (mode) {
+    case 1: return "SSAO and lights";
+    case 2: return "SSAO only";
+    case 3: return "DIAGNOSIS swap and CBeginEye only (no task moved)";
+    case 4: return "DIAGNOSIS SSAO early and again in the focus group";
+    case 5: return "DIAGNOSIS SSAO early, the G-buffer filled again in the focus group";
+    }
+    return "off";
+}
+
+void EarlyRefused(int eye, const char* why) {
+    if (eye < 0 || eye > 1 || !why) return;
+    AddReason(g_st.earlyReasons, why);
+    AddReason(g_tot.earlyReasons, why);
+}
+
+bool EarlyWanted(int eye) {
+    if (!On() || !g_early || !g_enabled || eye != 0) return false;  // focus L only (mvr_pass.h)
+    if (!g_ssaoVt || !g_phase2Vt || !g_phase3Vt) return false;      // logged at the start
+    const char* why = nullptr;
+    if (g_mode != Mode::Skip)
+        why = "a diagnosis mode of the G-buffer is on";
+    else if (g_shot.armed)
+        why = "shot frame";
+    else if (!g_stash[eye].valid || g_stash[eye].frame != g_frame)
+        why = "no stash from outer's pass in this frame";
+    else if (g_focus[eye].decided)
+        why = "the focus group already decided";
+    if (why) EarlyRefused(eye, why);
+    return why == nullptr;
+}
+
+bool EarlyBegin(int eye, bool projected) {
+    if (eye < 0 || eye > 1) return false;
+    bool ok = false;
+    Protect("EarlyBegin", [&] {
+        FocusGroup(eye, projected);
+        if (const char* why = Decide(eye)) {
+            EarlyRefused(eye, why);
+            return;
+        }
+        FocusState& f = g_focus[eye];
+        f.decided = f.skip = f.early = true;
+        f.earlyLights = g_early == 1;
+        f.ssaoAgain = g_early == 4;
+        f.refill = g_early == 5;
+        if (g_lastSkip[eye] == 0) {
+            ++g_st.switches[eye];
+            ++g_tot.switches[eye];
+        }
+        g_lastSkip[eye] = 1;
+        Fill(Imm(), eye);
+        ok = true;
+    });
+    return ok;
+}
+
+void EarlyWaited(double ms) {
+    for (Stats* s : {&g_st, &g_tot}) {
+        ++s->earlyWaits;
+        if (ms > 0.001) ++s->earlyWaited;
+        s->earlyWaitMs += ms;
+        s->earlyWaitMax = std::max(s->earlyWaitMax, ms);
+    }
+}
+
+void EarlyEnd(int eye, double ms, bool ok) {
+    if (eye < 0 || eye > 1) return;
+    ++g_st.earlyRuns[eye];
+    ++g_tot.earlyRuns[eye];
+    g_st.earlyMs[eye] += ms;
+    g_tot.earlyMs[eye] += ms;
+    if (!ok) {
+        ++g_st.earlyFaults;
+        ++g_tot.earlyFaults;
+    }
+}
+
+void TaskMapBegin(const char* group, const char* name, bool detail) {
+    g_map = TaskMap{};
+    g_map.on = true;
+    g_map.detail = detail;
+    snprintf(g_map.group, sizeof(g_map.group), "%s", group ? group : "?");
+    snprintf(g_map.name, sizeof(g_map.name), "%s", name ? name : "?");
+}
+
+void TaskMapEnd() {
+    if (!g_map.on) return;
+    g_map.on = false;
+    if (!g_map.draws && !g_map.binds && !g_map.clears) return;
+    std::string det;
+    if (g_map.detail) {
+        auto list = [](std::vector<std::pair<UINT, void*>>& v, const char* pre, bool desc) {
+            std::sort(v.begin(), v.end());
+            std::string out;
+            for (const auto& [slot, r] : v) {
+                char b[96];
+                std::string d;
+                if (desc) {
+                    bool ok = false;
+                    const D3D11_TEXTURE2D_DESC td = DescOf((ID3D11Resource*)r, &ok);
+                    if (ok) d = " " + std::to_string(td.Width) + "x" + std::to_string(td.Height) + " f" +
+                                std::to_string((int)td.Format);
+                }
+                snprintf(b, sizeof(b), "%s%s%u%s %s", out.empty() ? "" : ", ", pre, slot, d.c_str(), ResId(r).c_str());
+                out += b;
+            }
+            return out;
+        };
+        det = "; PS srv: " + list(g_map.srvs, "t", true) + (g_map.srvMore ? ", more" : "") + "; PS cb: " +
+              list(g_map.cbs, "b", false);
+    }
+    Log("MVR task map (frame %llu): %s %s: draws %u, binds %u, clears %u; targets: %s%s%s", (unsigned long long)g_frame,
+        g_map.group, g_map.name, g_map.draws, g_map.binds, g_map.clears,
+        g_map.targets.empty() ? "none" : g_map.targets.c_str(), g_map.more ? ", more" : "", det.c_str());
+}
+
 bool BeforeTask(uint8_t* task, int group) {
     if (!On() || !task || group < kOuterL || group > kFocusR) return false;
     uintptr_t vt = 0;
-    if (!hooks::TryRead(task, &vt, 8) || (vt != g_phase1Vt && vt != g_buildVt)) return false;
+    if (!hooks::TryRead(task, &vt, 8) || !vt) return false;
+    const bool late = vt == g_ssaoVt || vt == g_phase2Vt;  // after the G-buffer pair: skipped only after an early run
+    if (vt != g_phase1Vt && vt != g_buildVt && !late) return false;
     bool skip = false;
     Protect("BeforeTask", [&] {
         if (group <= kOuterR) {
@@ -1805,6 +2058,14 @@ bool BeforeTask(uint8_t* task, int group) {
         }
         const int eye = group - kFocusL;
         FocusState& f = g_focus[eye];
+        if (late) {
+            if (f.decided && f.early && (vt == g_ssaoVt ? !f.ssaoAgain : f.earlyLights)) {
+                ++g_st.earlySkipped[eye];
+                ++g_tot.earlySkipped[eye];
+                skip = true;
+            }
+            return;
+        }
         if (!f.decided) {
             f.decided = true;
             const char* why = g_enabled ? Decide(eye) : "off";
@@ -1827,7 +2088,8 @@ bool BeforeTask(uint8_t* task, int group) {
         }
         if (f.skip) {
             if (vt == g_phase1Vt) {
-                Fill(Imm(), eye);
+                // An early run filled the clones before focus's SSAO and lights (mode 5: again, diagnosis).
+                if (!f.early || f.refill) Fill(Imm(), eye);
                 ++g_st.skipped[eye];
                 ++g_tot.skipped[eye];
             }
@@ -1867,6 +2129,7 @@ void AfterTask(uint8_t* task) {
 
 bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv, ID3D11DepthStencilView* dsv,
                 ID3D11RenderTargetView** rtvOut, ID3D11DepthStencilView** dsvOut) {
+    MapBind(c, n, rtv, dsv);
     if (t_internal || g_p.part == PartNone || c != Imm()) return false;
     bool ok = false;
     Protect("MapTargets", [&] {
@@ -1924,6 +2187,7 @@ bool StartAtClear(ID3D11DeviceContext* c, ID3D11View* v) {
 }
 
 ID3D11RenderTargetView* MapClear(ID3D11DeviceContext* c, ID3D11RenderTargetView* v) {
+    if (g_map.on && !t_internal && c == Imm()) ++g_map.clears;
     StartAtClear(c, v);
     if (!InPass(c) || !v) return v;
     ID3D11RenderTargetView* out = v;
@@ -1935,6 +2199,7 @@ ID3D11RenderTargetView* MapClear(ID3D11DeviceContext* c, ID3D11RenderTargetView*
 }
 
 ID3D11DepthStencilView* MapClear(ID3D11DeviceContext* c, ID3D11DepthStencilView* v) {
+    if (g_map.on && !t_internal && c == Imm()) ++g_map.clears;
     StartAtClear(c, v);
     if (!InPass(c) || !v) return v;
     ID3D11DepthStencilView* out = v;
@@ -1946,6 +2211,10 @@ ID3D11DepthStencilView* MapClear(ID3D11DeviceContext* c, ID3D11DepthStencilView*
 }
 
 bool BeforeDraw(ID3D11DeviceContext* c) {
+    if (g_map.on && !t_internal && c == Imm()) {
+        ++g_map.draws;
+        if (g_map.detail) MapDetail(c);
+    }
     if (g_p.part == PartTail && !t_internal && c == Imm()) {
         ++g_p.tailDraws;
         if (g_p.lateBound) ++g_p.lateDraws;
@@ -1996,6 +2265,24 @@ void LogStats(bool totals) {
         (unsigned long long)s.mixed, (unsigned long long)s.lateBinds, (unsigned long long)s.lateDraws,
         (unsigned long long)s.mapFailures,
         (unsigned long long)s.viewsFailures);
+    if (g_early || s.earlyRuns[0] || s.earlyRuns[1] || !s.earlyReasons.empty()) {
+        std::string er;
+        for (const Reason& r : s.earlyReasons) {
+            char b[200];
+            snprintf(b, sizeof(b), "%s%s %llu", er.empty() ? "" : "; ", r.text.c_str(), (unsigned long long)r.n);
+            er += b;
+        }
+        auto ems = [&](int e) { return s.earlyRuns[e] ? s.earlyMs[e] / s.earlyRuns[e] : 0.0; };
+        Log("MVR early SSAO and lights%s (%llu frames, %s): runs in outer's group L %llu / R %llu, CPU per run L %.3f / "
+            "R %.3f ms, engine faults %llu; focus tasks skipped L %llu / R %llu; waits for the recording workers %llu "
+            "(non-zero %llu, avg %.3f, max %.3f ms)%s%s%s",
+            totals ? " (session)" : "", (unsigned long long)s.frames, EarlyName(g_early),
+            (unsigned long long)s.earlyRuns[0], (unsigned long long)s.earlyRuns[1], ems(0), ems(1),
+            (unsigned long long)s.earlyFaults, (unsigned long long)s.earlySkipped[0],
+            (unsigned long long)s.earlySkipped[1], (unsigned long long)s.earlyWaits, (unsigned long long)s.earlyWaited,
+            s.earlyWaits ? s.earlyWaitMs / s.earlyWaits : 0.0, s.earlyWaitMax, er.empty() ? "" : "; not run: ",
+            er.c_str(), "");
+    }
     if (!totals) s = Stats{};
 }
 

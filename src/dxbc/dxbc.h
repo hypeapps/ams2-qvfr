@@ -42,4 +42,7 @@ struct SigElement {
 bool ReadSignature(const Chunk& chunk, std::vector<SigElement>& out, std::string* err);
 Chunk WriteSignature(uint32_t fourcc, const std::vector<SigElement>& elements);
 
+// Whether an output signature of the shader (OSGN, OSG5 or OSG1) has an element with this system value (D3D_NAME).
+bool HasOutputSystemValue(const void* code, size_t size, uint32_t systemValue);
+
 }  // namespace qvfr::dxbc

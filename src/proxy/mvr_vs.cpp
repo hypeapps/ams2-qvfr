@@ -17,6 +17,7 @@
 
 #include "common.h"
 #include "hooks.h"
+#include "dxbc.h"
 #include "mvr_patch.h"
 
 namespace qvfr::mvrvs {
@@ -50,6 +51,7 @@ std::atomic<uint64_t> g_other{0};        // class linkage or no output pointer (
 std::atomic<uint64_t> g_beforeSubmit{0}; // patched before the first Submit
 std::atomic<uint64_t> g_patchUs{0};      // time in the patch and NVAPI creation of the patched shaders
 std::atomic<unsigned> g_maxReg{0};       // largest output register after the patch
+std::atomic<uint64_t> g_layered{0};      // VS writing SV_RenderTargetArrayIndex or SV_ViewportArrayIndex (mvr_ps.h)
 uint64_t g_loggedMade = 0;
 double g_firstMs = -1, g_lastMs = -1;
 
@@ -134,7 +136,10 @@ void Refuse(std::atomic<uint64_t>& counter, std::string reason, const void* code
     }
 }
 
+}  // namespace
+
 bool DeviceHasMvr(ID3D11Device* dev) {
+    if (!g_installed && !g_testing) return false;
     std::lock_guard lock(g_m);
     for (const DeviceInfo& d : g_devices)
         if (d.dev == dev) return d.mvr;
@@ -148,6 +153,8 @@ bool DeviceHasMvr(ID3D11Device* dev) {
     return mvr;
 }
 
+namespace {
+
 // The patched shader, or null (the caller makes the original).
 ID3D11VertexShader* MakePatched(ID3D11Device* dev, const void* code, SIZE_T len, ID3D11ClassLinkage* link,
                                 ID3D11VertexShader** out, uintptr_t caller) {
@@ -156,6 +163,17 @@ ID3D11VertexShader* MakePatched(ID3D11Device* dev, const void* code, SIZE_T len,
         return nullptr;
     }
     g_made.fetch_add(1, std::memory_order_relaxed);
+    // D3D_NAME_RENDER_TARGET_ARRAY_INDEX (4), D3D_NAME_VIEWPORT_ARRAY_INDEX (5): a patched pixel shader behind it
+    // would see a non-zero view number (mvr_ps.h).
+    if (dxbc::HasOutputSystemValue(code, len, 4) || dxbc::HasOutputSystemValue(code, len, 5)) {
+        if (g_layered.fetch_add(1, std::memory_order_relaxed) == 0) {
+            char sum[40];
+            SumText(code, len, sum);
+            Log("MVR VS patch: vertex shader %s writes the render target array or viewport index (counted from now on; "
+                "a patched pixel shader behind it would read view 1's textures)",
+                sum);
+        }
+    }
     if (!g_testing && caller >= g_selfBase && caller < g_selfEnd) {
         g_own.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
@@ -270,12 +288,12 @@ void LogLine(const char* what) {
     }
     Log("MVR VS patch stats%s: %s; vertex shaders made %llu: patched %llu (%llu before the first Submit, %.0f us each, "
         "%.1f..%.1f s), refused %llu, NVAPI failures %llu, device without MVR %llu, proxy's own %llu; other calls %llu; "
-        "largest output register o%u",
+        "largest output register o%u; writing the render target array index %llu",
         what, g_dead ? "STOPPED" : g_on ? "on" : "off", (unsigned long long)g_made.load(), (unsigned long long)patched,
         (unsigned long long)g_beforeSubmit.load(), patched ? (double)g_patchUs.load() / (double)patched : 0.0, firstS,
         lastS, (unsigned long long)g_refused.load(), (unsigned long long)g_nvFailed.load(),
         (unsigned long long)g_noMvr.load(), (unsigned long long)g_own.load(), (unsigned long long)g_other.load(),
-        g_maxReg.load());
+        g_maxReg.load(), (unsigned long long)g_layered.load());
 }
 
 }  // namespace

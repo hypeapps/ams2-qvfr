@@ -17,6 +17,7 @@
 
 #include <d3d11.h>
 
+#include <cstdint>
 #include <string>
 
 namespace qvfr::sunfx {
@@ -41,6 +42,15 @@ using DrawReplaceFn = bool (*)(ID3D11DeviceContext* c, UINT count);
 using InsideFn = bool (*)();
 using AfterFn = void (*)(ID3D11DeviceContext* c);
 bool SetDrawReplace(DrawReplaceFn replace, InsideFn inside, AfterFn after);
+
+// MVR pixel shader patch (mvr_ps.h): one hook per D3D11 function, so the game's pixel shaders made through this module's
+// CreatePixelShader hook go through create(..., original, caller) instead of the original function (`caller`: the
+// return address of the game's call). False: the hook is not in place.
+using CreatePsFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*, SIZE_T, ID3D11ClassLinkage*,
+                                               ID3D11PixelShader**);
+using CreatePsFilterFn = HRESULT (*)(ID3D11Device* dev, const void* code, SIZE_T len, ID3D11ClassLinkage* link,
+                                     ID3D11PixelShader** out, CreatePsFn original, uintptr_t caller);
+bool SetCreatePsFilter(CreatePsFilterFn create);
 
 std::string Describe();      // one part of the summary line
 void LogStats(bool totals);  // a stats line, with the session totals at the end

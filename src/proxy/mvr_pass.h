@@ -67,6 +67,36 @@ const char* ModeName(Mode m);
 bool BeforeTask(uint8_t* task, int group);
 void AfterTask(uint8_t* task);  // after the engine's Execute (not after a skipped one)
 
+// MVR forward, step 1 (docs/mvr.md B9a), [debug] mvr_early: focus L's SSAO and lights (mode 2: SSAO only) run in
+// outer L's group, right
+// before its CPhase3Render (the forward pass that a later step draws with MVR), and the focus group skips them. Only
+// focus L: the focus clones are shared, and outer R's group (which would run focus R's) comes before focus L's group.
+// The run order of quad's RunTask:
+//   EarlyWanted(eye) -> quad swaps focus's view in and puts focus's clones in -> EarlyBegin(eye, projected) -> the
+//   engine's CBeginEye, CSSAORender, CPhase2Render of the focus group without their Finish -> clones out, view back,
+//   outer's CBeginEye again without its Finish -> EarlyEnd(eye, ...).
+enum class Kind { Other, Phase1, Build, Ssao, Phase2, Phase3 };
+Kind KindOf(uint8_t* task);  // by vtable; Other when not installed
+void SetEarly(int mode);     // the setting and its hotkey: 0 off, 1 SSAO and lights, 2 SSAO only, 3-5 diagnosis
+constexpr int kEarlyModes = 6;
+int GetEarly();
+const char* EarlyName(int mode);
+// True when this frame's eye should get its focus's SSAO and lights now (setting, B8 on and in skip mode, outer's
+// stash from this frame, no shot). Counts the reason when not.
+bool EarlyWanted(int eye);
+// After the swap, with focus's clones in: the focus group's choice is made now (skip its G-buffer pass, SSAO and
+// lights) and the stash goes into the clones. False: not now (the reason is counted); the focus group decides at its
+// own time as in B8.
+bool EarlyBegin(int eye, bool projected);
+void EarlyRefused(int eye, const char* why);  // quad could not swap (the reason is counted)
+void EarlyEnd(int eye, double ms, bool ok);   // ok = false: an engine fault in the early tasks
+void EarlyWaited(double ms);                  // time quad waited for the engine's recording workers before the swap
+// Task map of a shot frame or of a map frame (render thread): every task of the eye groups with its draws, binds,
+// clears and the distinct targets it bound, one log line per task that touched the immediate context; `detail` adds
+// the distinct PS shader resources and constant buffers of its draws (resource ids, clones marked).
+void TaskMapBegin(const char* group, const char* name, bool detail);
+void TaskMapEnd();
+
 // D3D11 detours of the immediate context, before the real call (after the clones' mapping): the targets to bind or
 // clear instead during the MVR part. MapTargets: false = bind as they are; rtvOut has room for n entries.
 bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv, ID3D11DepthStencilView* dsv,

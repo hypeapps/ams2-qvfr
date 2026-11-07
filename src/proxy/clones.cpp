@@ -1835,6 +1835,15 @@ ID3D11Texture2D* CloneOf(ID3D11Resource* res, Set set) {
     return out;
 }
 
+bool IsReady() {
+    bool out = false;
+    Protect("IsReady", [&] {
+        std::lock_guard lock(g_cm);
+        out = !g_failed && g_phase == Ready && g_enabled && !g_dirty && !g_swapped;
+    });
+    return out;
+}
+
 bool SwappedIn(Set set) {
     bool out = false;
     Protect("SwappedIn", [&] {

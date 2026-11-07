@@ -213,4 +213,22 @@ Chunk WriteSignature(uint32_t fourcc, const std::vector<SigElement>& elements) {
     return c;
 }
 
+bool HasOutputSystemValue(const void* code, size_t size, uint32_t systemValue) {
+    std::vector<Chunk> chunks;
+    if (!Parse(code, size, chunks, nullptr)) return false;
+    for (const auto& c : chunks) {
+        // Element size and the offset of the system value: OSGN 24 / 8; OSG5 and OSG1 start with the stream.
+        size_t stride = 0, sv = 0;
+        if (c.fourcc == FourCC('O', 'S', 'G', 'N')) stride = 24, sv = 8;
+        if (c.fourcc == FourCC('O', 'S', 'G', '5')) stride = 28, sv = 12;
+        if (c.fourcc == FourCC('O', 'S', 'G', '1')) stride = 32, sv = 12;
+        if (!stride || c.data.size() < 8) continue;
+        const uint32_t count = Get32(c.data.data()), first = Get32(c.data.data() + 4);
+        if (first + stride * count > c.data.size()) continue;
+        for (uint32_t i = 0; i < count; ++i)
+            if (Get32(c.data.data() + first + stride * i + sv) == systemValue) return true;
+    }
+    return false;
+}
+
 }  // namespace qvfr::dxbc

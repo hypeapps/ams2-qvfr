@@ -24,6 +24,7 @@
 #include "gpu.h"
 #include "hooks.h"
 #include "mvr_pass.h"
+#include "mvr_ps.h"
 #include "mvr_vs.h"
 #include "shots.h"
 #include "sun_fx.h"
@@ -295,6 +296,17 @@ bool g_cullKeyDown = false;
 bool g_mvrOn = true;  // MVR gate B8 (the hotkey switches; mvr_gbuffer=1 installs it)
 bool g_mvrKeyDown = false;
 bool g_mvrModeKeyDown = false;
+int g_mvrEarlyCfg = 0;  // Cfg().mvrEarly last seen (a reload sets the step)
+bool g_mvrEarlyKeyDown = false;
+bool g_mvrMapKeyDown = false;
+bool g_mapFrame = false;  // a task map with PS resources in this frame (mvr_map_key)
+bool g_mapNext = false;
+// MVR forward step 1 (B9a): each eye group's CSSAORender and CPhase2Render (null when the graph has none or two).
+struct EyeTasks {
+    uint8_t* ssao = nullptr;
+    uint8_t* phase2 = nullptr;
+};
+EyeTasks g_eyeTasks[kGroups];  // under g_m, from BuildProfileLocked
 // Crepuscular rays and lens flares of the focus views from outer (sun_fx.h): setting and hotkey.
 bool g_sunOn = true;
 bool g_sunCfg = true;
@@ -467,6 +479,8 @@ const ProfTask* ProfFind(uint8_t* task) {
     return &p->entries[p->entry[it - p->tasks.begin()]];
 }
 
+void EarlyFocus(int eye);
+
 void __fastcall RunTask(uint8_t* task) {
     if (g_skip.load(std::memory_order_relaxed)) {
         if (InSkipSet(task)) {
@@ -480,14 +494,22 @@ void __fastcall RunTask(uint8_t* task) {
     const bool profOn = g_profOn.load(std::memory_order_relaxed);
     const bool mvr = mvrpass::On();
     const ProfTask* prof = profOn || mvr ? ProfFind(task) : nullptr;
-    // MVR gate B8: a focus group's G-buffer tasks are skipped when outer's pass drew its G-buffer.
+    // MVR forward step 1 (B9a): focus L's SSAO and lights right before outer L's forward pass.
+    if (mvr && prof && prof->group == OuterL && mvrpass::KindOf(task) == mvrpass::Kind::Phase3) EarlyFocus(0);
+    // MVR gate B8: a focus group's G-buffer tasks are skipped when outer's pass drew its G-buffer (B9a: and its SSAO
+    // and lights after an early run).
     if (mvr && mvrpass::BeforeTask(task, prof ? prof->group : -1)) {
         (*(ExecuteFn**)task)[kFinishSlot](task);
         return;
     }
+    // Task map of a shot frame: what each task of the eye groups draws and binds.
+    const bool map = mvr && prof && (g_shotFrame || g_mapFrame) &&
+                     GetCurrentThreadId() == g_renderTid.load(std::memory_order_relaxed);
+    if (map) mvrpass::TaskMapBegin(kGroupNames[prof->group], prof->name, g_mapFrame);
     LARGE_INTEGER t0{}, t1{};
     if (profOn) QueryPerformanceCounter(&t0);
     (*(ExecuteFn**)task)[kExecuteSlot](task);
+    if (map) mvrpass::TaskMapEnd();
     if (mvr) mvrpass::AfterTask(task);
     if (profOn) {
         QueryPerformanceCounter(&t1);
@@ -607,6 +629,7 @@ void PublishProfile(const Profile* p) {
 void ClearGroups() {
     PublishSkipSet(nullptr);
     PublishProfile(nullptr);
+    for (EyeTasks& e : g_eyeTasks) e = EyeTasks{};
 }
 
 using TaskNameFn = const char*(__fastcall*)(void*);
@@ -677,6 +700,18 @@ void BuildProfileLocked() {
                 taken.insert(t);
                 items.push_back({t, g, -1});
             }
+    for (EyeTasks& e : g_eyeTasks) e = EyeTasks{};
+    bool twice[kGroups] = {};
+    for (const Item& it : items) {
+        const mvrpass::Kind k = mvrpass::KindOf((uint8_t*)it.task);
+        uint8_t** slot = k == mvrpass::Kind::Ssao ? &g_eyeTasks[it.group].ssao
+                         : k == mvrpass::Kind::Phase2 ? &g_eyeTasks[it.group].phase2 : nullptr;
+        if (!slot) continue;
+        if (*slot) twice[it.group] = true;
+        *slot = (uint8_t*)it.task;
+    }
+    for (int g = 0; g < kGroups; ++g)
+        if (twice[g]) g_eyeTasks[g] = EyeTasks{};  // not one task of each: no early run for that group
     p->n = items.size();
     p->entries = std::make_unique<ProfTask[]>(p->n);
     size_t count[kGroups] = {};
@@ -1091,7 +1126,7 @@ void CullLocked(uint8_t* ctx, int group, const uint8_t* cam, const uint8_t* srcE
 // reads the eye tangents straight from the VR device by view - 1 (0x9ce0e8), the passes read the projection from the
 // camera (+0x138, +0x150). The frustum block stays the eye's (built from FOV, a superset of the focus window); focus
 // culling gives the group a draw queue culled for its window.
-void SwapInLocked(uint8_t* ctx, int group, int src, Run& run) {
+void SwapInLocked(uint8_t* ctx, int group, int src, Run& run, bool cull = true) {
     Swap& s = g_swap;
     memcpy(s.slot, ctx + kCtxSlots + kFocusView * kSlotSize, kSlotSize);
     memcpy(s.block, ctx + kCtxCamBlock + kFocusView * kCamBlockSize, kCamBlockSize);
@@ -1155,7 +1190,7 @@ void SwapInLocked(uint8_t* ctx, int group, int src, Run& run) {
             memcpy(s.camProj, cam + kCamProj, kMatSize);
             s.cam = cam;
             memcpy(cam + kCamProj, data + kEyeProj, kMatSize);
-            CullLocked(ctx, group, cam, srcEye, data, run);
+            if (cull) CullLocked(ctx, group, cam, srcEye, data, run);
         }
     }
     if (!proj) memcpy(data, srcEye, kVrEyeSize);
@@ -1338,6 +1373,22 @@ void HandleToolsLocked() {
     if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrKey, g_mvrKeyDown)) {
         g_mvrOn = !g_mvrOn;
         Log("Quad: MVR G-buffer %s (hotkey)", g_mvrOn ? "on" : "off");
+    }
+    if (mvrpass::On() && c.mvrEarly != g_mvrEarlyCfg) {
+        g_mvrEarlyCfg = c.mvrEarly;
+        mvrpass::SetEarly(c.mvrEarly);
+        Log("Quad: MVR early tasks of focus L: %s (ini)", mvrpass::EarlyName(c.mvrEarly));
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrEarlyKey, g_mvrEarlyKeyDown)) {
+        mvrpass::SetEarly((mvrpass::GetEarly() + 1) % mvrpass::kEarlyModes);
+        Log("Quad: MVR early tasks of focus L: %s (hotkey)", mvrpass::EarlyName(mvrpass::GetEarly()));
+    }
+    g_mapFrame = g_mapNext;
+    g_mapNext = false;
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrMapKey, g_mvrMapKeyDown)) {
+        g_mapNext = true;
+        Log("Quad: MVR task map with PS resources in the next frame (hotkey; early tasks: %s)",
+            mvrpass::EarlyName(mvrpass::GetEarly()));
     }
     if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrModeKey, g_mvrModeKeyDown)) {
         using M = mvrpass::Mode;
@@ -1822,6 +1873,212 @@ void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
     return r;
 }
 
+// ---------------------------------------------------------------- MVR forward step 1 (B9a)
+
+void __fastcall NoFinish(void*) {}
+
+// A leaf task's Execute without its Finish: Execute ends with `jmp [vtable+0x38]`, so for the call the task gets a copy
+// of its vtable whose slot 7 returns. The executor still runs the task later, and the proxy then skips it (Finish
+// only), so the group's scheduler sees it once. `fn`: the Execute to call (a detour's original), else vtable +0x48.
+constexpr int kVtCopy = 16;
+bool ExecuteOnly(uint8_t* task, Fn4 fn) {
+    void** vt = *(void***)task;
+    void* copy[kVtCopy];
+    if (!hooks::TryRead(vt, copy, sizeof(copy))) return false;
+    copy[kFinishSlot] = (void*)&NoFinish;
+    bool ok = true;
+    *(void***)task = copy;
+    __try {
+        if (fn)
+            fn(task, nullptr, nullptr, nullptr);
+        else
+            ((ExecuteFn)vt[kExecuteSlot])(task);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = false;
+    }
+    *(void***)task = vt;
+    return ok;
+}
+
+// The engine's command buffer recording (Ghidra, 2026-11-07): a *BuildCommandThread task queues each recording through
+// device+0x558 (a queue per worker at device+0xe1d0 + k * 0x30: u16 counters at +0x2 and +0xa, index mask at +0x24;
+// k = 0 is the shared one) and releases its dependents at once (0xcde2e0, state 3), so the render thread goes on while
+// workers 1..n-1 (n at device+0xf190) record. A worker takes a job by clearing its bit in device+0xe1c0 and sets it
+// again when done; the command buffer (vtable 0x2111cb8) has +0x98 set while it records, and its replaying task waits
+// for it (+0x60). Recordings read the engine objects' D3D11 views and sizes, so they must not run while the proxy has
+// focus's clones in those objects: a recording of outer's then holds clone views (B9a run 3, mode 3 flickered).
+constexpr uintptr_t kEngineDevice = 0x2684ea0;  // DAT_142684ea0: pointer to the engine device (RVA)
+constexpr size_t kDevWorkers = 0xf190, kDevIdle = 0xe1c0, kDevQueues = 0xe1d0, kDevQueueStride = 0x30;
+constexpr size_t kQueueA = 0x2, kQueueB = 0xa, kQueueMask = 0x24;
+constexpr uintptr_t kCmdBufVtable = 0x2111cb8;
+constexpr size_t kCmdBufBusy = 0x98;
+constexpr size_t kCtxBufFirst = 0x7e0, kCtxBufEnd = 0x8b8;  // the render context's command buffers (0x7d96f0)
+constexpr double kWorkerWaitMs = 2.0;
+
+// True when no recording is queued or running; `why` gets the reason when the state cannot be read.
+bool EngineIdle(uint8_t* ctx, const char** why) {
+    uint8_t* dev = nullptr;
+    uint32_t n = 0, idle = 0;
+    if (!hooks::TryRead((void*)(hooks::ExeBase() + kEngineDevice), &dev, 8) || !dev ||
+        !hooks::TryRead(dev + kDevWorkers, &n, 4) || n < 1 || n > 32 || !hooks::TryRead(dev + kDevIdle, &idle, 4)) {
+        *why = "the engine's worker state is unreadable";
+        return false;
+    }
+    for (uint32_t k = 0; k < n; ++k) {
+        uint8_t* q = dev + kDevQueues + k * kDevQueueStride;
+        uint16_t a = 0, b = 0;
+        uint32_t mask = 0;
+        if (!hooks::TryRead(q + kQueueA, &a, 2) || !hooks::TryRead(q + kQueueB, &b, 2) ||
+            !hooks::TryRead(q + kQueueMask, &mask, 4)) {
+            *why = "the engine's worker state is unreadable";
+            return false;
+        }
+        if (((uint32_t)a - (uint32_t)b) & mask) return false;  // queued
+        if (k && !(idle & (1u << k))) return false;            // worker k busy
+    }
+    const uintptr_t vt = hooks::ExeBase() + kCmdBufVtable;
+    for (size_t off = kCtxBufFirst; off < kCtxBufEnd; off += 8) {
+        uint8_t* buf = nullptr;
+        uintptr_t bvt = 0;
+        uint8_t busy = 0;
+        if (!hooks::TryRead(ctx + off, &buf, 8) || !buf || !hooks::TryRead(buf, &bvt, 8) || bvt != vt) continue;
+        if (hooks::TryRead(buf + kCmdBufBusy, &busy, 1) && busy) return false;
+    }
+    return true;
+}
+
+// Waits up to kWorkerWaitMs for EngineIdle. False: still busy (or unreadable, `why`).
+bool WaitEngineIdle(uint8_t* ctx, const char** why, double* waitedMs) {
+    LARGE_INTEGER t0{}, t{};
+    QueryPerformanceCounter(&t0);
+    const int64_t limit = (int64_t)(kWorkerWaitMs * g_qpcFreq / 1000.0);
+    for (unsigned i = 0;; ++i) {
+        const char* w = nullptr;
+        const bool idle = EngineIdle(ctx, &w);
+        QueryPerformanceCounter(&t);
+        *waitedMs = g_qpcFreq ? (t.QuadPart - t0.QuadPart) * 1000.0 / g_qpcFreq : 0;
+        if (idle) return true;
+        if (w) {
+            *why = w;
+            return false;
+        }
+        if (t.QuadPart - t0.QuadPart > limit) {
+            *why = "the engine's workers still recording after 2 ms";
+            return false;
+        }
+        if (i > 64)
+            SwitchToThread();
+        else
+            YieldProcessor();
+    }
+}
+
+// Render thread, inside RunTask right before outer's CPhase3Render (eye 0 only, mvr_pass.h): focus's view is swapped
+// in as its CBeginEye detour does (without the focus culling: the G-buffer pass it culls is skipped), focus's clones go
+// in, the stash goes into them, then the focus group's CBeginEye, CSSAORender and CPhase2Render run without Finish;
+// afterwards outer's clones state, view and CBeginEye (view number, eye target, global slot 0x13) come back.
+void EarlyFocus(int eye) {
+    if (!mvrpass::EarlyWanted(eye)) return;
+    const int og = OuterL + eye, fg = FocusL + eye;
+    uint8_t *fBegin = nullptr, *oBegin = nullptr, *ssao = nullptr, *phase2 = nullptr;
+    const char* why = nullptr;
+    Run run{};
+    // No recording may run while focus's view and clones are in (above).
+    {
+        uint8_t* octx = nullptr;
+        Safe("early focus (context)", [&] {
+            std::lock_guard lock(g_m);
+            if (g_graph.begin[og]) octx = *(uint8_t**)((uint8_t*)g_graph.begin[og] + kTaskCtx);
+        });
+        double waited = 0;
+        if (!octx) why = "no eye groups";
+        else if (!WaitEngineIdle(octx, &why, &waited)) {
+            if (!why) why = "the engine's workers busy";
+        }
+        mvrpass::EarlyWaited(waited);
+        if (why) {
+            mvrpass::EarlyRefused(eye, why);
+            return;
+        }
+    }
+    Safe("early focus (swap)", [&] {
+        std::lock_guard lock(g_m);
+        fBegin = (uint8_t*)g_graph.begin[fg];
+        oBegin = (uint8_t*)g_graph.begin[og];
+        ssao = g_eyeTasks[fg].ssao;
+        phase2 = g_eyeTasks[fg].phase2;
+        if (!g_graph.ok || !fBegin || !oBegin) {
+            why = "no eye groups";
+            return;
+        }
+        if (!ssao || !phase2) {
+            why = "the focus group has no single CSSAORender and CPhase2Render";
+            return;
+        }
+        if (!(g_began & (1u << og)) || (g_began & (1u << fg))) {
+            why = "outer's group not running or focus's already begun";
+            return;
+        }
+        if (!g_focus.on || g_frameSkip) {
+            why = "no focus window or outer only";
+            return;
+        }
+        if (g_swap.ctx) {
+            why = "a view swap is active";
+            return;
+        }
+        if (!clones::IsReady()) {
+            why = "the clones are not ready";
+            return;
+        }
+        uint8_t* ctx = *(uint8_t**)(fBegin + kTaskCtx);
+        const int view = *(int*)(fBegin + kTaskView);
+        if (!ctx || view != kFocusView || ctx != *(uint8_t**)(oBegin + kTaskCtx)) {
+            why = "focus's CBeginEye has another context or view";
+            return;
+        }
+        SwapInLocked(ctx, fg, kSourceView[fg], run, false);
+        if (!run.projected) {
+            RestoreLocked();
+            why = "no focus projection";
+        }
+    });
+    if (g_fault.load(std::memory_order_relaxed)) why = "proxy fault";
+    if (why) {
+        mvrpass::EarlyRefused(eye, why);
+        return;
+    }
+    LARGE_INTEGER t0{}, t1{};
+    QueryPerformanceCounter(&t0);
+    ID3D11DeviceContext* imm = gpu::Context();
+    clones::EndGroup(imm);  // outer's (no clones of its own in the game's render size)
+    clones::BeginGroup(imm, clones::Focus);
+    bool ran = false, ok = true;
+    if (mvrpass::GetEarly() == 3) {  // diagnosis: the swap and both CBeginEye, no task moved
+        ran = true;
+        ok = ExecuteOnly(fBegin, o_beginExec);
+    } else if (mvrpass::EarlyBegin(eye, run.projected)) {
+        ran = true;
+        ok = ExecuteOnly(fBegin, o_beginExec) && ExecuteOnly(ssao, nullptr) &&
+             (mvrpass::GetEarly() != 1 || ExecuteOnly(phase2, nullptr));
+    }
+    clones::EndGroup(imm);
+    clones::BeginGroup(imm, clones::Outer);
+    Guard("early focus (restore)", [&] {
+        std::lock_guard lock(g_m);
+        if (g_swap.ctx && g_swap.group == fg) RestoreLocked();
+    });
+    if (!ran) return;
+    ok &= ExecuteOnly(oBegin, o_beginExec);
+    QueryPerformanceCounter(&t1);
+    mvrpass::EarlyEnd(eye, g_qpcFreq ? (t1.QuadPart - t0.QuadPart) * 1000.0 / g_qpcFreq : 0, ok);
+    if (!ok) {
+        mvrpass::SetEarly(0);
+        Log("Quad: MVR early SSAO and lights: ENGINE FAULT in an early task (frame %llu); the step is off",
+            (unsigned long long)g_frameNo);
+    }
+}
+
 // ---------------------------------------------------------------- D3D11 detour
 
 using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*,
@@ -2092,7 +2349,14 @@ void Install() {
         // Sun effects: the shader creation hook must be in place before the game makes its effect shaders.
         if (g_patched) sunfx::Install();
         // MVR gate B6: the vertex shader hook must be in place before the game makes its scene shaders.
-        if (g_patched && Cfg().mvrVsPatch) mvrvs::Install();
+        const bool mvrVs = g_patched && Cfg().mvrVsPatch && mvrvs::Install();
+        // MVR gate B9b: the pixel shader patch runs in the sun effects hook and needs NVAPI from mvr_vs.
+        if (g_patched && Cfg().mvrPsPatch) {
+            if (mvrVs)
+                mvrps::Install();
+            else
+                Log("MVR PS patch: off (needs [debug] mvr_vs_patch=1)");
+        }
         // TAA views: the target helper hook must be in place before the game makes its TAA (track load).
         if (g_patched) taaviews::Install();
         // Quad <-> outer only needs the focus tasks from the builder's "add task" calls and the executor patch.
@@ -2105,6 +2369,7 @@ void Install() {
         if (Cfg().mvrGbuffer && g_execPatched && Cfg().mvrVsPatch) {
             mvrpass::SetJitterSource(&dlaa::FrameJitter);
             mvrpass::Install();
+            g_mvrEarlyCfg = Cfg().mvrEarly;  // Install took the setting
         }
         else if (Cfg().mvrGbuffer)
             Log("MVR G-buffer: off (needs [debug] mvr_vs_patch=1 and the executor patch)");
@@ -2151,6 +2416,7 @@ void OnFrameStart() {
         clones::OnFrameStart(gpu::Context(), g_clonesOn && g_focus.on);
         sunfx::OnFrameStart(gpu::Context(), g_sunOn && g_focus.on && !g_frameSkip);
         mvrvs::OnFrameStart(gpu::Context());
+        mvrps::OnFrameStart(gpu::Context());
         taaviews::OnFrameStart(g_taaOn && !g_frameSkip, g_shotFrame);
         dlaa::SetShotFrame(g_shotFrame);
     });
@@ -2375,6 +2641,7 @@ void LogStats(bool totals) {
         clones::LogStats(totals);
         sunfx::LogStats(totals);
         mvrvs::LogStats(totals);
+        mvrps::LogStats(totals);
         mvrpass::LogStats(totals);
         taaviews::LogStats(totals);
     });
@@ -2408,11 +2675,11 @@ std::string Describe() {
                            : g_cull.failed ? "focus culling off after failed checks"
                            : g_cullOn      ? "focus culling on"
                                            : "focus culling off";
-        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s, %s, %s, %s, %s, %s, %s%s",
+        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s, %s, %s, %s, %s, %s, %s, %s%s",
                  g_installed ? "engine hooks on" : "engine hooks off", g_patched ? "on" : "off",
                  g_graph.ok ? "running" : "not running", focus, view, cull, clones::Describe().c_str(),
                  sunfx::Describe().c_str(), taaviews::Describe().c_str(), mvrvs::Describe().c_str(),
-                 mvrpass::Describe().c_str(), g_fault ? ", stopped after an exception" : "");
+                 mvrps::Describe().c_str(), mvrpass::Describe().c_str(), g_fault ? ", stopped after an exception" : "");
     });
     return buf;
 }
