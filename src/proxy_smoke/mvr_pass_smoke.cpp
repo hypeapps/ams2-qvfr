@@ -325,8 +325,21 @@ void Spoil(const Targets& t) {
     c->ClearDepthStencilView(t.dsv.Get(), D3D11_CLEAR_DEPTH, 0.25f, 0);
 }
 
+// B17: the game's targets as two-slice arrays (the clones module's job in the game), and what the pass asked for.
+Targets g_arrT;
+std::vector<ID3D11Resource*> g_wanted;
+bool IsArrayTarget(ID3D11Resource* r) {
+    return r && (r == g_arrT.color.Get() || r == g_arrT.lin.Get() || r == g_arrT.depth.Get());
+}
+void WantArrayTarget(ID3D11Resource* r) {
+    if (std::find(g_wanted.begin(), g_wanted.end(), r) == g_wanted.end()) g_wanted.push_back(r);
+}
+
 // The fake clones module: the focus clone of each game target.
 ID3D11Texture2D* CloneOf(ID3D11Resource* r) {
+    if (r == g_arrT.color.Get()) return g_s.focus.color.Get();
+    if (r == g_arrT.lin.Get()) return g_s.focus.lin.Get();
+    if (r == g_arrT.depth.Get()) return g_s.focus.depth.Get();
     if (r == g_s.game.color.Get()) return g_s.focus.color.Get();
     if (r == g_s.game.lin.Get()) return g_s.focus.lin.Get();
     if (r == g_s.game.depth.Get()) return g_s.focus.depth.Get();
@@ -499,6 +512,7 @@ int RunMvrPass() {
         return 1;
     }
     qvfr::mvrpass::TestSetup(ctx.Get(), g_vtOuter, g_vtBuild, &CloneOf, &JitterOf);
+    qvfr::mvrpass::TestNative(&IsArrayTarget, &WantArrayTarget);
     qvfr::mvrpass::TestDepthBias(0, 0.0f, false);  // the depth as MVR draws it; the depth fix has its own frames
     // Outer L's group: CBeginEye's targets and window, then the pass.
     qvfr::mvrpass::OnFrameStart(true);
@@ -672,6 +686,73 @@ int RunMvrPass() {
                                 sD = Read(g_s.focus.depth.Get()), sM = Read(g_s.focus.mask.Get());
     qvfr::mvrpass::TestEnd();
     qvfr::mvrpass::SetDirectExtract(true);
+    // B17 (ninth frame, as the first): the game's outer-size targets are two-slice arrays with TEXTURE2D views (slice
+    // 0), as the clones module makes them: no copy in or back, outer's slice 0 and focus's clones as in the first frame.
+    // Tenth frame: mvr_native_targets off, the same arrays through copies again.
+    const std::vector<ID3D11Resource*> wanted = g_wanted;
+    bool arraysMade = false;
+    {
+        Targets& a = g_arrT;
+        a.color = Tex(kW, kH, DXGI_FORMAT_R8G8B8A8_UNORM, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 2);
+        a.lin = Tex(kW, kH, DXGI_FORMAT_R32_TYPELESS, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, 2);
+        a.depth = Tex(kW, kH, DXGI_FORMAT_R32_TYPELESS, D3D11_BIND_DEPTH_STENCIL | D3D11_BIND_SHADER_RESOURCE, 2);
+        a.mask = g_s.game.mask;
+        a.maskRtv = g_s.game.maskRtv;
+        D3D11_RENDER_TARGET_VIEW_DESC cv{};
+        cv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        cv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        D3D11_RENDER_TARGET_VIEW_DESC lv = cv;
+        lv.Format = DXGI_FORMAT_R32_FLOAT;
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = DXGI_FORMAT_R32_FLOAT;
+        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D = {0, 1};
+        D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+        dv.Format = DXGI_FORMAT_D32_FLOAT;
+        dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        arraysMade = a.color && a.lin && a.depth &&
+                     SUCCEEDED(dev->CreateRenderTargetView(a.color.Get(), &cv, &a.colorRtv)) &&
+                     SUCCEEDED(dev->CreateRenderTargetView(a.lin.Get(), &lv, &a.linRtv)) &&
+                     SUCCEEDED(dev->CreateShaderResourceView(a.lin.Get(), &sv, &a.linSrv)) &&
+                     SUCCEEDED(dev->CreateDepthStencilView(a.depth.Get(), &dv, &a.dsv));
+    }
+    const Targets plainGame = g_s.game;
+    qvfr::mvrpass::TestState stN[2], stNF[2];
+    std::vector<uint32_t> nGC[2], nGL[2], nGD[2], nGM[2], nFC[2], nFL[2], nFD[2], nFM[2];
+    bool nSkip[2] = {};
+    if (arraysMade) {
+        g_s.game = g_arrT;
+        for (int m = 0; m < 2; ++m) {
+            qvfr::mvrpass::SetNativeTargets(m == 0);
+            Spoil(g_s.game);
+            Spoil(g_s.focus);
+            qvfr::mvrpass::OnFrameStart(true);
+            qvfr::mvrpass::SetWindow(0, true, sx, ox, sy, oy, kW, kH);
+            ctx->VSSetConstantBuffers(qvfr::mvrvs::kCbSlot, 1, game3.GetAddressOf());
+            BindG(g_s.game);
+            if (!qvfr::mvrpass::BeforeTask((uint8_t*)&g_outer, 0)) RunTask(g_outer);
+            qvfr::mvrpass::AfterTask((uint8_t*)&g_outer);
+            stN[m] = qvfr::mvrpass::TestGet();
+            nGC[m] = Read(g_s.game.color.Get());
+            nGL[m] = Read(g_s.game.lin.Get());
+            nGD[m] = Read(g_s.game.depth.Get());
+            nGM[m] = Read(g_s.game.mask.Get());
+            qvfr::mvrpass::FocusGroup(0, true);
+            BindG(g_s.focus);
+            FakeTask focusNative{g_vtOuter};
+            if (qvfr::mvrpass::BeforeTask((uint8_t*)&g_build, 2)) Finish(g_build);
+            nSkip[m] = qvfr::mvrpass::BeforeTask((uint8_t*)&focusNative, 2);
+            if (nSkip[m]) Finish(focusNative);
+            stNF[m] = qvfr::mvrpass::TestGet();
+            nFC[m] = Read(g_s.focus.color.Get());
+            nFL[m] = Read(g_s.focus.lin.Get());
+            nFD[m] = Read(g_s.focus.depth.Get());
+            nFM[m] = Read(g_s.focus.mask.Get());
+            qvfr::mvrpass::TestEnd();
+        }
+        qvfr::mvrpass::SetNativeTargets(true);
+        g_s.game = plainGame;
+    }
     if (refC.empty() || refFC.empty() || gC.empty() || fC.empty() || fM.empty() || gM.empty() || s1.empty()) {
         printf("MVR pass: read-back failed\n");
         return 1;
@@ -858,8 +939,30 @@ int RunMvrPass() {
     }
     const bool directOk = st.direct == 3 && st8.direct == 0 && st8.stashValid && st8.stashed == 3 && stashSkip &&
                           st9.fills == 1 && st9.failures == 0 && sizesOk && viaStashDiff == 0;
+    // B17: the pass asked for the three outer-size targets (not the 1/4 mask); with the arrays slice 0 is the game's as
+    // without MVR and focus's clones are the first frame's bit for bit, without copies (ninth) and with them (tenth).
+    auto differ = [](const std::vector<uint32_t>& a, const std::vector<uint32_t>& b) {
+        if (a.empty() || a.size() != b.size()) return 1 << 30;
+        int d = 0;
+        for (size_t i = 0; i < a.size(); ++i) d += a[i] != b[i];
+        return d;
+    };
+    auto asked = [&](ID3D11Resource* r) { return std::find(wanted.begin(), wanted.end(), r) != wanted.end(); };
+    const bool wantOk = wanted.size() == 3 && asked(plainGame.color.Get()) && asked(plainGame.lin.Get()) &&
+                        asked(plainGame.depth.Get());
+    int nOuter[2] = {}, nFocus[2] = {};
+    bool nCounts[2] = {};
+    for (int m = 0; m < 2; ++m) {
+        nOuter[m] = differ(nGC[m], refC) + differ(nGL[m], refL) + differ(nGD[m], refD) + differ(nGM[m], refM);
+        nFocus[m] = differ(nFC[m], fC) + differ(nFL[m], fL) + differ(nFD[m], fD) + differ(nFM[m], fM);
+        nCounts[m] = stN[m].stashValid && stN[m].stashed == 3 && stN[m].mapFailures == 0 &&
+                     stN[m].native == (m == 0 ? 3u : 0u) && stN[m].copiedBack == (m == 0 ? 0u : 3u) && nSkip[m] &&
+                     stNF[m].fills == 1 && stNF[m].failures == 0;
+    }
+    const bool nativeOk = arraysMade && wantOk && nCounts[0] && nCounts[1] && nOuter[0] == 0 && nOuter[1] == 0 &&
+                          nFocus[0] == 0 && nFocus[1] == 0;
     const bool ok = countsOk && outerOk && focusOk && jitterOk && lateOk && owOk && biasOk && slopeOk && dilateOk &&
-                    directOk && !warnings;
+                    directOk && nativeOk && !warnings;
     printf("MVR pass: %s; outer pass %u, stash %s (%u targets, %u masks), binds %u, clears %u, map failures %u, VS sets "
            "patched %u / unpatched %u, slot 3 rebinds %u, copied back %u, SetMultiViewMode failures %u, jitter %s; "
            "focus: build %s, pass %s (runs %d / %d, Finish %d), fills %u (failed %u) (%s)\n",
@@ -878,6 +981,11 @@ int RunMvrPass() {
     printf("  B15: corners straight into the clones %u of 3 targets (first frame); through the stash %u straight, focus "
            "%s, fills %u, clones (color, linear depth, depth, mask) %d px differ from straight (%s)\n",
            st.direct, st8.direct, stashSkip ? "skipped" : "RUN", st9.fills, viaStashDiff, directOk ? "OK" : "WRONG");
+    printf("  B17: arrays asked for %zu targets (%s); the game's own two-slice arrays: targets %u, copied back %u, outer "
+           "slice 0 vs without MVR %d px, clones vs the first frame %d px; with mvr_native_targets off: targets %u, "
+           "copied back %u, outer %d px, clones %d px (%s)\n",
+           wanted.size(), wantOk ? "color, linear depth, depth" : "WRONG", stN[0].native, stN[0].copiedBack, nOuter[0],
+           nFocus[0], stN[1].native, stN[1].copiedBack, nOuter[1], nFocus[1], nativeOk ? "OK" : "WRONG");
     printf("  without the jitter fix (next frame, offset %s): focus color %d px differ, with it %d (%s)\n",
            noJitter ? "unknown" : "STILL KNOWN", nOff, cOff, jitterOk ? "OK" : "WRONG");
     printf("  game's order (nothing bound before outer's task): MVR part %s, stash %s (%u targets), clears %u, map "

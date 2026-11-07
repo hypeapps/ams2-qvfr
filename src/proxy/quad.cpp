@@ -311,6 +311,8 @@ bool g_mvrGbufPsCfg = true;  // Cfg().mvrGbufferPs last seen
 bool g_mvrGbufPsKeyDown = false;
 bool g_mvrDirectCfg = true;  // Cfg().mvrDirectExtract last seen
 bool g_mvrDirectKeyDown = false;
+bool g_mvrNativeCfg = true;  // Cfg().mvrNativeTargets last seen
+bool g_mvrNativeKeyDown = false;
 
 // mvr_motion's window source: mvr_pass's maps in uv.
 bool MotionWindows(int eye, mvrmotion::Map* cur, mvrmotion::Map* prev, bool* fromOuter) {
@@ -1506,6 +1508,16 @@ void HandleToolsLocked() {
         Log("Quad: MVR G-buffer corners straight into focus's clones %s (hotkey)",
             mvrpass::GetDirectExtract() ? "on" : "off");
     }
+    if (mvrpass::On() && c.mvrNativeTargets != g_mvrNativeCfg) {
+        g_mvrNativeCfg = c.mvrNativeTargets;
+        mvrpass::SetNativeTargets(c.mvrNativeTargets);
+        Log("Quad: MVR targets as the game's own two-slice arrays %s (ini)", c.mvrNativeTargets ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrNativeKey, g_mvrNativeKeyDown)) {
+        mvrpass::SetNativeTargets(!mvrpass::GetNativeTargets());
+        Log("Quad: MVR targets as the game's own two-slice arrays %s (hotkey; off: copies of slice 0 in and back)",
+            mvrpass::GetNativeTargets() ? "on" : "off");
+    }
     g_mapFrame = g_mapNext;
     g_mapNext = false;
     if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrMapKey, g_mvrMapKeyDown)) {
@@ -2510,6 +2522,7 @@ void Install() {
             g_mvrVelSkipCfg = Cfg().mvrVelocitySkip;  // Install took the setting
             g_mvrGbufPsCfg = Cfg().mvrGbufferPs;
             g_mvrDirectCfg = Cfg().mvrDirectExtract;
+            g_mvrNativeCfg = Cfg().mvrNativeTargets;
             mvrpass::SetVelocityFill(&FillFocusMotion);
         }
         else if (Cfg().mvrGbuffer)

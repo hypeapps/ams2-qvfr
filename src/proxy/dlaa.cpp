@@ -353,10 +353,12 @@ bool InitNgx(ID3D11DeviceContext* c) {
     return true;
 }
 
-// A texture we own that matches `like` (size, mips, array) in format `fmt` with the given bind flags.
+// A single texture we own that matches `like` (size, mips) in format `fmt` with the given bind flags. Always one slice:
+// DLSS takes 2D textures, and an engine target may be a two-slice array (MVR B17, clones.h), whose CopyResource into
+// it copies slice 0.
 ID3D11Texture2D* ScratchFor(const D3D11_TEXTURE2D_DESC& like, DXGI_FORMAT fmt, UINT bind) {
     for (Scratch& s : g_scratch)
-        if (s.tex && s.w == like.Width && s.h == like.Height && s.mips == like.MipLevels && s.arr == like.ArraySize &&
+        if (s.tex && s.w == like.Width && s.h == like.Height && s.mips == like.MipLevels && s.arr == 1 &&
             s.fmt == fmt && s.bind == bind)
             return s.tex;
     if (g_scratch.size() >= 12) {
@@ -369,7 +371,7 @@ ID3D11Texture2D* ScratchFor(const D3D11_TEXTURE2D_DESC& like, DXGI_FORMAT fmt, U
     d.Width = like.Width;
     d.Height = like.Height;
     d.MipLevels = like.MipLevels;
-    d.ArraySize = like.ArraySize;
+    d.ArraySize = 1;
     d.Format = fmt;
     d.SampleDesc.Count = 1;
     d.Usage = D3D11_USAGE_DEFAULT;
@@ -825,10 +827,11 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
                 Log("DLAA: TAA inputs differ in size or are multisampled; the game's TAA for this draw");
                 return;
             }
-        // DLSS reads typed resources: a typeless engine texture is copied into a typed one first.
+        // DLSS reads typed 2D resources: a typeless engine texture (or a two-slice array, MVR B17) is copied into a typed
+        // single one first.
         ID3D11Resource* in[3] = {};
         for (int i = 0; i < 3; ++i) {
-            if (!IsTypeless(d[i].Format)) {
+            if (!IsTypeless(d[i].Format) && d[i].ArraySize == 1) {
                 in[i] = tex[i];
                 continue;
             }

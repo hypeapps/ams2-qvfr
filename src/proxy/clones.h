@@ -67,6 +67,21 @@ void SetFocusEye(int eye);
 void WantTwin(ID3D11Resource* original);
 // Render thread: `original`'s focus clone has its twin now.
 bool HasTwin(ID3D11Resource* original);
+// MVR gate B17 (docs/mvr.md): two-slice arrays in place of the engine's own textures. mvr_pass asks for the targets of
+// outer's G-buffer pass; at the next frame start each listed texture whose object still holds it gets a Texture2DArray
+// of 2 slices with its description (a depth format also with a shader view bind), slice 0 starting with its contents.
+// The array and views like the engine's on it (a TEXTURE2D view of an array is slice 0) go into the texture object's
+// fields and the render targets' view arrays, so the engine draws and reads slice 0 itself and MVR's view 1 needs no
+// copy back. The engine's own texture and views stay alive: a hooked call that still reaches them (a view kept outside
+// the objects) goes to the array (a view made on it when needed), and CopyResource between an array and a single
+// texture (or two arrays) copies slice 0 only. Before the engine destroys an object, at a new game size, at VR_Shutdown
+// and on a fault the engine's own values go back. Made arrays drop the clones once: they are made again from the new
+// views (single textures as before). Render thread.
+void WantArray(ID3D11Resource* original);
+// Any thread, lock-free: `res` is one of these arrays.
+bool IsArray(ID3D11Resource* res);
+// Any thread: changes whenever the clones are dropped (views kept on old clones would keep them alive).
+uint32_t Generation();
 // Render thread: while one lives, this thread's D3D11 calls pass the clones' hooks as they are (no bind fix, not
 // observed). The MVR forward test (gate B9c) copies focus's clones inside outer's group, where the bind fix would put
 // the originals in their place.
@@ -103,6 +118,8 @@ struct TestState {
     uint64_t cloneUses = 0, leaks = 0, translated = 0, viewportsFixed = 0, viewportMismatches = 0;
     uint64_t bindsToClone = 0, bindsToOriginal = 0, lazyViews = 0;
     int twins = 0, twinViews = 0;
+    int arrays = 0;  // B17
+    uint64_t arrayFixes = 0, arrayLazy = 0, arrayCopies = 0;
 };
 TestState TestGet();
 

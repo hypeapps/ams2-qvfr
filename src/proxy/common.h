@@ -200,6 +200,10 @@ struct Config {
     // of through the stash. The hotkey (mvr_modifier + mvr_direct_extract_key) toggles it.
     bool mvrDirectExtract = true;
     int mvrDirectExtractKey = 0;
+    // Live (docs/mvr.md B17, mvr_pass.h): the G-buffer pass's targets become the game's own two-slice arrays (no copy
+    // of slice 0 in or back). The hotkey (mvr_modifier + mvr_native_key) toggles their use (off: copies as before).
+    bool mvrNativeTargets = true;
+    int mvrNativeKey = 0;
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
     bool dlaa = false;                // mode=dlaa (a change needs a restart)

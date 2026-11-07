@@ -374,6 +374,9 @@ struct Copy {
     bool filled = false;             // forward pass (B9c): both slices got their content at the first bind or clear
     ComPtr<ID3D11DepthStencilView> slice1Dsv;  // depth: slice 1 only (the forward pass's copy-in)
     uint64_t lastFrame = 0;
+    // B17: the game's texture is a two-slice array itself (clones::IsArray) and `arr` is it: slice 0 needs no copy in
+    // or back.
+    bool native = false;
 };
 struct ViewMap {
     void* orig = nullptr;  // the game's view (only compared)
@@ -406,6 +409,7 @@ struct Pass {
     unsigned binds = 0, clears = 0, mapFailures = 0, mixed = 0, patchedSets = 0, plainSets = 0, cbRebinds = 0;
     unsigned cbGame = 0, viewsFailures = 0, lateBinds = 0, tailBinds = 0, copiedBack = 0, draws = 0, plainDraws = 0;
     unsigned lateStarts = 0;  // 1: the MVR part started at the task's first bind or clear (not at its start)
+    unsigned nativeUsed = 0;  // B17: targets that were the game's own arrays (nothing copied back)
     unsigned waitBinds = 0;   // binds and clears of other sizes before it
     std::string tailSeq;      // the tail's binds and draws (logged for the first passes with late binds)
     unsigned tailDraws = 0;   // draws since the latest tail bind
@@ -509,6 +513,8 @@ struct Stats {
     uint64_t gbufPsDraws = 0, gbufPsKept = 0, liveTracks = 0, liveTrackFails = 0;
     // B15: targets whose corner went straight into focus's clone, through the stash, direct writes that failed.
     uint64_t direct[2] = {}, viaStash[2] = {}, directFails = 0;
+    // B17: targets of the MVR parts (0 G-buffer, 1 forward) that were the game's own arrays, that were copied back.
+    uint64_t nativeT[2] = {}, copiedT[2] = {};
 };
 Stats g_st, g_tot;
 std::string g_lastFail;  // the latest pass failure (logged once per text)
@@ -649,6 +655,7 @@ std::string g_lastFwdFail;
 struct TestLive {
     unsigned passes = 0, ok = 0, focusSkipped = 0, buildSkipped = 0, otherClears = 0, otherClearMisses = 0;
     unsigned velBinds = 0, velFilled = 0, velSkippedDraws = 0, velDrawn = 0;
+    unsigned native = 0, copiedBack = 0;  // B17: the last live pass's targets that were the game's arrays, copied back
     std::string why;
 };
 TestLive g_testLive;
@@ -664,6 +671,18 @@ bool g_velSkipOn = true;  // [debug] mvr_velocity_skip and its hotkey
 VelocityFillFn g_velFill = nullptr;
 bool g_gbufPsOn = true;  // B13: [debug] mvr_gbuffer_ps and its hotkey
 bool g_directOn = true;  // B15: [debug] mvr_direct_extract and its hotkey
+// B17: [debug] mvr_native_targets and its hotkey; the smoke's stand-ins for clones::IsArray and clones::WantArray.
+bool g_nativeOn = true;
+uint32_t g_cloneGen = 0;  // clones::Generation() last seen
+NativeFn g_nativeFn = nullptr;
+WantArrayFn g_wantFn = nullptr;
+bool IsNative(ID3D11Resource* r) { return g_nativeFn ? g_nativeFn(r) : clones::IsArray(r); }
+void WantNative(ID3D11Resource* r) {
+    if (g_wantFn)
+        g_wantFn(r);
+    else if (!g_cloneFn)
+        clones::WantArray(r);
+}
 
 // Jitter diagnosis (B9c run 2: view 1 about 0.27 px off focus's own forward pass in x, the sign changing between
 // frames): in a forward test shot frame the game's camera constants at the first draw of each eye group's
@@ -743,39 +762,59 @@ void Fail(const char* where, unsigned long code) {
 int CopyFor(ID3D11DeviceContext* c, ID3D11Resource* res) {
     bool ok = false;
     const D3D11_TEXTURE2D_DESC d = DescOf(res, &ok);
-    if (!ok || d.ArraySize != 1) return -1;
+    if (!ok) return -1;
+    // B17: the game's own two-slice array (clones.h) is the copy itself unless mvr_native_targets is off (then a copy
+    // like before, with slice 0 copied in and back: the A/B of the copies' cost).
+    const bool isArray = d.ArraySize == 2 && IsNative(res);
+    if (d.ArraySize != 1 && !isArray) return -1;
+    const bool native = isArray && g_nativeOn && d.SampleDesc.Count == 1;
     int slot = -1;
     for (int k = 0; k < (int)g_copies.size(); ++k) {
         Copy& cp = g_copies[k];
         if (cp.orig != res) continue;
-        if (SameLayout(cp.desc, d)) {
+        if (SameLayout(cp.desc, d) && cp.native == native) {
             cp.used = true;
             cp.lastFrame = g_frame;
             return k;
         }
-        slot = k;  // a new texture at the address of a released one
+        slot = k;  // a new texture at the address of a released one (or the other B17 mode)
         break;
+    }
+    if (slot < 0) {
+        for (int k = 0; k < (int)g_copies.size() && slot < 0; ++k)
+            if (!g_copies[k].arr) slot = k;  // released at a frame start
     }
     if (slot < 0 && (int)g_copies.size() >= kMaxCopies) {
         for (int k = 0; k < (int)g_copies.size() && slot < 0; ++k)
             if (g_copies[k].lastFrame + 2 < g_frame) slot = k;
         if (slot < 0) return -1;
     }
+    // The G-buffer's targets at the outer size become the game's own arrays at the next frame start (B17).
+    if (!isArray && g_nativeOn && t_pass && !g_p.forward && d.Width == g_p.w && d.Height == g_p.h &&
+        d.SampleDesc.Count == 1 && d.MipLevels == 1)
+        WantNative(res);
     Copy cp;
     cp.orig = res;
     cp.desc = d;
     cp.depth = (d.BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0;
-    D3D11_TEXTURE2D_DESC a = d;
-    a.ArraySize = 2;
-    a.MiscFlags &= ~(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
-                     D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_GDI_COMPATIBLE |
-                     D3D11_RESOURCE_MISC_TEXTURECUBE);
+    cp.native = native;
     DXGI_FORMAT dsvF, srvF;
     DepthFormats(d.Format, dsvF, srvF);
-    if (cp.depth && srvF != DXGI_FORMAT_UNKNOWN) a.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
     ComPtr<ID3D11Device> dev;
     c->GetDevice(&dev);
-    if (!dev || FAILED(dev->CreateTexture2D(&a, nullptr, &cp.arr))) return -1;
+    if (!dev) return -1;
+    if (native) {
+        if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&cp.arr))) return -1;
+        if (!(d.BindFlags & D3D11_BIND_SHADER_RESOURCE)) srvF = DXGI_FORMAT_UNKNOWN;  // no depth view: no stash
+    } else {
+        D3D11_TEXTURE2D_DESC a = d;
+        a.ArraySize = 2;
+        a.MiscFlags &= ~(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
+                         D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_GDI_COMPATIBLE |
+                         D3D11_RESOURCE_MISC_TEXTURECUBE);
+        if (cp.depth && srvF != DXGI_FORMAT_UNKNOWN) a.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(dev->CreateTexture2D(&a, nullptr, &cp.arr))) return -1;
+    }
     if (cp.depth && srvF != DXGI_FORMAT_UNKNOWN) {
         D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
         sv.Format = srvF;
@@ -1132,7 +1171,7 @@ void FillCopy(ID3D11DeviceContext* c, ID3D11View* v) {
     clones::RawScope raw;  // outer's group: the bind fix would copy the original in place of focus's clone
     const NvU32 views = p.views;
     if (views != 1) SetViews(c, 1);  // the depth copy-in draws
-    {
+    if (!cp.native) {  // B17: a native copy's slice 0 is the game's texture
         Internal in;
         for (UINT m = 0; m < cp.desc.MipLevels; ++m)
             c->CopySubresourceRegion(cp.arr.Get(), D3D11CalcSubresource(m, 0, cp.desc.MipLevels), 0, 0, 0, cp.orig,
@@ -1697,11 +1736,19 @@ void EndMvr(ID3D11DeviceContext* c, bool rebind) {
         Internal in;
         for (Copy& cp : g_copies) {
             if (!cp.used) continue;
+            if (cp.native) {  // B17: slice 0 is the game's texture
+                ++p.nativeUsed;
+                continue;
+            }
             for (UINT m = 0; m < cp.desc.MipLevels; ++m)
                 c->CopySubresourceRegion(cp.orig, D3D11CalcSubresource(m, 0, cp.desc.MipLevels), 0, 0, 0, cp.arr.Get(),
                                          D3D11CalcSubresource(m, 0, cp.desc.MipLevels), nullptr);
             ++p.copiedBack;
         }
+    }
+    for (Stats* st : {&g_st, &g_tot}) {
+        st->nativeT[p.forward] += p.nativeUsed;
+        st->copiedT[p.forward] += p.copiedBack;
     }
     if (spans) gpu::SpanEnd(p.eye ? gpu::CopyBackR : gpu::CopyBackL);
     p.part = PartTail;
@@ -1797,7 +1844,8 @@ const char* StartMvr(ID3D11DeviceContext* c, ID3D11Resource* main, int e, uint8_
     const char* why = !ok ? "no 2D target in outer's pass"
                       : win.w && (md.Width != win.w || md.Height != win.h)
                           ? "the first target of outer's pass is not at the game's size"
-                      : md.ArraySize != 1 || md.SampleDesc.Count != 1 ? "outer's depth is an array or multisampled"
+                      : (md.ArraySize != 1 && !(md.ArraySize == 2 && IsNative(main))) || md.SampleDesc.Count != 1
+                          ? "outer's depth is an array or multisampled"
                       : !clone                                         ? "no focus clone of outer's depth"
                       : cd.Width > md.Width || cd.Height > md.Height   ? "focus clones larger than outer"
                                                                        : nullptr;
@@ -2031,6 +2079,7 @@ void PassEnd(ID3D11DeviceContext* c) {
     t.plainSets = p.plainSets;
     t.cbRebinds = p.cbRebinds;
     t.copiedBack = p.copiedBack;
+    t.native = p.nativeUsed;
     t.stashed = (unsigned)s.n;
     t.masks = (unsigned)s.nm;
     t.viewsFailures = p.viewsFailures;
@@ -2209,6 +2258,8 @@ void LiveEnd(ID3D11DeviceContext* c) {
         if (!p.failed) ++st->ok[e];
     }
     ++g_testLive.passes;
+    g_testLive.native = p.nativeUsed;
+    g_testLive.copiedBack = p.copiedBack;
     if (!p.failed) {
         g_fwdOk[e] = g_frame;
         ++g_testLive.ok;
@@ -3037,6 +3088,7 @@ bool Install() {
         g_velSkipOn = Cfg().mvrVelocitySkip;
         g_gbufPsOn = Cfg().mvrGbufferPs;
         g_directOn = Cfg().mvrDirectExtract;
+        g_nativeOn = Cfg().mvrNativeTargets;
         g_installed = true;
         Log("MVR G-buffer: on; outer L's and outer R's G-buffer pass draw the eye's focus too (MVR, view 1 in the "
             "corner of slice 1 of two-slice copies), the focus groups skip CPhase1BuildCommandThread and CPhase1Render "
@@ -3103,6 +3155,18 @@ void OnFrameStart(bool enabled) {
             ReleasePassRefs(g_p);
             g_p = Pass{};
         }
+        // Clones made again (B17's arrays, a list change): the module's views on the old ones go (they hold them).
+        if (const uint32_t cg = clones::Generation(); cg != g_cloneGen) {
+            g_cloneGen = cg;
+            g_cloneViews.clear();
+            g_srvClones.clear();
+        }
+        // Copies not used for a while (B17: the game's targets became arrays, or the other mode) are released.
+        for (int k = 0; k < (int)g_copies.size(); ++k)
+            if (g_copies[k].arr && g_copies[k].lastFrame + 120 < g_frame) {
+                DropViewsOf(k);
+                g_copies[k] = Copy{};
+            }
         if (g_shot.armed) {
             ReportShot();
             g_shot = Shot{};
@@ -3871,6 +3935,12 @@ void SetGbufferPs(bool on) { g_gbufPsOn = on; }
 bool GetGbufferPs() { return g_gbufPsOn; }
 void SetDirectExtract(bool on) { g_directOn = on; }
 bool GetDirectExtract() { return g_directOn; }
+void SetNativeTargets(bool on) {
+    // The views found for the game's views point to copies of the other mode: found again (CopyFor) at their next bind.
+    if (on != g_nativeOn) g_views.clear();
+    g_nativeOn = on;
+}
+bool GetNativeTargets() { return g_nativeOn; }
 
 std::string Describe() {
     if (!g_installed) return "MVR G-buffer off";
@@ -3901,7 +3971,9 @@ void LogStats(bool totals) {
         "buffers %llu), mixed binds %llu, late binds %llu (draws after them %llu), map failures %llu, SetMultiViewMode failures %llu; "
         "patched PS with view 1's rows (mvr_gbuffer_ps %s) %llu draws, kept as before (screen textures) %llu, live "
         "track maps from outer %llu (failed %llu); slice 1 straight into focus's clones (mvr_direct_extract %s) L %llu "
-        "/ R %llu targets, through the stash L %llu / R %llu, direct writes failed %llu",
+        "/ R %llu targets, through the stash L %llu / R %llu, direct writes failed %llu; the game's own two-slice "
+        "arrays (mvr_native_targets %s) G-buffer %llu / forward %llu targets, copied in and back G-buffer %llu / "
+        "forward %llu",
         totals ? " (session)" : "", (unsigned long long)s.frames, (unsigned long long)s.passes[0],
         (unsigned long long)s.passes[1], (unsigned long long)s.passFailed[0], (unsigned long long)s.passFailed[1],
         ms(0), ms(1), (unsigned long long)s.lateStarts, (unsigned long long)s.waitBinds,
@@ -3917,7 +3989,9 @@ void LogStats(bool totals) {
         (unsigned long long)s.viewsFailures, g_gbufPsOn ? "on" : "off", (unsigned long long)s.gbufPsDraws,
         (unsigned long long)s.gbufPsKept, (unsigned long long)s.liveTracks, (unsigned long long)s.liveTrackFails,
         g_directOn ? "on" : "off", (unsigned long long)s.direct[0], (unsigned long long)s.direct[1],
-        (unsigned long long)s.viaStash[0], (unsigned long long)s.viaStash[1], (unsigned long long)s.directFails);
+        (unsigned long long)s.viaStash[0], (unsigned long long)s.viaStash[1], (unsigned long long)s.directFails,
+        g_nativeOn ? "on" : "off", (unsigned long long)s.nativeT[0], (unsigned long long)s.nativeT[1],
+        (unsigned long long)s.copiedT[0], (unsigned long long)s.copiedT[1]);
     if (g_early || s.earlyRuns[0] || s.earlyRuns[1] || !s.earlyReasons.empty()) {
         std::string er;
         for (const Reason& r : s.earlyReasons) {
@@ -3997,6 +4071,11 @@ void TestSetup(ID3D11DeviceContext* ctx, const void* phase1Vtable, const void* b
     InstallD3DHooks(ctx);
 }
 
+void TestNative(NativeFn isArray, WantArrayFn want) {
+    g_nativeFn = isArray;
+    g_wantFn = want;
+}
+
 TestState TestGet() { return g_test; }
 
 void TestDepthBias(int steps, float slope, bool dilate) {
@@ -4073,6 +4152,8 @@ TestLiveState TestLiveGet() {
     t.velFilled = s.velFilled;
     t.velSkippedDraws = s.velSkippedDraws;
     t.velDrawn = s.velDrawn;
+    t.native = s.native;
+    t.copiedBack = s.copiedBack;
     t.why = s.why;
     return t;
 }

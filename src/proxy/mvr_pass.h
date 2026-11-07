@@ -156,6 +156,12 @@ bool GetGbufferPs();
 // a diagnosis mode.
 void SetDirectExtract(bool on);
 bool GetDirectExtract();
+// B17 (docs/mvr.md), [debug] mvr_native_targets (live, hotkey mvr_modifier + mvr_native_key): the G-buffer pass's
+// outer-size targets become the game's own two-slice arrays (clones::WantArray, made at the next frame start); a target
+// that is one is its own copy, so slice 0 is neither copied in nor back (the forward pass's depth too). Off: such a
+// target gets a copy like before (the copies' cost in an A/B); arrays already made stay.
+void SetNativeTargets(bool on);
+bool GetNativeTargets();
 // Quad: the vtable of the focus groups' CPhase3BuildCommandThread (found by class name; 0: none).
 void SetPhase3BuildVtable(uintptr_t vt);
 // A focus group's CBeginEye, after its clones went in (the eye of the velocity pass's depth, above).
@@ -184,6 +190,10 @@ void Shutdown();             // VR_Shutdown: textures released
 
 // qvfr_proxy_smoke --mvr-pass: fake tasks and fake clones on a test device (no shot images).
 using CloneFn = ID3D11Texture2D* (*)(ID3D11Resource* original);
+// B17 in the smoke: stand-ins for clones::IsArray and clones::WantArray (null: the clones module).
+using NativeFn = bool (*)(ID3D11Resource* res);
+using WantArrayFn = void (*)(ID3D11Resource* res);
+void TestNative(NativeFn isArray, WantArrayFn want);
 void TestSetup(ID3D11DeviceContext* ctx, const void* phase1Vtable, const void* buildVtable, CloneFn clone,
                JitterFn jitter);
 struct TestState {
@@ -195,6 +205,7 @@ struct TestState {
     unsigned gbufPsDraws = 0, gbufPsKept = 0, srvMisses = 0;
     bool liveTrack = false;
     unsigned direct = 0;  // B15: targets written straight into focus's clones (in the frame)
+    unsigned native = 0;  // B17: the last pass's targets that were the game's own arrays
 };
 TestState TestGet();
 ID3D11Texture2D* TestArray(int k);
@@ -223,6 +234,7 @@ struct TestLiveState {
     unsigned passes = 0, ok = 0, focusSkipped = 0, buildSkipped = 0, otherClears = 0, otherClearMisses = 0;
     unsigned twinEntries = 0, velBinds = 0;  // focus clones noted for focus R's twins
     unsigned velFilled = 0, velSkippedDraws = 0, velDrawn = 0;  // B11
+    unsigned native = 0, copiedBack = 0;  // B17: the last live pass's targets that were the game's arrays, copied back
     std::string why;  // the latest live pass's failure
 };
 TestLiveState TestLiveGet();

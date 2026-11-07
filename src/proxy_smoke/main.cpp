@@ -1344,9 +1344,127 @@ int RunClones() {
     expect(!cl::TestGet().swapped && P.at<void*>(0x58) == texP, "focus group at the game size: no swap");
     cl::EndGroup(ctx);
     cl::Shutdown();
-    printf("Clones check %s: %d wrong (focus smaller %d, outer smaller %d); %d translations, original pixel 0x%08X, "
-           "clone pixel 0x%08X\n",
-           bad ? "FAILED" : "OK", bad, bad1, bad - bad1, translated1, pxA, pxClone);
+    const int bad2 = bad;
+
+    // Scenario 3 (MVR B17): a two-slice array in place of an engine texture. G: eye size, written by outer and focus,
+    // its SRV at +0x70 and RTV at +0x80, a second RTV in a render target's array, a view X the engine keeps elsewhere.
+    for (int k = 0; k < 4; ++k) {
+        devSize(k)[0] = devInit[k][0];
+        devSize(k)[1] = devInit[k][1];
+        devDirty(k) = 0;
+    }
+    post.at<int32_t>(0x100) = 64;
+    post.at<int32_t>(0x104) = 48;
+    cl::SetSizes(64, 48, 64, 48, 32, 24);
+    ID3D11Texture2D* texG = tex(64, 48);
+    ID3D11ShaderResourceView* srvG = srv(texG);
+    ID3D11RenderTargetView *rtvG = rtv(texG), *rtvG2 = rtv(texG), *rtvGX = rtv(texG);
+    static const char* const names3[] = {"Fake G", "Fake RT G"};
+    FakeObj G, RG;
+    G.at<void*>(0x58) = texG;
+    G.at<void*>(0x70) = srvG;
+    G.at<void*>(0x80) = rtvG;
+    G.at<const char*>(0xf0) = names3[0];
+    G.at<uint16_t>(0x68) = 64;
+    G.at<uint16_t>(0x6a) = 48;
+    void* arrG[1] = {rtvG2};
+    RG.at<uint16_t>(0x24) = 64;
+    RG.at<uint16_t>(0x26) = 48;
+    RG.at<uint16_t>(0x66) = 1;
+    RG.at<void**>(0x78) = arrG;
+    RG.at<const char*>(0xb8) = names3[1];
+    cl::TestRegister(false, &G);
+    cl::TestRegister(true, &RG);
+    for (int f = 0; f < 17; ++f) {
+        cl::OnFrameStart(ctx, true);
+        if (f == 16) break;
+        cl::BeginGroup(ctx, cl::Outer);
+        ctx->ClearRenderTargetView(rtvG, green);
+        cl::EndGroup(ctx);
+        cl::BeginGroup(ctx, cl::Focus);
+        ctx->ClearRenderTargetView(G.at<ID3D11RenderTargetView*>(0x80), blue);
+        cl::EndGroup(ctx);
+    }
+    st = cl::TestGet();
+    expect(st.phase == 2 && st.clones[1] == 1, "B17: ready with G's focus clone");
+    ctx->ClearRenderTargetView(rtvG, red);  // the contents slice 0 starts with
+    auto arraySize = [](ID3D11Texture2D* t) {
+        D3D11_TEXTURE2D_DESC d{};
+        if (t) t->GetDesc(&d);
+        return d.ArraySize;
+    };
+    auto resOf = [](void* v) {
+        ID3D11Resource* r = nullptr;
+        static_cast<ID3D11View*>(v)->GetResource(&r);
+        if (r) r->Release();
+        return (void*)r;
+    };
+    cl::WantArray(texG);
+    expect(!cl::IsArray(G.at<ID3D11Resource*>(0x58)), "B17: no array before the frame start");
+    cl::OnFrameStart(ctx, true);
+    ID3D11Texture2D* arrTex = G.at<ID3D11Texture2D*>(0x58);
+    expect(arrTex != texG && cl::IsArray(arrTex) && arraySize(arrTex) == 2 && size(arrTex) == size(texG),
+           "B17: G's texture replaced by a two-slice array of its size");
+    ID3D11ShaderResourceView* srvArr = G.at<ID3D11ShaderResourceView*>(0x70);
+    ID3D11RenderTargetView* rtvArr = G.at<ID3D11RenderTargetView*>(0x80);
+    expect(srvArr != srvG && rtvArr != rtvG && arrG[0] != rtvG2 && resOf(srvArr) == arrTex && resOf(rtvArr) == arrTex &&
+               resOf(arrG[0]) == arrTex,
+           "B17: the field views and the render target's view are views of the array");
+    D3D11_RENDER_TARGET_VIEW_DESC rvd{};
+    rtvArr->GetDesc(&rvd);
+    expect(rvd.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D, "B17: the array's views keep the engine's TEXTURE2D");
+    expect(pixel(arrTex) == 0xFF0000FFu, "B17: slice 0 starts with the texture's contents (red)");
+    st = cl::TestGet();
+    ID3D11Texture2D* cloneG = cl::CloneOf(arrTex, cl::Focus);
+    expect(st.arrays == 1 && st.phase == 2 && st.clones[1] == 1 && cloneG && arraySize(cloneG) == 1 &&
+               size(cloneG) == std::make_pair(32u, 24u),
+           "B17: one array, focus's clone made again (single, 32 x 24)");
+    // Outside the groups: a clear through view X goes to slice 0 of the array; the old texture keeps red.
+    ctx->ClearRenderTargetView(rtvGX, green);
+    uint32_t oldPx = 0;
+    {
+        cl::RawScope raw;
+        oldPx = pixel(texG);
+    }
+    expect(pixel(arrTex) == 0xFF00FF00u && oldPx == 0xFF0000FFu, "B17: a view kept elsewhere clears the array");
+    st = cl::TestGet();
+    expect(st.arrayLazy == 1 && st.arrayFixes >= 1, "B17: one view made on the array for view X");
+    // A bind of the engine's old SRV gets the array's.
+    ctx->PSSetShaderResources(0, 1, &srvG);
+    ID3D11ShaderResourceView* boundG = nullptr;
+    ctx->PSGetShaderResources(0, 1, &boundG);
+    expect(boundG == srvArr, "B17: the engine's old SRV bound as the array's");
+    if (boundG) boundG->Release();
+    ctx->PSSetShaderResources(0, 2, none);
+    // CopyResource between the array and a single texture copies slice 0.
+    ID3D11Texture2D* texS1 = tex(64, 48);
+    const uint64_t copies0 = cl::TestGet().arrayCopies;
+    ctx->CopyResource(texS1, arrTex);
+    expect(pixel(texS1) == 0xFF00FF00u && cl::TestGet().arrayCopies > copies0, "B17: CopyResource array -> single");
+    // A focus group swaps the clone in; after it the array's views are back.
+    cl::OnFrameStart(ctx, true);
+    cl::BeginGroup(ctx, cl::Focus);
+    expect(cl::TestGet().swapped && G.at<void*>(0x58) == cloneG, "B17: focus group with G's clone");
+    cl::EndGroup(ctx);
+    expect(G.at<void*>(0x58) == arrTex && G.at<void*>(0x70) == srvArr && G.at<void*>(0x80) == rtvArr &&
+               arrG[0] != rtvG2,
+           "B17: the array and its views back after the focus group");
+    // Destroyed objects get the engine's own texture and views back.
+    cl::TestDestroy(true, &RG);
+    expect(arrG[0] == rtvG2, "B17: the render target's view back at its destroy");
+    cl::TestDestroy(false, &G);
+    expect(G.at<void*>(0x58) == texG && G.at<void*>(0x70) == srvG && G.at<void*>(0x80) == rtvG,
+           "B17: G's texture and views back at its destroy");
+    cl::OnFrameStart(ctx, true);
+    st = cl::TestGet();
+    expect(st.arrays == 0 && !cl::IsArray(arrTex), "B17: no array left");
+    cl::Shutdown();
+    printf("Clones check %s: %d wrong (focus smaller %d, outer smaller %d, two-slice arrays %d); %d translations, "
+           "original pixel 0x%08X, clone pixel 0x%08X\n",
+           bad ? "FAILED" : "OK", bad, bad1, bad2 - bad1, bad - bad2, translated1, pxA, pxClone);
+    for (IUnknown* u : {(IUnknown*)texG, (IUnknown*)srvG, (IUnknown*)rtvG, (IUnknown*)rtvG2, (IUnknown*)rtvGX,
+                        (IUnknown*)texS1})
+        u->Release();
     for (IUnknown* u : {(IUnknown*)srvA, (IUnknown*)srvC, (IUnknown*)rtvA, (IUnknown*)rtvA2, (IUnknown*)rtvA3,
                         (IUnknown*)rtvD, (IUnknown*)texA, (IUnknown*)texB, (IUnknown*)texC, (IUnknown*)texD,
                         (IUnknown*)texE, (IUnknown*)rtvX, (IUnknown*)rtvP, (IUnknown*)rtvQ, (IUnknown*)rtvS, (IUnknown*)srvQ,

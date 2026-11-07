@@ -751,6 +751,59 @@ int RunMvrForward() {
     // (the twins themselves: qvfr_proxy_smoke --clones).
     const qvfr::mvrpass::TestLiveState lv = qvfr::mvrpass::TestLiveGet();
     qvfr::mvrpass::TestEnd();
+    // B17: the same live pass with outer's depth as the game's own two-slice array (the G-buffer's depth, which the
+    // clones module makes one in the game; the color stays a single texture): no copy of the depth's slice 0 in or back,
+    // outer's color and depth (slice 0) and focus's clones as in the live run above, bit for bit.
+    ComPtr<ID3D11Texture2D> arrDepth;
+    ComPtr<ID3D11DepthStencilView> arrDsv;
+    {
+        D3D11_TEXTURE2D_DESC ad{};
+        g_s.game.depth->GetDesc(&ad);
+        ad.ArraySize = 2;
+        ad.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+        D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+        dv.Format = DXGI_FORMAT_D32_FLOAT;
+        dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        if (SUCCEEDED(dev->CreateTexture2D(&ad, nullptr, &arrDepth))) dev->CreateDepthStencilView(arrDepth.Get(), &dv, &arrDsv);
+    }
+    static ID3D11Resource* s_arrDepth = nullptr;
+    s_arrDepth = arrDepth.Get();
+    qvfr::mvrpass::TestLiveState nlv{};
+    std::vector<uint64_t> ngC, ngD, nC, nD;
+    if (arrDsv) {
+        Restore();
+        ctx->CopySubresourceRegion(arrDepth.Get(), 0, 0, 0, 0, g_s.init[1].Get(), 0, nullptr);
+        const ComPtr<ID3D11Texture2D> plainDepth = g_s.game.depth;
+        const ComPtr<ID3D11DepthStencilView> plainDsv = g_s.game.dsv;
+        g_s.game.depth = arrDepth;
+        g_s.game.dsv = arrDsv;
+        qvfr::mvrpass::TestNative([](ID3D11Resource* r) { return r && r == s_arrDepth; }, nullptr);
+        qvfr::mvrpass::SetForward(true);
+        qvfr::mvrpass::OnFrameStart(true);
+        qvfr::mvrpass::SetWindow(0, true, sx, ox, sy, oy, kW, kH);
+        qvfr::mvrpass::TestForwardLive(g_vtPhase3);
+        FakeTask outerN{g_vtPhase3};
+        if (!qvfr::mvrpass::BeforeTask((uint8_t*)&outerN, 0)) RunTask(outerN);
+        qvfr::mvrpass::AfterTask((uint8_t*)&outerN);
+        nlv = qvfr::mvrpass::TestLiveGet();
+        ngC = Read(g_s.game.color.Get());
+        ngD = Read(arrDepth.Get(), 0);
+        nC = Read(g_s.focus.color.Get());
+        nD = Read(g_s.focus.depth.Get());
+        qvfr::mvrpass::TestEnd();
+        qvfr::mvrpass::TestNative(nullptr, nullptr);
+        g_s.game.depth = plainDepth;
+        g_s.game.dsv = plainDsv;
+    }
+    auto differ = [](const std::vector<uint64_t>& a, const std::vector<uint64_t>& b) {
+        if (a.empty() || a.size() != b.size()) return 1 << 30;
+        int d = 0;
+        for (size_t i = 0; i < a.size(); ++i) d += a[i] != b[i];
+        return d;
+    };
+    const int nOuter = differ(ngC, lgC) + differ(ngD, lgD), nFocus = differ(nC, lC) + differ(nD, lD);
+    const bool nativeOk = arrDsv && nlv.passes == 1 && nlv.ok == 1 && nlv.native == 1 && nlv.copiedBack == 1 &&
+                          lv.native == 0 && lv.copiedBack == 2 && nOuter == 0 && nFocus == 0;
     qvfr::mvrpass::SetForward(false);
     qvfr::mvrpass::TestDepthBias(-1, 0.0f, false);
     const int lpx = (int)(kFW * kFH);
@@ -872,7 +925,11 @@ int RunMvrForward() {
     const bool outerOk = outerC == 0 && outerD == 0 && outerH == 0 && gH.size() == refH.size();
     const bool focusOk = clonesChanged == 0 && covered > px / 3 && occluded > px / 8 && occOurs == occluded &&
                          cBig * 100 <= px && dOff * 100 <= px;
-    const bool ok = countsOk && outerOk && focusOk && liveOk && velSkipOk && gbufOk && !warnings;
+    const bool ok = countsOk && outerOk && focusOk && liveOk && velSkipOk && gbufOk && nativeOk && !warnings;
+    printf("  B17: live pass with outer's depth as the game's own two-slice array: %s, targets as the arrays %u (before "
+           "%u), copied back %u (before %u); outer %d px, focus's clones %d px differ from the live run (%s)\n",
+           nlv.ok ? "ok" : "FAILED", nlv.native, lv.native, nlv.copiedBack, lv.copiedBack, nOuter, nFocus,
+           nativeOk ? "OK" : "WRONG");
     printf("MVR forward: %s; PS %s (globalTexture0 in t%u, globalTexture2 in t%u), VS %s; outer pass %s%s%s, stash %d "
            "targets, binds %u, copy-ins %u, map failures %u, draws %u (one view %u, patched PS %u, PS slot 3 rebinds "
            "%u, screen textures without a clone %u), copied back %u, SetMultiViewMode failures %u; paused %u times "

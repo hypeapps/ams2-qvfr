@@ -130,6 +130,7 @@ struct Counters {
     uint64_t vpMismatch = 0, vpFixed = 0, vpOutside = 0, devSizes = 0, postSizes = 0;
     uint64_t fixFwd = 0, fixBack = 0, lazy = 0, sizeMismatch = 0;
     uint64_t twinSwaps = 0;  // focus swaps for eye 1 (with focus R's twins when there are any)
+    uint64_t arrFix = 0, arrLazy = 0;  // B17: binds and copies of a replaced texture's own views (made on the array)
 };
 
 std::mutex g_cm;
@@ -190,6 +191,41 @@ constexpr UINT kMapMax = 128;
 std::vector<IUnknown*> g_lazyRefs;          // originals of views cloned on the fly (referenced: their address stays theirs)
 std::unordered_set<void*> g_lazyFailed;     // views that could not be cloned (logged once)
 std::vector<std::pair<void*, bool>> g_fixCallers;  // logged callers of the bind fix (caller, to the clone)
+
+// MVR gate B17 (clones.h): two-slice arrays in place of engine textures. A field written: the engine's value and ours
+// (the field holds one reference of ours, released when the engine's value goes back).
+struct ArrField {
+    uint8_t* obj = nullptr;  // texture object, or the render target object (rt)
+    uint8_t* addr = nullptr;
+    void* old = nullptr;
+    void* now = nullptr;
+    bool rt = false;
+};
+struct ArrRec {
+    uint8_t* obj = nullptr;          // the texture object
+    ID3D11Resource* old = nullptr;   // the engine's texture (one reference ours: its address stays its own)
+    ID3D11Texture2D* arr = nullptr;  // ours
+    std::vector<ArrField> fields;
+    std::vector<IUnknown*> refs;     // ours: views on the array, the engine's views of the texture (pinned)
+    std::vector<void*> keys;         // its entries in g_arrView
+    double mb = 0;
+};
+constexpr int kMaxArrays = 16;
+std::vector<ArrRec> g_arrs;
+std::unordered_map<void*, void*> g_arrView;       // engine view of a replaced texture -> the same view on the array
+std::unordered_map<void*, ID3D11Texture2D*> g_arrRes;  // replaced engine texture -> its array
+// Views seen that are not of a replaced texture (nearly every bound view), direct-mapped by address: one compare per
+// bound view while arrays exist. Cleared when the arrays change.
+constexpr size_t kPlainCache = 4096;
+void* g_arrPlain[kPlainCache] = {};
+void ClearPlain() { memset(g_arrPlain, 0, sizeof(g_arrPlain)); }
+std::vector<ID3D11Resource*> g_arrWant;           // asked for since the last frame start (only compared)
+std::atomic<ID3D11Resource*> g_arrList[kMaxArrays] = {};  // the arrays, for IsArray on any thread
+std::atomic<bool> g_arrOn{false};
+std::atomic<uint64_t> g_arrCopies{0}, g_arrCopiesTot{0};  // CopyResource with an array turned into slice 0 copies
+std::vector<void*> g_arrCallers;                  // logged callers of a replaced texture's own views
+int g_arrLogs = 0;
+uint64_t g_arrMade = 0;                            // arrays made in this process
 
 // ---------------------------------------------------------------- helpers
 
@@ -408,9 +444,12 @@ void RestoreObjectLocked(uint8_t* obj) {
     }
 }
 
+void DestroyArraysOfLocked(uint8_t* obj, bool rt);
+
 void DestroyLocked(uint8_t* obj, bool rt) {
     g_pending.erase(obj);
     if (g_swapped) RestoreObjectLocked(obj);
+    DestroyArraysOfLocked(obj, rt);  // B17: then the engine's own texture and views
     bool listed = false;
     for (SetState& s : g_set) {
         const size_t before = s.entries.size();
@@ -449,7 +488,10 @@ void DropSetLocked(SetState& s) {
     s.proofLeft = 0;
 }
 
+std::atomic<uint32_t> g_cloneGen{0};  // Generation(): the clones dropped this many times
+
 void DropClonesLocked() {
+    g_cloneGen.fetch_add(1, std::memory_order_relaxed);
     for (IUnknown* u : g_owned) g_grave.push_back(u);
     g_owned.clear();
     for (auto& [obj, t] : g_tex) {
@@ -511,8 +553,9 @@ void ResetLocked(const char* why) {
 
 uint32_t MipSize(uint32_t s, UINT mip) { return std::max(1u, s >> std::min(mip, 31u)); }
 
-// A view with v's description on `clone` (owned in g_owned), or null (logged). `mip`: a target view's mip, else -1.
-IUnknown* MakeViewLocked(ID3D11Device* dev, void* v, ID3D11Texture2D* clone, const Tex& t, int& mip) {
+// A view with v's description on `tex` (the caller owns it), or null with the result in *hrOut. `mip`: a target
+// view's mip, else -1.
+IUnknown* ViewLike(ID3D11Device* dev, void* v, ID3D11Texture2D* tex, int& mip, HRESULT* hrOut) {
     IUnknown* u = static_cast<IUnknown*>(v);
     IUnknown* out = nullptr;
     HRESULT hr = E_NOINTERFACE;
@@ -525,7 +568,7 @@ IUnknown* MakeViewLocked(ID3D11Device* dev, void* v, ID3D11Texture2D* clone, con
         D3D11_SHADER_RESOURCE_VIEW_DESC d{};
         srv->GetDesc(&d);
         srv->Release();
-        hr = dev->CreateShaderResourceView(clone, &d, (ID3D11ShaderResourceView**)&out);
+        hr = dev->CreateShaderResourceView(tex, &d, (ID3D11ShaderResourceView**)&out);
     } else if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D11RenderTargetView), (void**)&rtv)) && rtv) {
         D3D11_RENDER_TARGET_VIEW_DESC d{};
         rtv->GetDesc(&d);
@@ -533,7 +576,7 @@ IUnknown* MakeViewLocked(ID3D11Device* dev, void* v, ID3D11Texture2D* clone, con
         mip = d.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D        ? (int)d.Texture2D.MipSlice
               : d.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY ? (int)d.Texture2DArray.MipSlice
                                                                       : 0;
-        hr = dev->CreateRenderTargetView(clone, &d, (ID3D11RenderTargetView**)&out);
+        hr = dev->CreateRenderTargetView(tex, &d, (ID3D11RenderTargetView**)&out);
     } else if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D11DepthStencilView), (void**)&dsv)) && dsv) {
         D3D11_DEPTH_STENCIL_VIEW_DESC d{};
         dsv->GetDesc(&d);
@@ -541,14 +584,24 @@ IUnknown* MakeViewLocked(ID3D11Device* dev, void* v, ID3D11Texture2D* clone, con
         mip = d.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2D        ? (int)d.Texture2D.MipSlice
               : d.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DARRAY ? (int)d.Texture2DArray.MipSlice
                                                                       : 0;
-        hr = dev->CreateDepthStencilView(clone, &d, (ID3D11DepthStencilView**)&out);
+        hr = dev->CreateDepthStencilView(tex, &d, (ID3D11DepthStencilView**)&out);
     } else if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D11UnorderedAccessView), (void**)&uav)) && uav) {
         D3D11_UNORDERED_ACCESS_VIEW_DESC d{};
         uav->GetDesc(&d);
         uav->Release();
-        hr = dev->CreateUnorderedAccessView(clone, &d, (ID3D11UnorderedAccessView**)&out);
+        hr = dev->CreateUnorderedAccessView(tex, &d, (ID3D11UnorderedAccessView**)&out);
     }
-    if (FAILED(hr) || !out) {
+    if (FAILED(hr)) out = nullptr;
+    if (!out && SUCCEEDED(hr)) hr = E_FAIL;
+    *hrOut = hr;
+    return out;
+}
+
+// A view with v's description on `clone` (owned in g_owned), or null (logged). `mip`: a target view's mip, else -1.
+IUnknown* MakeViewLocked(ID3D11Device* dev, void* v, ID3D11Texture2D* clone, const Tex& t, int& mip) {
+    HRESULT hr = S_OK;
+    IUnknown* out = ViewLike(dev, v, clone, mip, &hr);
+    if (!out) {
         const D3D11_TEXTURE2D_DESC cd = DescOf(clone);
         Log("Clones: cannot clone view %p of %s on its %u x %u clone with %u mips (0x%08lX)", v, TexName(t), cd.Width,
             cd.Height, cd.MipLevels, (unsigned long)hr);
@@ -963,6 +1016,338 @@ void* TranslateLocked(ID3D11DeviceContext* imm, const std::unordered_map<void*, 
     return bound;
 }
 
+// ---------------------------------------------------------------- B17: two-slice arrays in place of engine textures
+
+// A depth format the array gets a shader view bind for (mvr_pass reads both slices of the depth).
+bool DepthTypeless(DXGI_FORMAT f) {
+    return f == DXGI_FORMAT_R32_TYPELESS || f == DXGI_FORMAT_R24G8_TYPELESS || f == DXGI_FORMAT_R16_TYPELESS ||
+           f == DXGI_FORMAT_R32G8X24_TYPELESS;
+}
+
+void PublishArraysLocked() {
+    int n = 0;
+    for (const ArrRec& a : g_arrs)
+        if (n < kMaxArrays) g_arrList[n++].store(a.arr, std::memory_order_relaxed);
+    for (int i = n; i < kMaxArrays; ++i) g_arrList[i].store(nullptr, std::memory_order_relaxed);
+    g_arrOn.store(!g_arrs.empty(), std::memory_order_release);
+}
+
+void WriteArrField(ArrRec& a, uint8_t* obj, void* addr, void* old, void* now, bool rt) {
+    static_cast<IUnknown*>(now)->AddRef();  // the field's
+    memcpy(addr, &now, 8);
+    a.fields.push_back({obj, (uint8_t*)addr, old, now, rt});
+}
+
+// The engine's values back in the fields that still hold ours (rt: only the render target object's `only`, else all).
+// raw: on a fault, without releasing anything.
+void RestoreArrFields(ArrRec& a, uint8_t* only, bool raw) {
+    for (size_t i = 0; i < a.fields.size();) {
+        ArrField& f = a.fields[i];
+        if (only && f.obj != only) {
+            ++i;
+            continue;
+        }
+        void* cur = nullptr;
+        if (hooks::TryRead(f.addr, &cur, 8) && cur == f.now) {
+            memcpy(f.addr, &f.old, 8);
+            if (!raw) g_grave.push_back(static_cast<IUnknown*>(f.now));  // the field's reference
+        }
+        // A field the engine wrote itself keeps its value (and our reference, if it is still ours: never released).
+        if (only) {
+            a.fields.erase(a.fields.begin() + i);
+            continue;
+        }
+        ++i;
+    }
+    if (!only) a.fields.clear();
+}
+
+// Record a's references to the grave and its translations dropped (its fields restored before).
+void DropArrLocked(ArrRec& a) {
+    for (void* k : a.keys) g_arrView.erase(k);
+    g_arrRes.erase(a.old);
+    ClearPlain();
+    for (IUnknown* u : a.refs) g_grave.push_back(u);
+    if (a.arr) g_grave.push_back(a.arr);
+    if (a.old) g_grave.push_back(a.old);
+    a = ArrRec{};
+}
+
+// All arrays out of the engine objects (the engine's textures and views back), released. The listed textures get
+// their own D3D11 texture back.
+void RestoreArraysLocked() {
+    for (ArrRec& a : g_arrs) {
+        RestoreArrFields(a, nullptr, false);
+        if (auto it = g_tex.find(a.obj); it != g_tex.end() && it->second.res == a.arr) {
+            g_byRes.erase(a.arr);
+            it->second.res = a.old;
+            g_byRes[a.old] = a.obj;
+        }
+        DropArrLocked(a);
+    }
+    g_arrs.clear();
+    g_arrView.clear();
+    g_arrRes.clear();
+    ClearPlain();
+    g_arrWant.clear();
+    PublishArraysLocked();
+}
+
+// A texture object (or a render target object) being destroyed: its fields get the engine's values back first.
+void DestroyArraysOfLocked(uint8_t* obj, bool rt) {
+    bool changed = false;
+    for (size_t i = 0; i < g_arrs.size();) {
+        ArrRec& a = g_arrs[i];
+        if (rt) {
+            RestoreArrFields(a, obj, false);
+            ++i;
+            continue;
+        }
+        if (a.obj != obj) {
+            ++i;
+            continue;
+        }
+        RestoreArrFields(a, nullptr, false);
+        DropArrLocked(a);
+        g_arrs.erase(g_arrs.begin() + i);
+        changed = true;
+    }
+    if (changed) PublishArraysLocked();
+}
+
+// Frame start: an array whose texture field the engine replaced is dropped (its other fields stay as they are).
+void CheckArraysLocked() {
+    bool changed = false;
+    for (size_t i = 0; i < g_arrs.size();) {
+        ArrRec& a = g_arrs[i];
+        void* cur = nullptr;
+        if (hooks::TryRead(a.obj + kTexRes, &cur, 8) && cur == a.arr) {
+            ++i;
+            continue;
+        }
+        if (g_arrLogs < kMaxResetLogs) {
+            ++g_arrLogs;
+            Log("Clones: B17: the engine replaced the D3D11 texture of an object with a two-slice array (%p -> %p); "
+                "that array is dropped",
+                (void*)a.arr, cur);
+        }
+        // Fields that still hold ours keep them with the field's reference (never released: the engine may use them).
+        a.fields.clear();
+        if (auto it = g_tex.find(a.obj); it != g_tex.end() && it->second.res == a.arr) {
+            g_byRes.erase(a.arr);
+            it->second.res = (ID3D11Resource*)cur;
+            if (cur) g_byRes[it->second.res] = a.obj;
+            g_dirty = true;  // the list is watched again
+        }
+        DropArrLocked(a);
+        g_arrs.erase(g_arrs.begin() + i);
+        changed = true;
+    }
+    if (changed) PublishArraysLocked();
+}
+
+// A view of a replaced texture on its array (made like v and noted in record a), or null.
+void* ArrViewForLocked(ArrRec& a, void* v) {
+    ID3D11Device* dev = nullptr;
+    a.arr->GetDevice(&dev);
+    if (!dev) return nullptr;
+    int mip = -1;
+    HRESULT hr = S_OK;
+    IUnknown* nv = ViewLike(dev, v, a.arr, mip, &hr);
+    dev->Release();
+    if (!nv) {
+        if (g_arrLogs < kMaxResetLogs) {
+            ++g_arrLogs;
+            Log("Clones: B17: cannot make view %p of the engine's texture on its two-slice array (0x%08lX)", v,
+                (unsigned long)hr);
+        }
+        return nullptr;
+    }
+    static_cast<IUnknown*>(v)->AddRef();  // pinned: its address stays its own
+    a.refs.push_back(static_cast<IUnknown*>(v));
+    a.refs.push_back(nv);
+    g_arrView[v] = nv;
+    a.keys.push_back(v);
+    return nv;
+}
+
+void NoteArrFixLocked(const char* method, void* caller, bool lazy) {
+    ++g_c.arrFix;
+    if (lazy) ++g_c.arrLazy;
+    if ((int)g_arrCallers.size() >= kMaxCallerLogs ||
+        std::find(g_arrCallers.begin(), g_arrCallers.end(), caller) != g_arrCallers.end())
+        return;
+    g_arrCallers.push_back(caller);
+    Log("Clones: B17: %s from %s reaches the engine's own %s of a texture replaced by a two-slice array; the array's "
+        "used instead%s",
+        method, Where(caller).c_str(), lazy ? "view (a view made on the array)" : "view or texture",
+        (int)g_arrCallers.size() == kMaxCallerLogs ? " (further callers only counted)" : "");
+}
+
+// The view to use for v: the same view on the array when v belongs to a replaced texture, else v.
+void* ArrViewLocked(void* v, const char* method, void* caller) {
+    if (!v || g_arrs.empty()) return v;
+    void*& plain = g_arrPlain[((uintptr_t)v >> 4) & (kPlainCache - 1)];
+    if (plain == v) return v;
+    if (auto it = g_arrView.find(v); it != g_arrView.end()) {
+        NoteArrFixLocked(method, caller, false);
+        return it->second;
+    }
+    ID3D11Resource* r = nullptr;
+    static_cast<ID3D11View*>(v)->GetResource(&r);
+    if (!r) return v;
+    ArrRec* rec = nullptr;
+    for (ArrRec& a : g_arrs)
+        if (a.old == r) rec = &a;
+    r->Release();
+    if (!rec) {  // the arrays' own views land here too
+        plain = v;
+        return v;
+    }
+    void* nv = ArrViewForLocked(*rec, v);
+    if (!nv) {
+        plain = v;
+        return v;
+    }
+    NoteArrFixLocked(method, caller, true);
+    return nv;
+}
+
+ID3D11Resource* ArrResLocked(ID3D11Resource* r, const char* method, void* caller) {
+    if (!r || g_arrs.empty()) return r;
+    auto it = g_arrRes.find(r);
+    if (it == g_arrRes.end()) return r;
+    NoteArrFixLocked(method, caller, false);
+    return it->second;
+}
+
+// The arrays asked for since the last frame start, made and written into the engine objects. Returns the number made.
+int BuildArraysLocked(ID3D11DeviceContext* imm) {
+    std::vector<ID3D11Resource*> want;
+    want.swap(g_arrWant);
+    ID3D11Device* dev = nullptr;
+    imm->GetDevice(&dev);
+    if (!dev) return 0;
+    int made = 0, failed = 0, views = 0, rtViews = 0;
+    double mb = 0;
+    for (ID3D11Resource* res : want) {
+        auto bt = g_byRes.find(res);
+        if (bt == g_byRes.end() || g_arrRes.count(res) || (int)g_arrs.size() >= kMaxArrays) continue;
+        uint8_t* obj = bt->second;
+        Tex& t = g_tex[obj];
+        void* cur = nullptr;
+        if (!hooks::TryRead(obj + kTexRes, &cur, 8) || cur != res) continue;
+        ID3D11Texture2D* t2 = nullptr;
+        if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&t2)) || !t2) continue;
+        const D3D11_TEXTURE2D_DESC d = DescOf(t2);
+        t2->Release();
+        if (d.ArraySize != 1 || d.SampleDesc.Count != 1 || d.Usage != D3D11_USAGE_DEFAULT ||
+            (d.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE)) {
+            if (g_arrLogs < kMaxResetLogs) {
+                ++g_arrLogs;
+                Log("Clones: B17: %s %u x %u fmt %d x%u arr %u gets no two-slice array (only single 2D textures without "
+                    "MSAA)",
+                    TexName(t), d.Width, d.Height, (int)d.Format, d.SampleDesc.Count, d.ArraySize);
+            }
+            continue;
+        }
+        D3D11_TEXTURE2D_DESC ad = d;
+        ad.ArraySize = 2;
+        ad.MiscFlags &= ~(UINT)(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
+                                D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_GDI_COMPATIBLE);
+        if ((ad.BindFlags & D3D11_BIND_DEPTH_STENCIL) && DepthTypeless(ad.Format))
+            ad.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+        ArrRec a;
+        a.obj = obj;
+        if (FAILED(dev->CreateTexture2D(&ad, nullptr, &a.arr)) || !a.arr) {
+            ++failed;
+            Log("Clones: B17: cannot create the two-slice array of %s (%u x %u fmt %d)", TexName(t), d.Width, d.Height,
+                (int)d.Format);
+            continue;
+        }
+        a.old = res;
+        res->AddRef();
+        a.mb = Megabytes(ad);
+        // The engine's views of the texture: in the object's fields and in the render targets' view arrays.
+        struct Plan {
+            uint8_t* obj;
+            void* addr;
+            void* old;
+            bool rt;
+        };
+        std::vector<Plan> plan;
+        for (size_t off = kTexRes + 8; off + 8 <= kTexEnd; off += 8) {
+            if (off == kTexSize) continue;
+            void* v = nullptr;
+            if (!hooks::TryRead(obj + off, &v, 8)) continue;
+            ID3D11Resource* r = ViewResource(v);
+            if (!r) continue;
+            const bool mine = r == res;
+            r->Release();
+            if (mine) plan.push_back({obj, obj + off, v, false});
+        }
+        for (auto& [ro, rt] : g_rt)
+            for (const RtArray& ra : kRtArrays) {
+                uint16_t count = 0;
+                void** arr = nullptr;
+                if (!hooks::TryRead(ro + ra.countOff, &count, 2) || !hooks::TryRead(ro + ra.off, &arr, 8) || !arr)
+                    continue;
+                for (unsigned i = 0; i < std::min<unsigned>(count, kMaxRtViews); ++i) {
+                    void* v = nullptr;
+                    if (!hooks::TryRead(arr + i, &v, 8)) continue;
+                    ID3D11Resource* r = ViewResource(v);
+                    if (!r) continue;
+                    const bool mine = r == res;
+                    r->Release();
+                    if (mine) plan.push_back({ro, arr + i, v, true});
+                }
+            }
+        bool ok = true;
+        std::vector<void*> now(plan.size());
+        for (size_t i = 0; i < plan.size() && ok; ++i) {
+            auto it = g_arrView.find(plan[i].old);
+            now[i] = it != g_arrView.end() ? it->second : ArrViewForLocked(a, plan[i].old);
+            ok = now[i] != nullptr;
+        }
+        if (!ok) {
+            ++failed;
+            RestoreArrFields(a, nullptr, false);
+            DropArrLocked(a);
+            continue;
+        }
+        // Slice 0 starts with the texture's contents (a pass may read last frame's).
+        t_internal = true;
+        for (UINT m = 0; m < d.MipLevels; ++m)
+            imm->CopySubresourceRegion(a.arr, D3D11CalcSubresource(m, 0, d.MipLevels), 0, 0, 0, res, m, nullptr);
+        t_internal = false;
+        WriteArrField(a, obj, obj + kTexRes, res, a.arr, false);
+        for (size_t i = 0; i < plan.size(); ++i) {
+            WriteArrField(a, plan[i].obj, plan[i].addr, plan[i].old, now[i], plan[i].rt);
+            ++(plan[i].rt ? rtViews : views);
+        }
+        g_byRes.erase(res);
+        t.res = a.arr;  // t.desc stays the engine's (single): the clones stay single textures
+        g_byRes[a.arr] = obj;
+        g_arrRes[res] = a.arr;
+        ClearPlain();
+        mb += a.mb;
+        ++made;
+        g_arrs.push_back(std::move(a));
+    }
+    dev->Release();
+    PublishArraysLocked();
+    if (made || failed) {
+        double all = 0;
+        for (const ArrRec& a : g_arrs) all += a.mb;
+        g_arrMade += made;
+        Log("Clones: B17: %d two-slice arrays in place of the engine's textures (%.0f MB; %d texture views, %d render "
+            "target views replaced)%s; %zu in all (%.0f MB)",
+            made, mb, views, rtViews, failed ? ", some FAILED (see above)" : "", g_arrs.size(), all);
+    }
+    if (made) TranslateLocked(imm, g_arrView);
+    return made;
+}
+
 // ---------------------------------------------------------------- engine device: render target size per context
 
 // Every context whose size is a fraction of (fromW, fromH) gets the same fraction of (toW, toH) and its dirty flag.
@@ -1115,6 +1500,10 @@ bool PutBackRaw() {
             MapDeviceSizes(s.w, s.h, g_gameW, g_gameH);
             MapPostSize(s.w, s.h, g_gameW, g_gameH);
         }
+        // B17: the engine's own textures and views back (nothing released: a reference may still be in use).
+        for (ArrRec& a : g_arrs) RestoreArrFields(a, nullptr, true);
+        g_arrOn = false;
+        for (auto& p : g_arrList) p.store(nullptr, std::memory_order_relaxed);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -1138,7 +1527,8 @@ void Fail(const char* where, unsigned long code) {
 // ---------------------------------------------------------------- bind fix
 
 bool Live(ID3D11DeviceContext* c) {
-    return g_live.load(std::memory_order_relaxed) != LiveOff && !t_internal && c == g_imm;
+    return (g_live.load(std::memory_order_relaxed) != LiveOff || g_arrOn.load(std::memory_order_relaxed)) &&
+           !t_internal && c == g_imm;
 }
 
 const Tex* TexOfResLocked(ID3D11Resource* r) {
@@ -1187,6 +1577,7 @@ void NoteFixLocked(bool toClone, const char* method, void* caller, void* item, b
 // The view to bind instead of v (v itself when nothing to translate).
 void* MapViewLocked(void* v, const char* method, void* caller) {
     if (!v) return v;
+    v = ArrViewLocked(v, method, caller);  // B17: a replaced texture's own view goes to its array first
     const int live = g_live.load(std::memory_order_relaxed);
     if (live == LiveBack) {
         for (const SetState& s : g_set)
@@ -1249,6 +1640,7 @@ void* MapViewLocked(void* v, const char* method, void* caller) {
 
 ID3D11Resource* MapResLocked(ID3D11Resource* r, const char* method, void* caller) {
     if (!r) return r;
+    r = ArrResLocked(r, method, caller);  // B17
     const int live = g_live.load(std::memory_order_relaxed);
     if (live == LiveSwap) {
         const int eye = g_cur == Focus ? g_swapEye : 0;
@@ -1278,7 +1670,7 @@ V* const* MapViews(ID3D11DeviceContext* c, V* const* views, UINT n, V** tmp, con
     bool changed = false;
     Protect(method, [&] {
         std::lock_guard lock(g_cm);
-        if (g_live.load(std::memory_order_relaxed) == LiveOff) return;
+        if (g_live.load(std::memory_order_relaxed) == LiveOff && g_arrs.empty()) return;
         for (UINT i = 0; i < n; ++i) {
             tmp[i] = (V*)MapViewLocked(views[i], method, caller);
             changed |= tmp[i] != views[i];
@@ -1573,6 +1965,36 @@ void STDMETHODCALLTYPE D_CopyRegion(ID3D11DeviceContext* c, ID3D11Resource* dst,
     }
     o_copyRegion(c, dst, ds, x, y, z, src, ss, box);
 }
+bool IsArrayFast(ID3D11Resource* r) {
+    for (const auto& p : g_arrList)
+        if (p.load(std::memory_order_relaxed) == r) return true;
+    return false;
+}
+
+// B17: CopyResource with a two-slice array on either side copies slice 0's subresources (a single texture and an array
+// cannot be copied as a whole; two arrays need only slice 0). False: not such a copy.
+bool CopySlice0(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src) {
+    if (!g_arrOn.load(std::memory_order_acquire) || !dst || !src || !o_copyRegion ||
+        (!IsArrayFast(dst) && !IsArrayFast(src)))
+        return false;
+    ID3D11Texture2D *d2 = nullptr, *s2 = nullptr;
+    dst->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&d2);
+    src->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&s2);
+    bool ok = d2 && s2;
+    if (ok) {
+        const D3D11_TEXTURE2D_DESC dd = DescOf(d2), sd = DescOf(s2);
+        ok = dd.Width == sd.Width && dd.Height == sd.Height && dd.MipLevels == sd.MipLevels && dd.ArraySize <= 2 &&
+             sd.ArraySize <= 2 && dd.SampleDesc.Count == 1 && sd.SampleDesc.Count == 1;
+        for (UINT m = 0; ok && m < dd.MipLevels; ++m)
+            o_copyRegion(c, dst, D3D11CalcSubresource(m, 0, dd.MipLevels), 0, 0, 0, src,
+                         D3D11CalcSubresource(m, 0, sd.MipLevels), nullptr);
+    }
+    if (d2) d2->Release();
+    if (s2) s2->Release();
+    if (ok) g_arrCopies.fetch_add(1, std::memory_order_relaxed);
+    return ok;
+}
+
 void STDMETHODCALLTYPE D_Copy(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src) {
     void* caller = _ReturnAddress();
     dst = MapRes(c, dst, "CopyResource", caller);
@@ -1581,6 +2003,7 @@ void STDMETHODCALLTYPE D_Copy(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D1
         ObserveRes(c, Write, "CopyResource", dst, caller);
         ObserveRes(c, Read, "CopyResource", src, caller);
     }
+    if (CopySlice0(c, dst, src)) return;
     o_copy(c, dst, src);
 }
 void STDMETHODCALLTYPE D_Resolve(ID3D11DeviceContext* c, ID3D11Resource* dst, UINT ds, ID3D11Resource* src, UINT ss,
@@ -1827,6 +2250,7 @@ void SetSizes(uint32_t gameW, uint32_t gameH, uint32_t outerW, uint32_t outerH, 
         }
         if (gameChanged) {
             // Listed under the old size: dropped (a new size comes with a new render target pool).
+            RestoreArraysLocked();
             g_tex.clear();
             g_rt.clear();
             g_byRes.clear();
@@ -1864,10 +2288,18 @@ void OnFrameStart(ID3D11DeviceContext* imm, bool enabled) {
                 for (SetState& s : g_set) StartProofLocked(s);
         }
         ProcessPendingLocked();
+        CheckArraysLocked();
         if (g_gameW && g_d3dLo && (g_dirty || g_phase == Waiting || g_phase == Failed)) {
             const bool wasFailed = g_phase == Failed;
             if (g_dirty || !wasFailed) ResetLocked(g_phase == Waiting ? "first list" : "list changed");
             g_dirty = false;
+        }
+        // B17: arrays asked for go into the engine objects; clones made from the old views are made again from the new
+        // ones (what was learned stays, so they are made below in this frame start).
+        if (!g_arrWant.empty() && imm && BuildArraysLocked(imm) && g_phase == Ready) {
+            DropClonesLocked();
+            g_phase = Learning;
+            Log("Clones: B17: clones made again on the two-slice arrays' views");
         }
         if (g_phase == Learning && g_set[Outer].learned >= kLearnGroups && g_set[Focus].learned >= kLearnGroups &&
             g_enabled && imm)
@@ -2023,6 +2455,20 @@ bool HasTwin(ID3D11Resource* original) {
     return out;
 }
 
+void WantArray(ID3D11Resource* original) {
+    if (!original || IsArrayFast(original)) return;
+    Protect("WantArray", [&] {
+        std::lock_guard lock(g_cm);
+        if (g_failed || !g_installed || g_arrRes.count(original) || !g_byRes.count(original)) return;
+        if ((int)(g_arrs.size() + g_arrWant.size()) >= kMaxArrays) return;
+        if (std::find(g_arrWant.begin(), g_arrWant.end(), original) == g_arrWant.end()) g_arrWant.push_back(original);
+    });
+}
+
+bool IsArray(ID3D11Resource* res) { return res && g_arrOn.load(std::memory_order_acquire) && IsArrayFast(res); }
+
+uint32_t Generation() { return g_cloneGen.load(std::memory_order_relaxed); }
+
 bool IsReady() {
     bool out = false;
     Protect("IsReady", [&] {
@@ -2101,8 +2547,14 @@ std::string Describe() {
                 snprintf(sets[s], sizeof(sets[s]), "%s %u x %u: %d clones %.0f MB%s%s", kSetNames[s], st.w, st.h,
                          clones[s], mb[s], tw, st.failed ? " (FAILED)" : "");
         }
-        snprintf(buf, sizeof(buf), "clones %s (%s; %zu textures, %zu render targets listed; %s; %s)",
-                 g_enabled ? "on" : "off", kPhaseNames[g_phase], g_tex.size(), g_rt.size(), sets[0], sets[1]);
+        char arrs[64] = "";
+        if (!g_arrs.empty()) {
+            double amb = 0;
+            for (const ArrRec& a : g_arrs) amb += a.mb;
+            snprintf(arrs, sizeof(arrs), "; two-slice arrays in place of %zu engine textures %.0f MB", g_arrs.size(), amb);
+        }
+        snprintf(buf, sizeof(buf), "clones %s (%s; %zu textures, %zu render targets listed; %s; %s%s)",
+                 g_enabled ? "on" : "off", kPhaseNames[g_phase], g_tex.size(), g_rt.size(), sets[0], sets[1], arrs);
     });
     return buf;
 }
@@ -2125,7 +2577,18 @@ void LogStats(bool totals) {
         g_ctot.lazy += g_c.lazy;
         g_ctot.sizeMismatch += g_c.sizeMismatch;
         g_ctot.twinSwaps += g_c.twinSwaps;
+        g_ctot.arrFix += g_c.arrFix;
+        g_ctot.arrLazy += g_c.arrLazy;
+        const uint64_t copies = g_arrCopies.exchange(0);
+        g_arrCopiesTot += copies;
         const Counters& c = totals ? g_ctot : g_c;
+        if (!g_arrs.empty() || g_arrMade)
+            Log("Clones B17%s: two-slice arrays in place of %zu engine textures (%llu made in this process); the "
+                "engine's own views or textures reached (and sent to the arrays) %llu, views made on the arrays for "
+                "them %llu; CopyResource with an array as slice 0 copies %llu",
+                totals ? " (session total)" : "", g_arrs.size(), (unsigned long long)g_arrMade,
+                (unsigned long long)c.arrFix, (unsigned long long)c.arrLazy,
+                (unsigned long long)(totals ? g_arrCopiesTot.load() : copies));
         if (c.swaps[0] || c.swaps[1] || c.lists || c.changed)
             Log("Clones stats%s: %s, groups with clones outer %llu focus %llu (with focus R's twins %llu, %zu views and "
                 "textures twinned), %llu with bound views translated, %llu "
@@ -2151,6 +2614,7 @@ void Shutdown() {
         g_watch = false;
         g_inGroup = false;
         if (g_swapped) RestoreLocked(nullptr);
+        RestoreArraysLocked();
         DropClonesLocked();
         ReleaseGraveLocked();
         g_tex.clear();
@@ -2172,6 +2636,8 @@ void Shutdown() {
         g_bound = nullptr;
         g_eye = g_swapEye = 0;
         g_twinLogs = 0;
+        g_arrCallers.clear();
+        g_arrLogs = 0;
     });
 }
 
@@ -2210,6 +2676,10 @@ TestState TestGet() {
     s.lazyViews = g_c.lazy + g_ctot.lazy;
     for (auto& [obj, t] : g_tex) s.twins += t.twin ? 1 : 0;
     s.twinViews = (int)g_twin.size() - s.twins;
+    s.arrays = (int)g_arrs.size();
+    s.arrayFixes = g_c.arrFix + g_ctot.arrFix;
+    s.arrayLazy = g_c.arrLazy + g_ctot.arrLazy;
+    s.arrayCopies = g_arrCopies.load() + g_arrCopiesTot.load();
     return s;
 }
 
