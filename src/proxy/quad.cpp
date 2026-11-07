@@ -1829,6 +1829,9 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         g_began |= 1u << g;
         gpu::Begin((gpu::Phase)g);  // the groups and the GPU phases have the same order
         dlaa::BeginGroup(g);        // its own DLSS history per eye group
+        // The eye of this group's focus work (outer R's group runs focus R's early tasks and forward pass): focus R's
+        // clones are its twins (B9d).
+        clones::SetFocusEye(g == OuterR || g == FocusR ? 1 : 0);
         if (!g_graph.ok) return;
         // The groups run in build order; a task without its predecessors in this frame is a stale address (the race
         // graph is gone and the menu reuses the memory).
@@ -1852,7 +1855,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         SwapInLocked(ctx, g, kSourceView[g], r);
         mvrpass::FocusGroup(g - FocusL, r.projected);
         clones::BeginGroup(gpu::Context(), clones::Focus);
-        mvrpass::FocusGroupIn(g - FocusL);  // B9d: this eye's snapshot of the shared focus clones back
+        mvrpass::FocusGroupIn(g - FocusL);
         taaviews::BeginGroup(g);
         // The focus window as a part of outer (which covers the whole grid); without the focus projection the
         // group renders outer's view.

@@ -563,7 +563,7 @@ int RunMvrForward() {
 
     // Live mode (B9d): the same pass, view 1 straight into focus's clones (the depth as MVR drew it here, to compare it
     // with focus's own), the 1/2 size clears repeated on their clones, focus's CPhase3BuildCommandThread and
-    // CPhase3Render skipped; then the snapshots of the shared clones in the order quad drives them.
+    // CPhase3Render skipped; the clones it wrote noted for focus R's twins.
     Restore();
     const float mark[4] = {0.3f, 0.9f, 0.1f, 1.0f};
     ctx->ClearRenderTargetView(g_s.focus.halfRtv.Get(), mark);
@@ -619,21 +619,8 @@ int RunMvrForward() {
     }
     qvfr::mvrpass::AfterTask((uint8_t*)&focusL);
     const int finishes = g_finish - finishBefore;
-    // Snapshots: outer R's early run saves focus L's state, then writes focus R's into the shared clones; focus L's
-    // CBeginEye saves focus R's and puts focus L's back; focus R's puts focus R's back.
-    qvfr::mvrpass::TestEarlyMark(1);
-    const float rColor[4] = {0.05f, 0.15f, 0.95f, 1.0f}, rHalf[4] = {0.5f, 0.5f, 0.5f, 0.5f};
-    ctx->ClearRenderTargetView(g_s.focus.rtv.Get(), rColor);
-    ctx->ClearDepthStencilView(g_s.focus.dsv.Get(), D3D11_CLEAR_DEPTH, 0.5f, 0);
-    ctx->ClearRenderTargetView(g_s.focus.halfRtv.Get(), rHalf);
-    const std::vector<uint64_t> rC = Read(g_s.focus.color.Get()), rD = Read(g_s.focus.depth.Get()),
-                                rH = Read(g_s.focus.half.Get());
-    qvfr::mvrpass::FocusGroupIn(0);
-    const bool backL = Read(g_s.focus.color.Get()) == lC && Read(g_s.focus.depth.Get()) == lD &&
-                       Read(g_s.focus.half.Get()) == lH;
-    qvfr::mvrpass::FocusGroupIn(1);
-    const bool backR = Read(g_s.focus.color.Get()) == rC && Read(g_s.focus.depth.Get()) == rD &&
-                       Read(g_s.focus.half.Get()) == rH;
+    // The focus clones the pass wrote (color, depth, the 1/2 size target and its depth) are noted for focus R's twins
+    // (the twins themselves: qvfr_proxy_smoke --clones).
     const qvfr::mvrpass::TestLiveState lv = qvfr::mvrpass::TestLiveGet();
     qvfr::mvrpass::TestEnd();
     qvfr::mvrpass::SetForward(false);
@@ -656,8 +643,7 @@ int RunMvrForward() {
                         lv.focusSkipped == 1 && lv.buildSkipped == 1 && lv.otherClears == 2 &&
                         lv.otherClearMisses == 0 && lC.size() == (size_t)lpx && lOuter == 0 && lCBig * 100 <= lpx &&
                         lD1 * 100 <= lpx && lHalf == 0 && lHalfD == 0 && lH.size() == (size_t)(kFW / 2) * (kFH / 2) &&
-                        lv.snapEntries == 4 && lv.saves[0] == 1 && lv.saves[1] == 1 && lv.restores[0] == 1 &&
-                        lv.restores[1] == 1 && backL && backR && velOk && plainOk && lv.velBinds == 1;
+                        lv.twinEntries == 4 && velOk && plainOk && lv.velBinds == 1;
 
     int warnings = 0, expected = 0;
     if (info) {
@@ -705,13 +691,11 @@ int RunMvrForward() {
            st2.focusDone ? "compared" : "NOT COMPARED", ownOff, focusOk ? "OK" : "WRONG");
     printf("  live (B9d): outer pass %u, into the clones %u%s%s; outer vs without MVR %d px; clones vs focus's own pass: "
            "color %d px differ (%d by > 0.02, max %.4f), depth %d px off; 1/2 size clone cleared %s (%d / %d px off), "
-           "clears repeated %u (shared %u); focus build %s, CPhase3Render %s (finishes %d); snapshots: %u clones, "
-           "saved L %u / R %u, put back L %u / R %u, focus L's back %s, focus R's back %s; velocity pass on the copy %s "
-           "(binds %u), other targets on the clone %s (%s)\n",
+           "clears repeated %u (shared %u); focus build %s, CPhase3Render %s (finishes %d); clones noted for focus R's "
+           "twins %u; velocity pass on the copy %s (binds %u), other targets on the clone %s (%s)\n",
            lv.passes, lv.ok, lv.why.empty() ? "" : ": ", lv.why.c_str(), lOuter, lC1, lCBig, lMax, lD1,
            lHalf || lHalfD ? "WRONG" : "ok", lHalf, lHalfD, lv.otherClears, lv.otherClearMisses,
-           buildSkip ? "skipped" : "RUN", liveFocusSkip ? "skipped" : "RUN", finishes, lv.snapEntries, lv.saves[0],
-           lv.saves[1], lv.restores[0], lv.restores[1], backL ? "yes" : "NO", backR ? "yes" : "NO",
+           buildSkip ? "skipped" : "RUN", liveFocusSkip ? "skipped" : "RUN", finishes, lv.twinEntries,
            velOk ? "yes" : "NO", lv.velBinds, plainOk ? "yes" : "NO", liveOk ? "OK" : "WRONG");
     printf("  debug layer %s, %d warnings, %d expected linkage reports\n", debugLayer ? "on" : "not installed", warnings,
            expected);

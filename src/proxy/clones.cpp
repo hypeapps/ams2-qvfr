@@ -85,6 +85,8 @@ struct Tex {
     bool read[2] = {}, written[2] = {};  // seen in the groups of each set while learning
     ID3D11Texture2D* clone[2] = {};      // ours, per set
     int views[2] = {};                   // view fields swapped
+    ID3D11Texture2D* twin = nullptr;     // focus R's own copy of clone[Focus] (MVR B9d), ours
+    bool twinWanted = false;             // made at the next frame start
 };
 struct Rt {
     uint8_t* obj = nullptr;
@@ -127,6 +129,7 @@ struct Counters {
     uint64_t swaps[2] = {}, translated = 0, lateRestores = 0, changed = 0, lists = 0;
     uint64_t vpMismatch = 0, vpFixed = 0, vpOutside = 0, devSizes = 0, postSizes = 0;
     uint64_t fixFwd = 0, fixBack = 0, lazy = 0, sizeMismatch = 0;
+    uint64_t twinSwaps = 0;  // focus swaps for eye 1 (with focus R's twins when there are any)
 };
 
 std::mutex g_cm;
@@ -144,6 +147,12 @@ bool g_dirty = false;    // the list of objects or the sizes changed
 bool g_swapped = false;  // clones in the engine objects now (set g_cur)
 bool g_inGroup = false;
 Set g_cur = Focus;
+// Focus R's twins: the focus eye of the work now (SetFocusEye), the eye of the swap in place, and per focus clone
+// texture or view its twin (focus's views of the twins are also in g_set[Focus].back and .targets).
+int g_eye = 0, g_swapEye = 0;
+std::unordered_map<void*, void*> g_twin;
+bool g_twinPending = false;
+int g_twinLogs = 0;
 int g_resetLogs = 0;
 uint64_t g_frame = 0;
 bool g_texSizeLogged = false, g_devLogged = false;
@@ -322,6 +331,17 @@ bool ReadField(const Entry& e, uint64_t& v) {
 }
 void WriteField(const Entry& e, uint64_t v) { memcpy(e.addr, &v, e.bytes); }
 
+// A focus clone texture or view, or its twin for eye 1 when it has one.
+void* ForEye(void* p, int eye) {
+    if (eye != 1 || !p) return p;
+    auto it = g_twin.find(p);
+    return it == g_twin.end() ? p : it->second;
+}
+// The value an entry holds while its set is in for `eye` (pointers only: sizes are the same for the twin).
+uint64_t CloneValue(const Entry& e, int eye) {
+    return e.bytes == 8 ? (uint64_t)ForEye((void*)e.clone, eye) : e.clone;
+}
+
 // ---------------------------------------------------------------- object lists
 
 void RegisterTexLocked(uint8_t* obj) {
@@ -384,7 +404,7 @@ void RestoreObjectLocked(uint8_t* obj) {
     for (const Entry& e : g_set[g_cur].entries) {
         if (e.obj != obj) continue;
         uint64_t cur = 0;
-        if (ReadField(e, cur) && cur == e.clone) WriteField(e, e.orig);
+        if (ReadField(e, cur) && cur == CloneValue(e, g_swapEye)) WriteField(e, e.orig);
     }
 }
 
@@ -408,6 +428,11 @@ void DestroyLocked(uint8_t* obj, bool rt) {
             g_grave.push_back(c);
             c = nullptr;
         }
+        if (ID3D11Texture2D*& tw = it->second.twin) {  // its views stay in g_twin until the list is dropped
+            g_byClone.erase(tw);
+            g_grave.push_back(tw);
+            tw = nullptr;
+        }
         g_tex.erase(it);
         listed = true;
     }
@@ -427,14 +452,20 @@ void DropSetLocked(SetState& s) {
 void DropClonesLocked() {
     for (IUnknown* u : g_owned) g_grave.push_back(u);
     g_owned.clear();
-    for (auto& [obj, t] : g_tex)
+    for (auto& [obj, t] : g_tex) {
         for (int s = 0; s < 2; ++s) {
             if (t.clone[s]) g_grave.push_back(t.clone[s]);
             t.clone[s] = nullptr;
             t.views[s] = 0;
         }
+        if (t.twin) g_grave.push_back(t.twin);
+        t.twin = nullptr;
+        t.twinWanted = false;
+    }
     for (auto& [obj, r] : g_rt) r.views[0] = r.views[1] = 0;
     g_byClone.clear();
+    g_twin.clear();
+    g_twinPending = false;
     for (SetState& s : g_set) DropSetLocked(s);
     for (IUnknown* u : g_lazyRefs) g_grave.push_back(u);
     g_lazyRefs.clear();
@@ -480,10 +511,8 @@ void ResetLocked(const char* why) {
 
 uint32_t MipSize(uint32_t s, UINT mip) { return std::max(1u, s >> std::min(mip, 31u)); }
 
-// A clone of view v (the same description) on set s's clone texture; reused when v appears twice. Render target and
-// depth views are noted with their sizes for the viewport check.
-void* CloneViewLocked(SetState& s, ID3D11Device* dev, void* v, ID3D11Texture2D* clone, const Tex& t) {
-    if (auto it = s.fwd.find(v); it != s.fwd.end()) return it->second;
+// A view with v's description on `clone` (owned in g_owned), or null (logged). `mip`: a target view's mip, else -1.
+IUnknown* MakeViewLocked(ID3D11Device* dev, void* v, ID3D11Texture2D* clone, const Tex& t, int& mip) {
     IUnknown* u = static_cast<IUnknown*>(v);
     IUnknown* out = nullptr;
     HRESULT hr = E_NOINTERFACE;
@@ -491,7 +520,7 @@ void* CloneViewLocked(SetState& s, ID3D11Device* dev, void* v, ID3D11Texture2D* 
     ID3D11RenderTargetView* rtv = nullptr;
     ID3D11DepthStencilView* dsv = nullptr;
     ID3D11UnorderedAccessView* uav = nullptr;
-    int mip = -1;  // a target view's mip
+    mip = -1;
     if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D11ShaderResourceView), (void**)&srv)) && srv) {
         D3D11_SHADER_RESOURCE_VIEW_DESC d{};
         srv->GetDesc(&d);
@@ -526,7 +555,12 @@ void* CloneViewLocked(SetState& s, ID3D11Device* dev, void* v, ID3D11Texture2D* 
         return nullptr;
     }
     g_owned.push_back(out);
-    s.fwd[v] = out;
+    return out;
+}
+
+// A view of `clone` made for the engine's view v: noted as v's translation back, and with its sizes for the viewport
+// check when it is a target view.
+void NoteViewLocked(SetState& s, void* v, IUnknown* out, ID3D11Texture2D* clone, const Tex& t, int mip) {
     s.back[out] = v;
     if (mip >= 0) {
         const D3D11_TEXTURE2D_DESC cd = DescOf(clone);
@@ -534,6 +568,29 @@ void* CloneViewLocked(SetState& s, ID3D11Device* dev, void* v, ID3D11Texture2D* 
         tg = {MipSize(cd.Width, mip), MipSize(cd.Height, mip), MipSize(t.desc.Width, mip), MipSize(t.desc.Height, mip)};
         memcpy(tg.name, t.name, sizeof(tg.name));
     }
+}
+
+// A clone of view v (the same description) on set s's clone texture; reused when v appears twice. Render target and
+// depth views are noted with their sizes for the viewport check.
+void* CloneViewLocked(SetState& s, ID3D11Device* dev, void* v, ID3D11Texture2D* clone, const Tex& t) {
+    if (auto it = s.fwd.find(v); it != s.fwd.end()) return it->second;
+    int mip = -1;
+    IUnknown* out = MakeViewLocked(dev, v, clone, t, mip);
+    if (!out) return nullptr;
+    s.fwd[v] = out;
+    NoteViewLocked(s, v, out, clone, t, mip);
+    return out;
+}
+
+// Focus R's view of t's twin for the engine's view v whose focus clone view is cv; reused. Null on failure.
+void* TwinViewLocked(ID3D11Device* dev, void* v, void* cv, const Tex& t) {
+    if (auto it = g_twin.find(cv); it != g_twin.end()) return it->second;
+    if (!t.twin) return nullptr;
+    int mip = -1;
+    IUnknown* out = MakeViewLocked(dev, v, t.twin, t, mip);
+    if (!out) return nullptr;
+    g_twin[cv] = out;
+    NoteViewLocked(g_set[Focus], v, out, t.twin, t, mip);
     return out;
 }
 
@@ -748,15 +805,83 @@ bool BuildLocked(ID3D11DeviceContext* imm) {
     return any;
 }
 
+// Focus R's twins wanted since the last frame start: a texture like the focus clone, starting with its contents (what
+// focus R saw in the shared clone), and a twin of each of focus's views of the clone.
+void BuildTwinsLocked(ID3D11DeviceContext* imm) {
+    g_twinPending = false;
+    ID3D11Device* dev = nullptr;
+    imm->GetDevice(&dev);
+    if (!dev) return;
+    int made = 0, views = 0, failed = 0;
+    double mb = 0;
+    for (auto& [obj, t] : g_tex) {
+        if (!t.twinWanted || t.twin) continue;
+        t.twinWanted = false;
+        ID3D11Texture2D* c = t.clone[Focus];
+        if (!c) continue;
+        const D3D11_TEXTURE2D_DESC d = DescOf(c);
+        ID3D11Texture2D* tw = nullptr;
+        if (FAILED(dev->CreateTexture2D(&d, nullptr, &tw)) || !tw) {
+            ++failed;
+            if (g_twinLogs < kMaxResetLogs) {
+                ++g_twinLogs;
+                Log("Clones: cannot create focus R's twin of the focus clone of %s (%u x %u fmt %d)", TexName(t), d.Width,
+                    d.Height, (int)d.Format);
+            }
+            continue;
+        }
+        t.twin = tw;
+        // Focus's views of the clone (the swapped fields and the views made on the fly), each with its twin.
+        std::vector<std::pair<void*, void*>> mine;
+        for (auto& [v, cv] : g_set[Focus].fwd) {
+            ID3D11Resource* r = ViewResource(cv);
+            if (!r) continue;
+            if (r == c) mine.emplace_back(v, cv);
+            r->Release();
+        }
+        bool ok = true;
+        for (auto& [v, cv] : mine) ok = ok && TwinViewLocked(dev, v, cv, t);
+        if (!ok) {  // a twin without all its views would let focus R write into focus L's clone: none
+            for (auto& [v, cv] : mine) g_twin.erase(cv);
+            g_grave.push_back(tw);
+            t.twin = nullptr;
+            ++failed;
+            continue;
+        }
+        t_internal = true;
+        imm->CopyResource(tw, c);
+        t_internal = false;
+        g_byClone[tw] = obj;
+        g_twin[c] = tw;
+        mb += Megabytes(d);
+        views += (int)mine.size();
+        ++made;
+    }
+    dev->Release();
+    if (made && g_twinLogs < kMaxResetLogs) {
+        ++g_twinLogs;
+        size_t total = 0;
+        double all = 0;
+        for (auto& [obj, t] : g_tex)
+            if (t.twin) {
+                ++total;
+                all += Megabytes(DescOf(t.twin));
+            }
+        Log("Clones: focus R's own clones: %d new twins (%.0f MB, %d views), %zu in all (%.0f MB)%s", made, mb, views,
+            total, all, failed ? "; some FAILED (see above)" : "");
+    }
+}
+
 // The D3D11 state bound now, with every view found in `map` replaced (RTVs, DSV, SRVs of all stages, CS UAVs).
-// Returns the bound target after it (the first RTV, else the DSV).
-void* TranslateLocked(ID3D11DeviceContext* imm, const std::unordered_map<void*, void*>& map) {
+// Returns the bound target after it (the first RTV, else the DSV). `eye` 1: a translation to a focus clone view gives
+// its twin when it has one.
+void* TranslateLocked(ID3D11DeviceContext* imm, const std::unordered_map<void*, void*>& map, int eye = 0) {
     if (!imm) return nullptr;
     t_internal = true;
     auto tr = [&](void* p) -> void* {
         if (!p) return p;
         auto it = map.find(p);
-        return it == map.end() ? p : it->second;
+        return it == map.end() ? p : ForEye(it->second, eye);
     };
     bool any = false;
     ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
@@ -952,7 +1077,7 @@ void RestoreLocked(ID3D11DeviceContext* imm) {
     for (const Entry& e : s.entries) {
         uint64_t cur = 0;
         if (!ReadField(e, cur)) continue;
-        if (cur == e.clone)
+        if (cur == CloneValue(e, g_swapEye))
             WriteField(e, e.orig);
         else
             ++changed;
@@ -985,7 +1110,7 @@ bool PutBackRaw() {
             const SetState& s = g_set[g_cur];
             for (const Entry& e : s.entries) {
                 uint64_t cur = 0;
-                if (ReadField(e, cur) && cur == e.clone) WriteField(e, e.orig);
+                if (ReadField(e, cur) && cur == CloneValue(e, g_swapEye)) WriteField(e, e.orig);
             }
             MapDeviceSizes(s.w, s.h, g_gameW, g_gameH);
             MapPostSize(s.w, s.h, g_gameW, g_gameH);
@@ -1073,9 +1198,30 @@ void* MapViewLocked(void* v, const char* method, void* caller) {
     }
     if (live != LiveSwap) return v;
     SetState& s = g_set[g_cur];
+    const int eye = g_cur == Focus ? g_swapEye : 0;
+    // Focus R: a view of focus's shared clone (kept by a pointer) goes to its twin, and so does a translation.
+    if (eye == 1)
+        if (auto it = g_twin.find(v); it != g_twin.end()) {
+            NoteFixLocked(true, method, caller, v, false, false);
+            return it->second;
+        }
+    auto twinOf = [&](void* ov, void* cv) -> void* {
+        if (eye != 1) return cv;
+        if (void* tw = ForEye(cv, 1); tw != cv) return tw;
+        ID3D11Resource* r = ViewResource(cv);
+        if (!r) return cv;
+        auto ct = g_byClone.find(r);
+        r->Release();
+        if (ct == g_byClone.end() || !g_tex[ct->second].twin) return cv;  // no twin: shared
+        ID3D11Device* dev = nullptr;
+        g_imm->GetDevice(&dev);
+        void* tw = dev ? TwinViewLocked(dev, ov, cv, g_tex[ct->second]) : nullptr;
+        if (dev) dev->Release();
+        return tw ? tw : cv;
+    };
     if (auto it = s.fwd.find(v); it != s.fwd.end()) {
         NoteFixLocked(true, method, caller, v, false, false);
-        return it->second;
+        return twinOf(v, it->second);
     }
     if (s.back.count(v) || g_lazyFailed.count(v)) return v;
     // A view the engine keeps outside the swapped fields: cloned on the fly when its texture has a clone.
@@ -1098,17 +1244,23 @@ void* MapViewLocked(void* v, const char* method, void* caller) {
     static_cast<IUnknown*>(v)->AddRef();
     g_lazyRefs.push_back(static_cast<IUnknown*>(v));
     NoteFixLocked(true, method, caller, v, false, true);
-    return cv;
+    return twinOf(v, cv);
 }
 
 ID3D11Resource* MapResLocked(ID3D11Resource* r, const char* method, void* caller) {
     if (!r) return r;
     const int live = g_live.load(std::memory_order_relaxed);
     if (live == LiveSwap) {
+        const int eye = g_cur == Focus ? g_swapEye : 0;
+        if (eye == 1)  // focus R: focus's shared clone goes to its twin
+            if (auto it = g_twin.find(r); it != g_twin.end()) {
+                NoteFixLocked(true, method, caller, r, true, false);
+                return (ID3D11Resource*)it->second;
+            }
         auto it = g_byRes.find(r);
         if (it == g_byRes.end() || !g_tex[it->second].clone[g_cur]) return r;
         NoteFixLocked(true, method, caller, r, true, false);
-        return g_tex[it->second].clone[g_cur];
+        return (ID3D11Resource*)ForEye(g_tex[it->second].clone[g_cur], eye);
     }
     if (live == LiveBack) {
         auto it = g_byClone.find(r);
@@ -1720,6 +1872,7 @@ void OnFrameStart(ID3D11DeviceContext* imm, bool enabled) {
         if (g_phase == Learning && g_set[Outer].learned >= kLearnGroups && g_set[Focus].learned >= kLearnGroups &&
             g_enabled && imm)
             BuildLocked(imm);
+        if (g_phase == Ready && !g_dirty && g_twinPending && imm) BuildTwinsLocked(imm);
     });
 }
 
@@ -1753,12 +1906,14 @@ void BeginGroup(ID3D11DeviceContext* imm, Set set) {
                 return;
             }
         }
-        for (const Entry& e : s.entries) WriteField(e, e.clone);
+        g_swapEye = set == Focus ? g_eye : 0;
+        for (const Entry& e : s.entries) WriteField(e, CloneValue(e, g_swapEye));
         g_swapped = true;
         ++g_c.swaps[set];
+        if (g_swapEye == 1 && !g_twin.empty()) ++g_c.twinSwaps;
         g_c.devSizes += MapDeviceSizes(g_gameW, g_gameH, s.w, s.h);
         g_c.postSizes += MapPostSize(g_gameW, g_gameH, s.w, s.h);
-        g_bound = TranslateLocked(imm, s.fwd);
+        g_bound = TranslateLocked(imm, s.fwd, g_swapEye);
         // The viewport the engine set last, checked against the bound target.
         g_vpN = 0;
         if (imm) {
@@ -1830,7 +1985,40 @@ ID3D11Texture2D* CloneOf(ID3D11Resource* res, Set set) {
     Protect("CloneOf", [&] {
         std::lock_guard lock(g_cm);
         if (g_failed || g_phase != Ready || g_dirty) return;
-        if (auto it = g_byRes.find(res); it != g_byRes.end()) out = g_tex[it->second].clone[set];
+        if (auto it = g_byRes.find(res); it != g_byRes.end()) {
+            const Tex& t = g_tex[it->second];
+            out = set == Focus && g_eye == 1 && t.twin ? t.twin : t.clone[set];
+        }
+    });
+    return out;
+}
+
+void SetFocusEye(int eye) {
+    std::lock_guard lock(g_cm);
+    g_eye = eye == 1 ? 1 : 0;
+}
+
+void WantTwin(ID3D11Resource* original) {
+    if (!original) return;
+    Protect("WantTwin", [&] {
+        std::lock_guard lock(g_cm);
+        if (g_failed || g_phase != Ready || g_dirty) return;
+        auto it = g_byRes.find(original);
+        if (it == g_byRes.end()) return;
+        Tex& t = g_tex[it->second];
+        if (!t.clone[Focus] || t.twin || t.twinWanted) return;
+        t.twinWanted = true;
+        g_twinPending = true;
+    });
+}
+
+bool HasTwin(ID3D11Resource* original) {
+    bool out = false;
+    if (!original) return out;
+    Protect("HasTwin", [&] {
+        std::lock_guard lock(g_cm);
+        if (g_failed || g_phase != Ready || g_dirty) return;
+        if (auto it = g_byRes.find(original); it != g_byRes.end()) out = g_tex[it->second].twin != nullptr;
     });
     return out;
 }
@@ -1884,7 +2072,7 @@ int ListForShot(Set set, ID3D11Resource** out, char (*labels)[64], int max) {
 }
 
 std::string Describe() {
-    char buf[320] = "clones: (error)";
+    char buf[400] = "clones: (error)";
     Protect("Describe", [&] {
         std::lock_guard lock(g_cm);
         int clones[2] = {};
@@ -1895,14 +2083,23 @@ std::string Describe() {
                     ++clones[s];
                     mb[s] += Megabytes(DescOf(t.clone[s]));
                 }
-        char sets[2][96];
+        int twins = 0;
+        double twinMb = 0;
+        for (auto& [obj, t] : g_tex)
+            if (t.twin) {
+                ++twins;
+                twinMb += Megabytes(DescOf(t.twin));
+            }
+        char sets[2][128];
         for (int s = 0; s < 2; ++s) {
             const SetState& st = g_set[s];
+            char tw[48] = "";
+            if (s == Focus && twins) snprintf(tw, sizeof(tw), ", focus R's own %d %.0f MB", twins, twinMb);
             if (!st.wanted)
                 snprintf(sets[s], sizeof(sets[s]), "%s at the game size", kSetNames[s]);
             else
-                snprintf(sets[s], sizeof(sets[s]), "%s %u x %u: %d clones %.0f MB%s", kSetNames[s], st.w, st.h,
-                         clones[s], mb[s], st.failed ? " (FAILED)" : "");
+                snprintf(sets[s], sizeof(sets[s]), "%s %u x %u: %d clones %.0f MB%s%s", kSetNames[s], st.w, st.h,
+                         clones[s], mb[s], tw, st.failed ? " (FAILED)" : "");
         }
         snprintf(buf, sizeof(buf), "clones %s (%s; %zu textures, %zu render targets listed; %s; %s)",
                  g_enabled ? "on" : "off", kPhaseNames[g_phase], g_tex.size(), g_rt.size(), sets[0], sets[1]);
@@ -1927,15 +2124,18 @@ void LogStats(bool totals) {
         g_ctot.fixBack += g_c.fixBack;
         g_ctot.lazy += g_c.lazy;
         g_ctot.sizeMismatch += g_c.sizeMismatch;
+        g_ctot.twinSwaps += g_c.twinSwaps;
         const Counters& c = totals ? g_ctot : g_c;
         if (c.swaps[0] || c.swaps[1] || c.lists || c.changed)
-            Log("Clones stats%s: %s, groups with clones outer %llu focus %llu, %llu with bound views translated, %llu "
+            Log("Clones stats%s: %s, groups with clones outer %llu focus %llu (with focus R's twins %llu, %zu views and "
+                "textures twinned), %llu with bound views translated, %llu "
                 "late restores, %llu lists watched, %llu changed fields, %llu device sizes and %llu postprocess sizes "
                 "swapped; viewports for an original on its clone %llu (scaled %llu), larger than the original %llu; "
                 "bind fix: originals to clones %llu (views made on clones %llu), clones to originals %llu; target size "
                 "mismatches in proof groups %llu",
                 totals ? " (session total)" : "", kPhaseNames[g_phase], (unsigned long long)c.swaps[0],
-                (unsigned long long)c.swaps[1], (unsigned long long)c.translated, (unsigned long long)c.lateRestores,
+                (unsigned long long)c.swaps[1], (unsigned long long)c.twinSwaps, g_twin.size(),
+                (unsigned long long)c.translated, (unsigned long long)c.lateRestores,
                 (unsigned long long)c.lists, (unsigned long long)c.changed, (unsigned long long)c.devSizes,
                 (unsigned long long)c.postSizes,
                 (unsigned long long)c.vpMismatch, (unsigned long long)c.vpFixed, (unsigned long long)c.vpOutside,
@@ -1970,6 +2170,8 @@ void Shutdown() {
         g_mismatchCallers.clear();
         g_vpN = g_vpSetN = 0;
         g_bound = nullptr;
+        g_eye = g_swapEye = 0;
+        g_twinLogs = 0;
     });
 }
 
@@ -2006,6 +2208,8 @@ TestState TestGet() {
     s.bindsToClone = g_c.fixFwd + g_ctot.fixFwd;
     s.bindsToOriginal = g_c.fixBack + g_ctot.fixBack;
     s.lazyViews = g_c.lazy + g_ctot.lazy;
+    for (auto& [obj, t] : g_tex) s.twins += t.twin ? 1 : 0;
+    s.twinViews = (int)g_twin.size() - s.twins;
     return s;
 }
 

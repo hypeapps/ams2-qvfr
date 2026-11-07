@@ -1223,6 +1223,51 @@ int RunClones() {
     expect(boundRtv == rtvA, "bound RTV translated back");
     if (boundRtv) boundRtv->Release();
     ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    // Focus R's twins (MVR B9d): A's focus clone gets a twin at the next frame start, with a twin of each focus view of
+    // the clone; with eye 1 focus's swap, CloneOf and the bind fix give the twin (B stays shared), with eye 0 the clone.
+    cl::WantTwin(texA);
+    expect(!cl::HasTwin(texA), "no twin before the frame start");
+    cl::OnFrameStart(ctx, true);
+    st = cl::TestGet();
+    expect(cl::HasTwin(texA) && !cl::HasTwin(texB) && st.twins == 1 && st.twinViews == 5,
+           "A's twin with 5 views (SRV and RTV fields, the render target's two arrays, view X)");
+    cl::SetFocusEye(1);
+    ID3D11Texture2D* twinA = cl::CloneOf(texA, cl::Focus);
+    expect(twinA && twinA != cloneA && size(twinA) == size(cloneA) && cl::CloneOf(texB, cl::Focus) == cloneB,
+           "eye 1: CloneOf gives A's twin and B's shared clone");
+    expect(cl::Original(twinA) == texA, "Original() of a twin");
+    expect(twinA && pixel(twinA) == pixel(cloneA), "the twin starts with the clone's contents");
+    cl::BeginGroup(ctx, cl::Focus);
+    ID3D11ShaderResourceView* twinSrvA = A.at<ID3D11ShaderResourceView*>(0x70);
+    expect(A.at<void*>(0x58) == twinA && twinSrvA != cloneSrvA && twinSrvA != srvA && B.at<void*>(0x58) == cloneB &&
+               arr78[0] != rtvA2 && A.at<uint16_t>(0x68) == 32,
+           "eye 1 swap: A's twin and its views in the fields, B's shared clone");
+    ctx->ClearRenderTargetView((ID3D11RenderTargetView*)arr78[0], red);
+    ID3D11RenderTargetView* mappedR[8] = {};
+    ID3D11DepthStencilView* mappedDsvR = nullptr;
+    cl::MapTargets(ctx, 1, &rtvX, nullptr, mappedR, &mappedDsvR, nullptr);
+    ID3D11Resource* mappedResR = nullptr;
+    if (mappedR[0]) mappedR[0]->GetResource(&mappedResR);
+    expect(twinA && mappedResR == twinA, "eye 1: a view kept outside the fields goes to the twin");
+    if (mappedResR) mappedResR->Release();
+    cl::EndGroup(ctx);
+    expect(A.at<void*>(0x58) == texA && A.at<void*>(0x70) == srvA && arr78[0] == rtvA2 && B.at<void*>(0x58) == texB,
+           "originals back after the eye 1 group");
+    expect(twinA && pixel(twinA) == 0xFF0000FFu && pixel(cloneA) == 0xFF00FF00u,
+           "eye 1 wrote the twin (red), the clone kept eye 0's (green)");
+    cl::SetFocusEye(0);
+    expect(cl::CloneOf(texA, cl::Focus) == cloneA, "eye 0: CloneOf gives the shared clone");
+    cl::BeginGroup(ctx, cl::Focus);
+    expect(A.at<void*>(0x58) == cloneA && A.at<void*>(0x70) == cloneSrvA, "eye 0 swap: the shared clone");
+    cl::EndGroup(ctx);
+    cl::BeginGroup(ctx, cl::Outer);
+    ctx->PSSetShaderResources(0, 1, &twinSrvA);
+    back = nullptr;
+    ctx->PSGetShaderResources(0, 1, &back);
+    expect(back == srvA, "a twin's view bound in an outer group goes back to the original");
+    if (back) back->Release();
+    cl::EndGroup(ctx);
+    ctx->PSSetShaderResources(0, 2, none);
     // An object destroyed inside a focus group gets its originals back at once; the list is watched again.
     cl::OnFrameStart(ctx, true);
     cl::BeginGroup(ctx, cl::Focus);

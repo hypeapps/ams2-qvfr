@@ -71,7 +71,7 @@ void AfterTask(uint8_t* task);  // after the engine's Execute (not after a skipp
 // outer L's group, right
 // before its CPhase3Render (the forward pass that a later step draws with MVR), and the focus group skips them. Only
 // focus L: the focus clones are shared, and outer R's group (which would run focus R's) comes before focus L's group.
-// With mvr_forward (step 3, below) focus R's run in outer R's group as well, with snapshots of the shared clones.
+// With mvr_forward (step 3, below) focus R's run in outer R's group as well, into focus R's own clones.
 // The run order of quad's RunTask:
 //   EarlyWanted(eye) -> quad swaps focus's view in and puts focus's clones in -> EarlyBegin(eye, projected) -> the
 //   engine's CBeginEye, CSSAORender, CPhase2Render of the focus group without their Finish -> clones out, view back,
@@ -110,10 +110,10 @@ void EarlyWaited(double ms);                  // time quad waited for the engine
 // pass's clears of targets of other sizes (the 1/2 size f9) are repeated on their focus clones, and the focus group
 // skips its CPhase3BuildCommandThread and CPhase3Render (Finish only). A pass with draws that miss view 1 (one view, or
 // into targets of other sizes) leaves the clones alone and the focus group runs its own.
-// The focus clones are shared by both eyes, so the module keeps two snapshots of the clones that the early runs and
-// the forward passes write (noted as they are bound, cleared or filled): before outer R's early run it saves focus L's
-// (snapshot L); at focus L's CBeginEye it saves focus R's and puts focus L's back; at focus R's CBeginEye it puts focus
-// R's back.
+// The focus clones are shared by both eyes, and outer R's group comes before focus L's: each clone that the early runs
+// and the forward passes write (noted as they are bound, cleared or filled) gets focus R's own copy from the clones
+// module (clones::WantTwin, made at the next frame start), which focus R's work then uses (clones::SetFocusEye). Focus
+// R's early run (and with it its live pass) waits until every noted clone has one.
 void SetForward(bool on);
 bool GetForward();
 // The depth the live pass leaves in focus's clone ([debug] mvr_forward_depth): 0 as MVR drew it, 1 plus mvr_depth_bias
@@ -128,7 +128,7 @@ int GetForwardDepth();
 const char* ForwardDepthName(int mode);
 // Quad: the vtable of the focus groups' CPhase3BuildCommandThread (found by class name; 0: none).
 void SetPhase3BuildVtable(uintptr_t vt);
-// A focus group's CBeginEye, after its clones went in (snapshots, above).
+// A focus group's CBeginEye, after its clones went in (the eye of the velocity pass's depth, above).
 void FocusGroupIn(int eye);
 // Task map of a shot frame or of a map frame (render thread): every task of the eye groups with its draws, binds,
 // clears and the distinct targets it bound, one log line per task that touched the immediate context; `detail` adds
@@ -183,11 +183,11 @@ ID3D11Texture2D* TestForwardStash(int k);  // the corner of slice 1 of forward t
 // qvfr_proxy_smoke --mvr-forward, live mode (B9d): after OnFrameStart and SetWindow, the live forward pass of eye L as
 // if focus L's early run had gone (focus L decided to skip, its SSAO and lights done).
 void TestForwardLive(const void* phase3Vtable);
-// As if the eye's early run began now (eye 1: snapshot L first, as EarlyBegin does).
+// As if the eye's early run began now.
 void TestEarlyMark(int eye);
 struct TestLiveState {
     unsigned passes = 0, ok = 0, focusSkipped = 0, buildSkipped = 0, otherClears = 0, otherClearMisses = 0;
-    unsigned snapEntries = 0, saves[2] = {}, restores[2] = {}, velBinds = 0;
+    unsigned twinEntries = 0, velBinds = 0;  // focus clones noted for focus R's twins
     std::string why;  // the latest live pass's failure
 };
 TestLiveState TestLiveGet();

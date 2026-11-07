@@ -580,7 +580,7 @@ char g_fwdLabels[kMaxTargets][96] = {};
 char g_fwdNames[2 * kMaxTargets][32] = {};
 uint64_t g_earlyOk[2] = {};  // the frame of the eye's latest early SSAO and lights run without an engine fault
 
-// MVR forward step 3 (B9d, mvr_pass.h): the live forward pass of each eye, the focus groups' skips, the snapshots.
+// MVR forward step 3 (B9d, mvr_pass.h): the live forward pass of each eye, the focus groups' skips, focus R's twins.
 bool g_forwardOn = false;       // [debug] mvr_forward and its hotkey
 int g_fwdDepth = 3;             // [debug] mvr_forward_depth and its hotkey (mvr_pass.h)
 // Mode 3: per eye a conservative copy of the forward depth, bound in place of focus's depth clone while the focus
@@ -597,15 +597,11 @@ uint64_t g_fwdOk[2] = {};       // the frame whose forward pass of the eye put v
 std::atomic<uint64_t> g_buildRan[2] = {};  // the frame in which focus's CPhase3BuildCommandThread ran (then its
                                             // CPhase3Render runs too: the pair records and replays its buffers)
 bool g_track = false;           // an early run: the focus clones its tasks bind or clear are noted
-// One focus clone that the early runs or the forward passes write, by its engine texture, with its two snapshots.
-struct Snap {
-    ID3D11Resource* orig = nullptr;  // only compared
-    ComPtr<ID3D11Texture2D> tex[2];
-    uint64_t saved[2] = {};
-};
-constexpr size_t kMaxSnaps = 48;
-std::vector<Snap> g_snaps;
-uint64_t g_snapSaved[2] = {};  // the frame of the eye's latest snapshot
+// The engine textures whose focus clones the early runs or the forward passes write (only compared). Focus L and R
+// share the focus clones, and outer R's group writes focus R's results before focus L's group reads focus L's: each
+// of these clones needs focus R's own copy (a twin, clones::WantTwin) before focus R's work goes into outer R's group.
+constexpr size_t kMaxTwins = 48;
+std::vector<ID3D11Resource*> g_twinOrigs;
 // A clear of a target of another size in the live forward pass (repeated on its focus clone at the end).
 struct OtherClear {
     ID3D11Resource* orig = nullptr;  // only compared
@@ -629,17 +625,17 @@ std::vector<CloneView> g_cloneViews;
 // The live forward pass per stats interval and for the session (in Stats would make it longer still).
 struct FwdStats {
     uint64_t passes[2] = {}, ok[2] = {}, skipped[2] = {}, buildSkipped[2] = {}, own[2] = {};
-    uint64_t draws = 0, saves[2] = {}, restores[2] = {}, snapFailures = 0, otherClears = 0, otherClearMisses = 0;
+    uint64_t draws = 0, otherClears = 0, otherClearMisses = 0;
     uint64_t velBinds = 0;  // mode 3: velocity pass binds given the conservative depth
     uint64_t liveTracks = 0, liveTrackFails = 0;  // live track maps read in the focus window for view 1
-    double ms[2] = {}, snapMs = 0, snapMb = 0;
+    double ms[2] = {};
     std::vector<Reason> reasons;
 };
 FwdStats g_fs, g_ftot;
 std::string g_lastFwdFail;
 struct TestLive {
     unsigned passes = 0, ok = 0, focusSkipped = 0, buildSkipped = 0, otherClears = 0, otherClearMisses = 0;
-    unsigned saves[2] = {}, restores[2] = {}, velBinds = 0;
+    unsigned velBinds = 0;
     std::string why;
 };
 TestLive g_testLive;
@@ -698,7 +694,7 @@ void ReleaseAll() {
     g_fwdN = 0;
     g_fwdDepthIn.Reset();
     g_srvClones.clear();
-    g_snaps.clear();
+    g_twinOrigs.clear();
     g_otherClears.clear();
     g_cloneViews.clear();
     for (VelDepth& v : g_vel) v = VelDepth{};
@@ -895,7 +891,7 @@ bool OuterSize(ID3D11View* v) {
     return d.Width == g_p.w && d.Height == g_p.h;
 }
 
-// ---------------------------------------------------------------- B9d: focus clones written, snapshots, clone views
+// ---------------------------------------------------------------- B9d: focus clones written, focus R's twins, views
 
 // Bytes per pixel of the formats the eye targets use (4 for the rest; only for the logged size).
 double BytesPerPixel(DXGI_FORMAT f) {
@@ -916,15 +912,35 @@ void FwdReason(int eye, const char* why) {
     AddReason(g_ftot.reasons, b);
 }
 
-// A focus clone written by an early run or a forward pass, by its engine texture.
+// A focus clone written by an early run or a forward pass, by its engine texture: it gets focus R's twin.
 void NoteOrig(ID3D11Resource* orig) {
-    if (!orig) return;
-    for (const Snap& s : g_snaps)
-        if (s.orig == orig) return;
-    if (g_snaps.size() >= kMaxSnaps) return;
-    Snap s;
-    s.orig = orig;
-    g_snaps.push_back(std::move(s));
+    if (!orig || !g_forwardOn) return;  // B8's fills alone need no twins
+    for (ID3D11Resource* o : g_twinOrigs)
+        if (o == orig) return;
+    if (g_twinOrigs.size() >= kMaxTwins) return;
+    g_twinOrigs.push_back(orig);
+    if (!g_cloneFn) clones::WantTwin(orig);
+}
+
+// Every focus clone noted has focus R's twin (asked again for the missing ones; textures without a focus clone any
+// more, after a list change, are dropped). Eye L's work notes them, so focus R's early run and forward pass wait one
+// frame after a list change. The smoke's fake clones have none.
+bool TwinsReady() {
+    if (g_cloneFn) return true;
+    bool ready = true;
+    for (size_t i = 0; i < g_twinOrigs.size();) {
+        ID3D11Resource* o = g_twinOrigs[i];
+        if (!clones::CloneOf(o, clones::Focus)) {
+            g_twinOrigs.erase(g_twinOrigs.begin() + i);
+            continue;
+        }
+        if (!clones::HasTwin(o)) {
+            clones::WantTwin(o);
+            ready = false;
+        }
+        ++i;
+    }
+    return ready && !g_twinOrigs.empty();
 }
 
 // A view bound or cleared during an early run (focus's clones are in): its texture when it is a clone.
@@ -941,7 +957,7 @@ ID3D11View* CloneViewOf(ID3D11Texture2D* t, int kind, const void* desc, size_t n
     if (!t || n > sizeof(CloneView::desc)) return nullptr;
     for (const CloneView& e : g_cloneViews)
         if (e.tex == t && e.kind == kind && !memcmp(e.desc, desc, n)) return e.v.Get();
-    if (g_cloneViews.size() >= 32) g_cloneViews.clear();
+    if (g_cloneViews.size() >= 64) g_cloneViews.clear();  // both eyes' clones
     CloneView e;
     e.tex = t;
     e.kind = kind;
@@ -959,72 +975,6 @@ ID3D11View* CloneViewOf(ID3D11Texture2D* t, int kind, const void* desc, size_t n
     if (FAILED(hr) || !e.v) return nullptr;
     g_cloneViews.push_back(e);
     return g_cloneViews.back().v.Get();
-}
-
-// Snapshot `eye` of the noted focus clones (their contents now).
-void SaveSnap(ID3D11DeviceContext* c, int eye) {
-    if (!c || !EnsureGpu(c)) return;
-    const double t0 = NowMs();
-    clones::RawScope raw;  // in outer's group the bind fix would copy the originals
-    Internal in;
-    double mb = 0;
-    bool failed = false;
-    for (Snap& s : g_snaps) {
-        s.saved[eye] = 0;
-        ID3D11Texture2D* clone = FocusClone(s.orig);
-        if (!clone) continue;
-        D3D11_TEXTURE2D_DESC d{}, have{};
-        clone->GetDesc(&d);
-        if (s.tex[eye]) s.tex[eye]->GetDesc(&have);
-        if (!s.tex[eye] || !SameLayout(have, d)) {
-            s.tex[eye].Reset();
-            D3D11_TEXTURE2D_DESC sd = d;
-            sd.MiscFlags &= ~(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
-                              D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_GDI_COMPATIBLE);
-            if (FAILED(g_g.dev->CreateTexture2D(&sd, nullptr, &s.tex[eye]))) {
-                failed = true;
-                continue;
-            }
-        }
-        c->CopyResource(s.tex[eye].Get(), clone);
-        s.saved[eye] = g_frame;
-        mb += (double)d.Width * d.Height * d.ArraySize * std::max(1u, d.SampleDesc.Count) * BytesPerPixel(d.Format) *
-              (d.MipLevels > 1 ? 4.0 / 3 : 1.0) / (1024.0 * 1024.0);
-    }
-    g_snapSaved[eye] = g_frame;
-    for (FwdStats* st : {&g_fs, &g_ftot}) {
-        ++st->saves[eye];
-        st->snapMs += NowMs() - t0;
-        st->snapMb += mb;
-        if (failed) ++st->snapFailures;
-    }
-    ++g_testLive.saves[eye];
-}
-
-// Snapshot `eye` back into the focus clones.
-void RestoreSnap(ID3D11DeviceContext* c, int eye) {
-    const double t0 = NowMs();
-    clones::RawScope raw;
-    Internal in;
-    bool failed = false;
-    for (Snap& s : g_snaps) {
-        if (s.saved[eye] != g_frame || !s.tex[eye]) continue;
-        ID3D11Texture2D* clone = FocusClone(s.orig);
-        D3D11_TEXTURE2D_DESC d{}, have{};
-        if (clone) clone->GetDesc(&d);
-        s.tex[eye]->GetDesc(&have);
-        if (!clone || !SameLayout(have, d)) {
-            failed = true;
-            continue;
-        }
-        c->CopyResource(clone, s.tex[eye].Get());
-    }
-    for (FwdStats* st : {&g_fs, &g_ftot}) {
-        ++st->restores[eye];
-        st->snapMs += NowMs() - t0;
-        if (failed) ++st->snapFailures;
-    }
-    ++g_testLive.restores[eye];
 }
 
 // ---------------------------------------------------------------- view 1
@@ -3154,14 +3104,6 @@ void SetPhase3BuildVtable(uintptr_t vt) { g_phase3BuildVt = vt; }
 void FocusGroupIn(int eye) {
     if (!On() || eye < 0 || eye > 1) return;
     g_curFocus = eye;
-    if (!g_forwardOn) return;
-    Protect("FocusGroupIn", [&] {
-        if (!FocusSwapped()) return;
-        ID3D11DeviceContext* c = Imm();
-        // Focus L's group comes after outer R's: the clones hold focus R's early run and forward pass.
-        if (eye == 0 && g_focus[1].early) SaveSnap(c, 1);
-        if (g_snapSaved[eye] == g_frame) RestoreSnap(c, eye);
-    });
 }
 
 Kind KindOf(uint8_t* task) {
@@ -3195,7 +3137,7 @@ void EarlyRefused(int eye, const char* why) {
 }
 
 bool EarlyWanted(int eye) {
-    // Focus L; focus R only with the live forward pass (B9d), which keeps snapshots of the shared clones (mvr_pass.h).
+    // Focus L; focus R only with the live forward pass (B9d), into focus R's own clones (mvr_pass.h).
     if (!On() || !g_early || !g_enabled || eye < 0 || eye > 1) return false;
     if (eye == 1 && !(g_forwardOn && g_early == 1)) return false;
     if (!g_ssaoVt || !g_phase2Vt || !g_phase3Vt) return false;      // logged at the start
@@ -3208,6 +3150,8 @@ bool EarlyWanted(int eye) {
         why = "no stash from outer's pass in this frame";
     else if (g_focus[eye].decided)
         why = "the focus group already decided";
+    else if (eye == 1 && !TwinsReady())
+        why = "focus R's own clones are not made yet";
     if (why) EarlyRefused(eye, why);
     return why == nullptr;
 }
@@ -3231,9 +3175,7 @@ bool EarlyBegin(int eye, bool projected) {
             ++g_tot.switches[eye];
         }
         g_lastSkip[eye] = 1;
-        // B9d: focus L's early run and forward pass are in the shared clones; focus L's group comes after outer R's.
-        if (eye == 1 && g_forwardOn && g_focus[0].early) SaveSnap(Imm(), 0);
-        g_track = g_forwardOn;  // the clones the early tasks write, for the snapshots
+        g_track = g_forwardOn;  // the clones the early tasks write: each gets focus R's twin
         Fill(Imm(), eye);
         ok = true;
     });
@@ -3724,11 +3666,12 @@ void LogStats(bool totals) {
             fr += b;
         }
         auto fms = [&](int e) { return f.passes[e] ? f.ms[e] / f.passes[e] : 0.0; };
-        const uint64_t snaps = f.saves[0] + f.saves[1] + f.restores[0] + f.restores[1];
+        size_t twins = 0;
+        for (ID3D11Resource* o : g_twinOrigs) twins += !g_cloneFn && clones::HasTwin(o);
         Log("MVR forward%s (%llu frames, %s, depth %d): outer passes L %llu / R %llu (into focus's clones L %llu / R %llu), "
             "task CPU per pass L %.3f / R %.3f ms, draws per pass %.0f; focus forward skipped L %llu / R %llu (builds "
-            "%llu / %llu), own L %llu / R %llu; snapshots saved L %llu / R %llu, put back L %llu / R %llu (%zu clones, "
-            "avg %.1f MB per save, CPU %.3f ms per copy set, failures %llu); other-size clears repeated %llu (shared "
+            "%llu / %llu), own L %llu / R %llu; focus clones written from outer %zu, with focus R's twin %zu; "
+            "other-size clears repeated %llu (shared "
             "%llu); velocity pass binds on the conservative depth %llu; live track maps from outer %llu (failed %llu)%s%s",
             totals ? " (session)" : "", (unsigned long long)s.frames, g_forwardOn ? "on" : "off", g_fwdDepth,
             (unsigned long long)f.passes[0], (unsigned long long)f.passes[1], (unsigned long long)f.ok[0],
@@ -3736,10 +3679,7 @@ void LogStats(bool totals) {
             f.passes[0] + f.passes[1] ? (double)f.draws / (f.passes[0] + f.passes[1]) : 0.0,
             (unsigned long long)f.skipped[0], (unsigned long long)f.skipped[1], (unsigned long long)f.buildSkipped[0],
             (unsigned long long)f.buildSkipped[1], (unsigned long long)f.own[0], (unsigned long long)f.own[1],
-            (unsigned long long)f.saves[0], (unsigned long long)f.saves[1], (unsigned long long)f.restores[0],
-            (unsigned long long)f.restores[1], g_snaps.size(),
-            f.saves[0] + f.saves[1] ? f.snapMb / (f.saves[0] + f.saves[1]) : 0.0, snaps ? f.snapMs / snaps : 0.0,
-            (unsigned long long)f.snapFailures, (unsigned long long)f.otherClears,
+            g_twinOrigs.size(), twins, (unsigned long long)f.otherClears,
             (unsigned long long)f.otherClearMisses, (unsigned long long)f.velBinds, (unsigned long long)f.liveTracks,
             (unsigned long long)f.liveTrackFails,
             fr.empty() ? "" : "; not from outer: ", fr.c_str());
@@ -3824,7 +3764,6 @@ void TestForwardLive(const void* phase3Vtable) {
 
 void TestEarlyMark(int eye) {
     if (eye < 0 || eye > 1) return;
-    if (eye == 1 && g_forwardOn && g_focus[0].early) SaveSnap(Imm(), 0);
     FocusState& f = g_focus[eye];
     f.decided = f.skip = f.early = f.earlyLights = true;
     g_earlyOk[eye] = g_frame;
@@ -3839,12 +3778,8 @@ TestLiveState TestLiveGet() {
     t.buildSkipped = s.buildSkipped;
     t.otherClears = s.otherClears;
     t.otherClearMisses = s.otherClearMisses;
-    t.snapEntries = (unsigned)g_snaps.size();
+    t.twinEntries = (unsigned)g_twinOrigs.size();
     t.velBinds = s.velBinds;
-    for (int e = 0; e < 2; ++e) {
-        t.saves[e] = s.saves[e];
-        t.restores[e] = s.restores[e];
-    }
     t.why = s.why;
     return t;
 }

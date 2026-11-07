@@ -57,6 +57,16 @@ void* Original(void* res);
 ID3D11Texture2D* CloneOf(ID3D11Resource* res, Set set);
 // Render thread: a group of `set` runs now with its clones in the engine objects.
 bool SwappedIn(Set set);
+// Focus R's own clones (MVR gate B9d). Focus L and R share one set of clones; a focus clone that outer's groups write
+// for an eye before the focus groups run (the early SSAO and lights, the live forward pass) gets a second texture, the
+// twin, for focus R. While eye 1 is chosen, focus's swap, CloneOf(…, Focus) and the bind fix give the twin in its place
+// (clones without a twin stay shared). Original() of a twin is the engine's texture.
+// Render thread, at the start of each eye group: the focus eye of the work that follows (0 L, 1 R).
+void SetFocusEye(int eye);
+// Render thread: `original`'s focus clone gets a twin at the next frame start (no-op without a focus clone).
+void WantTwin(ID3D11Resource* original);
+// Render thread: `original`'s focus clone has its twin now.
+bool HasTwin(ID3D11Resource* original);
 // Render thread: while one lives, this thread's D3D11 calls pass the clones' hooks as they are (no bind fix, not
 // observed). The MVR forward test (gate B9c) copies focus's clones inside outer's group, where the bind fix would put
 // the originals in their place.
@@ -92,6 +102,7 @@ struct TestState {
     bool swapped = false;
     uint64_t cloneUses = 0, leaks = 0, translated = 0, viewportsFixed = 0, viewportMismatches = 0;
     uint64_t bindsToClone = 0, bindsToOriginal = 0, lazyViews = 0;
+    int twins = 0, twinViews = 0;
 };
 TestState TestGet();
 
