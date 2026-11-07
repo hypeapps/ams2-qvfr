@@ -309,6 +309,8 @@ bool g_mvrVelSkipCfg = true;  // Cfg().mvrVelocitySkip last seen
 bool g_mvrVelSkipKeyDown = false;
 bool g_mvrGbufPsCfg = true;  // Cfg().mvrGbufferPs last seen
 bool g_mvrGbufPsKeyDown = false;
+bool g_mvrDirectCfg = true;  // Cfg().mvrDirectExtract last seen
+bool g_mvrDirectKeyDown = false;
 
 // mvr_motion's window source: mvr_pass's maps in uv.
 bool MotionWindows(int eye, mvrmotion::Map* cur, mvrmotion::Map* prev, bool* fromOuter) {
@@ -1494,6 +1496,16 @@ void HandleToolsLocked() {
         Log("Quad: MVR G-buffer pixel shaders with view 1's rows and live track map %s (hotkey)",
             mvrpass::GetGbufferPs() ? "on" : "off");
     }
+    if (mvrpass::On() && c.mvrDirectExtract != g_mvrDirectCfg) {
+        g_mvrDirectCfg = c.mvrDirectExtract;
+        mvrpass::SetDirectExtract(c.mvrDirectExtract);
+        Log("Quad: MVR G-buffer corners straight into focus's clones %s (ini)", c.mvrDirectExtract ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrDirectExtractKey, g_mvrDirectKeyDown)) {
+        mvrpass::SetDirectExtract(!mvrpass::GetDirectExtract());
+        Log("Quad: MVR G-buffer corners straight into focus's clones %s (hotkey)",
+            mvrpass::GetDirectExtract() ? "on" : "off");
+    }
     g_mapFrame = g_mapNext;
     g_mapNext = false;
     if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrMapKey, g_mvrMapKeyDown)) {
@@ -2497,6 +2509,7 @@ void Install() {
             mvrmotion::SetWindowSource(&MotionWindows);
             g_mvrVelSkipCfg = Cfg().mvrVelocitySkip;  // Install took the setting
             g_mvrGbufPsCfg = Cfg().mvrGbufferPs;
+            g_mvrDirectCfg = Cfg().mvrDirectExtract;
             mvrpass::SetVelocityFill(&FillFocusMotion);
         }
         else if (Cfg().mvrGbuffer)

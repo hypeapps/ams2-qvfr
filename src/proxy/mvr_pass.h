@@ -150,6 +150,12 @@ bool SkipDraw(ID3D11DeviceContext* c);
 // (none in the capture's G-buffer pass) keeps the game's slot 3 and draws view 1 as before.
 void SetGbufferPs(bool on);
 bool GetGbufferPs();
+// B15 (docs/mvr.md), [debug] mvr_direct_extract (live, hotkey mvr_modifier + mvr_direct_extract_key): at the end of the
+// G-buffer pass the corners of slice 1 go straight into focus's clones instead of into the eye's stash (one copy less
+// per target and eye). Eye L always; eye R only into focus R's twins, the rest through the stash. Not in a shot frame or
+// a diagnosis mode.
+void SetDirectExtract(bool on);
+bool GetDirectExtract();
 // Quad: the vtable of the focus groups' CPhase3BuildCommandThread (found by class name; 0: none).
 void SetPhase3BuildVtable(uintptr_t vt);
 // A focus group's CBeginEye, after its clones went in (the eye of the velocity pass's depth, above).
@@ -188,6 +194,7 @@ struct TestState {
     // B13, the last pass: draws of patched PS with view 1's rows, kept as before, the live track map read, misses.
     unsigned gbufPsDraws = 0, gbufPsKept = 0, srvMisses = 0;
     bool liveTrack = false;
+    unsigned direct = 0;  // B15: targets written straight into focus's clones (in the frame)
 };
 TestState TestGet();
 ID3D11Texture2D* TestArray(int k);

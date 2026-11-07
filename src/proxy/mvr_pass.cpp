@@ -443,6 +443,7 @@ struct StashG {
     D3D11_TEXTURE2D_DESC desc{};
     ComPtr<ID3D11DepthStencilView> dsv;
     bool depth = false;
+    bool direct = false;  // B15: this frame's corner went straight into focus's clone (tex not written)
 };
 struct StashM {
     ID3D11Resource* orig = nullptr;
@@ -506,6 +507,8 @@ struct Stats {
     std::vector<Reason> reasons;
     // B13: G-buffer draws of patched PS with view 1's rows, kept as before; live track maps read for view 1.
     uint64_t gbufPsDraws = 0, gbufPsKept = 0, liveTracks = 0, liveTrackFails = 0;
+    // B15: targets whose corner went straight into focus's clone, through the stash, direct writes that failed.
+    uint64_t direct[2] = {}, viaStash[2] = {}, directFails = 0;
 };
 Stats g_st, g_tot;
 std::string g_lastFail;  // the latest pass failure (logged once per text)
@@ -660,6 +663,7 @@ std::atomic<int> g_velBound{-1};
 bool g_velSkipOn = true;  // [debug] mvr_velocity_skip and its hotkey
 VelocityFillFn g_velFill = nullptr;
 bool g_gbufPsOn = true;  // B13: [debug] mvr_gbuffer_ps and its hotkey
+bool g_directOn = true;  // B15: [debug] mvr_direct_extract and its hotkey
 
 // Jitter diagnosis (B9c run 2: view 1 about 0.27 px off focus's own forward pass in x, the sign changing between
 // frames): in a forward test shot frame the game's camera constants at the first draw of each eye group's
@@ -1496,7 +1500,40 @@ void RestoreSlot3(ID3D11DeviceContext* c) {
         c->VSSetConstantBuffers(mvrvs::kCbSlot, 1, &p.slot3);
 }
 
-// The corners of slice 1 of the outer-size copies into the eye's stash.
+// B15: the corner of slice 1 goes straight into focus's clone of `orig` (no stash copy) when nothing reads that clone
+// before the focus group would have got the stash: for eye L always (its clones are focus L's, and outer R's pass writes
+// only focus R's twins or its stash); for eye R only into focus R's twin (a shared clone still holds eye L's G-buffer for
+// focus L's group). Not in a shot frame or a diagnosis mode, which read the stash.
+bool DirectOk(int eye, ID3D11Resource* orig) {
+    if (!g_directOn || g_mode != Mode::Skip || g_shot.armed || g_early == 5) return false;
+    if (eye == 0) return true;
+    return !g_cloneFn && clones::HasTwin(orig);
+}
+
+// The corner of slice 1 of copy `cp` straight into focus's clone (true) or nothing written (false).
+bool ExtractDirect(ID3D11DeviceContext* c, Copy& cp, ID3D11Texture2D* clone) {
+    Pass& p = g_p;
+    clones::RawScope raw;  // outer's group: the bind fix would put the original in place of focus's clone
+    if (cp.depth) {
+        if (!cp.depthSrv) return false;
+        DXGI_FORMAT dsvF, srvF;
+        DepthFormats(cp.desc.Format, dsvF, srvF);
+        if (dsvF == DXGI_FORMAT_UNKNOWN) return false;
+        D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+        dv.Format = dsvF;
+        dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+        auto* dsv = static_cast<ID3D11DepthStencilView*>(CloneViewOf(clone, 1, &dv, sizeof(dv)));
+        if (!dsv) return false;
+        DepthPass(c, cp.depthSrv.Get(), dsv, p.fw, p.fh, DepthBias(), DepthSlope(), DepthDilate());
+        return true;
+    }
+    const D3D11_BOX box{0, 0, 0, p.fw, p.fh, 1};
+    Internal in;
+    c->CopySubresourceRegion(clone, 0, 0, 0, 0, cp.arr.Get(), D3D11CalcSubresource(0, 1, cp.desc.MipLevels), &box);
+    return true;
+}
+
+// The corners of slice 1 of the outer-size copies into the eye's stash (or straight into focus's clones, B15).
 void Extract(ID3D11DeviceContext* c) {
     Pass& p = g_p;
     Stash& s = g_stash[p.eye];
@@ -1513,14 +1550,33 @@ void Extract(ID3D11DeviceContext* c) {
             cd.SampleDesc.Count != 1)
             return PassFailed(p, "a focus clone of another size or format");
         StashG& g = s.g[s.n];
-        if (!g.tex || !SameLayout(g.desc, cd)) {
-            g = StashG{};
+        if (g.tex && !SameLayout(g.desc, cd)) g = StashG{};
+        g.orig = cp.orig;
+        g.desc = cd;
+        g.depth = cp.depth;
+        g.direct = false;
+        if (DirectOk(p.eye, cp.orig)) {
+            g.direct = ExtractDirect(c, cp, clone);
+            if (!g.direct) {
+                ++g_st.directFails;
+                ++g_tot.directFails;
+            }
+        }
+        if (g.direct) {
+            ++g_st.direct[p.eye];
+            ++g_tot.direct[p.eye];
+            ++g_test.direct;
+            ++s.n;
+            continue;
+        }
+        if (!g.tex) {
             D3D11_TEXTURE2D_DESC sd = cd;
             sd.MiscFlags &= ~(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
                               D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_GDI_COMPATIBLE);
-            if (FAILED(g_g.dev->CreateTexture2D(&sd, nullptr, &g.tex))) return PassFailed(p, "stash texture");
-            g.desc = cd;
-            g.depth = cp.depth;
+            if (FAILED(g_g.dev->CreateTexture2D(&sd, nullptr, &g.tex))) {
+                g = StashG{};
+                return PassFailed(p, "stash texture");
+            }
             if (g.depth) {
                 DXGI_FORMAT dsvF, srvF;
                 DepthFormats(cd.Format, dsvF, srvF);
@@ -1533,7 +1589,6 @@ void Extract(ID3D11DeviceContext* c) {
                 }
             }
         }
-        g.orig = cp.orig;
         if (g.depth) {
             if (!cp.depthSrv) return PassFailed(p, "the depth format has no shader view");
             DepthPass(c, cp.depthSrv.Get(), g.dsv.Get(), p.fw, p.fh, DepthBias(), DepthSlope(), DepthDilate());
@@ -1543,6 +1598,8 @@ void Extract(ID3D11DeviceContext* c) {
             c->CopySubresourceRegion(g.tex.Get(), 0, 0, 0, 0, cp.arr.Get(),
                                      D3D11CalcSubresource(0, 1, cp.desc.MipLevels), &box);
         }
+        ++g_st.viaStash[p.eye];
+        ++g_tot.viaStash[p.eye];
         ++s.n;
     }
     if (!s.n) PassFailed(p, "no outer-size target");
@@ -2239,7 +2296,7 @@ void Fill(ID3D11DeviceContext* c, int eye, bool depth = true) {
     for (int k = 0; k < s.n; ++k) {
         if (s.g[k].depth && !depth) continue;
         if (ID3D11Texture2D* t = FocusClone(s.g[k].orig)) {
-            c->CopyResource(t, s.g[k].tex.Get());
+            if (!s.g[k].direct) c->CopyResource(t, s.g[k].tex.Get());  // B15: else the pass wrote it already
             NoteOrig(s.g[k].orig);
         } else {
             failed = true;
@@ -2979,6 +3036,7 @@ bool Install() {
         SetForwardDepth(Cfg().mvrForwardDepth);
         g_velSkipOn = Cfg().mvrVelocitySkip;
         g_gbufPsOn = Cfg().mvrGbufferPs;
+        g_directOn = Cfg().mvrDirectExtract;
         g_installed = true;
         Log("MVR G-buffer: on; outer L's and outer R's G-buffer pass draw the eye's focus too (MVR, view 1 in the "
             "corner of slice 1 of two-slice copies), the focus groups skip CPhase1BuildCommandThread and CPhase1Render "
@@ -3811,6 +3869,8 @@ void SetVelocitySkip(bool on) { g_velSkipOn = on; }
 bool GetVelocitySkip() { return g_velSkipOn; }
 void SetGbufferPs(bool on) { g_gbufPsOn = on; }
 bool GetGbufferPs() { return g_gbufPsOn; }
+void SetDirectExtract(bool on) { g_directOn = on; }
+bool GetDirectExtract() { return g_directOn; }
 
 std::string Describe() {
     if (!g_installed) return "MVR G-buffer off";
@@ -3840,7 +3900,8 @@ void LogStats(bool totals) {
         "masks %llu; jitter moved in %llu passes (unknown %llu); unpatched VS sets %llu, slot 3 rebinds %llu (game "
         "buffers %llu), mixed binds %llu, late binds %llu (draws after them %llu), map failures %llu, SetMultiViewMode failures %llu; "
         "patched PS with view 1's rows (mvr_gbuffer_ps %s) %llu draws, kept as before (screen textures) %llu, live "
-        "track maps from outer %llu (failed %llu)",
+        "track maps from outer %llu (failed %llu); slice 1 straight into focus's clones (mvr_direct_extract %s) L %llu "
+        "/ R %llu targets, through the stash L %llu / R %llu, direct writes failed %llu",
         totals ? " (session)" : "", (unsigned long long)s.frames, (unsigned long long)s.passes[0],
         (unsigned long long)s.passes[1], (unsigned long long)s.passFailed[0], (unsigned long long)s.passFailed[1],
         ms(0), ms(1), (unsigned long long)s.lateStarts, (unsigned long long)s.waitBinds,
@@ -3854,7 +3915,9 @@ void LogStats(bool totals) {
         (unsigned long long)s.mixed, (unsigned long long)s.lateBinds, (unsigned long long)s.lateDraws,
         (unsigned long long)s.mapFailures,
         (unsigned long long)s.viewsFailures, g_gbufPsOn ? "on" : "off", (unsigned long long)s.gbufPsDraws,
-        (unsigned long long)s.gbufPsKept, (unsigned long long)s.liveTracks, (unsigned long long)s.liveTrackFails);
+        (unsigned long long)s.gbufPsKept, (unsigned long long)s.liveTracks, (unsigned long long)s.liveTrackFails,
+        g_directOn ? "on" : "off", (unsigned long long)s.direct[0], (unsigned long long)s.direct[1],
+        (unsigned long long)s.viaStash[0], (unsigned long long)s.viaStash[1], (unsigned long long)s.directFails);
     if (g_early || s.earlyRuns[0] || s.earlyRuns[1] || !s.earlyReasons.empty()) {
         std::string er;
         for (const Reason& r : s.earlyReasons) {

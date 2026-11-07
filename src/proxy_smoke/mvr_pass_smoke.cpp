@@ -650,6 +650,28 @@ int RunMvrPass() {
     qvfr::mvrpass::TestDepthBias(0, 0.0f, false);
     qvfr::mvrpass::SetMode(qvfr::mvrpass::Mode::Skip);
     g_bindFirst = false;
+    // B15 (eighth frame, as the first): the corners through the stash (mvr_direct_extract off) give the same clones bit
+    // for bit as straight into them (the first frame).
+    qvfr::mvrpass::SetDirectExtract(false);
+    Spoil(g_s.focus);
+    qvfr::mvrpass::OnFrameStart(true);
+    qvfr::mvrpass::SetWindow(0, true, sx, ox, sy, oy, kW, kH);
+    ctx->VSSetConstantBuffers(qvfr::mvrvs::kCbSlot, 1, game3.GetAddressOf());
+    BindG(g_s.game);
+    if (!qvfr::mvrpass::BeforeTask((uint8_t*)&g_outer, 0)) RunTask(g_outer);
+    qvfr::mvrpass::AfterTask((uint8_t*)&g_outer);
+    const qvfr::mvrpass::TestState st8 = qvfr::mvrpass::TestGet();
+    qvfr::mvrpass::FocusGroup(0, true);
+    BindG(g_s.focus);
+    FakeTask focusStash{g_vtOuter};
+    if (qvfr::mvrpass::BeforeTask((uint8_t*)&g_build, 2)) Finish(g_build);
+    const bool stashSkip = qvfr::mvrpass::BeforeTask((uint8_t*)&focusStash, 2);
+    if (stashSkip) Finish(focusStash);
+    const qvfr::mvrpass::TestState st9 = qvfr::mvrpass::TestGet();
+    const std::vector<uint32_t> sC = Read(g_s.focus.color.Get()), sL = Read(g_s.focus.lin.Get()),
+                                sD = Read(g_s.focus.depth.Get()), sM = Read(g_s.focus.mask.Get());
+    qvfr::mvrpass::TestEnd();
+    qvfr::mvrpass::SetDirectExtract(true);
     if (refC.empty() || refFC.empty() || gC.empty() || fC.empty() || fM.empty() || gM.empty() || s1.empty()) {
         printf("MVR pass: read-back failed\n");
         return 1;
@@ -826,7 +848,18 @@ int RunMvrPass() {
     for (size_t i = 0; i < refFC.size() && i < owC.size(); ++i) owBig += ChannelDiff(owC[i], refFC[i]) > 2;
     const bool owOk = !owSkipBuild && !owSkipFocus && g_buildRuns == owBuild + 1 && g_focusRuns == owFocus + 1 &&
                       st5.fills == 1 && st5.focusSkipped == 0 && owC.size() == refFC.size() && owBig * 200 <= px;
-    const bool ok = countsOk && outerOk && focusOk && jitterOk && lateOk && owOk && biasOk && slopeOk && dilateOk && !warnings;
+    int viaStashDiff = 0;
+    const bool sizesOk = sC.size() == fC.size() && sL.size() == fL.size() && sD.size() == fD.size() && sM.size() == fM.size();
+    if (sizesOk) {
+        for (size_t i = 0; i < fC.size(); ++i) viaStashDiff += sC[i] != fC[i];
+        for (size_t i = 0; i < fL.size(); ++i) viaStashDiff += sL[i] != fL[i];
+        for (size_t i = 0; i < fD.size(); ++i) viaStashDiff += sD[i] != fD[i];
+        for (size_t i = 0; i < fM.size(); ++i) viaStashDiff += sM[i] != fM[i];
+    }
+    const bool directOk = st.direct == 3 && st8.direct == 0 && st8.stashValid && st8.stashed == 3 && stashSkip &&
+                          st9.fills == 1 && st9.failures == 0 && sizesOk && viaStashDiff == 0;
+    const bool ok = countsOk && outerOk && focusOk && jitterOk && lateOk && owOk && biasOk && slopeOk && dilateOk &&
+                    directOk && !warnings;
     printf("MVR pass: %s; outer pass %u, stash %s (%u targets, %u masks), binds %u, clears %u, map failures %u, VS sets "
            "patched %u / unpatched %u, slot 3 rebinds %u, copied back %u, SetMultiViewMode failures %u, jitter %s; "
            "focus: build %s, pass %s (runs %d / %d, Finish %d), fills %u (failed %u) (%s)\n",
@@ -842,6 +875,9 @@ int RunMvrPass() {
            "linear depth %d px, depth %d px off (max %.2g); mask vs outer's in the window max %.4f (vs focus's own "
            "%.3f) (%s)\n",
            kFW, kFH, covered, cOff, cBig, lOff, dOff, dMax, mMax, ownMax, focusOk ? "OK" : "WRONG");
+    printf("  B15: corners straight into the clones %u of 3 targets (first frame); through the stash %u straight, focus "
+           "%s, fills %u, clones (color, linear depth, depth, mask) %d px differ from straight (%s)\n",
+           st.direct, st8.direct, stashSkip ? "skipped" : "RUN", st9.fills, viaStashDiff, directOk ? "OK" : "WRONG");
     printf("  without the jitter fix (next frame, offset %s): focus color %d px differ, with it %d (%s)\n",
            noJitter ? "unknown" : "STILL KNOWN", nOff, cOff, jitterOk ? "OK" : "WRONG");
     printf("  game's order (nothing bound before outer's task): MVR part %s, stash %s (%u targets), clears %u, map "
