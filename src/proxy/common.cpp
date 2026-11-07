@@ -414,6 +414,8 @@ Config ReadConfig(const fs::path& ini) {
     c.mvrVelocityKey = IniInt(ini, L"debug", L"mvr_velocity_key", c.mvrVelocityKey);
     c.mvrVelocitySkip = IniInt(ini, L"debug", L"mvr_velocity_skip", 1) != 0;
     c.mvrVelocitySkipKey = IniInt(ini, L"debug", L"mvr_velocity_skip_key", c.mvrVelocitySkipKey);
+    c.mvrGbufferPs = IniInt(ini, L"debug", L"mvr_gbuffer_ps", 1) != 0;
+    c.mvrGbufferPsKey = IniInt(ini, L"debug", L"mvr_gbuffer_ps_key", c.mvrGbufferPsKey);
     if (c.quadMode == QuadMode::Quad)
         Log("Settings: [debug] overlay=%d overlay_modifier=0x%X overlay_key=0x%X freeze_modifier=0x%X freeze_key=0x%X "
             "outer_modifier=0x%X outer_key=0x%X gaze_modifier=0x%X gaze_key=0x%X clones=%d clones_modifier=0x%X "
@@ -423,7 +425,8 @@ Config ReadConfig(const fs::path& ini) {
             "mvr_ps_patch=%d mvr_gbuffer=%d mvr_modifier=0x%X mvr_key=0x%X mvr_jitter_fix=%d mvr_mode_key=0x%X mvr_depth_bias=%d mvr_depth_slope=%.3f mvr_depth_dilate=%d "
             "mvr_early=%d mvr_early_key=0x%X mvr_map_key=0x%X mvr_shot_compare=%d mvr_forward_test=%d "
             "mvr_forward=%d mvr_forward_key=0x%X mvr_forward_depth=%d mvr_forward_depth_key=0x%X mvr_velocity=%d "
-            "mvr_velocity_key=0x%X mvr_velocity_skip=%d mvr_velocity_skip_key=0x%X",
+            "mvr_velocity_key=0x%X mvr_velocity_skip=%d mvr_velocity_skip_key=0x%X mvr_gbuffer_ps=%d "
+            "mvr_gbuffer_ps_key=0x%X",
             c.overlay, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey,
             c.gazeKeyMod, c.gazeKey, c.clones, c.clonesKeyMod, c.clonesKey, c.clonesViewportFix, c.clonesBindFix,
             c.shotClones, c.focusCull, c.cullKeyMod, c.cullKey, c.sunEffects, c.sunKeyMod, c.sunKey, c.taaViews,
@@ -431,7 +434,7 @@ Config ReadConfig(const fs::path& ini) {
             c.mvrJitterFix, c.mvrModeKey, c.mvrDepthBias, c.mvrDepthSlope, c.mvrDepthDilate,
             c.mvrEarly, c.mvrEarlyKey, c.mvrMapKey, c.mvrShotCompare, c.mvrForwardTest, c.mvrForward,
             c.mvrForwardKey, c.mvrForwardDepth, c.mvrForwardDepthKey, c.mvrVelocity, c.mvrVelocityKey,
-            c.mvrVelocitySkip, c.mvrVelocitySkipKey);
+            c.mvrVelocitySkip, c.mvrVelocitySkipKey, c.mvrGbufferPs, c.mvrGbufferPsKey);
     const std::string dlaa = IniString(ini, L"dlaa", L"mode", L"off");
     c.dlaa = dlaa == "dlaa";
     if (dlaa != "off" && dlaa != "dlaa") Log("Settings: unknown [dlaa] mode=\"%s\", using off", dlaa.c_str());
@@ -631,6 +634,8 @@ bool ReloadConfig() {
     c.mvrVelocityKey = n.mvrVelocityKey;
     c.mvrVelocitySkip = n.mvrVelocitySkip;
     c.mvrVelocitySkipKey = n.mvrVelocitySkipKey;
+    c.mvrGbufferPs = n.mvrGbufferPs;
+    c.mvrGbufferPsKey = n.mvrGbufferPsKey;
     Log("Settings reloaded (live): stats_interval_s=%d | benchmark modifier=0x%X key=0x%X delay_s=%.1f duration_s=%.1f "
         "freeze_pose=%d beep=%d | gaze read=%d | quad focus_offset=(%.3f, %.3f) fixed_offset=(%.3f, %.3f) "
         "smoothen_focus_view_edges=%.3f%s follow_gaze=%d gaze_hold_s=%.2f compose=%d margin_px=%d shot_modifier=0x%X "

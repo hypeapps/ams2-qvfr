@@ -307,6 +307,8 @@ bool g_mvrVelocityCfg = true;  // Cfg().mvrVelocity last seen (a reload sets it)
 bool g_mvrVelocityKeyDown = false;
 bool g_mvrVelSkipCfg = true;  // Cfg().mvrVelocitySkip last seen
 bool g_mvrVelSkipKeyDown = false;
+bool g_mvrGbufPsCfg = true;  // Cfg().mvrGbufferPs last seen
+bool g_mvrGbufPsKeyDown = false;
 
 // mvr_motion's window source: mvr_pass's maps in uv.
 bool MotionWindows(int eye, mvrmotion::Map* cur, mvrmotion::Map* prev, bool* fromOuter) {
@@ -1461,6 +1463,17 @@ void HandleToolsLocked() {
         Log("Quad: MVR focus velocity pass skipped with outer's vectors %s (hotkey)",
             mvrpass::GetVelocitySkip() ? "on" : "off");
     }
+    if (mvrpass::On() && c.mvrGbufferPs != g_mvrGbufPsCfg) {
+        g_mvrGbufPsCfg = c.mvrGbufferPs;
+        mvrpass::SetGbufferPs(c.mvrGbufferPs);
+        Log("Quad: MVR G-buffer pixel shaders with view 1's rows and live track map %s (ini)",
+            c.mvrGbufferPs ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrGbufferPsKey, g_mvrGbufPsKeyDown)) {
+        mvrpass::SetGbufferPs(!mvrpass::GetGbufferPs());
+        Log("Quad: MVR G-buffer pixel shaders with view 1's rows and live track map %s (hotkey)",
+            mvrpass::GetGbufferPs() ? "on" : "off");
+    }
     g_mapFrame = g_mapNext;
     g_mapNext = false;
     if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrMapKey, g_mvrMapKeyDown)) {
@@ -2460,6 +2473,7 @@ void Install() {
             mvrmotion::SetEnabled(Cfg().mvrVelocity);
             mvrmotion::SetWindowSource(&MotionWindows);
             g_mvrVelSkipCfg = Cfg().mvrVelocitySkip;  // Install took the setting
+            g_mvrGbufPsCfg = Cfg().mvrGbufferPs;
             mvrpass::SetVelocityFill(&FillFocusMotion);
         }
         else if (Cfg().mvrGbuffer)

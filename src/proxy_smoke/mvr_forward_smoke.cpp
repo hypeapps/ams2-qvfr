@@ -72,6 +72,15 @@ float4 VSOcc(uint id : SV_VertexID) : SV_Position {
     return float4(lerp(-1.0, 0.0, uv.x), lerp(1.0, 0.0, uv.y), 0.05, 1);
 }
 float4 Zero(float4 p : SV_Position) : SV_Target { return 0; }
+// B13: a G-buffer PS like the game's (PS 82705): the live track map at SV_Position * ssd.zw, extrapolated by the
+// screen input.
+Texture2D GLOBAL_liveTrackTextureMap_tex : register(t7);
+float4 Gbuf(VsOut i) : SV_Target {
+    float2 s = i.pos.xy * screenSpaceDimensions.zw;
+    float2 uv = s + 2.1 * (i.scr.xy / i.scr.w - s);
+    float4 m = GLOBAL_liveTrackTextureMap_tex.SampleLevel(pointSampler, uv, 0);
+    return float4(m.xy, 0, 1);
+}
 )";
 
 constexpr UINT kW = 96, kH = 80, kFW = 64, kFH = 48;
@@ -127,7 +136,9 @@ struct Scene {
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
     ComPtr<ID3D11VertexShader> vs, vsOcc;
-    ComPtr<ID3D11PixelShader> fwd, zero;
+    ComPtr<ID3D11PixelShader> fwd, zero, gbuf;
+    ComPtr<ID3D11Texture2D> live;  // B13: outer's live track map, texel (x, y) = its UV
+    ComPtr<ID3D11ShaderResourceView> liveSrv;
     ComPtr<ID3D11DepthStencilState> ds;
     ComPtr<ID3D11RasterizerState> rs;
     ComPtr<ID3D11SamplerState> point;
@@ -343,14 +354,14 @@ bool JitterOf(float out[2]) {
     return true;
 }
 
-// One texture as raw texels (8 bytes for RGBA16F, 4 for R32).
-std::vector<uint64_t> Read(ID3D11Texture2D* src) {
+// One texture (subresource `sub`) as raw texels (8 bytes for RGBA16F, 4 for R32).
+std::vector<uint64_t> Read(ID3D11Texture2D* src, UINT sub = 0) {
     D3D11_TEXTURE2D_DESC d{};
     src->GetDesc(&d);
     ComPtr<ID3D11Texture2D> st = Tex(d.Width, d.Height, d.Format, 0);
     std::vector<uint64_t> px;
     if (!st) return px;
-    g_s.ctx->CopySubresourceRegion(st.Get(), 0, 0, 0, 0, src, 0, nullptr);
+    g_s.ctx->CopySubresourceRegion(st.Get(), 0, 0, 0, 0, src, sub, nullptr);
     D3D11_MAPPED_SUBRESOURCE m{};
     if (FAILED(g_s.ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m))) return px;
     const size_t texel = d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
@@ -383,7 +394,37 @@ float AsFloat(uint64_t v) {
     return f;
 }
 
+// B13: outer's G-buffer pass (the game binds and clears inside the task): the grid with the live track PS.
+const float kGbufClear[4] = {0, 0, 0, 0};
+void DrawGbuf(const Set& s) {
+    ID3D11DeviceContext* c = g_s.ctx;
+    ID3D11RenderTargetView* rtv = s.rtv.Get();
+    c->OMSetRenderTargets(1, &rtv, s.dsv.Get());
+    c->ClearRenderTargetView(rtv, kGbufClear);
+    c->ClearDepthStencilView(s.dsv.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+    D3D11_VIEWPORT vp{0, 0, (float)s.w, (float)s.h, 0, 1};
+    c->RSSetViewports(1, &vp);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    c->IASetInputLayout(nullptr);
+    c->OMSetDepthStencilState(g_s.ds.Get(), 0);
+    c->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    c->RSSetState(g_s.rs.Get());
+    ID3D11Buffer* vcb[4] = {s.cam.Get(), nullptr, nullptr, nullptr};
+    c->VSSetConstantBuffers(0, 4, vcb);
+    ID3D11Buffer* pcb[2] = {nullptr, s.g.Get()};
+    c->PSSetConstantBuffers(0, 2, pcb);
+    c->PSSetShaderResources(7, 1, g_s.liveSrv.GetAddressOf());
+    c->PSSetSamplers(0, 1, g_s.point.GetAddressOf());
+    c->VSSetShader(g_s.vs.Get(), nullptr, 0);
+    c->PSSetShader(g_s.gbuf.Get(), nullptr, 0);
+    c->Draw(kQuads * 6, 0);
+    ID3D11ShaderResourceView* none = nullptr;
+    c->PSSetShaderResources(7, 1, &none);
+    c->OMSetRenderTargets(0, nullptr, nullptr);
+}
+
 using TaskFn = void(__fastcall*)(void*);
+void* g_vtPhase1[32];  // B13: outer's CPhase1Render
 void* g_vtPhase3[32];
 void* g_vtFocus[32];
 void* g_vtDummy[32];
@@ -399,6 +440,10 @@ void __fastcall OuterExecute(void* task) {
 }
 void __fastcall FocusExecute(void* task) {
     DrawForward(g_s.focus);
+    (*(TaskFn**)task)[0x38 / 8](task);
+}
+void __fastcall GbufExecute(void* task) {
+    DrawGbuf(g_s.game);
     (*(TaskFn**)task)[0x38 / 8](task);
 }
 void RunTask(FakeTask& t) { (*(TaskFn**)&t)[0x48 / 8](&t); }
@@ -435,10 +480,12 @@ int RunMvrForward() {
     qvfr::mvrvs::TestSetEnabled(true);
     qvfr::mvrps::TestSetEnabled(true);
     ComPtr<ID3DBlob> vsCode = Compile("VS", "vs_5_0"), occCode = Compile("VSOcc", "vs_5_0"),
-                     fwdCode = Compile("Fwd", "ps_5_0"), zeroCode = Compile("Zero", "ps_5_0");
-    if (!vsCode || !occCode || !fwdCode || !zeroCode) return 1;
+                     fwdCode = Compile("Fwd", "ps_5_0"), zeroCode = Compile("Zero", "ps_5_0"),
+                     gbufCode = Compile("Gbuf", "ps_5_0");
+    if (!vsCode || !occCode || !fwdCode || !zeroCode || !gbufCode) return 1;
     bool made =
         SUCCEEDED(dev->CreatePixelShader(zeroCode->GetBufferPointer(), zeroCode->GetBufferSize(), nullptr, &g_s.zero)) &&
+        SUCCEEDED(dev->CreatePixelShader(gbufCode->GetBufferPointer(), gbufCode->GetBufferSize(), nullptr, &g_s.gbuf)) &&
         SUCCEEDED(dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &g_s.vs)) &&
         SUCCEEDED(dev->CreateVertexShader(occCode->GetBufferPointer(), occCode->GetBufferSize(), nullptr, &g_s.vsOcc)) &&
         SUCCEEDED(dev->CreatePixelShader(fwdCode->GetBufferPointer(), fwdCode->GetBufferSize(), nullptr, &g_s.fwd));
@@ -446,6 +493,9 @@ int RunMvrForward() {
     const bool shadersOk = made && qvfr::mvrvs::IsPatched(g_s.vs.Get()) && psInfo.kind == qvfr::mvrps::Kind::Patched &&
                            psInfo.slot[0] == kSlot0 && psInfo.slot[2] == kSlot2 &&
                            psInfo.slot[1] == qvfr::mvrps::kNoSlot;
+    const qvfr::mvrps::Info gbufInfo = qvfr::mvrps::InfoOf(g_s.gbuf.Get());
+    bool gbufPsOk = made && gbufInfo.kind == qvfr::mvrps::Kind::Patched && gbufInfo.slot[qvfr::mvrps::kLiveTrack] == 7;
+    for (unsigned k = 0; k < qvfr::mvrps::kLiveTrack; ++k) gbufPsOk = gbufPsOk && gbufInfo.slot[k] == qvfr::mvrps::kNoSlot;
 
     const double sx = 2 / (kX1 - kX0), ox = -(kX1 + kX0) / (kX1 - kX0);
     const double sy = 2 / (kY1 - kY0), oy = -(kY1 + kY0) / (kY1 - kY0);
@@ -492,6 +542,19 @@ int RunMvrForward() {
         D3D11_SUBRESOURCE_DATA oi{obj.data(), 0, 0};
         made = made && SUCCEEDED(dev->CreateBuffer(&od, &oi, &g_s.obj13));
     }
+    {  // B13: outer's live track map, a ramp (texel centres hold their UV: bilinear reads give the UV exactly)
+        std::vector<float> lt((size_t)kW * kH * 4);
+        for (UINT y = 0; y < kH; ++y)
+            for (UINT x = 0; x < kW; ++x) {
+                float* p = &lt[((size_t)y * kW + x) * 4];
+                p[0] = (x + 0.5f) / kW;
+                p[1] = (y + 0.5f) / kH;
+                p[2] = 0;
+                p[3] = 1;
+            }
+        g_s.live = Tex(kW, kH, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D11_BIND_SHADER_RESOURCE, lt.data(), kW * 16);
+        made = made && g_s.live && SUCCEEDED(dev->CreateShaderResourceView(g_s.live.Get(), nullptr, &g_s.liveSrv));
+    }
     if (!made) {
         printf("MVR forward: D3D11 objects could not be made\n");
         return 1;
@@ -517,7 +580,9 @@ int RunMvrForward() {
     g_vtPhase3[0x48 / 8] = (void*)&OuterExecute;
     memcpy(g_vtFocus, g_vtPhase3, sizeof(g_vtFocus));
     g_vtFocus[0x48 / 8] = (void*)&FocusExecute;
-    qvfr::mvrpass::TestSetup(ctx.Get(), g_vtDummy, g_vtDummy, &CloneOf, &JitterOf);
+    memcpy(g_vtPhase1, g_vtDummy, sizeof(g_vtPhase1));
+    g_vtPhase1[0x48 / 8] = (void*)&GbufExecute;
+    qvfr::mvrpass::TestSetup(ctx.Get(), g_vtPhase1, g_vtDummy, &CloneOf, &JitterOf);
     qvfr::mvrpass::OnFrameStart(true);
     qvfr::mvrpass::SetWindow(0, true, sx, ox, sy, oy, kW, kH);
     qvfr::mvrpass::TestForward(g_vtPhase3);
@@ -713,6 +778,73 @@ int RunMvrForward() {
                            lv.velDrawn == 0 && velQuarter == velPx / 4 && velMarked == velPx - velPx / 4 &&
                            velOther == 0;
 
+    // B13: outer L's G-buffer pass (CPhase1Render) with a PS that reads the live track map like the game's: view 1 (the
+    // corner of slice 1 of the color copy) must read outer's map in the focus window (texel = outer UV of the focus
+    // pixel) with mvr_gbuffer_ps, and reads it elsewhere without it; slice 0 equals the pass without the module.
+    struct GbufRun {
+        qvfr::mvrpass::TestState st;
+        std::vector<uint64_t> s1, game;
+        bool ran = false;
+    };
+    auto runGbuf = [&](bool on) {
+        GbufRun r;
+        qvfr::mvrpass::SetGbufferPs(on);
+        qvfr::mvrpass::OnFrameStart(true);
+        qvfr::mvrpass::SetWindow(0, true, sx, ox, sy, oy, kW, kH);
+        FakeTask g1{g_vtPhase1};
+        r.ran = !qvfr::mvrpass::BeforeTask((uint8_t*)&g1, 0);
+        if (r.ran) RunTask(g1);
+        qvfr::mvrpass::AfterTask((uint8_t*)&g1);
+        r.st = qvfr::mvrpass::TestGet();
+        r.game = Read(g_s.game.color.Get());
+        for (int k = 0; k < 8; ++k) {
+            ID3D11Texture2D* a = qvfr::mvrpass::TestArray(k);
+            if (!a) continue;
+            D3D11_TEXTURE2D_DESC d{};
+            a->GetDesc(&d);
+            if (d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && d.Width == kW && d.Height == kH && d.ArraySize == 2)
+                r.s1 = Read(a, 1);
+        }
+        qvfr::mvrpass::TestEnd();
+        return r;
+    };
+    const GbufRun gOff = runGbuf(false), gOn = runGbuf(true);
+    qvfr::mvrpass::SetGbufferPs(true);
+    DrawGbuf(g_s.game);  // the reference: outside any pass the module leaves the draws alone
+    const std::vector<uint64_t> refG = Read(g_s.game.color.Get());
+    // A covered pixel has alpha 1; the expected texel is outer's UV of the focus pixel's centre.
+    auto gbufCheck = [&](const GbufRun& r, int& covered, int& wrong, float& maxErr) {
+        covered = wrong = 0;
+        maxErr = 0;
+        if (r.s1.size() != (size_t)kW * kH) return;
+        for (UINT y = 0; y < kFH; ++y)
+            for (UINT x = 0; x < kFW; ++x) {
+                const uint64_t p = r.s1[(size_t)y * kW + x];
+                if (Half((uint32_t)(p >> 48) & 0xFFFF) != 1.0f) continue;
+                ++covered;
+                const float eu = (float)((1 + kX0) / 2 + (x + 0.5) / kFW * (kX1 - kX0) / 2);
+                const float ev = (float)((1 - kY1) / 2 + (y + 0.5) / kFH * (kY1 - kY0) / 2);
+                const float e = std::max(std::fabs(Half((uint32_t)p & 0xFFFF) - eu),
+                                         std::fabs(Half((uint32_t)(p >> 16) & 0xFFFF) - ev));
+                maxErr = std::max(maxErr, e);
+                wrong += e > 1e-3f;
+            }
+    };
+    int gCovOn = 0, gWrongOn = 0, gCovOff = 0, gWrongOff = 0, gOuterOn = 0, gOuterOff = 0;
+    float gMaxOn = 0, gMaxOff = 0;
+    gbufCheck(gOn, gCovOn, gWrongOn, gMaxOn);
+    gbufCheck(gOff, gCovOff, gWrongOff, gMaxOff);
+    for (size_t i = 0; i < refG.size(); ++i) {
+        gOuterOn += i >= gOn.game.size() || gOn.game[i] != refG[i];
+        gOuterOff += i >= gOff.game.size() || gOff.game[i] != refG[i];
+    }
+    const int gpx = (int)(kFW * kFH);
+    const bool gbufOk = gbufPsOk && gOn.ran && gOff.ran && gOn.st.stashValid && gOn.st.gbufPsDraws == 1 &&
+                        gOn.st.gbufPsKept == 0 && gOn.st.liveTrack && gOn.st.srvMisses == 0 &&
+                        gOff.st.gbufPsDraws == 0 && !gOff.st.liveTrack && gCovOn > gpx / 3 && gCovOff == gCovOn &&
+                        gWrongOn == 0 && gWrongOff > gCovOff / 2 && gOuterOn == 0 && gOuterOff == 0 &&
+                        refG.size() == (size_t)kW * kH;
+
     int warnings = 0, expected = 0;
     if (info) {
         for (UINT64 i = 0, n = info->GetNumStoredMessages(); i < n; ++i) {
@@ -740,7 +872,7 @@ int RunMvrForward() {
     const bool outerOk = outerC == 0 && outerD == 0 && outerH == 0 && gH.size() == refH.size();
     const bool focusOk = clonesChanged == 0 && covered > px / 3 && occluded > px / 8 && occOurs == occluded &&
                          cBig * 100 <= px && dOff * 100 <= px;
-    const bool ok = countsOk && outerOk && focusOk && liveOk && velSkipOk && !warnings;
+    const bool ok = countsOk && outerOk && focusOk && liveOk && velSkipOk && gbufOk && !warnings;
     printf("MVR forward: %s; PS %s (globalTexture0 in t%u, globalTexture2 in t%u), VS %s; outer pass %s%s%s, stash %d "
            "targets, binds %u, copy-ins %u, map failures %u, draws %u (one view %u, patched PS %u, PS slot 3 rebinds "
            "%u, screen textures without a clone %u), copied back %u, SetMultiViewMode failures %u; paused %u times "
@@ -771,6 +903,13 @@ int RunMvrForward() {
            g_fill.calls, g_fill.eye, g_fill.depth == g_s.focus.gt2.Get() ? "ok" : "WRONG",
            g_fill.target == velTex.Get() ? "ok" : "WRONG", lv.velFilled, lv.velSkippedDraws, lv.velDrawn, velQuarter,
            velPx / 4, velMarked, velPx - velPx / 4, velOther, velSkipOk ? "OK" : "WRONG");
+    printf("  G-buffer PS with the live track map (B13): PS %s (map in t%u); on: pass %s, stash %s, draws with view 1's "
+           "rows %u, kept %u, map read %s, misses %u, view 1 %d px covered, %d off (max %.5f), slice 0 %d px off; off: "
+           "draws %u, view 1 %d px covered, %d off (max %.3f), slice 0 %d px off (%s)\n",
+           gbufInfo.kind == qvfr::mvrps::Kind::Patched ? "patched" : "NOT PATCHED", gbufInfo.slot[qvfr::mvrps::kLiveTrack],
+           gOn.ran ? "ran" : "SKIPPED", gOn.st.stashValid ? "valid" : "INVALID", gOn.st.gbufPsDraws,
+           gOn.st.gbufPsKept, gOn.st.liveTrack ? "yes" : "NO", gOn.st.srvMisses, gCovOn, gWrongOn, gMaxOn, gOuterOn,
+           gOff.st.gbufPsDraws, gCovOff, gWrongOff, gMaxOff, gOuterOff, gbufOk ? "OK" : "WRONG");
     printf("  debug layer %s, %d warnings, %d expected linkage reports\n", debugLayer ? "on" : "not installed", warnings,
            expected);
     return ok ? 0 : 1;

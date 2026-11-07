@@ -431,6 +431,9 @@ struct Pass {
     // B9d run 5: the live track map of outer read in the focus window into a focus-size texture for view 1 (once per
     // forward pass, at the first draw whose PS reads it).
     bool liveTrackDone = false, liveTrackOk = false;
+    // B13 (mvr_gbuffer_ps): the G-buffer pass's draws of patched PS; psSlot3 holds the game's PS slot 3 from the first.
+    bool gbufPsBound = false;
+    unsigned gbufPsDraws = 0, gbufPsKept = 0;  // with view 1's rows; kept as before (they read globalTexture0..4)
 };
 Pass g_p;
 
@@ -501,6 +504,8 @@ struct Stats {
     std::vector<Reason> earlyReasons;
     double passMs[2] = {};
     std::vector<Reason> reasons;
+    // B13: G-buffer draws of patched PS with view 1's rows, kept as before; live track maps read for view 1.
+    uint64_t gbufPsDraws = 0, gbufPsKept = 0, liveTracks = 0, liveTrackFails = 0;
 };
 Stats g_st, g_tot;
 std::string g_lastFail;  // the latest pass failure (logged once per text)
@@ -654,6 +659,7 @@ VelSkip g_velSkip[2];
 std::atomic<int> g_velBound{-1};
 bool g_velSkipOn = true;  // [debug] mvr_velocity_skip and its hotkey
 VelocityFillFn g_velFill = nullptr;
+bool g_gbufPsOn = true;  // B13: [debug] mvr_gbuffer_ps and its hotkey
 
 // Jitter diagnosis (B9c run 2: view 1 about 0.27 px off focus's own forward pass in x, the sign changing between
 // frames): in a forward test shot frame the game's camera constants at the first draw of each eye group's
@@ -1048,7 +1054,7 @@ void FillM(ID3D11DeviceContext* c) {
     BuildRows(p, g_win[p.eye]);
     Internal in;
     c->UpdateSubresource(g_g.rowsCb.Get(), 0, nullptr, p.rows, 0, 0);
-    if (p.forward) {
+    if (p.forward || g_gbufPsOn) {
         float r[4][4];
         PsRows(p, r);
         c->UpdateSubresource(g_g.psRowsCb.Get(), 0, nullptr, r, 0, 0);
@@ -1153,8 +1159,8 @@ void FillCopy(ID3D11DeviceContext* c, ID3D11View* v) {
 }
 
 // The live track map for view 1 (B9d run 5): outer's map (bound by the game, outer size) read in the eye's focus window
-// into a focus-size texture once per forward pass. Focus's own map is drawn only later, in its group. Null: none (the
-// draw counts as a screen texture without a copy).
+// into a focus-size texture once per forward pass (B13: and once per G-buffer pass). Focus's own map is drawn only
+// later, in its group. Null: none (the draw counts as a screen texture without a copy).
 struct LiveTrackMap {
     ComPtr<ID3D11Texture2D> tex;
     D3D11_TEXTURE2D_DESC desc{};
@@ -1170,8 +1176,8 @@ ID3D11ShaderResourceView* LiveTrackSrv(ID3D11DeviceContext* c, ID3D11ShaderResou
     if (p.liveTrackDone) return p.liveTrackOk ? g_liveTrack.srv.Get() : nullptr;
     p.liveTrackDone = true;
     auto fail = [&]() -> ID3D11ShaderResourceView* {
-        ++g_fs.liveTrackFails;
-        ++g_ftot.liveTrackFails;
+        ++(p.forward ? g_fs.liveTrackFails : g_st.liveTrackFails);
+        ++(p.forward ? g_ftot.liveTrackFails : g_tot.liveTrackFails);
         return nullptr;
     };
     ComPtr<ID3D11Resource> r;
@@ -1218,8 +1224,8 @@ ID3D11ShaderResourceView* LiveTrackSrv(ID3D11DeviceContext* c, ID3D11ShaderResou
     MaskPass(c, g, m.rtv.Get(), p.fw, p.fh, origin, scale, g_g.psBlit.Get());
     if (views != 1) SetViews(c, views);
     p.liveTrackOk = true;
-    ++g_fs.liveTracks;
-    ++g_ftot.liveTracks;
+    ++(p.forward ? g_fs.liveTracks : g_st.liveTracks);
+    ++(p.forward ? g_ftot.liveTracks : g_tot.liveTracks);
     return m.srv.Get();
 }
 
@@ -1289,6 +1295,53 @@ void ForwardDraw(ID3D11DeviceContext* c) {
     if (want != p.views && SetViews(c, want)) p.views = want;
     ++p.draws;
     if (p.views != 2) ++p.plainDraws;
+}
+
+// B13: before each draw of the G-buffer pass with two views: a patched PS gets PS slot 3 (view 1's rows, the magic
+// value) and outer's live track map in the focus window. One that also reads globalTexture0..4 gets the game's slot 3
+// (no magic: view 1 draws it as before); the G-buffer pass has no focus copies of them (none in the capture, B2).
+// With one view the patched PS draw as the original whatever slot 3 holds.
+void GbufDraw(ID3D11DeviceContext* c) {
+    Pass& p = g_p;
+    if (p.views != 2) return;
+    ID3D11PixelShader* ps = nullptr;
+    c->PSGetShader(&ps, nullptr, nullptr);
+    const mvrps::Info info = mvrps::InfoOf(ps);
+    if (ps) ps->Release();
+    if (info.kind != mvrps::Kind::Patched) return;
+    if (!p.gbufPsBound) {
+        c->PSGetConstantBuffers(mvrps::kCbSlot, 1, &p.psSlot3);
+        p.gbufPsBound = true;
+    }
+    bool screen = false;
+    for (unsigned k = 0; k < mvrps::kLiveTrack; ++k) screen |= info.slot[k] != mvrps::kNoSlot;
+    ID3D11Buffer* want = screen ? p.psSlot3 : g_g.psRowsCb.Get();
+    ID3D11Buffer* cur = nullptr;
+    c->PSGetConstantBuffers(mvrps::kCbSlot, 1, &cur);
+    if (cur != want) {
+        Internal in;
+        c->PSSetConstantBuffers(mvrps::kCbSlot, 1, &want);
+        ++p.psCbRebinds;
+    }
+    if (cur) cur->Release();
+    if (screen) {
+        ++p.gbufPsKept;
+        return;
+    }
+    ++p.gbufPsDraws;
+    ID3D11ShaderResourceView* map = nullptr;
+    if (info.slot[mvrps::kLiveTrack] != mvrps::kNoSlot) {
+        ID3D11ShaderResourceView* g = nullptr;
+        c->PSGetShaderResources(info.slot[mvrps::kLiveTrack], 1, &g);
+        if (g) {
+            map = LiveTrackSrv(c, g);
+            if (!map) ++p.srvMisses;
+            g->Release();
+        }
+    }
+    Internal in;
+    clones::RawScope raw;
+    c->PSSetShaderResources(mvrps::kTexBase + mvrps::kLiveTrack, 1, &map);
 }
 
 // A constant buffer range the next draw reads (VS `slot` from its binding offset), read back at once (shot frame only:
@@ -1563,7 +1616,7 @@ void EndMvr(ID3D11DeviceContext* c, bool rebind) {
     if (p.views != 1) SetViews(c, 1);
     p.views = 1;
     RestoreSlot3(c);
-    if (p.forward) RestorePsSlots(c);
+    if (p.forward || p.gbufPsBound) RestorePsSlots(c);
     if (rebind) {
         ID3D11RenderTargetView* rt[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
         ID3D11DepthStencilView* ds = nullptr;
@@ -1896,9 +1949,15 @@ void PassEnd(ID3D11DeviceContext* c) {
         st->viewsFailures += p.viewsFailures;
         st->lateStarts += p.lateStarts;
         st->waitBinds += p.waitBinds;
+        st->gbufPsDraws += p.gbufPsDraws;
+        st->gbufPsKept += p.gbufPsKept;
     }
     TestState& t = g_test;
     ++t.passes;
+    t.gbufPsDraws = p.gbufPsDraws;
+    t.gbufPsKept = p.gbufPsKept;
+    t.liveTrack = p.liveTrackOk;
+    t.srvMisses = p.srvMisses;
     t.binds = p.binds;
     t.clears = p.clears;
     t.mapFailures = p.mapFailures;
@@ -1917,6 +1976,7 @@ void PassEnd(ID3D11DeviceContext* c) {
     if (g_shot.armed && e == 0 && !g_shot.outerDone) {
         g_shot.pass = p;
         g_shot.pass.slot3 = nullptr;
+        g_shot.pass.psSlot3 = nullptr;
         g_shot.pass.masks.clear();
         ShotOuter(c);
     }
@@ -2906,6 +2966,7 @@ bool Install() {
         g_forwardOn = Cfg().mvrForward && g_phase3Vt;
         SetForwardDepth(Cfg().mvrForwardDepth);
         g_velSkipOn = Cfg().mvrVelocitySkip;
+        g_gbufPsOn = Cfg().mvrGbufferPs;
         g_installed = true;
         Log("MVR G-buffer: on; outer L's and outer R's G-buffer pass draw the eye's focus too (MVR, view 1 in the "
             "corner of slice 1 of two-slice copies), the focus groups skip CPhase1BuildCommandThread and CPhase1Render "
@@ -3629,6 +3690,7 @@ bool BeforeDraw(ID3D11DeviceContext* c) {
         Protect("Draw", [&] { ForwardDraw(c); });
         return false;
     }
+    if (g_gbufPsOn) Protect("Draw", [&] { GbufDraw(c); });
     if (!g_shot.armed || g_p.eye != 0) return false;
     ++g_p.draws;
     if (g_p.views != 2) ++g_p.plainDraws;
@@ -3735,6 +3797,8 @@ bool SkipDraw(ID3D11DeviceContext* c) {
 void SetVelocityFill(VelocityFillFn fn) { g_velFill = fn; }
 void SetVelocitySkip(bool on) { g_velSkipOn = on; }
 bool GetVelocitySkip() { return g_velSkipOn; }
+void SetGbufferPs(bool on) { g_gbufPsOn = on; }
+bool GetGbufferPs() { return g_gbufPsOn; }
 
 std::string Describe() {
     if (!g_installed) return "MVR G-buffer off";
@@ -3762,7 +3826,9 @@ void LogStats(bool totals) {
     Log("MVR G-buffer%s (%llu frames): outer passes L %llu / R %llu (no stash %llu / %llu), CPU per pass L %.3f / R "
         "%.3f ms, started at the first bind %llu (after %llu other binds); focus choice changes L %llu / R %llu; own pass with outer's on top (diagnosis modes) L %llu / R %llu; focus G-buffer from outer L %llu / R %llu, own pass L %llu / R %llu%s%s%s; fills %llu (failed %llu), "
         "masks %llu; jitter moved in %llu passes (unknown %llu); unpatched VS sets %llu, slot 3 rebinds %llu (game "
-        "buffers %llu), mixed binds %llu, late binds %llu (draws after them %llu), map failures %llu, SetMultiViewMode failures %llu",
+        "buffers %llu), mixed binds %llu, late binds %llu (draws after them %llu), map failures %llu, SetMultiViewMode failures %llu; "
+        "patched PS with view 1's rows (mvr_gbuffer_ps %s) %llu draws, kept as before (screen textures) %llu, live "
+        "track maps from outer %llu (failed %llu)",
         totals ? " (session)" : "", (unsigned long long)s.frames, (unsigned long long)s.passes[0],
         (unsigned long long)s.passes[1], (unsigned long long)s.passFailed[0], (unsigned long long)s.passFailed[1],
         ms(0), ms(1), (unsigned long long)s.lateStarts, (unsigned long long)s.waitBinds,
@@ -3775,7 +3841,8 @@ void LogStats(bool totals) {
         (unsigned long long)s.plainSets, (unsigned long long)s.cbRebinds, (unsigned long long)s.cbGame,
         (unsigned long long)s.mixed, (unsigned long long)s.lateBinds, (unsigned long long)s.lateDraws,
         (unsigned long long)s.mapFailures,
-        (unsigned long long)s.viewsFailures);
+        (unsigned long long)s.viewsFailures, g_gbufPsOn ? "on" : "off", (unsigned long long)s.gbufPsDraws,
+        (unsigned long long)s.gbufPsKept, (unsigned long long)s.liveTracks, (unsigned long long)s.liveTrackFails);
     if (g_early || s.earlyRuns[0] || s.earlyRuns[1] || !s.earlyReasons.empty()) {
         std::string er;
         for (const Reason& r : s.earlyReasons) {

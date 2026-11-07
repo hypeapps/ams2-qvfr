@@ -143,6 +143,13 @@ void SetVelocitySkip(bool on);
 bool GetVelocitySkip();
 // From every draw detour before the real draw: true = drop the draw (a velocity pass whose target got the vectors).
 bool SkipDraw(ID3D11DeviceContext* c);
+// B13 (docs/mvr.md), [debug] mvr_gbuffer_ps (live, hotkey mvr_modifier + mvr_gbuffer_ps_key): in the G-buffer pass a
+// draw with two views and a patched PS gets PS slot 3 (view 1's rows with the magic value) and in t26 outer's live track
+// map read in the focus window, as in the forward pass. The track's G-buffer shaders read that map (wetness, roughness)
+// at their screen UV; without it view 1 reads outer's map at another place. A patched PS that also reads globalTexture0..4
+// (none in the capture's G-buffer pass) keeps the game's slot 3 and draws view 1 as before.
+void SetGbufferPs(bool on);
+bool GetGbufferPs();
 // Quad: the vtable of the focus groups' CPhase3BuildCommandThread (found by class name; 0: none).
 void SetPhase3BuildVtable(uintptr_t vt);
 // A focus group's CBeginEye, after its clones went in (the eye of the velocity pass's depth, above).
@@ -178,6 +185,9 @@ struct TestState {
     unsigned plainSets = 0, cbRebinds = 0, copiedBack = 0, stashed = 0, masks = 0, viewsFailures = 0, failures = 0;
     bool stashValid = false, jitterKnown = false, faulted = false, lateStart = false;
     float rows[2][4] = {};  // M's x and y rows of the last pass
+    // B13, the last pass: draws of patched PS with view 1's rows, kept as before, the live track map read, misses.
+    unsigned gbufPsDraws = 0, gbufPsKept = 0, srvMisses = 0;
+    bool liveTrack = false;
 };
 TestState TestGet();
 ID3D11Texture2D* TestArray(int k);

@@ -192,6 +192,10 @@ struct Config {
     // toggles it.
     bool mvrVelocitySkip = true;
     int mvrVelocitySkipKey = 0;
+    // Live (docs/mvr.md B13, mvr_pass.h): the G-buffer pass's patched pixel shaders get view 1's rows and the live track
+    // map read in the focus window, as in the forward pass. The hotkey (mvr_modifier + mvr_gbuffer_ps_key) toggles it.
+    bool mvrGbufferPs = true;
+    int mvrGbufferPsKey = 0;
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
     bool dlaa = false;                // mode=dlaa (a change needs a restart)
