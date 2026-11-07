@@ -54,12 +54,21 @@ add_custom_command(
   DEPENDS ${QVFR_MVRPASS_HLSL}
   COMMENT "fxc mvr_pass.hlsl"
   VERBATIM)
+set(QVFR_MVRMOTION_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/shaders/mvr_motion.hlsl)
+add_custom_command(
+  OUTPUT ${QVFR_SHADER_OUT}/mvr_motion_cs.h
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${QVFR_SHADER_OUT}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSFocusMotion /Vn kMvrMotionCS
+          /Fh ${QVFR_SHADER_OUT}/mvr_motion_cs.h ${QVFR_MVRMOTION_HLSL}
+  DEPENDS ${QVFR_MVRMOTION_HLSL}
+  COMMENT "fxc mvr_motion.hlsl"
+  VERBATIM)
 # Linking this target gives the include directory and builds the headers first (proxy and smoke test).
 add_library(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT}/compose_vs.h ${QVFR_SHADER_OUT}/compose_ps.h
             ${QVFR_SHADER_OUT}/sun_fx_vs.h ${QVFR_SHADER_OUT}/sun_fx_ps.h ${QVFR_SHADER_OUT}/dlaa_mask_cs.h
             ${QVFR_SHADER_OUT}/dlaa_cockpit_cs.h ${QVFR_SHADER_OUT}/mvr_pass_vs.h ${QVFR_SHADER_OUT}/mvr_pass_depth_ps.h
             ${QVFR_SHADER_OUT}/mvr_pass_mask_ps.h ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ps.h
-            ${QVFR_SHADER_OUT}/mvr_pass_blit_ps.h)
+            ${QVFR_SHADER_OUT}/mvr_pass_blit_ps.h ${QVFR_SHADER_OUT}/mvr_motion_cs.h)
 target_include_directories(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT})
 
 enable_language(ASM_MASM)  # export thunks (generated/thunks.asm)
@@ -90,6 +99,7 @@ add_library(qvfr_proxy SHARED
   mvr_ps.cpp
   mvr_vs.cpp
   mvr_pass.cpp
+  mvr_motion.cpp
   taa_views.cpp
   common.cpp
 )

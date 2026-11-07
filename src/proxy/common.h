@@ -182,6 +182,11 @@ struct Config {
     // mvr_forward_depth_key; testers: VK_PRIOR) cycles them.
     int mvrForwardDepth = 3;
     int mvrForwardDepthKey = 0;
+    // Live (docs/mvr.md B10, mvr_motion.h): with the live forward, DLSS gets the focus views' motion vectors made from
+    // outer's (the geometry the focus image shows) in place of the focus velocity pass's. The hotkey (mvr_modifier +
+    // mvr_velocity_key; testers: VK_PAUSE) toggles it.
+    bool mvrVelocity = true;
+    int mvrVelocityKey = 0;
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
     bool dlaa = false;                // mode=dlaa (a change needs a restart)

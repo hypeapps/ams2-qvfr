@@ -468,6 +468,8 @@ struct Win {
     uint32_t w = 0, h = 0;  // outer's target size (the game's render size)
 };
 Win g_win[2];
+Win g_winPrev[2];  // the window of the last frame that had one (mvr_motion: the previous positions)
+uint64_t g_fwdSkipFrame[2] = {};  // the frame in which the focus group skipped its own forward pass (mvr_motion)
 struct FocusState {
     bool projected = false;
     uint64_t frame = 0;
@@ -3055,6 +3057,7 @@ void CancelShot() {
 void SetWindow(int eye, bool valid, double sx, double ox, double sy, double oy, uint32_t width, uint32_t height) {
     if (eye < 0 || eye > 1) return;
     Win& w = g_win[eye];
+    if (w.frame != g_frame) g_winPrev[eye] = w;
     w.valid = valid;
     w.frame = g_frame;
     w.sx = sx;
@@ -3063,6 +3066,18 @@ void SetWindow(int eye, bool valid, double sx, double ox, double sy, double oy, 
     w.oy = oy;
     w.w = width;
     w.h = height;
+}
+
+bool MotionWindows(int eye, double cur[4], double prev[4], bool* fromOuter) {
+    if (eye < 0 || eye > 1 || !On()) return false;
+    const Win& w = g_win[eye];
+    if (!w.valid || w.frame != g_frame) return false;
+    const Win& p = g_winPrev[eye].valid && g_winPrev[eye].frame + 1 == g_frame ? g_winPrev[eye] : w;
+    const double c[4] = {w.sx, w.ox, w.sy, w.oy}, q[4] = {p.sx, p.ox, p.sy, p.oy};
+    memcpy(cur, c, sizeof(c));
+    memcpy(prev, q, sizeof(q));
+    *fromOuter = g_fwdSkipFrame[eye] == g_frame;
+    return true;
 }
 
 void SetMode(Mode m) { g_mode = m; }
@@ -3308,6 +3323,7 @@ bool Phase3Task(uint8_t* task, int group, bool build) {
         ++g_fs.skipped[eye];
         ++g_ftot.skipped[eye];
         ++g_testLive.focusSkipped;
+        g_fwdSkipFrame[eye] = g_frame;
         return true;
     }
     if (ok) FwdReason(eye, "focus's CPhase3BuildCommandThread ran before outer's forward pass was done");

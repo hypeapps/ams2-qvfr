@@ -51,6 +51,10 @@ void CancelShot();  // the shot did not start: the comparison is dropped without
 // space, focus = (sx x + ox w, sy y + oy w, z, w). valid = false: no focus projection in this frame. w x h: outer's
 // target size (the game's render size; 0: not checked).
 void SetWindow(int eye, bool valid, double sx, double ox, double sy, double oy, uint32_t w, uint32_t h);
+// mvr_motion's window source (docs/mvr.md B10): the eye's SetWindow map of this frame and of the last frame (cur when
+// the last frame had none), {sx, ox, sy, oy}; fromOuter: the focus group of the eye skipped its own forward pass in this
+// frame (B9d). False: no valid window in this frame.
+bool MotionWindows(int eye, double cur[4], double prev[4], bool* fromOuter);
 // Focus L's (eye 0) and focus R's (eye 1) CBeginEye: whether the group renders the focus window.
 void FocusGroup(int eye, bool projected);
 // Skip (default): the focus groups skip their G-buffer pass and get the stash, its depth made conservative

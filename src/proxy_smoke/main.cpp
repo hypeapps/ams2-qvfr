@@ -47,6 +47,8 @@
 //                                     CPhase3Render with MVR, view 1 against focus's own forward pass; the patched VS
 //                                     and PS, the copy-in of focus's clones) on an NVIDIA D3D11 device
 //                                     (mvr_forward_smoke.cpp)
+//   --mvr-motion                      without SteamVR and without the proxy DLL: the focus motion vectors from outer's
+//                                     (B10) against a clip-space reference on a D3D11 device (mvr_motion_smoke.cpp)
 //   --xr-layer                        without SteamVR: the proxy DLL as an OpenXR API layer between a fake loader and a
 //                                     fake runtime (extension, gaze set in attach and sync, own sync, gaze, 2 sessions)
 //   --openxr-path                     [runtime] path=openxr with the Valve DLL as the backend: loader environment,
@@ -84,6 +86,7 @@ int RunMvrPs();  // mvr_ps_smoke.cpp
 int RunMvrPass();  // mvr_pass_smoke.cpp
 int RunMvrForward();  // mvr_forward_smoke.cpp
 int RunTaaFix();  // taa_fix_smoke.cpp
+int RunMvrMotion();  // mvr_motion_smoke.cpp
 #include "focus_cull.h"
 #include "focus_geometry.h"
 #include "hooks.h"
@@ -1393,6 +1396,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--clones")) clonesTest = true;
         else if (!strcmp(argv[i], "--sun-fx")) sunFxTest = true;
         else if (!strcmp(argv[i], "--taa-fix")) return RunTaaFix();
+        else if (!strcmp(argv[i], "--mvr-motion")) return RunMvrMotion();
         else if (!strcmp(argv[i], "--mvr-vs")) mvrVsTest = true;
         else if (!strcmp(argv[i], "--mvr-ps")) mvrPsTest = true;
         else if (!strcmp(argv[i], "--mvr-pass")) mvrPassTest = true;

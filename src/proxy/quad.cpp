@@ -23,6 +23,7 @@
 #include "focus_geometry.h"
 #include "gpu.h"
 #include "hooks.h"
+#include "mvr_motion.h"
 #include "mvr_pass.h"
 #include "mvr_ps.h"
 #include "mvr_vs.h"
@@ -302,6 +303,17 @@ bool g_mvrForwardCfg = false;  // Cfg().mvrForward last seen (a reload sets it)
 bool g_mvrForwardKeyDown = false;
 int g_mvrFwdDepthCfg = 3;  // Cfg().mvrForwardDepth last seen
 bool g_mvrFwdDepthKeyDown = false;
+bool g_mvrVelocityCfg = true;  // Cfg().mvrVelocity last seen (a reload sets it)
+bool g_mvrVelocityKeyDown = false;
+
+// mvr_motion's window source: mvr_pass's maps in uv.
+bool MotionWindows(int eye, mvrmotion::Map* cur, mvrmotion::Map* prev, bool* fromOuter) {
+    double c[4], p[4];
+    if (!mvrpass::MotionWindows(eye, c, p, fromOuter)) return false;
+    *cur = mvrmotion::FromClip(c[0], c[1], c[2], c[3]);
+    *prev = mvrmotion::FromClip(p[0], p[1], p[2], p[3]);
+    return true;
+}
 bool g_mvrMapKeyDown = false;
 bool g_mapFrame = false;  // a task map with PS resources in this frame (mvr_map_key)
 bool g_mapNext = false;
@@ -1417,6 +1429,15 @@ void HandleToolsLocked() {
         mvrpass::SetForwardDepth((mvrpass::GetForwardDepth() + 1) % mvrpass::kForwardDepthModes);
         Log("Quad: MVR live forward depth %s (hotkey)", mvrpass::ForwardDepthName(mvrpass::GetForwardDepth()));
     }
+    if (mvrpass::On() && c.mvrVelocity != g_mvrVelocityCfg) {
+        g_mvrVelocityCfg = c.mvrVelocity;
+        mvrmotion::SetEnabled(c.mvrVelocity);
+        Log("Quad: MVR focus motion vectors from outer %s (ini)", c.mvrVelocity ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrVelocityKey, g_mvrVelocityKeyDown)) {
+        mvrmotion::SetEnabled(!mvrmotion::Enabled());
+        Log("Quad: MVR focus motion vectors from outer %s (hotkey)", mvrmotion::Enabled() ? "on" : "off");
+    }
     g_mapFrame = g_mapNext;
     g_mapNext = false;
     if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrMapKey, g_mvrMapKeyDown)) {
@@ -2412,6 +2433,9 @@ void Install() {
             g_mvrEarlyCfg = Cfg().mvrEarly;  // Install took the setting
             g_mvrForwardCfg = Cfg().mvrForward;
             g_mvrFwdDepthCfg = Cfg().mvrForwardDepth;
+            g_mvrVelocityCfg = Cfg().mvrVelocity;
+            mvrmotion::SetEnabled(Cfg().mvrVelocity);
+            mvrmotion::SetWindowSource(&MotionWindows);
         }
         else if (Cfg().mvrGbuffer)
             Log("MVR G-buffer: off (needs [debug] mvr_vs_patch=1 and the executor patch)");

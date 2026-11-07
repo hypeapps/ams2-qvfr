@@ -16,6 +16,7 @@
 #include "diag.h"
 #include "gpu.h"
 #include "hooks.h"
+#include "mvr_motion.h"
 #include "sun_fx.h"
 #include "sysinfo.h"
 
@@ -269,6 +270,7 @@ void DropNgxLocked() {
         SafeRelease(s.tex);
     }
     g_scratch.clear();
+    mvrmotion::Release();
     SafeRelease(g_cockpitCs);
     SafeRelease(g_cockpitCb);
     g_cockpitCbBits = 0;
@@ -912,6 +914,17 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
         Protect("evaluate", [&] {
             f = FeatureFor(c, view, (uintptr_t)tex[2], w, h);
             if (!f) return;
+            // MVR (mvr_motion.h): outer's motion vectors kept per eye, the focus views' made from them.
+            ID3D11Resource* mv = in[2];
+            if (view >= 1) {
+                const int eye = (view - 1) & 1;
+                const bool shot = g_shot.load(std::memory_order_relaxed);
+                if (view <= 2)
+                    mvrmotion::StoreOuter(c, eye, (ID3D11Texture2D*)in[2], (ID3D11Texture2D*)in[0], frame, shot);
+                else if (ID3D11Texture2D* m = mvrmotion::ForFocus(c, eye, (ID3D11Texture2D*)in[0],
+                                                                  (ID3D11Texture2D*)in[2], w, h, frame, shot))
+                    mv = m;
+            }
             if (mask) {
                 c->CSSetShader(g_maskCs, nullptr, 0);
                 c->CSSetConstantBuffers(0, 1, &g_maskCb);
@@ -930,7 +943,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             e.Feature.pInColor = in[1];
             e.Feature.pInOutput = out;
             e.pInDepth = in[0];
-            e.pInMotionVectors = in[2];
+            e.pInMotionVectors = mv;
             e.InJitterOffsetX = j[0] * Cfg().dlaaJitterScaleX;
             e.InJitterOffsetY = j[1] * Cfg().dlaaJitterScaleY;
             e.InRenderSubrectDimensions.Width = w;
@@ -1258,6 +1271,7 @@ void LogStats(bool totals) {
             (unsigned long long)g_maskEvals, (unsigned long long)g_expEvals, (unsigned long long)g_cockpitEvals);
 #endif
     if (Cfg().quadMode != QuadMode::Quad) return;
+    mvrmotion::LogStats(totals);
     std::string views;
     for (int v = 1; v < kViews; ++v) {
         const uint64_t n = g_viewEvals[v].load();
