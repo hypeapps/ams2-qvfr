@@ -409,6 +409,9 @@ MvrPsPatchResult PatchPsForMvr(const void* code, size_t size, const MvrPsPatchOp
     inf.temps = next - temps;
     inf.screenInputMask = screenMask;
     inf.textureMask = texMask;
+    inf.textureRegs.assign(opt.screenTextures.size(), MvrPsPatchInfo::kNoRegister);
+    for (const auto& [r, k] : texRegs)
+        if (texMask & (1u << k)) inf.textureRegs[k] = r;
 
     // New declarations.
     const uint32_t cbDecl[4] = {kOpDclConstantBuffer | (4u << 24), kSrcCbXyzw, opt.cbSlot, kMvrPsRows};

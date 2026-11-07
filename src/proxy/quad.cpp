@@ -1489,6 +1489,8 @@ void HandleShotLocked() {
     } else {
         g_shotFrame = true;
         Log("Quad: shot (%s) in frame %llu", why, (unsigned long long)g_frameNo + 1);
+        // MVR jitter diagnosis (B9c): which contexts set which projection offset in the shot frame.
+        if (c.dlaa && c.mvrForwardTest) dlaa::TraceJitter(64);
     }
 }
 

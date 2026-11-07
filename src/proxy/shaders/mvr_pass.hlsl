@@ -8,6 +8,8 @@
 //   depth of focus's geometry is back after it.
 // - PSMask: a sun mask of outer (1/4 size, drawn at the end of the G-buffer pass) read in the focus window into the
 //   focus group's mask target: outer UV = origin + focus UV * scale.
+// - PSDepthIn (gate B9c): a focus-size depth (focus's clone) as it is into the top-left corner of slice 1 of a
+//   two-slice copy, where the MVR forward pass then draws view 1 against it.
 
 cbuffer Params : register(b0) {
     float2 origin;   // the focus window's top left corner in outer UV
@@ -26,6 +28,7 @@ cbuffer DepthParams : register(b1) {
 
 Texture2DArray<float> depthArr : register(t0);
 Texture2D<float> mask : register(t0);
+Texture2D<float> depthIn : register(t0);
 SamplerState linearClamp : register(s0);
 
 float4 VSMain(uint id : SV_VertexID) : SV_Position {
@@ -63,4 +66,8 @@ float PSDepth(float4 pos : SV_Position) : SV_Depth {
 
 float PSMask(float4 pos : SV_Position) : SV_Target {
     return mask.SampleLevel(linearClamp, origin + pos.xy * invSize * scale, 0);
+}
+
+float PSDepthIn(float4 pos : SV_Position) : SV_Depth {
+    return depthIn.Load(int3(pos.xy, 0));
 }

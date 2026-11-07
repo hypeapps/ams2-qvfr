@@ -168,6 +168,9 @@ struct Config {
     int mvrMapKey = 0;
     // Live: a shot compares focus L's own G-buffer pass with outer's stash (B8); 0 = the shot shows the frame as it runs.
     bool mvrShotCompare = true;
+    // Live, gate B9c (mvr_pass.h): with mvr_early=1 and mvr_ps_patch, a shot also runs outer L's forward pass
+    // (CPhase3Render) with MVR and compares view 1 with focus L's own forward pass.
+    bool mvrForwardTest = false;
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
     bool dlaa = false;                // mode=dlaa (a change needs a restart)

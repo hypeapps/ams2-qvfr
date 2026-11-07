@@ -405,6 +405,7 @@ Config ReadConfig(const fs::path& ini) {
     c.mvrEarlyKey = IniInt(ini, L"debug", L"mvr_early_key", c.mvrEarlyKey);
     c.mvrMapKey = IniInt(ini, L"debug", L"mvr_map_key", c.mvrMapKey);
     c.mvrShotCompare = IniInt(ini, L"debug", L"mvr_shot_compare", 1) != 0;
+    c.mvrForwardTest = IniInt(ini, L"debug", L"mvr_forward_test", 0) != 0;
     if (c.quadMode == QuadMode::Quad)
         Log("Settings: [debug] overlay=%d overlay_modifier=0x%X overlay_key=0x%X freeze_modifier=0x%X freeze_key=0x%X "
             "outer_modifier=0x%X outer_key=0x%X gaze_modifier=0x%X gaze_key=0x%X clones=%d clones_modifier=0x%X "
@@ -412,13 +413,13 @@ Config ReadConfig(const fs::path& ini) {
             "cull_key=0x%X sun_effects=%d sun_effects_modifier=0x%X sun_effects_key=0x%X taa_views=%d "
             "taa_views_modifier=0x%X taa_views_key=0x%X task_profile=%d mvr_vs_patch=%d "
             "mvr_ps_patch=%d mvr_gbuffer=%d mvr_modifier=0x%X mvr_key=0x%X mvr_jitter_fix=%d mvr_mode_key=0x%X mvr_depth_bias=%d mvr_depth_slope=%.3f mvr_depth_dilate=%d "
-            "mvr_early=%d mvr_early_key=0x%X mvr_map_key=0x%X mvr_shot_compare=%d",
+            "mvr_early=%d mvr_early_key=0x%X mvr_map_key=0x%X mvr_shot_compare=%d mvr_forward_test=%d",
             c.overlay, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey,
             c.gazeKeyMod, c.gazeKey, c.clones, c.clonesKeyMod, c.clonesKey, c.clonesViewportFix, c.clonesBindFix,
             c.shotClones, c.focusCull, c.cullKeyMod, c.cullKey, c.sunEffects, c.sunKeyMod, c.sunKey, c.taaViews,
             c.taaViewsKeyMod, c.taaViewsKey, c.taskProfile, c.mvrVsPatch, c.mvrPsPatch, c.mvrGbuffer, c.mvrKeyMod, c.mvrKey,
             c.mvrJitterFix, c.mvrModeKey, c.mvrDepthBias, c.mvrDepthSlope, c.mvrDepthDilate,
-            c.mvrEarly, c.mvrEarlyKey, c.mvrMapKey, c.mvrShotCompare);
+            c.mvrEarly, c.mvrEarlyKey, c.mvrMapKey, c.mvrShotCompare, c.mvrForwardTest);
     const std::string dlaa = IniString(ini, L"dlaa", L"mode", L"off");
     c.dlaa = dlaa == "dlaa";
     if (dlaa != "off" && dlaa != "dlaa") Log("Settings: unknown [dlaa] mode=\"%s\", using off", dlaa.c_str());
@@ -609,17 +610,18 @@ bool ReloadConfig() {
     c.mvrEarlyKey = n.mvrEarlyKey;
     c.mvrMapKey = n.mvrMapKey;
     c.mvrShotCompare = n.mvrShotCompare;
+    c.mvrForwardTest = n.mvrForwardTest;
     Log("Settings reloaded (live): stats_interval_s=%d | benchmark modifier=0x%X key=0x%X delay_s=%.1f duration_s=%.1f "
         "freeze_pose=%d beep=%d | gaze read=%d | quad focus_offset=(%.3f, %.3f) fixed_offset=(%.3f, %.3f) "
         "smoothen_focus_view_edges=%.3f%s follow_gaze=%d gaze_hold_s=%.2f compose=%d margin_px=%d shot_modifier=0x%X "
         "shot_key=0x%X shot_auto_s=%.1f | debug overlay=%d clones=%d clones_viewport_fix=%d clones_bind_fix=%d "
-        "shot_clones=%d focus_cull=%d sun_effects=%d taa_views=%d task_profile=%d mvr_jitter_fix=%d mvr_early=%d mvr_shot_compare=%d keys 0x%X+0x%X, "
+        "shot_clones=%d focus_cull=%d sun_effects=%d taa_views=%d task_profile=%d mvr_jitter_fix=%d mvr_early=%d mvr_shot_compare=%d mvr_forward_test=%d keys 0x%X+0x%X, "
         "0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X%s%s",
         c.statsIntervalS, c.benchKeyMod, c.benchKey, c.benchDelayS, c.benchDurationS, c.benchFreezePose, c.benchBeep,
         c.gazeRead, c.focusOffsetX, c.focusOffsetY, c.fixedOffsetX, c.fixedOffsetY, c.smoothen,
         c.legacyEdge ? " (pre-M7 feather_px instead)" : "", c.followGaze, c.gazeHoldS, c.quadCompose, c.quadMarginPx,
         c.shotKeyMod, c.shotKey, c.shotAutoS, c.overlay, c.clones, c.clonesViewportFix, c.clonesBindFix, c.shotClones,
-        c.focusCull, c.sunEffects, c.taaViews, c.taskProfile, c.mvrJitterFix, c.mvrEarly, c.mvrShotCompare, c.overlayKeyMod, c.overlayKey,
+        c.focusCull, c.sunEffects, c.taaViews, c.taskProfile, c.mvrJitterFix, c.mvrEarly, c.mvrShotCompare, c.mvrForwardTest, c.overlayKeyMod, c.overlayKey,
         c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey, c.gazeKeyMod, c.gazeKey, c.clonesKeyMod, c.clonesKey,
         c.cullKeyMod, c.cullKey, c.sunKeyMod, c.sunKey, c.taaViewsKeyMod, c.taaViewsKey, c.mvrKeyMod, c.mvrKey,
         restart.empty() ? "" : "; CHANGED BUT NEEDS A GAME RESTART: ", restart.c_str());

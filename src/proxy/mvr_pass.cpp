@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -17,9 +18,12 @@
 #include "common.h"
 #include "gpu.h"
 #include "hooks.h"
-#include "mvr_pass_depth_ps.h"  // kMvrPassDepthPS (fxc from shaders/mvr_pass.hlsl)
+#include "mvr_pass_depth_in_ps.h"  // kMvrPassDepthInPS
+#include "mvr_pass_depth_ps.h"     // kMvrPassDepthPS (fxc from shaders/mvr_pass.hlsl)
 #include "mvr_pass_mask_ps.h"   // kMvrPassMaskPS
 #include "mvr_pass_vs.h"        // kMvrPassVS
+#include "mvr_ps.h"
+#include "mvr_ps_patch.h"  // dxbc::kMvrPsMagic
 #include "mvr_vs.h"
 
 namespace qvfr::mvrpass {
@@ -85,6 +89,7 @@ thread_local uint8_t* t_focusTask = nullptr;  // focus L's CPhase1Render running
 thread_local uint8_t* t_fillTask = nullptr;   // overwrite mode: a focus CPhase1Render whose clones get the stash after it
 thread_local int t_fillEye = -1;
 thread_local bool t_fillDepth = true;
+thread_local uint8_t* t_fwdFocusTask = nullptr;  // focus L's CPhase3Render in a forward test shot frame (B9c)
 
 void Fail(const char* where, unsigned long code);
 
@@ -147,11 +152,12 @@ struct Gpu {
     ComPtr<ID3D11Device> dev;
     ComPtr<ID3D11DeviceContext1> c1;
     ComPtr<ID3D11VertexShader> vs;
-    ComPtr<ID3D11PixelShader> psDepth, psMask;
+    ComPtr<ID3D11PixelShader> psDepth, psMask, psDepthIn;
     ComPtr<ID3D11SamplerState> sampler;
     ComPtr<ID3D11DepthStencilState> dssWrite, dssOff;
     ComPtr<ID3D11RasterizerState> rs;
     ComPtr<ID3D11Buffer> rowsCb, maskCb, depthCb;
+    ComPtr<ID3D11Buffer> psRowsCb;  // B9c: the patched pixel shaders' rows (S and O, UV scale, magic) in PS slot 3
     uint32_t depthCbData[8] = {};  // in depthCb: bias steps, slope scale (float bits), corner width, height, dilate
     bool failed = false;
 };
@@ -167,6 +173,8 @@ bool EnsureGpu(ID3D11DeviceContext* c) {
     if (SUCCEEDED(hr)) hr = g.dev->CreateVertexShader(kMvrPassVS, sizeof(kMvrPassVS), nullptr, &g.vs);
     if (SUCCEEDED(hr)) hr = g.dev->CreatePixelShader(kMvrPassDepthPS, sizeof(kMvrPassDepthPS), nullptr, &g.psDepth);
     if (SUCCEEDED(hr)) hr = g.dev->CreatePixelShader(kMvrPassMaskPS, sizeof(kMvrPassMaskPS), nullptr, &g.psMask);
+    if (SUCCEEDED(hr))
+        hr = g.dev->CreatePixelShader(kMvrPassDepthInPS, sizeof(kMvrPassDepthInPS), nullptr, &g.psDepthIn);
     D3D11_SAMPLER_DESC sd{};
     sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -192,6 +200,8 @@ bool EnsureGpu(ID3D11DeviceContext* c) {
     if (SUCCEEDED(hr)) hr = g.dev->CreateBuffer(&bd, nullptr, &g.rowsCb);
     bd.ByteWidth = 8 * sizeof(float);
     if (SUCCEEDED(hr)) hr = g.dev->CreateBuffer(&bd, nullptr, &g.maskCb);
+    bd.ByteWidth = 4 * 4 * sizeof(float);
+    if (SUCCEEDED(hr)) hr = g.dev->CreateBuffer(&bd, nullptr, &g.psRowsCb);
     bd.ByteWidth = 8 * sizeof(uint32_t);
     const uint32_t zero[8] = {};
     const D3D11_SUBRESOURCE_DATA init{zero, 0, 0};
@@ -358,6 +368,8 @@ struct Copy {
     ComPtr<ID3D11ShaderResourceView> depthSrv;  // depth: both slices
     bool depth = false;
     bool used = false;               // in the current pass
+    bool filled = false;             // forward pass (B9c): both slices got their content at the first bind or clear
+    ComPtr<ID3D11DepthStencilView> slice1Dsv;  // depth: slice 1 only (the forward pass's copy-in)
     uint64_t lastFrame = 0;
 };
 struct ViewMap {
@@ -399,6 +411,18 @@ struct Pass {
     bool failed = false;
     std::string why;
     double t0 = 0;
+    // The forward pass (B9c): outer L's CPhase3Render in a forward test shot frame. Views per draw (VS and PS patched),
+    // PS slot 3 and the focus copies of the screen textures in t21..t25 bound before each patched PS's draw.
+    bool forward = false;
+    bool vsPatched = false;          // the bound VS (VSSetShader hook)
+    ID3D11Buffer* psSlot3 = nullptr;  // the game's binding of PS slot 3 at the start (referenced)
+    unsigned psPatchedDraws = 0, psPlainDraws = 0, psOriginalDraws = 0, psUnknownDraws = 0, vsPlainDraws = 0;
+    unsigned psCbRebinds = 0, srvMisses = 0, copyIns = 0;
+    // The forward pass also binds targets of other sizes (in the game a 1/2 size f9 with its own depth, run of
+    // 2026-11-07 12:44): MVR pauses while they are bound (the game's views, one view) and goes on at the next bind with
+    // an outer-size target.
+    bool paused = false;
+    unsigned pauses = 0, pausedDraws = 0, pausedClears = 0;
 };
 Pass g_p;
 
@@ -524,6 +548,48 @@ Shot g_shot;
 char g_shotLabels[kMaxTargets + kMaxMasks][96] = {};
 char g_shotNames[kShotImages][32] = {};
 
+// The forward test (B9c, eye L): outer L's CPhase3Render with MVR in a shot frame, view 1's corner vs focus L's own
+// forward pass. Its own state: the G-buffer comparison (g_shot) would make focus run its own G-buffer pass and stop the
+// early SSAO and lights, which the forward pass needs in focus's clones.
+struct FwdShot {
+    bool armed = false, reported = false, outerDone = false, focusDone = false;
+    int base = -1;
+    uint64_t frame = 0;
+    std::string why;  // why outer L's forward pass did not run with MVR
+    Pass pass;        // its counters and rows (no references)
+    double ms = 0;
+    int n = 0;        // targets stashed
+};
+FwdShot g_fshot;
+StashG g_fwd[kMaxTargets];  // the corners of slice 1 after the forward pass, in the focus size
+int g_fwdN = 0;
+ComPtr<ID3D11Texture2D> g_fwdDepthIn;  // focus's depth clone copied for a shader view (the copy-in)
+struct SrvClone {
+    ComPtr<ID3D11ShaderResourceView> game, clone;  // clone null: the texture has no focus clone
+};
+std::vector<SrvClone> g_srvClones;  // the forward pass's screen texture views on focus's clones
+char g_fwdLabels[kMaxTargets][96] = {};
+char g_fwdNames[2 * kMaxTargets][32] = {};
+uint64_t g_earlyOk[2] = {};  // the frame of the eye's latest early SSAO and lights run without an engine fault
+
+// Jitter diagnosis (B9c run 2: view 1 about 0.27 px off focus's own forward pass in x, the sign changing between
+// frames): in a forward test shot frame the game's camera constants at the first draw of each eye group's
+// CPhase1Render and CPhase3Render: VS slot 12 (COMMON_BUFFER2, capture B2): projMatrix at byte 128,
+// screenSpaceDimensions 384, viewportPixelDimensions 464, cameraJitter 944 (61 registers).
+constexpr UINT kCamSlot = 12, kCamBytes = 976, kCamProj = 128, kCamSsd = 384, kCamVpd = 464, kCamJitter = 944;
+struct Probe {
+    bool on = false, done = false;
+    int group = -1;
+    uint8_t* task = nullptr;
+    const char* name = "";
+};
+Probe g_probe;
+const char* const kGroupName[4] = {"outer L", "outer R", "focus L", "focus R"};
+
+void FwdRefused(const char* why) {
+    if (g_fshot.armed && g_fshot.why.empty() && why) g_fshot.why = why;
+}
+
 // Test (smoke) snapshot of the latest pass.
 TestState g_test;
 
@@ -542,6 +608,8 @@ bool SetViews(ID3D11DeviceContext* c, NvU32 views) {
 void ReleasePassRefs(Pass& p) {
     if (p.slot3) p.slot3->Release();
     p.slot3 = nullptr;
+    if (p.psSlot3) p.psSlot3->Release();
+    p.psSlot3 = nullptr;
 }
 
 void ReleaseAll() {
@@ -551,6 +619,11 @@ void ReleaseAll() {
     g_views.clear();
     for (Stash& s : g_stash) s = Stash{};
     g_shot = Shot{};
+    g_fshot = FwdShot{};
+    for (StashG& g : g_fwd) g = StashG{};
+    g_fwdN = 0;
+    g_fwdDepthIn.Reset();
+    g_srvClones.clear();
     g_g = Gpu{};
 }
 
@@ -771,6 +844,20 @@ void BuildRows(Pass& p, const Win& win) {
     memcpy(p.rows, rows, sizeof(rows));
 }
 
+// PS slot 3 of the forward pass (mvr_ps_patch.h): row 0 = S and O of the screen inputs from view 1's corner map in M
+// (x_c = S.x x + o.x w, y_c = S.y y + o.y w; the screen UV scale ssd.xy of the game's VS taken as 1, B2), row 1 = the
+// UV scale from the outer-size slice to the focus-size textures, row 2.x = the magic value that turns the view on.
+void PsRows(const Pass& p, float r[4][4]) {
+    const float sx = p.rows[0][0], ox = p.rows[0][3], sy = p.rows[1][1], oy = p.rows[1][3];
+    const float rows[4][4] = {{sx, sy, 0.5f * (1 + ox - sx), 0.5f * (1 - oy - sy)},
+                              {(float)p.w / p.fw, (float)p.h / p.fh, 1, 1},
+                              {},
+                              {}};
+    memcpy(r, rows, sizeof(rows));
+    const uint32_t magic = dxbc::kMvrPsMagic;
+    memcpy(&r[2][0], &magic, sizeof(magic));
+}
+
 // At the pass's patched VS sets until this frame's jitter is known (the engine sets it while it records the pass,
 // before the first replayed draw).
 void FillM(ID3D11DeviceContext* c) {
@@ -785,6 +872,11 @@ void FillM(ID3D11DeviceContext* c) {
     BuildRows(p, g_win[p.eye]);
     Internal in;
     c->UpdateSubresource(g_g.rowsCb.Get(), 0, nullptr, p.rows, 0, 0);
+    if (p.forward) {
+        float r[4][4];
+        PsRows(p, r);
+        c->UpdateSubresource(g_g.psRowsCb.Get(), 0, nullptr, r, 0, 0);
+    }
     p.mFilled = true;
 }
 
@@ -793,6 +885,305 @@ void FillM(ID3D11DeviceContext* c) {
 void PassFailed(Pass& p, const char* why) {
     if (!p.failed) p.why = why;
     p.failed = true;
+}
+
+// The forward pass (B9c) draws over what the earlier tasks left, so each copy gets it at its first bind or clear:
+// slice 0 = the game's texture, the corner of slice 1 = focus's clone (focus L's G-buffer from the stash, its SSAO and
+// lights from the early run; the depth through PSDepthIn, D3D11 copies no part of a depth texture).
+bool DepthIn(ID3D11DeviceContext* c, Copy& cp, ID3D11Texture2D* clone) {
+    DXGI_FORMAT dsvF, srvF;
+    DepthFormats(cp.desc.Format, dsvF, srvF);
+    if (dsvF == DXGI_FORMAT_UNKNOWN || srvF == DXGI_FORMAT_UNKNOWN) return false;
+    if (!cp.slice1Dsv) {
+        D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+        dv.Format = dsvF;
+        dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+        dv.Texture2DArray = {0, 1, 1};
+        if (FAILED(g_g.dev->CreateDepthStencilView(cp.arr.Get(), &dv, &cp.slice1Dsv))) return false;
+    }
+    D3D11_TEXTURE2D_DESC cd{};
+    clone->GetDesc(&cd);
+    cd.MipLevels = 1;
+    cd.ArraySize = 1;
+    cd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    cd.MiscFlags = 0;
+    cd.CPUAccessFlags = 0;
+    cd.Usage = D3D11_USAGE_DEFAULT;
+    D3D11_TEXTURE2D_DESC have{};
+    if (g_fwdDepthIn) g_fwdDepthIn->GetDesc(&have);
+    if (!g_fwdDepthIn || !SameLayout(have, cd)) {
+        g_fwdDepthIn.Reset();
+        if (FAILED(g_g.dev->CreateTexture2D(&cd, nullptr, &g_fwdDepthIn))) return false;
+    }
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = srvF;
+    sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sv.Texture2D = {0, 1};
+    ComPtr<ID3D11ShaderResourceView> srv;
+    if (FAILED(g_g.dev->CreateShaderResourceView(g_fwdDepthIn.Get(), &sv, &srv))) return false;
+    Internal in;
+    c->CopySubresourceRegion(g_fwdDepthIn.Get(), 0, 0, 0, 0, clone, 0, nullptr);
+    Saved s;
+    s.Save(c);
+    c->OMSetRenderTargets(0, nullptr, cp.slice1Dsv.Get());
+    ID3D11ShaderResourceView* v = srv.Get();
+    c->PSSetShaderResources(0, 1, &v);
+    FullScreen(c, g_g.psDepthIn.Get(), g_g.dssWrite.Get(), g_p.fw, g_p.fh);
+    ID3D11ShaderResourceView* none = nullptr;
+    c->PSSetShaderResources(0, 1, &none);
+    s.Restore(c);
+    return true;
+}
+
+// `v`: a bound view of a copy (once per copy and pass).
+void FillCopy(ID3D11DeviceContext* c, ID3D11View* v) {
+    Pass& p = g_p;
+    int k = -1;
+    if (!v || !FindView(v, &k) || k < 0 || k >= (int)g_copies.size()) return;
+    Copy& cp = g_copies[k];
+    if (cp.filled) return;
+    cp.filled = true;
+    clones::RawScope raw;  // outer's group: the bind fix would copy the original in place of focus's clone
+    const NvU32 views = p.views;
+    if (views != 1) SetViews(c, 1);  // the depth copy-in draws
+    {
+        Internal in;
+        for (UINT m = 0; m < cp.desc.MipLevels; ++m)
+            c->CopySubresourceRegion(cp.arr.Get(), D3D11CalcSubresource(m, 0, cp.desc.MipLevels), 0, 0, 0, cp.orig,
+                                     m, nullptr);
+    }
+    const bool outerSize = cp.desc.Width == p.w && cp.desc.Height == p.h;
+    ID3D11Texture2D* clone = outerSize ? FocusClone(cp.orig) : nullptr;
+    D3D11_TEXTURE2D_DESC cd{};
+    if (clone) clone->GetDesc(&cd);
+    if (!outerSize) {
+        PassFailed(p, "a forward target not at the outer size");
+    } else if (!clone) {
+        PassFailed(p, "a forward target without a focus clone");
+    } else if (cd.Width != p.fw || cd.Height != p.fh || cd.Format != cp.desc.Format || cd.SampleDesc.Count != 1 ||
+               cp.desc.SampleDesc.Count != 1) {
+        PassFailed(p, "a forward target's focus clone of another size or format");
+    } else if (!cp.depth) {
+        Internal in;
+        const D3D11_BOX box{0, 0, 0, p.fw, p.fh, 1};
+        c->CopySubresourceRegion(cp.arr.Get(), D3D11CalcSubresource(0, 1, cp.desc.MipLevels), 0, 0, 0, clone, 0, &box);
+        ++p.copyIns;
+    } else if (DepthIn(c, cp, clone)) {
+        ++p.copyIns;
+    } else {
+        PassFailed(p, "focus's depth could not go into slice 1");
+    }
+    if (views != 1) SetViews(c, views);
+}
+
+// The view of a screen texture on its focus clone, with the game view's description (null: no clone).
+ID3D11ShaderResourceView* CloneSrv(ID3D11ShaderResourceView* v) {
+    for (const SrvClone& e : g_srvClones)
+        if (e.game.Get() == v) return e.clone.Get();
+    SrvClone e;
+    e.game = v;
+    ComPtr<ID3D11Resource> r;
+    v->GetResource(&r);
+    if (ID3D11Texture2D* clone = FocusClone(r.Get())) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC d{};
+        v->GetDesc(&d);
+        if (FAILED(g_g.dev->CreateShaderResourceView(clone, &d, &e.clone))) e.clone.Reset();
+    }
+    if (g_srvClones.size() < 64) g_srvClones.push_back(e);
+    return e.clone.Get();
+}
+
+// Before each draw of the forward pass: two views when the VS and the PS are right for view 1 (VS patched; PS
+// patched or not needing it), else one; a patched PS gets the rows in slot 3 and focus's copies of its screen textures.
+void ForwardDraw(ID3D11DeviceContext* c) {
+    Pass& p = g_p;
+    if (p.paused) {
+        ++p.pausedDraws;
+        ++p.draws;
+        ++p.plainDraws;
+        if (p.views != 1 && SetViews(c, 1)) p.views = 1;
+        return;
+    }
+    ID3D11PixelShader* ps = nullptr;
+    c->PSGetShader(&ps, nullptr, nullptr);
+    const mvrps::Info info = mvrps::InfoOf(ps);
+    if (ps) ps->Release();
+    const bool psOk = info.kind == mvrps::Kind::Patched || info.kind == mvrps::Kind::NotNeeded;
+    if (info.kind == mvrps::Kind::Patched && p.vsPatched) {
+        ++p.psPatchedDraws;
+        ID3D11Buffer* cur = nullptr;
+        c->PSGetConstantBuffers(mvrps::kCbSlot, 1, &cur);
+        ID3D11Buffer* mine = g_g.psRowsCb.Get();
+        if (cur != mine) {
+            Internal in;
+            c->PSSetConstantBuffers(mvrps::kCbSlot, 1, &mine);
+            ++p.psCbRebinds;
+        }
+        if (cur) cur->Release();
+        ID3D11ShaderResourceView* tex[mvrps::kTextures] = {};
+        for (unsigned k = 0; k < mvrps::kTextures; ++k) {
+            if (info.slot[k] == mvrps::kNoSlot) continue;
+            ID3D11ShaderResourceView* g = nullptr;
+            c->PSGetShaderResources(info.slot[k], 1, &g);
+            if (!g) continue;
+            tex[k] = CloneSrv(g);
+            if (!tex[k]) ++p.srvMisses;
+            g->Release();
+        }
+        Internal in;
+        clones::RawScope raw;
+        c->PSSetShaderResources(mvrps::kTexBase, mvrps::kTextures, tex);
+    }
+    if (!p.vsPatched)
+        ++p.vsPlainDraws;
+    else if (!psOk)
+        ++(info.kind == mvrps::Kind::Original ? p.psOriginalDraws : p.psUnknownDraws);
+    const NvU32 want = p.vsPatched && psOk ? 2 : 1;
+    if (want != p.views && SetViews(c, want)) p.views = want;
+    ++p.draws;
+    if (p.views != 2) ++p.plainDraws;
+}
+
+// A constant buffer range the next draw reads (VS `slot` from its binding offset), read back at once (shot frame only:
+// the read-back waits for the GPU). False: nothing bound. `how` says how it was read.
+bool ReadVsCb(ID3D11DeviceContext* c, UINT slot, UINT bytes, float* out, UINT& off, UINT& size, const char*& how) {
+    ID3D11Buffer* b = nullptr;
+    UINT first = 0, num = 0;
+    if (g_g.c1)
+        g_g.c1->VSGetConstantBuffers1(slot, 1, &b, &first, &num);
+    else
+        c->VSGetConstantBuffers(slot, 1, &b);
+    if (!b) return false;
+    ComPtr<ID3D11Buffer> buf;
+    buf.Attach(b);
+    D3D11_BUFFER_DESC bd{};
+    b->GetDesc(&bd);
+    off = first * 16;
+    size = bd.ByteWidth;
+    memset(out, 0, bytes);
+    bool got = false;
+    auto readBack = [&](UINT stSize, bool part) {
+        D3D11_BUFFER_DESC sd{};
+        sd.ByteWidth = stSize;
+        sd.Usage = D3D11_USAGE_STAGING;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ComPtr<ID3D11Buffer> st;
+        if (FAILED(g_g.dev->CreateBuffer(&sd, nullptr, &st))) return;
+        {
+            Internal in;
+            if (part) {
+                const D3D11_BOX box{off, 0, 0, off + bytes, 1, 1};
+                c->CopySubresourceRegion(st.Get(), 0, 0, 0, 0, b, 0, &box);
+            } else {
+                c->CopyResource(st.Get(), b);
+            }
+        }
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (FAILED(c->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m))) return;
+        memcpy(out, (const uint8_t*)m.pData + (part ? 0 : off), bytes);
+        c->Unmap(st.Get(), 0);
+        for (UINT i = 0; i < bytes / 4; ++i) got |= out[i] != 0;
+    };
+    if (off + bytes <= bd.ByteWidth) {
+        readBack((bytes + 255) & ~255u, true);
+        how = got ? "part" : "part (all zero)";
+        if (!got && bd.ByteWidth <= (256u << 20)) {
+            readBack(bd.ByteWidth, false);
+            how = got ? "whole buffer" : "whole buffer (all zero)";
+        }
+    } else {
+        how = "out of range";
+    }
+    return true;
+}
+
+// Row-major 4 x 4 inverse (Gauss-Jordan with pivoting); false when singular.
+bool Inverse4(const double m[16], double inv[16]) {
+    double a[4][8];
+    for (int r = 0; r < 4; ++r)
+        for (int col = 0; col < 8; ++col) a[r][col] = col < 4 ? m[r * 4 + col] : (col - 4 == r ? 1.0 : 0.0);
+    for (int col = 0; col < 4; ++col) {
+        int piv = col;
+        for (int r = col + 1; r < 4; ++r)
+            if (std::fabs(a[r][col]) > std::fabs(a[piv][col])) piv = r;
+        if (std::fabs(a[piv][col]) < 1e-12) return false;
+        if (piv != col)
+            for (int k = 0; k < 8; ++k) std::swap(a[piv][k], a[col][k]);
+        const double d = a[col][col];
+        for (int k = 0; k < 8; ++k) a[col][k] /= d;
+        for (int r = 0; r < 4; ++r) {
+            if (r == col) continue;
+            const double f = a[r][col];
+            for (int k = 0; k < 8; ++k) a[r][k] -= f * a[col][k];
+        }
+    }
+    for (int r = 0; r < 4; ++r)
+        for (int col = 0; col < 4; ++col) inv[r * 4 + col] = a[r][col + 4];
+    return true;
+}
+
+std::string Mat(const float* m) {
+    char b[200];
+    snprintf(b, sizeof(b), "[%.6f %.6f %.6f %.6f] [%.6f %.6f %.6f %.6f] [%.6f %.6f %.6f %.6f] [%.6f %.6f %.6f %.6f]", m[0],
+             m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11], m[12], m[13], m[14], m[15]);
+    return b;
+}
+
+// COMMON_BUFFER1 (VS slot 13, per draw; capture B2): worldViewProj at byte 0, worldView at 144.
+constexpr UINT kObjSlot = 13, kObjBytes = 464, kObjWvp = 0, kObjWv = 144;
+constexpr UINT kCamView = 0, kCamPos = 736;
+
+// The camera constants the next draw reads (VS slot 12) and its object constants (slot 13: the projection the vertices
+// really get, worldView^-1 * worldViewProj in the row-vector convention), logged once per probed task.
+void ProbeCamera(ID3D11DeviceContext* c) {
+    float v[kCamBytes / 4];
+    UINT off = 0, size = 0;
+    const char* how = "none";
+    if (!ReadVsCb(c, kCamSlot, kCamBytes, v, off, size, how)) return;  // the next draw then
+    g_probe.done = true;
+    const float* pm = v + kCamProj / 4;
+    const float* ssd = v + kCamSsd / 4;
+    const float* vpd = v + kCamVpd / 4;
+    const float* cj = v + kCamJitter / 4;
+    float fj[2] = {};
+    const bool known = FrameJitter(fj);
+    const Pass& p = g_p;
+    Log("MVR jitter probe (frame %llu): %s %s, VS slot 12 at byte %u of %u (%s): projMatrix %s; cameraJitter (%.6f, %.6f, "
+        "%.6f, %.6f); screenSpaceDimensions (%.6f, %.6f, %.8f, %.8f); viewportPixelDimensions (%.1f, %.1f, %.1f, %.1f); "
+        "the engine's offset now %s (%.4f, %.4f); MVR pass %s (M jitter %s (%.4f, %.4f), rows x [%.6f %.6f], y "
+        "[%.6f %.6f])",
+        (unsigned long long)g_frame, kGroupName[g_probe.group], g_probe.name, off, size, how, Mat(pm).c_str(), cj[0],
+        cj[1], cj[2], cj[3], ssd[0], ssd[1], ssd[2], ssd[3], vpd[0], vpd[1], vpd[2], vpd[3], known ? "known" : "UNKNOWN",
+        fj[0], fj[1], t_pass ? (p.forward ? "forward" : "G-buffer") : "none", p.jitterKnown ? "moved" : "not moved",
+        p.jit[0], p.jit[1], p.rows[0][0], p.rows[0][3], p.rows[1][1], p.rows[1][3]);
+    const float* view = v + kCamView / 4;
+    const float* pos = v + kCamPos / 4;
+    float o[kObjBytes / 4];
+    UINT ooff = 0, osize = 0;
+    const char* ohow = "none";
+    if (!ReadVsCb(c, kObjSlot, kObjBytes, o, ooff, osize, ohow)) {
+        Log("MVR jitter probe (frame %llu): %s %s: view %s, worldCameraPos (%.6f, %.6f, %.6f); no VS slot 13",
+            (unsigned long long)g_frame, kGroupName[g_probe.group], g_probe.name, Mat(view).c_str(), pos[0], pos[1],
+            pos[2]);
+        return;
+    }
+    const float* wvp = o + kObjWvp / 4;
+    const float* wv = o + kObjWv / 4;
+    double dwv[16], inv[16];
+    for (int i = 0; i < 16; ++i) dwv[i] = wv[i];
+    float peff[16] = {};
+    const bool inverted = Inverse4(dwv, inv);
+    if (inverted)
+        for (int r = 0; r < 4; ++r)
+            for (int col = 0; col < 4; ++col) {
+                double sum = 0;
+                for (int k = 0; k < 4; ++k) sum += inv[r * 4 + k] * wvp[k * 4 + col];
+                peff[r * 4 + col] = (float)sum;
+            }
+    Log("MVR jitter probe (frame %llu): %s %s: view %s; worldCameraPos (%.6f, %.6f, %.6f); first draw's VS slot 13 at byte "
+        "%u of %u (%s): worldViewProj %s; worldView %s; their projection worldView^-1 * worldViewProj %s%s",
+        (unsigned long long)g_frame, kGroupName[g_probe.group], g_probe.name, Mat(view).c_str(), pos[0], pos[1], pos[2],
+        ooff, osize, ohow, Mat(wvp).c_str(), Mat(wv).c_str(), Mat(peff).c_str(), inverted ? "" : " (worldView SINGULAR)");
 }
 
 // Slot 3 back to the game's binding.
@@ -857,6 +1248,66 @@ void Extract(ID3D11DeviceContext* c) {
     if (!s.n) PassFailed(p, "no outer-size target");
 }
 
+// The forward pass's corners of slice 1 for the comparison (not into focus's clones): colors by copy, the depth as MVR
+// drew it.
+void ExtractForward(ID3D11DeviceContext* c) {
+    Pass& p = g_p;
+    g_fwdN = 0;
+    for (Copy& cp : g_copies) {
+        if (!cp.used || !cp.filled || cp.desc.Width != p.w || cp.desc.Height != p.h) continue;
+        if (g_fwdN >= kMaxTargets) return PassFailed(p, "more than 4 outer-size forward targets");
+        D3D11_TEXTURE2D_DESC cd = cp.desc;
+        cd.Width = p.fw;
+        cd.Height = p.fh;
+        cd.MipLevels = 1;
+        cd.ArraySize = 1;
+        cd.MiscFlags = 0;
+        cd.BindFlags = cp.depth ? D3D11_BIND_DEPTH_STENCIL : D3D11_BIND_SHADER_RESOURCE;
+        StashG& g = g_fwd[g_fwdN];
+        if (!g.tex || !SameLayout(g.desc, cd)) {
+            g = StashG{};
+            if (FAILED(g_g.dev->CreateTexture2D(&cd, nullptr, &g.tex))) return PassFailed(p, "forward stash texture");
+            g.desc = cd;
+            g.depth = cp.depth;
+            if (g.depth) {
+                DXGI_FORMAT dsvF, srvF;
+                DepthFormats(cd.Format, dsvF, srvF);
+                D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+                dv.Format = dsvF;
+                dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+                if (dsvF == DXGI_FORMAT_UNKNOWN || FAILED(g_g.dev->CreateDepthStencilView(g.tex.Get(), &dv, &g.dsv))) {
+                    g = StashG{};
+                    return PassFailed(p, "forward stash depth view");
+                }
+            }
+        }
+        g.orig = cp.orig;
+        if (g.depth) {
+            if (!cp.depthSrv) return PassFailed(p, "the forward depth format has no shader view");
+            DepthPass(c, cp.depthSrv.Get(), g.dsv.Get(), p.fw, p.fh, 0, 0.0f, false);
+        } else {
+            const D3D11_BOX box{0, 0, 0, p.fw, p.fh, 1};
+            Internal in;
+            c->CopySubresourceRegion(g.tex.Get(), 0, 0, 0, 0, cp.arr.Get(),
+                                     D3D11CalcSubresource(0, 1, cp.desc.MipLevels), &box);
+        }
+        ++g_fwdN;
+    }
+    if (!g_fwdN) PassFailed(p, "no outer-size forward target");
+}
+
+void ExtractForward(ID3D11DeviceContext* c);
+
+// The forward pass's PS slot 3 back to the game's binding, t21..t25 empty.
+void RestorePsSlots(ID3D11DeviceContext* c) {
+    Pass& p = g_p;
+    Internal in;
+    clones::RawScope raw;
+    c->PSSetConstantBuffers(mvrps::kCbSlot, 1, &p.psSlot3);
+    ID3D11ShaderResourceView* none[mvrps::kTextures] = {};
+    c->PSSetShaderResources(mvrps::kTexBase, mvrps::kTextures, none);
+}
+
 // End of the MVR part: MVR off, slot 3 back, the game's views bound again (rebind; at a tail bind the game binds its
 // own next), slice 0 into the game's targets, slice 1's corners into the stash. The rest of the task runs plain.
 void EndMvr(ID3D11DeviceContext* c, bool rebind) {
@@ -865,6 +1316,7 @@ void EndMvr(ID3D11DeviceContext* c, bool rebind) {
     if (p.views != 1) SetViews(c, 1);
     p.views = 1;
     RestoreSlot3(c);
+    if (p.forward) RestorePsSlots(c);
     if (rebind) {
         ID3D11RenderTargetView* rt[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
         ID3D11DepthStencilView* ds = nullptr;
@@ -895,7 +1347,12 @@ void EndMvr(ID3D11DeviceContext* c, bool rebind) {
     if (p.mapFailures) PassFailed(p, "a target could not be mapped to a copy");
     if (p.viewsFailures) PassFailed(p, "SetMultiViewMode failed");
     if (p.cbGame) PassFailed(p, "the game bound VS slot 3");
-    if (!p.failed) Extract(c);
+    if (!p.failed) {
+        if (p.forward)
+            ExtractForward(c);
+        else
+            Extract(c);
+    }
 }
 
 // A bind in the tail: its targets are the masks (an outer-size one again is drawn without view 1: no stash).
@@ -964,7 +1421,7 @@ ComPtr<ID3D11Resource> MainOf(UINT n, ID3D11RenderTargetView* const* rtv, ID3D11
 
 // The MVR part of outer's pass starts on `main` (the depth of the first targets): null, or why the pass runs plain.
 // The caller binds the targets after it, through the detour.
-const char* StartMvr(ID3D11DeviceContext* c, ID3D11Resource* main, int e, uint8_t* task, double t0) {
+const char* StartMvr(ID3D11DeviceContext* c, ID3D11Resource* main, int e, uint8_t* task, double t0, bool forward) {
     Pass& p = g_p;
     const Win& win = g_win[e];
     bool ok = false;
@@ -989,7 +1446,8 @@ const char* StartMvr(ID3D11DeviceContext* c, ID3D11Resource* main, int e, uint8_
     p.fw = cd.Width;
     p.fh = cd.Height;
     p.t0 = t0;
-    for (Copy& cp : g_copies) cp.used = false;
+    p.forward = forward;
+    for (Copy& cp : g_copies) cp.used = cp.filled = false;
     {
         Internal in;
         if (g_g.c1)
@@ -998,30 +1456,46 @@ const char* StartMvr(ID3D11DeviceContext* c, ID3D11Resource* main, int e, uint8_
             c->VSGetConstantBuffers(mvrvs::kCbSlot, 1, &p.slot3);
         ID3D11Buffer* cb = g_g.rowsCb.Get();
         c->VSSetConstantBuffers(mvrvs::kCbSlot, 1, &cb);
+        if (forward) {
+            c->PSGetConstantBuffers(mvrps::kCbSlot, 1, &p.psSlot3);
+            ID3D11Buffer* pcb = g_g.psRowsCb.Get();
+            c->PSSetConstantBuffers(mvrps::kCbSlot, 1, &pcb);
+            g_srvClones.clear();
+        }
     }
     ID3D11VertexShader* vs = nullptr;
     c->VSGetShader(&vs, nullptr, nullptr);
     const bool patched = mvrvs::IsPatched(vs);
     if (vs) vs->Release();
+    p.vsPatched = patched;
     FillM(c);
-    if (patched && SetViews(c, 2)) p.views = 2;
+    // The forward pass picks the views at each draw (its PS counts too).
+    if (!forward && patched && SetViews(c, 2)) p.views = 2;
     t_pass = true;
     return nullptr;
 }
 
-void PassBegin(uint8_t* task, int e) {
+// A pass that runs plain: the G-buffer's focus group runs its own pass, the forward test has no comparison.
+void PassRefused(bool forward, int e, const char* why) {
+    if (forward)
+        FwdRefused(why);
+    else
+        Own(e, why);
+}
+
+// Outer's G-buffer pass (or, forward = true, outer L's forward pass of the forward test, B9c) begins.
+void PassBegin(uint8_t* task, int e, bool forward) {
     Pass& p = g_p;
-    Stash& s = g_stash[e];
-    s.valid = false;
+    if (!forward) g_stash[e].valid = false;
     if (p.part != PartNone) {  // a pass whose task did not end (should not happen)
         ReleasePassRefs(p);
         p = Pass{};
     }
     if (!g_enabled) return;
     const Win& win = g_win[e];
-    if (!win.valid || win.frame != g_frame) return Own(e, "no focus window in outer's pass");
+    if (!win.valid || win.frame != g_frame) return PassRefused(forward, e, "no focus window in outer's pass");
     ID3D11DeviceContext* c = Imm();
-    if (!c || !EnsureGpu(c)) return Own(e, "no D3D11 objects");
+    if (!c || !EnsureGpu(c)) return PassRefused(forward, e, "no D3D11 objects");
     ID3D11RenderTargetView* rt[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
     ID3D11DepthStencilView* ds = nullptr;
     c->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rt, &ds);
@@ -1038,11 +1512,12 @@ void PassBegin(uint8_t* task, int e) {
         p.eye = e;
         p.task = task;
         p.t0 = NowMs();
+        p.forward = forward;
         return;
     }
-    if (const char* why = StartMvr(c, main.Get(), e, task, NowMs())) {
+    if (const char* why = StartMvr(c, main.Get(), e, task, NowMs(), forward)) {
         release();
-        return Own(e, why);
+        return PassRefused(forward, e, why);
     }
     // The targets the previous tasks left: bound again through the detour, so the pass starts on copies.
     c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rt, ds);
@@ -1062,9 +1537,10 @@ bool StartAtFirst(ID3D11DeviceContext* c, ID3D11Resource* main) {
         return false;
     }
     const unsigned waited = p.waitBinds;
-    if (const char* why = StartMvr(c, main, e, p.task, p.t0)) {
+    const bool forward = p.forward;
+    if (const char* why = StartMvr(c, main, e, p.task, p.t0, forward)) {
         p = Pass{};
-        Own(e, why);
+        PassRefused(forward, e, why);
         return false;
     }
     g_p.lateStarts = 1;
@@ -1073,12 +1549,14 @@ bool StartAtFirst(ID3D11DeviceContext* c, ID3D11Resource* main) {
 }
 
 void ShotOuter(ID3D11DeviceContext* c);
+void ForwardEnd(ID3D11DeviceContext* c);
 void ShotFocusBefore(ID3D11DeviceContext* c);
 void ShotFocusAfter(ID3D11DeviceContext* c);
 void ReportShot();
 
 void PassEnd(ID3D11DeviceContext* c) {
     Pass& p = g_p;
+    if (p.forward) return ForwardEnd(c);
     if (p.part == PartWait) {  // the task bound nothing
         const int e = p.eye;
         p = Pass{};
@@ -1186,6 +1664,29 @@ void PassEnd(ID3D11DeviceContext* c) {
         g_shot.pass.masks.clear();
         ShotOuter(c);
     }
+    ReleasePassRefs(p);
+    p = Pass{};
+}
+
+// End of outer L's forward pass (B9c): the corners are kept for the comparison after focus L's own forward pass.
+void ForwardEnd(ID3D11DeviceContext* c) {
+    Pass& p = g_p;
+    FwdShot& sh = g_fshot;
+    if (p.part == PartWait) {
+        p = Pass{};
+        return FwdRefused("outer L's forward pass bound no target at the game's size");
+    }
+    if (p.part == PartMvr) EndMvr(c, true);
+    if (p.lateDraws) PassFailed(p, "draws into an outer-size target after the MVR part");
+    sh.outerDone = true;
+    sh.ms = NowMs() - p.t0;
+    sh.pass = p;
+    sh.pass.slot3 = nullptr;
+    sh.pass.psSlot3 = nullptr;
+    sh.pass.masks.clear();
+    sh.n = p.failed ? 0 : g_fwdN;
+    if (sh.base >= 0)
+        for (int k = 0; k < sh.n; ++k) shots::Grab(c, g_fwd[k].tex.Get(), sh.base + 2 * k + 1);
     ReleasePassRefs(p);
     p = Pass{};
 }
@@ -1388,7 +1889,9 @@ void CompareRgba16(ID3D11DeviceContext* c, int k, ID3D11Texture2D* own, ID3D11Te
 }
 
 // A shot's depth target, bit for bit: focus's own vs ours (float steps; ours farther = larger, the far plane 1).
-void CompareDepth(ID3D11DeviceContext* c, int k, ID3D11Texture2D* own, ID3D11Texture2D* ours) {
+// `what`: the line's start ("MVR G-buffer shot: target 3"), `fix`: how ours was made, `pass`: its jitter.
+void CompareDepth(ID3D11DeviceContext* c, const char* what, const char* fix, ID3D11Texture2D* own, ID3D11Texture2D* ours,
+                  const Pass& pass) {
     const ComPtr<ID3D11Texture2D> a = StagingOf(c, own), b = StagingOf(c, ours);
     if (!a || !b) return;
     D3D11_TEXTURE2D_DESC d{};
@@ -1456,18 +1959,147 @@ void CompareDepth(ID3D11DeviceContext* c, int k, ID3D11Texture2D* own, ID3D11Tex
     c->Unmap(a.Get(), 0);
     c->Unmap(b.Get(), 0);
     const double px = (double)d.Width * d.Height / 100.0;
-    float slope = 0;
-    memcpy(&slope, &g_g.depthCbData[1], sizeof(slope));
-    Log("MVR G-buffer shot: target %d (depth, bias %u steps + %.3f px of slope%s) focus L own vs from outer L, bit for bit: same %.3f%%, ours "
+    Log("%s (depth, %s) focus L own vs ours, bit for bit: same %.3f%%, ours "
         "farther %.3f%% (max %lld steps), nearer %.3f%% (max %lld); |steps| 1: %.3f%%, 2-4: %.3f%%, 5-16: %.3f%%, 17-64: "
         "%.3f%%, 65-1024: %.3f%%, more: %.3f%%; far plane in focus's own %.2f%%",
-        k, g_g.depthCbData[0], slope, g_g.depthCbData[4] ? ", 3 x 3 farthest" : "", same / px, farther / px, (long long)maxFar, nearer / px, (long long)maxNear, bucket[0] / px,
+        what, fix, same / px, farther / px, (long long)maxFar, nearer / px, (long long)maxNear, bucket[0] / px,
         bucket[1] / px, bucket[2] / px, bucket[3] / px, bucket[4] / px, bucket[5] / px, far1 / px);
-    Log("MVR G-buffer shot: depth target %d: ours - own fitted as own's slope times a shift over %llu smooth pixels: shift "
+    Log("%s: ours - own fitted as own's slope times a shift over %llu smooth pixels: shift "
         "(%.4f, %.4f) px (ours = own sampled there), rms %.3g, left after the shift %.3g; the pass's jitter offset "
         "(%.4f, %.4f), M %s",
-        k, (unsigned long long)fitN, shx, shy, rms, resid, g_shot.pass.jit[0], g_shot.pass.jit[1],
-        g_shot.pass.jitterKnown ? "moved to focus's own" : "with outer's jitter");
+        what, (unsigned long long)fitN, shx, shy, rms, resid, pass.jit[0], pass.jit[1],
+        pass.jitterKnown ? "moved to focus's own" : "with outer's jitter");
+}
+
+// A color texel as linear floats (R11G11B10_FLOAT, R16G16B16A16_FLOAT, R8G8B8A8); false: format not read.
+float HalfToFloat(uint16_t h) {
+    const uint32_t e = (h >> 10) & 0x1F, m = h & 0x3FF;
+    const float sign = (h & 0x8000) ? -1.0f : 1.0f;
+    if (e == 0) return sign * std::ldexp((float)m, -24);
+    if (e == 31) return m ? NAN : sign * INFINITY;
+    return sign * std::ldexp((float)(m | 0x400), (int)e - 25);
+}
+float SmallFloat(uint32_t v, int mbits) {  // unsigned 5-bit exponent, mbits mantissa (R11G11B10)
+    const uint32_t m = v & ((1u << mbits) - 1), e = v >> mbits;
+    if (e == 0) return std::ldexp((float)m, -14 - mbits);
+    if (e == 31) return m ? NAN : INFINITY;
+    return std::ldexp((float)(m | (1u << mbits)), (int)e - 15 - mbits);
+}
+bool Texel(DXGI_FORMAT f, const uint8_t* row, UINT x, float out[3]) {
+    switch (f) {
+    case DXGI_FORMAT_R11G11B10_FLOAT: {
+        uint32_t v;
+        memcpy(&v, row + 4 * x, 4);
+        out[0] = SmallFloat(v & 0x7FF, 6);
+        out[1] = SmallFloat((v >> 11) & 0x7FF, 6);
+        out[2] = SmallFloat(v >> 22, 5);
+        return true;
+    }
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: {
+        uint16_t h[4];
+        memcpy(h, row + 8 * x, 8);
+        for (int i = 0; i < 3; ++i) out[i] = HalfToFloat(h[i]);
+        return true;
+    }
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        for (int i = 0; i < 3; ++i) out[i] = row[4 * x + i] / 255.0f;
+        return true;
+    default: return false;
+    }
+}
+
+// A shot's color target: focus's own vs ours, relative to the brighter of the two (plus 2% of own's mean luminance, so
+// dark pixels do not count small absolute steps), and where the differences lie (64 x 64 blocks).
+void CompareColor(ID3D11DeviceContext* c, const char* what, ID3D11Texture2D* own, ID3D11Texture2D* ours) {
+    const ComPtr<ID3D11Texture2D> a = StagingOf(c, own), b = StagingOf(c, ours);
+    if (!a || !b) return;
+    D3D11_TEXTURE2D_DESC d{};
+    a->GetDesc(&d);
+    float probe[3];
+    const uint8_t zero[16] = {};
+    if (!Texel(d.Format, zero, 0, probe)) {
+        Log("%s: format %d not compared (the PNG pair still is)", what, (int)d.Format);
+        return;
+    }
+    D3D11_MAPPED_SUBRESOURCE ma{}, mb{};
+    if (FAILED(c->Map(a.Get(), 0, D3D11_MAP_READ, 0, &ma))) return;
+    if (FAILED(c->Map(b.Get(), 0, D3D11_MAP_READ, 0, &mb))) {
+        c->Unmap(a.Get(), 0);
+        return;
+    }
+    auto luma = [](const float v[3]) { return 0.2126f * v[0] + 0.7152f * v[1] + 0.0722f * v[2]; };
+    double sumOwn = 0;
+    uint64_t finite = 0;
+    for (UINT y = 0; y < d.Height; ++y) {
+        const uint8_t* ra = (const uint8_t*)ma.pData + (size_t)y * ma.RowPitch;
+        for (UINT x = 0; x < d.Width; ++x) {
+            float va[3];
+            Texel(d.Format, ra, x, va);
+            const float l = luma(va);
+            if (std::isfinite(l)) {
+                sumOwn += l;
+                ++finite;
+            }
+        }
+    }
+    const double meanOwn = finite ? sumOwn / finite : 0;
+    const float floorV = (float)(0.02 * meanOwn) + 1e-6f;
+    constexpr UINT kBlock = 64;
+    const UINT bw = (d.Width + kBlock - 1) / kBlock, bh = (d.Height + kBlock - 1) / kBlock;
+    std::vector<uint32_t> blocks((size_t)bw * bh);
+    uint64_t same = 0, over[3] = {}, nanOwn = 0, nanOurs = 0;
+    double sumAbs = 0, sumSigned = 0;
+    for (UINT y = 0; y < d.Height; ++y) {
+        const uint8_t* ra = (const uint8_t*)ma.pData + (size_t)y * ma.RowPitch;
+        const uint8_t* rb = (const uint8_t*)mb.pData + (size_t)y * mb.RowPitch;
+        const size_t texel = d.Format == DXGI_FORMAT_R11G11B10_FLOAT || d.Format >= DXGI_FORMAT_R8G8B8A8_TYPELESS ? 4 : 8;
+        for (UINT x = 0; x < d.Width; ++x) {
+            if (!memcmp(ra + texel * x, rb + texel * x, texel)) {
+                ++same;
+                continue;
+            }
+            float va[3], vb[3];
+            Texel(d.Format, ra, x, va);
+            Texel(d.Format, rb, x, vb);
+            const float la = luma(va), lb = luma(vb);
+            if (!std::isfinite(la)) ++nanOwn;
+            if (!std::isfinite(lb)) ++nanOurs;
+            if (!std::isfinite(la) || !std::isfinite(lb)) continue;
+            float rel = 0;
+            for (int i = 0; i < 3; ++i)
+                rel = std::max(rel, std::fabs(va[i] - vb[i]) / (std::max(std::fabs(va[i]), std::fabs(vb[i])) + floorV));
+            if (rel > 0.01f) ++over[0];
+            if (rel > 0.05f) {
+                ++over[1];
+                ++blocks[(size_t)(y / kBlock) * bw + x / kBlock];
+            }
+            if (rel > 0.25f) ++over[2];
+            sumAbs += std::fabs(lb - la);
+            sumSigned += lb - la;
+        }
+    }
+    c->Unmap(a.Get(), 0);
+    c->Unmap(b.Get(), 0);
+    std::vector<size_t> idx(blocks.size());
+    for (size_t i = 0; i < idx.size(); ++i) idx[i] = i;
+    std::sort(idx.begin(), idx.end(), [&](size_t x, size_t y) { return blocks[x] > blocks[y]; });
+    std::string worst;
+    for (size_t i = 0; i < idx.size() && i < 6 && blocks[idx[i]]; ++i) {
+        char t[64];
+        snprintf(t, sizeof(t), "%s(%u, %u) %.1f%%", worst.empty() ? "" : ", ", (unsigned)(idx[i] % bw) * kBlock,
+                 (unsigned)(idx[i] / bw) * kBlock, blocks[idx[i]] * 100.0 / (kBlock * kBlock));
+        worst += t;
+    }
+    const double px = (double)d.Width * d.Height / 100.0, n = (double)d.Width * d.Height;
+    Log("%s (%ux%u fmt %d) focus L own vs ours: bit for bit same %.3f%%; relative difference > 1%% %.3f%%, > 5%% %.3f%%, "
+        "> 25%% %.3f%%; luminance: own's mean %.4g, mean |ours - own| %.4g (%.2f%% of the mean), mean ours - own %.4g; "
+        "NaN or infinity own %llu, ours %llu; 64 x 64 blocks with the most pixels > 5%% (x, y of the corner): %s",
+        what, d.Width, d.Height, (int)d.Format, same / px, over[0] / px, over[1] / px, over[2] / px, meanOwn, sumAbs / n,
+        meanOwn > 0 ? 100.0 * sumAbs / n / meanOwn : 0.0, sumSigned / n, (unsigned long long)nanOwn,
+        (unsigned long long)nanOurs, worst.empty() ? "none" : worst.c_str());
 }
 
 // After focus L's own pass: its targets.
@@ -1480,8 +2112,15 @@ void ShotFocusAfter(ID3D11DeviceContext* c) {
         const DXGI_FORMAT f = s.g[k].desc.Format;
         if (t && s.g[k].tex && f >= DXGI_FORMAT_R16G16B16A16_TYPELESS && f <= DXGI_FORMAT_R16G16B16A16_SINT)
             CompareRgba16(c, k, t, s.g[k].tex.Get());
-        if (t && s.g[k].tex && s.g[k].depth && (f == DXGI_FORMAT_R32_TYPELESS || f == DXGI_FORMAT_D32_FLOAT))
-            CompareDepth(c, k, t, s.g[k].tex.Get());
+        if (t && s.g[k].tex && s.g[k].depth && (f == DXGI_FORMAT_R32_TYPELESS || f == DXGI_FORMAT_D32_FLOAT)) {
+            char what[48], fix[96];
+            snprintf(what, sizeof(what), "MVR G-buffer shot: target %d", k);
+            float slope = 0;
+            memcpy(&slope, &g_g.depthCbData[1], sizeof(slope));
+            snprintf(fix, sizeof(fix), "bias %u steps + %.3f px of slope%s", g_g.depthCbData[0], slope,
+                     g_g.depthCbData[4] ? ", 3 x 3 farthest" : "");
+            CompareDepth(c, what, fix, t, s.g[k].tex.Get(), g_shot.pass);
+        }
         const D3D11_TEXTURE2D_DESC& d = s.g[k].desc;
         snprintf(g_shotLabels[k], sizeof(g_shotLabels[k]), "MVR G-buffer %d (%ux%u fmt %d%s): focus L vs from outer L", k,
                  d.Width, d.Height, (int)d.Format, s.g[k].depth ? ", depth" : "");
@@ -1530,6 +2169,65 @@ void ReportShot() {
         "[%.6f 0 0 %.6f] [0 %.6f 0 %.6f]; focus L ran its own pass for the comparison: %s",
         p.fw, p.fh, p.w, p.h, jit, p.jit[0], p.jit[1], p.rows[0][0], p.rows[0][3], p.rows[1][1], p.rows[1][3],
         sh.focusDone ? "yes" : "NO");
+}
+
+// After focus L's own CPhase3Render in a forward test shot frame: its targets vs the corners of outer L's view 1.
+void ReportForward();
+void ShotForwardFocus(ID3D11DeviceContext* c) {
+    FwdShot& sh = g_fshot;
+    sh.focusDone = true;
+    for (int k = 0; k < sh.n; ++k) {
+        const StashG& g = g_fwd[k];
+        ID3D11Texture2D* t = FocusClone(g.orig);
+        const D3D11_TEXTURE2D_DESC& d = g.desc;
+        snprintf(g_fwdLabels[k], sizeof(g_fwdLabels[k]), "MVR forward %d (%ux%u fmt %d%s): focus L vs view 1 of outer L", k,
+                 d.Width, d.Height, (int)d.Format, g.depth ? ", depth" : "");
+        if (!t) {
+            Log("MVR forward test shot: target %d lost its focus clone", k);
+            continue;
+        }
+        char what[48];
+        snprintf(what, sizeof(what), "MVR forward test shot: target %d", k);
+        const DXGI_FORMAT f = d.Format;
+        if (g.depth && (f == DXGI_FORMAT_R32_TYPELESS || f == DXGI_FORMAT_D32_FLOAT))
+            CompareDepth(c, what, "as MVR drew it", t, g.tex.Get(), sh.pass);
+        else if (!g.depth)
+            CompareColor(c, what, t, g.tex.Get());
+        if (sh.base >= 0) shots::Grab(c, t, sh.base + 2 * k);
+    }
+    ReportForward();
+}
+
+void ReportForward() {
+    FwdShot& sh = g_fshot;
+    if (!sh.armed || sh.reported) return;
+    sh.reported = true;
+    if (!sh.outerDone) {
+        Log("MVR forward test shot (frame %llu): no comparison: %s", (unsigned long long)sh.frame,
+            sh.why.empty() ? "outer L's CPhase3Render did not run in the shot frame" : sh.why.c_str());
+        return;
+    }
+    const Pass& p = sh.pass;
+    const std::string state = p.failed ? "FAILED: " + p.why : "ok";
+    Log("MVR forward test shot (frame %llu): outer L's CPhase3Render with MVR %s, %.3f ms; %d outer-size target(s) "
+        "stashed; binds %u (tail %u, draws there into outer-size targets %u), clears %u, copy-ins %u, map failures %u; "
+        "draws %u, with one view %u (VS unpatched %u, PS refused %u, PS not made through the patch %u); patched PS "
+        "draws %u (PS slot 3 rebinds %u, screen textures without a focus clone %u); VS sets patched %u, unpatched %u; "
+        "VS slot 3 rebinds %u (game buffers %u); copied back %u; SetMultiViewMode failures %u; focus L's own forward pass "
+        "for the comparison: %s; paused at binds of other sizes %u times (draws there %u, clears %u)",
+        (unsigned long long)sh.frame, state.c_str(), sh.ms, sh.n, p.binds, p.tailBinds, p.lateDraws, p.clears,
+        p.copyIns, p.mapFailures, p.draws, p.plainDraws, p.vsPlainDraws, p.psOriginalDraws, p.psUnknownDraws,
+        p.psPatchedDraws, p.psCbRebinds, p.srvMisses, p.patchedSets, p.plainSets, p.cbRebinds, p.cbGame, p.copiedBack,
+        p.viewsFailures, sh.focusDone ? "yes" : "NO", p.pauses, p.pausedDraws, p.pausedClears);
+    float r[4][4];
+    PsRows(p, r);
+    const char* jit = p.jitterKnown ? "moved to focus's own" : Cfg().mvrJitterFix ? "UNKNOWN (outer's kept)"
+                                                                                  : "outer's (mvr_jitter_fix=0)";
+    Log("MVR forward test shot: view 1 = focus L in the corner %u x %u of %u x %u; jitter %s (offset %.4f, %.4f); M rows "
+        "[%.6f 0 0 %.6f] [0 %.6f 0 %.6f]; PS rows: screen inputs S (%.6f, %.6f) O (%.6f, %.6f) with the game's screen "
+        "UV scale taken as 1, UV scale (%.6f, %.6f)",
+        p.fw, p.fh, p.w, p.h, jit, p.jit[0], p.jit[1], p.rows[0][0], p.rows[0][3], p.rows[1][1], p.rows[1][3], r[0][0],
+        r[0][1], r[0][2], r[0][3], r[1][0], r[1][1]);
 }
 
 // ---------------------------------------------------------------- task map (shot frame)
@@ -1640,6 +2338,16 @@ void OnVs(ID3D11DeviceContext* c, ID3D11VertexShader* vs) {
     Protect("VSSetShader", [&] {
         Pass& p = g_p;
         if (!vs) return;
+        if (p.forward) {  // views per draw (ForwardDraw)
+            p.vsPatched = mvrvs::IsPatched(vs);
+            if (p.vsPatched) {
+                ++p.patchedSets;
+                FillM(c);
+            } else {
+                ++p.plainSets;
+            }
+            return;
+        }
         const bool shot = g_shot.armed && p.eye == 0;
         char sum[40] = "";
         const bool patched = mvrvs::IsPatched(vs, shot ? sum : nullptr);
@@ -1758,9 +2466,10 @@ bool Install() {
         Log("MVR G-buffer: on; outer L's and outer R's G-buffer pass draw the eye's focus too (MVR, view 1 in the "
             "corner of slice 1 of two-slice copies), the focus groups skip CPhase1BuildCommandThread and CPhase1Render "
             "and get it in their clones; jitter fix %s; hotkey 0x%X+0x%X; early SSAO and lights of focus L (mvr_early) "
-            "%s, hotkey 0x%X+0x%X",
+            "%s, hotkey 0x%X+0x%X; forward test in shots (mvr_forward_test) %s",
             Cfg().mvrJitterFix ? "on" : "off", Cfg().mvrKeyMod, Cfg().mvrKey,
-            !g_ssaoVt ? "unavailable" : EarlyName(g_early), Cfg().mvrKeyMod, Cfg().mvrEarlyKey);
+            !g_ssaoVt ? "unavailable" : EarlyName(g_early), Cfg().mvrKeyMod, Cfg().mvrEarlyKey,
+            !g_phase3Vt ? "unavailable" : Cfg().mvrForwardTest ? "on" : "off");
     });
     g_on = g_installed;
     return g_installed;
@@ -1820,6 +2529,12 @@ void OnFrameStart(bool enabled) {
             ReportShot();
             g_shot = Shot{};
         }
+        if (g_fshot.armed) {
+            ReportForward();
+            g_fshot = FwdShot{};
+        }
+        t_fwdFocusTask = nullptr;
+        g_probe = Probe{};
         const bool on = enabled && On();
         if (on != g_enabled)
             Log("MVR G-buffer: %s (frame %llu)", on ? "ON" : "OFF (the focus groups run their own pass)",
@@ -1838,6 +2553,36 @@ int PrepareShot(const char** names, int base, int max, shots::Pair* pairs, int m
     Protect("PrepareShot", [&] {
         if (!g_enabled) {
             Log("MVR G-buffer: no comparison in this shot (off by the hotkey)");
+            return;
+        }
+        if (Cfg().mvrForwardTest && g_early) {
+            const char* why = g_early != 1      ? "it needs mvr_early=1 (focus L's SSAO and lights in outer L's group)"
+                              : !mvrps::On()    ? "it needs [debug] mvr_ps_patch=1"
+                              : !g_phase3Vt     ? "the CPhase3Render vtable did not match"
+                              : max < 2 * kMaxTargets || maxPairs < kMaxTargets ? "no room for its images"
+                                                                               : nullptr;
+            if (why) {
+                Log("MVR forward test: no comparison in this shot (%s)", why);
+                return;
+            }
+            FwdShot& sh = g_fshot;
+            sh = FwdShot{};
+            sh.armed = true;
+            sh.base = base;
+            sh.frame = g_frame;
+            for (int k = 0; k < kMaxTargets; ++k) {
+                snprintf(g_fwdNames[2 * k], sizeof(g_fwdNames[0]), "mvr_f%d_focus", k);
+                snprintf(g_fwdNames[2 * k + 1], sizeof(g_fwdNames[0]), "mvr_f%d_ours", k);
+                names[base + 2 * k] = g_fwdNames[2 * k];
+                names[base + 2 * k + 1] = g_fwdNames[2 * k + 1];
+                snprintf(g_fwdLabels[k], sizeof(g_fwdLabels[k]), "MVR forward %d: focus L vs view 1 of outer L", k);
+                pairs[k] = {base + 2 * k, base + 2 * k + 1, g_fwdLabels[k]};
+            }
+            *pairCount = kMaxTargets;
+            n = 2 * kMaxTargets;
+            Log("MVR forward test: armed in frame %llu (outer L's CPhase3Render with MVR, focus L's own for the "
+                "comparison)",
+                (unsigned long long)g_frame);
             return;
         }
         if (!Cfg().mvrShotCompare) {
@@ -1877,6 +2622,7 @@ int PrepareShot(const char** names, int base, int max, shots::Pair* pairs, int m
 
 void CancelShot() {
     if (g_shot.armed) Protect("CancelShot", [&] { g_shot = Shot{}; });
+    if (g_fshot.armed) Protect("CancelShot", [&] { g_fshot = FwdShot{}; });
 }
 
 void SetWindow(int eye, bool valid, double sx, double ox, double sy, double oy, uint32_t width, uint32_t height) {
@@ -1999,6 +2745,7 @@ void EarlyEnd(int eye, double ms, bool ok) {
     ++g_tot.earlyRuns[eye];
     g_st.earlyMs[eye] += ms;
     g_tot.earlyMs[eye] += ms;
+    if (ok && g_focus[eye].early && g_focus[eye].earlyLights) g_earlyOk[eye] = g_frame;
     if (!ok) {
         ++g_st.earlyFaults;
         ++g_tot.earlyFaults;
@@ -2044,16 +2791,45 @@ void TaskMapEnd() {
         g_map.targets.empty() ? "none" : g_map.targets.c_str(), g_map.more ? ", more" : "", det.c_str());
 }
 
+// Forward test (B9c): outer L's CPhase3Render starts the MVR pass, focus L's is noted for the comparison after it.
+void ForwardTask(uint8_t* task, int group) {
+    FwdShot& sh = g_fshot;
+    if (group == kFocusL) {
+        if (sh.outerDone && !sh.focusDone) t_fwdFocusTask = task;
+        return;
+    }
+    if (group != kOuterL || sh.outerDone) return;
+    const char* why = !g_enabled                    ? "MVR G-buffer off (hotkey)"
+                      : g_mode != Mode::Skip        ? "a diagnosis mode of the G-buffer is on"
+                      : g_earlyOk[0] != g_frame     ? "focus L's SSAO and lights did not run early in this frame"
+                      : g_p.part != PartNone        ? "another MVR pass is running"
+                      : !mvrps::On()                ? "the PS patch is off"
+                                                    : nullptr;
+    if (why) return FwdRefused(why);
+    PassBegin(task, kOuterL, true);
+}
+
 bool BeforeTask(uint8_t* task, int group) {
     if (!On() || !task || group < kOuterL || group > kFocusR) return false;
     uintptr_t vt = 0;
     if (!hooks::TryRead(task, &vt, 8) || !vt) return false;
+    if (g_fshot.armed && (vt == g_phase1Vt || (g_phase3Vt && vt == g_phase3Vt))) {
+        g_probe = Probe{};
+        g_probe.on = true;
+        g_probe.group = group;
+        g_probe.task = task;
+        g_probe.name = vt == g_phase1Vt ? "CPhase1Render" : "CPhase3Render";
+    }
+    if (g_phase3Vt && vt == g_phase3Vt) {
+        if (g_fshot.armed) Protect("BeforeTask", [&] { ForwardTask(task, group); });
+        return false;
+    }
     const bool late = vt == g_ssaoVt || vt == g_phase2Vt;  // after the G-buffer pair: skipped only after an early run
     if (vt != g_phase1Vt && vt != g_buildVt && !late) return false;
     bool skip = false;
     Protect("BeforeTask", [&] {
         if (group <= kOuterR) {
-            if (vt == g_phase1Vt) PassBegin(task, group);
+            if (vt == g_phase1Vt) PassBegin(task, group, false);
             return;
         }
         const int eye = group - kFocusL;
@@ -2102,11 +2878,18 @@ bool BeforeTask(uint8_t* task, int group) {
             t_focusTask = task;
         }
     });
+    if (skip && g_probe.task == task) g_probe = Probe{};  // a skipped task draws nothing
     return skip;
 }
 
 void AfterTask(uint8_t* task) {
     if (!task) return;
+    if (g_probe.on && task == g_probe.task) {
+        if (!g_probe.done)
+            Log("MVR jitter probe (frame %llu): %s %s drew nothing with VS slot 12 bound", (unsigned long long)g_frame,
+                kGroupName[g_probe.group], g_probe.name);
+        g_probe = Probe{};
+    }
     if (task == t_fillTask) {
         const int eye = t_fillEye;
         t_fillTask = nullptr;
@@ -2121,6 +2904,11 @@ void AfterTask(uint8_t* task) {
     if (task == t_focusTask) {
         t_focusTask = nullptr;
         Protect("AfterTask", [&] { ShotFocusAfter(Imm()); });
+        return;
+    }
+    if (task == t_fwdFocusTask) {
+        t_fwdFocusTask = nullptr;
+        Protect("AfterTask", [&] { ShotForwardFocus(Imm()); });
         return;
     }
     if (g_p.part == PartNone || task != g_p.task) return;
@@ -2154,11 +2942,18 @@ bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* r
                 else
                     ++mixed;
             }
-        if (any && !outer) {  // the masks: the G-buffer is done
-            EndMvr(c, false);
+        if (any && !outer) {
+            if (p.forward) {  // a target of another size: MVR pauses, the game's views go as they are
+                if (!p.paused) ++p.pauses;
+                p.paused = true;
+                if (p.views != 1 && SetViews(c, 1)) p.views = 1;
+                return;
+            }
+            EndMvr(c, false);  // the masks: the G-buffer is done
             NoteTail(n, rtv, dsv);
             return;
         }
+        if (any) p.paused = false;
         p.mixed += mixed;
         for (UINT i = 0; i < n && i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
             rtvOut[i] = rtv && rtv[i] ? ArrayRtv(c, rtv[i]) : nullptr;
@@ -2168,6 +2963,10 @@ bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* r
         if (failed) {  // a view without its copy: no MVR for the rest (view 1 would land in slice 0)
             EndMvr(c, false);
             return;
+        }
+        if (p.forward) {
+            for (UINT i = 0; i < n && i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) FillCopy(c, rtvOut[i]);
+            FillCopy(c, *dsvOut);
         }
         ok = true;
     });
@@ -2190,10 +2989,17 @@ ID3D11RenderTargetView* MapClear(ID3D11DeviceContext* c, ID3D11RenderTargetView*
     if (g_map.on && !t_internal && c == Imm()) ++g_map.clears;
     StartAtClear(c, v);
     if (!InPass(c) || !v) return v;
+    if (g_p.forward && !OuterSize(v)) {
+        ++g_p.pausedClears;
+        return v;
+    }
     ID3D11RenderTargetView* out = v;
     Protect("ClearRenderTargetView", [&] {
         ++g_p.clears;
-        if (ID3D11RenderTargetView* m = ArrayRtv(c, v)) out = m;
+        if (ID3D11RenderTargetView* m = ArrayRtv(c, v)) {
+            out = m;
+            if (g_p.forward) FillCopy(c, m);
+        }
     });
     return out;
 }
@@ -2202,15 +3008,24 @@ ID3D11DepthStencilView* MapClear(ID3D11DeviceContext* c, ID3D11DepthStencilView*
     if (g_map.on && !t_internal && c == Imm()) ++g_map.clears;
     StartAtClear(c, v);
     if (!InPass(c) || !v) return v;
+    if (g_p.forward && !OuterSize(v)) {
+        ++g_p.pausedClears;
+        return v;
+    }
     ID3D11DepthStencilView* out = v;
     Protect("ClearDepthStencilView", [&] {
         ++g_p.clears;
-        if (ID3D11DepthStencilView* m = ArrayDsv(c, v)) out = m;
+        if (ID3D11DepthStencilView* m = ArrayDsv(c, v)) {
+            out = m;
+            if (g_p.forward) FillCopy(c, m);  // first: a clear may cover only the depth or only the stencil
+        }
     });
     return out;
 }
 
 bool BeforeDraw(ID3D11DeviceContext* c) {
+    if (g_probe.on && !g_probe.done && !t_internal && c == Imm() && g_g.dev)
+        Protect("ProbeCamera", [&] { ProbeCamera(c); });
     if (g_map.on && !t_internal && c == Imm()) {
         ++g_map.draws;
         if (g_map.detail) MapDetail(c);
@@ -2219,7 +3034,12 @@ bool BeforeDraw(ID3D11DeviceContext* c) {
         ++g_p.tailDraws;
         if (g_p.lateBound) ++g_p.lateDraws;
     }
-    if (!t_pass || t_internal || !g_shot.armed || c != Imm() || g_p.eye != 0) return false;
+    if (!t_pass || t_internal || c != Imm()) return false;
+    if (g_p.forward) {
+        Protect("Draw", [&] { ForwardDraw(c); });
+        return false;
+    }
+    if (!g_shot.armed || g_p.eye != 0) return false;
     ++g_p.draws;
     if (g_p.views != 2) ++g_p.plainDraws;
     return false;
@@ -2311,6 +3131,41 @@ void TestDepthBias(int steps, float slope, bool dilate) {
     g_testDilate = dilate;
 }
 ID3D11Texture2D* TestArray(int k) { return k >= 0 && k < (int)g_copies.size() ? g_copies[k].arr.Get() : nullptr; }
+
+void TestForward(const void* phase3Vtable) {
+    g_phase3Vt = (uintptr_t)phase3Vtable;
+    g_fshot = FwdShot{};
+    g_fshot.armed = true;
+    g_fshot.frame = g_frame;
+    g_earlyOk[0] = g_frame;
+}
+
+TestForwardState TestForwardGet() {
+    TestForwardState t;
+    const FwdShot& sh = g_fshot;
+    const Pass& p = sh.pass;
+    t.outerDone = sh.outerDone;
+    t.focusDone = sh.focusDone;
+    t.failed = p.failed;
+    t.why = p.failed ? p.why : sh.why;
+    t.draws = p.draws;
+    t.plainDraws = p.plainDraws;
+    t.psPatchedDraws = p.psPatchedDraws;
+    t.psCbRebinds = p.psCbRebinds;
+    t.srvMisses = p.srvMisses;
+    t.copyIns = p.copyIns;
+    t.binds = p.binds;
+    t.mapFailures = p.mapFailures;
+    t.viewsFailures = p.viewsFailures;
+    t.copiedBack = p.copiedBack;
+    t.pauses = p.pauses;
+    t.pausedDraws = p.pausedDraws;
+    t.pausedClears = p.pausedClears;
+    t.stashed = sh.n;
+    return t;
+}
+
+ID3D11Texture2D* TestForwardStash(int k) { return k >= 0 && k < g_fwdN ? g_fwd[k].tex.Get() : nullptr; }
 
 void TestEnd() {
     const bool faulted = g_test.faulted;

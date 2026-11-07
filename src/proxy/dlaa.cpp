@@ -127,6 +127,7 @@ uint32_t g_jitCounter = 0xFFFFFFFFu;
 uint32_t g_jitCtx = 0;
 uint64_t g_setCalls = 0, g_setNonzero = 0, g_lastSetCalls = 0, g_lastSetNonzero = 0;
 int g_setLogs = 0;
+std::atomic<int> g_traceLeft{0};  // TraceJitter: further SetJitter calls to log
 bool g_faultLogged = false;
 thread_local bool t_inside = false;  // inside our evaluation
 
@@ -1115,7 +1116,8 @@ void __fastcall D_SetJitter(void* dev, const float* offset, uint32_t ctx) {
             g_jitCounter = counter;
             g_jitCtx = ctx;
         }
-        if (g_setLogs < 8) {  // one frame's worth: which tasks set and clear the offset
+        const bool trace = g_traceLeft.load(std::memory_order_relaxed) > 0 && g_traceLeft.fetch_sub(1) > 0;
+        if (g_setLogs < 8 || trace) {  // one frame's worth: which tasks set and clear the offset
             ++g_setLogs;
             Log("DLAA: SetJitter #%d: context %u, (%.4f, %.4f), frame counter %u, from AMS2AVX.exe+0x%llX", g_setLogs, ctx,
                 v[0], v[1], counter, (unsigned long long)((uintptr_t)ret - hooks::ExeBase()));
@@ -1268,6 +1270,8 @@ void LogStats(bool totals) {
     Log("DLAA%s: DLSS evaluations per view: %s; outside the eye groups %llu in the session",
         totals ? " (session total)" : "", views.c_str(), (unsigned long long)g_viewEvals[0].load());
 }
+
+void TraceJitter(int calls) { g_traceLeft.store(calls); }
 
 bool FrameJitter(float out[2]) {
     bool ok = false;

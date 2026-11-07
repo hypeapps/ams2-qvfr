@@ -52,6 +52,10 @@ struct MvrPsPatchInfo {
     uint32_t viewReg = 0;          // input register of SV_RenderTargetArrayIndex
     uint32_t firstTemp = 0;        // first temp register the patch added
     uint32_t temps = 0;            // temps the patch added
+    // Per screen texture (option order): the shader's own texture register, kNoRegister when it reads none with a
+    // branch. The extra view's copy then has to be bound at texBase + i.
+    static constexpr uint32_t kNoRegister = 0xFFFFFFFFu;
+    std::vector<uint32_t> textureRegs;
 };
 
 enum class MvrPsPatchResult {

@@ -19,6 +19,7 @@
 
 #include <d3d11.h>
 
+#include <cstdint>
 #include <string>
 
 namespace qvfr::mvrps {
@@ -41,6 +42,15 @@ enum class Kind {
 };
 // Any thread.
 Kind KindOf(ID3D11PixelShader* ps);
+// A patched shader's game slots of globalTexture0..4 (kNoSlot: not read): the MVR pass binds the extra view's copy of
+// the texture in slot k at kTexBase + k (gate B9c).
+constexpr uint8_t kNoSlot = 0xFF;
+struct Info {
+    Kind kind = Kind::Unknown;
+    uint8_t slot[kTextures] = {kNoSlot, kNoSlot, kNoSlot, kNoSlot, kNoSlot};
+};
+Info InfoOf(ID3D11PixelShader* ps);
+bool On();  // installed and not stopped
 
 std::string Describe();      // one part of the summary line
 void LogStats(bool totals);  // a stats line when something changed, and at the end with the refusal reasons

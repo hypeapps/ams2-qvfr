@@ -57,6 +57,19 @@ void* Original(void* res);
 ID3D11Texture2D* CloneOf(ID3D11Resource* res, Set set);
 // Render thread: a group of `set` runs now with its clones in the engine objects.
 bool SwappedIn(Set set);
+// Render thread: while one lives, this thread's D3D11 calls pass the clones' hooks as they are (no bind fix, not
+// observed). The MVR forward test (gate B9c) copies focus's clones inside outer's group, where the bind fix would put
+// the originals in their place.
+class RawScope {
+public:
+    RawScope();
+    ~RawScope();
+    RawScope(const RawScope&) = delete;
+    RawScope& operator=(const RawScope&) = delete;
+
+private:
+    bool prev_;
+};
 // Render thread: the clones are made, wanted in this frame and their list unchanged (a group of a set with clones
 // would get them now). MVR forward step 1 swaps focus's in inside outer's group only then (not while learning).
 bool IsReady();

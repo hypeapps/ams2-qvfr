@@ -91,6 +91,17 @@ bool EarlyBegin(int eye, bool projected);
 void EarlyRefused(int eye, const char* why);  // quad could not swap (the reason is counted)
 void EarlyEnd(int eye, double ms, bool ok);   // ok = false: an engine fault in the early tasks
 void EarlyWaited(double ms);                  // time quad waited for the engine's recording workers before the swap
+// MVR forward, step 2 (docs/mvr.md B9c), [debug] mvr_forward_test with mvr_early=1 and the PS patch (mvr_ps.h): a shot
+// frame also runs outer L's forward pass (CPhase3Render, right after the early run) with MVR. Its targets go to the
+// two-slice copies as in the G-buffer pass, each filled at its first bind or clear: slice 0 with the game's texture,
+// the corner of slice 1 with focus's clone (focus L's G-buffer, SSAO and lights from the early run). Before each draw
+// the module picks 2 views when the VS is patched and the PS is patched or needs no patch, else 1; a patched PS gets
+// PS slot 3 (view 1's screen input map, the UV scale, the magic value) and the views of its screen textures on focus's
+// clones in t21..t25. After the pass slice 0 goes back to the game's targets and the corners are kept; focus L's own
+// CPhase3Render then runs as always and the shot compares its targets with them (images mvr_f<k>_focus and _ours, log
+// lines "MVR forward test shot"). Nothing goes into focus's clones: the frame shows focus's own forward pass.
+// A bind of targets of another size (the game's 1/2 size f9 and its depth) pauses MVR: one view into the game's
+// targets until the next bind with an outer-size target; their clears go to the game's views too.
 // Task map of a shot frame or of a map frame (render thread): every task of the eye groups with its draws, binds,
 // clears and the distinct targets it bound, one log line per task that touched the immediate context; `detail` adds
 // the distinct PS shader resources and constant buffers of its draws (resource ids, clones marked).
@@ -126,5 +137,18 @@ ID3D11Texture2D* TestArray(int k);
 // Overrides mvr_depth_bias, mvr_depth_slope and mvr_depth_dilate (steps < 0: the settings).
 void TestDepthBias(int steps, float slope, bool dilate);  // the two-slice copy of target k (not referenced), null when none
 void TestEnd();                     // the next frame start (counters of the frame reset)
+// qvfr_proxy_smoke --mvr-forward: after OnFrameStart and SetWindow, arms the forward test of this frame without shot
+// images, as if focus L's SSAO and lights had run early; `phase3Vtable` stands for CPhase3Render's.
+void TestForward(const void* phase3Vtable);
+struct TestForwardState {
+    bool outerDone = false, focusDone = false, failed = false;
+    std::string why;  // the pass's failure or why it did not run
+    unsigned draws = 0, plainDraws = 0, psPatchedDraws = 0, psCbRebinds = 0, srvMisses = 0, copyIns = 0;
+    unsigned binds = 0, mapFailures = 0, viewsFailures = 0, copiedBack = 0;
+    unsigned pauses = 0, pausedDraws = 0, pausedClears = 0;  // binds of other sizes (MVR paused)
+    int stashed = 0;
+};
+TestForwardState TestForwardGet();
+ID3D11Texture2D* TestForwardStash(int k);  // the corner of slice 1 of forward target k (not referenced)
 
 }  // namespace qvfr::mvrpass

@@ -1,0 +1,606 @@
+// --mvr-forward: gate B9c (mvr_pass.h, the forward test) on a real D3D11 device, without the game and without SteamVR
+// (NVIDIA with Multi-View Rendering only; elsewhere the test reports a skip).
+// The modules run as in the game: the sun effects module's hooks (CreatePixelShader for the PS patch, Draw), the VS and
+// PS patches, the pass module's own VS and draw hooks; hooks on OMSetRenderTargets and the clears call the module the
+// way quad's detour does. A fake CPhase3Render task of outer L draws a forward-like pass: a grid of tilted quads (a
+// patched VS with outer's projection and TAA jitter, screen coordinates as the game's VS give them) whose PS reads
+// globalTexture0 by Load at the screen input's pixel and gathers globalTexture2 at SV_Position (as the game's forward
+// PS do, B2), with LESS_EQUAL against the depth the earlier tasks left. Fake focus clones (focus size) hold focus's
+// state before its forward pass: another color, a depth with an occluder in one corner, other screen textures.
+// As in the game (run of 2026-11-07 12:44), the task first binds its targets, clears a 1/2 size target and its depth,
+// draws into them, and then binds the outer-size targets again for the forward draws: MVR must pause there.
+// Checks:
+// - outer: the game's color and depth equal the same pass drawn without MVR, bit for bit, the 1/2 size target too
+//   (drawn with one view into the game's own target);
+// - view 1: the corner of slice 1 (the module's stash) equals focus's own pass drawn straight into the clones with the
+//   focus projection, focus's jitter and its screen textures (edge pixels may round differently): the copy-in of the
+//   clones (color and depth), the screen inputs' map, the screen textures in t21..t25 and their UV scale;
+// - the clones are not changed by outer's pass; the comparison after focus's own pass runs;
+// - the module's counters and the debug layer (its linkage report for SV_RenderTargetArrayIndex is expected).
+#include <windows.h>
+#include <d3d11_1.h>
+#include <d3dcompiler.h>
+#include <wrl/client.h>
+
+#include <nvapi.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "hooks.h"
+#include "mvr_pass.h"
+#include "mvr_ps.h"
+#include "mvr_vs.h"
+#include "sun_fx.h"
+
+using Microsoft::WRL::ComPtr;
+
+namespace {
+
+const char kHlsl[] = R"(
+cbuffer Cam : register(b0) { row_major float4x4 proj; };
+cbuffer G : register(b1) { float4 viewportPixelDimensions; float4 screenSpaceDimensions; };
+struct VsOut { float4 pos : SV_Position; float4 scr : TEXCOORD0; float3 vp : VIEWPOS; };
+VsOut VS(uint id : SV_VertexID) {
+    const float2 c[6] = {float2(0, 0), float2(1, 0), float2(0, 1), float2(0, 1), float2(1, 0), float2(1, 1)};
+    uint q = id / 6, k = id % 6;
+    uint qx = q % 6, qy = q / 6;
+    float z = 2.0 + (float)((qx + 2 * qy) % 3) * 0.75 + c[k].x * 0.3;
+    float2 t = float2(-1.2, -1.0) + (float2(qx, qy) + c[k] * 0.9) * 0.4;
+    VsOut o;
+    o.vp = float3(t * z, z);
+    o.pos = mul(float4(o.vp, 1), proj);
+    o.scr = float4(0.5 * (o.pos.x + o.pos.w), 0.5 * (o.pos.w - o.pos.y), o.pos.z, o.pos.w);
+    return o;
+}
+Texture2D globalTexture0 : register(t3);
+Texture2D<float> globalTexture2 : register(t5);
+SamplerState pointSampler : register(s0);
+float4 Fwd(VsOut i) : SV_Target {
+    float2 uv = i.scr.xy / i.scr.w;
+    int2 p = int2(min(uv * viewportPixelDimensions.zw, viewportPixelDimensions.zw - 1));
+    float4 a = globalTexture0.Load(int3(p, 0));
+    float4 g = globalTexture2.GatherRed(pointSampler, i.pos.xy * screenSpaceDimensions.zw);
+    return float4(a.x, a.y, dot(g, 0.25), frac(i.vp.x));
+}
+float4 VSOcc(uint id : SV_VertexID) : SV_Position {
+    float2 uv = float2(id & 1, id >> 1);
+    return float4(lerp(-1.0, 0.0, uv.x), lerp(1.0, 0.0, uv.y), 0.05, 1);
+}
+)";
+
+constexpr UINT kW = 96, kH = 80, kFW = 64, kFH = 48;
+constexpr UINT kQuads = 30;
+constexpr UINT kSlot0 = 3, kSlot2 = 5;  // the PS's registers of globalTexture0 and globalTexture2
+constexpr double kX0 = -0.6, kX1 = 0.3, kY0 = -0.2, kY1 = 0.7;  // the focus window in outer NDC (y up)
+const float kJitter[2] = {0.4f, -0.3f};
+const float kOuterColor[4] = {0.1f, 0.2f, 0.3f, 1.0f};  // what the earlier tasks left in the forward target
+const float kFocusColor[4] = {0.7f, 0.6f, 0.5f, 1.0f};
+constexpr float kDepthLeft = 0.9f;
+
+ComPtr<ID3DBlob> Compile(const char* entry, const char* target) {
+    ComPtr<ID3DBlob> code, err;
+    if (FAILED(D3DCompile(kHlsl, sizeof(kHlsl) - 1, "mvr_forward_smoke", nullptr, nullptr, entry, target,
+                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &err))) {
+        printf("D3DCompile %s: %s\n", entry, err ? (const char*)err->GetBufferPointer() : "?");
+        return nullptr;
+    }
+    return code;
+}
+
+void OuterProj(float m[16]) {
+    memset(m, 0, 16 * sizeof(float));
+    const float n = 0.5f, f = 100.0f;
+    m[0] = 1;
+    m[5] = 1;
+    m[10] = f / (f - n);
+    m[11] = 1;
+    m[14] = -n * f / (f - n);
+}
+void FocusProj(const float o[16], double sx, double ox, double sy, double oy, float m[16]) {
+    memcpy(m, o, 16 * sizeof(float));
+    for (int i = 0; i < 4; ++i) {
+        m[i * 4 + 0] = (float)(sx * o[i * 4 + 0] + ox * o[i * 4 + 3]);
+        m[i * 4 + 1] = (float)(sy * o[i * 4 + 1] + oy * o[i * 4 + 3]);
+    }
+}
+void Jitter(float m[16], double jx, double jy) {
+    m[8] += (float)jx;
+    m[9] += (float)jy;
+}
+
+struct Set {  // one size: the forward target, its depth, the two screen textures, a 1/2 size target and depth
+    ComPtr<ID3D11Texture2D> color, depth, gt0, gt2, half, halfDepth;
+    ComPtr<ID3D11RenderTargetView> rtv, halfRtv;
+    ComPtr<ID3D11DepthStencilView> dsv, halfDsv;
+    ComPtr<ID3D11ShaderResourceView> srv0, srv2;
+    ComPtr<ID3D11Buffer> cam, g;
+    UINT w = 0, h = 0;
+};
+
+struct Scene {
+    ID3D11Device* dev = nullptr;
+    ID3D11DeviceContext* ctx = nullptr;
+    ComPtr<ID3D11VertexShader> vs, vsOcc;
+    ComPtr<ID3D11PixelShader> fwd;
+    ComPtr<ID3D11DepthStencilState> ds;
+    ComPtr<ID3D11RasterizerState> rs;
+    ComPtr<ID3D11SamplerState> point;
+    ComPtr<ID3D11Buffer> cam12;  // the game's camera constants in VS slot 12 at an offset (the jitter probe reads them)
+    ComPtr<ID3D11Buffer> obj13;  // object constants in VS slot 13: worldViewProj = worldView * (1..16)
+    Set game, focus;
+    ComPtr<ID3D11Texture2D> init[4];  // the start of the pass: game color, depth, focus color, depth
+};
+Scene g_s;
+
+using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*,
+                                                      ID3D11DepthStencilView*);
+using ClearRtvFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11RenderTargetView*, const FLOAT[4]);
+using ClearDsvFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11DepthStencilView*, UINT, FLOAT, UINT8);
+OMSetRenderTargetsFn o_om = nullptr;
+ClearRtvFn o_clearRtv = nullptr;
+ClearDsvFn o_clearDsv = nullptr;
+
+void STDMETHODCALLTYPE D_OM(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv,
+                            ID3D11DepthStencilView* dsv) {
+    ID3D11RenderTargetView* mr[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* md = nullptr;
+    if (n <= D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT && qvfr::mvrpass::MapTargets(c, n, rtv, dsv, mr, &md)) {
+        rtv = mr;
+        dsv = md;
+    }
+    o_om(c, n, rtv, dsv);
+}
+void STDMETHODCALLTYPE D_ClearRtv(ID3D11DeviceContext* c, ID3D11RenderTargetView* v, const FLOAT col[4]) {
+    o_clearRtv(c, qvfr::mvrpass::MapClear(c, v), col);
+}
+void STDMETHODCALLTYPE D_ClearDsv(ID3D11DeviceContext* c, ID3D11DepthStencilView* v, UINT f, FLOAT d, UINT8 st) {
+    o_clearDsv(c, qvfr::mvrpass::MapClear(c, v), f, d, st);
+}
+bool HookContext(ID3D11DeviceContext* c) {
+    void** vt = *(void***)c;
+    return qvfr::hooks::CreateAt(vt[33], (void*)D_OM, (void**)&o_om, "OMSetRenderTargets") &&
+           qvfr::hooks::CreateAt(vt[50], (void*)D_ClearRtv, (void**)&o_clearRtv, "ClearRenderTargetView") &&
+           qvfr::hooks::CreateAt(vt[53], (void*)D_ClearDsv, (void**)&o_clearDsv, "ClearDepthStencilView");
+}
+
+ComPtr<ID3D11Texture2D> Tex(UINT w, UINT h, DXGI_FORMAT f, UINT bind, const void* data = nullptr, UINT pitch = 0) {
+    D3D11_TEXTURE2D_DESC d{};
+    d.Width = w;
+    d.Height = h;
+    d.MipLevels = 1;
+    d.ArraySize = 1;
+    d.Format = f;
+    d.SampleDesc = {1, 0};
+    d.BindFlags = bind;
+    if (!bind) {
+        d.Usage = D3D11_USAGE_STAGING;
+        d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    }
+    D3D11_SUBRESOURCE_DATA sd{data, pitch, 0};
+    ComPtr<ID3D11Texture2D> t;
+    g_s.dev->CreateTexture2D(&d, data ? &sd : nullptr, &t);
+    return t;
+}
+
+// Screen textures with distinct values per texel and per set (`k` = 0 outer, 1 focus).
+bool MakeSet(Set& s, UINT w, UINT h, int k, const float proj[16]) {
+    ID3D11Device* dev = g_s.dev;
+    s.w = w;
+    s.h = h;
+    std::vector<float> p0((size_t)w * h * 4), p2((size_t)w * h);
+    for (UINT y = 0; y < h; ++y)
+        for (UINT x = 0; x < w; ++x) {
+            float* p = &p0[((size_t)y * w + x) * 4];
+            p[0] = 0.01f * x + 0.5f * k;
+            p[1] = 0.01f * y + 0.25f * k;
+            p[2] = p[3] = 0;
+            p2[(size_t)y * w + x] = 0.003f * x + 0.007f * y + 0.6f * k;
+        }
+    s.color = Tex(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE);
+    s.depth = Tex(w, h, DXGI_FORMAT_R32_TYPELESS, D3D11_BIND_DEPTH_STENCIL);
+    s.gt0 = Tex(w, h, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D11_BIND_SHADER_RESOURCE, p0.data(), w * 16);
+    s.gt2 = Tex(w, h, DXGI_FORMAT_R32_FLOAT, D3D11_BIND_SHADER_RESOURCE, p2.data(), w * 4);
+    s.half = Tex(w / 2, h / 2, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_RENDER_TARGET);
+    s.halfDepth = Tex(w / 2, h / 2, DXGI_FORMAT_R32_TYPELESS, D3D11_BIND_DEPTH_STENCIL);
+    if (!s.color || !s.depth || !s.gt0 || !s.gt2 || !s.half || !s.halfDepth) return false;
+    D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+    dv.Format = DXGI_FORMAT_D32_FLOAT;
+    dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    const float g[8] = {0, 0, (float)w, (float)h, 1, 1, 1.0f / w, 1.0f / h};
+    D3D11_BUFFER_DESC bd{64, D3D11_USAGE_IMMUTABLE, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+    D3D11_SUBRESOURCE_DATA cam{proj, 0, 0};
+    D3D11_BUFFER_DESC gd{32, D3D11_USAGE_IMMUTABLE, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+    D3D11_SUBRESOURCE_DATA gi{g, 0, 0};
+    return SUCCEEDED(dev->CreateRenderTargetView(s.color.Get(), nullptr, &s.rtv)) &&
+           SUCCEEDED(dev->CreateDepthStencilView(s.depth.Get(), &dv, &s.dsv)) &&
+           SUCCEEDED(dev->CreateRenderTargetView(s.half.Get(), nullptr, &s.halfRtv)) &&
+           SUCCEEDED(dev->CreateDepthStencilView(s.halfDepth.Get(), &dv, &s.halfDsv)) &&
+           SUCCEEDED(dev->CreateShaderResourceView(s.gt0.Get(), nullptr, &s.srv0)) &&
+           SUCCEEDED(dev->CreateShaderResourceView(s.gt2.Get(), nullptr, &s.srv2)) &&
+           SUCCEEDED(dev->CreateBuffer(&bd, &cam, &s.cam)) && SUCCEEDED(dev->CreateBuffer(&gd, &gi, &s.g));
+}
+
+// The forward pass of one set into its targets (the game binds them inside the task).
+void DrawForward(const Set& s) {
+    ID3D11DeviceContext* c = g_s.ctx;
+    ID3D11RenderTargetView* rtv = s.rtv.Get();
+    c->OMSetRenderTargets(1, &rtv, s.dsv.Get());
+    const float black[4] = {0, 0, 0, 0};
+    c->ClearRenderTargetView(s.halfRtv.Get(), black);
+    c->ClearDepthStencilView(s.halfDsv.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+    ID3D11RenderTargetView* hrtv = s.halfRtv.Get();
+    c->OMSetRenderTargets(1, &hrtv, s.halfDsv.Get());
+    D3D11_VIEWPORT hvp{0, 0, (float)(s.w / 2), (float)(s.h / 2), 0, 1};
+    c->RSSetViewports(1, &hvp);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    c->IASetInputLayout(nullptr);
+    c->OMSetDepthStencilState(g_s.ds.Get(), 0);
+    c->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    c->RSSetState(g_s.rs.Get());
+    ID3D11Buffer* vcb[4] = {s.cam.Get(), nullptr, nullptr, nullptr};
+    c->VSSetConstantBuffers(0, 4, vcb);
+    ComPtr<ID3D11DeviceContext1> c1;
+    if (SUCCEEDED(c->QueryInterface(IID_PPV_ARGS(&c1)))) {
+        const UINT first = 16, num = 64;  // byte 256 of the buffer, 1024 bytes
+        c1->VSSetConstantBuffers1(12, 1, g_s.cam12.GetAddressOf(), &first, &num);
+        c->VSSetConstantBuffers(13, 1, g_s.obj13.GetAddressOf());
+    }
+    ID3D11Buffer* pcb[2] = {nullptr, s.g.Get()};
+    c->PSSetConstantBuffers(0, 2, pcb);
+    c->PSSetShaderResources(kSlot0, 1, s.srv0.GetAddressOf());
+    c->PSSetShaderResources(kSlot2, 1, s.srv2.GetAddressOf());
+    c->PSSetSamplers(0, 1, g_s.point.GetAddressOf());
+    c->VSSetShader(g_s.vs.Get(), nullptr, 0);
+    c->PSSetShader(g_s.fwd.Get(), nullptr, 0);
+    c->Draw(kQuads * 6, 0);  // the 1/2 size target (one view)
+    c->OMSetRenderTargets(1, &rtv, s.dsv.Get());
+    D3D11_VIEWPORT vp{0, 0, (float)s.w, (float)s.h, 0, 1};
+    c->RSSetViewports(1, &vp);
+    // The grid through the sun effects module's Draw hook, its first quad once more (same depth, LESS_EQUAL) through
+    // the pass module's own DrawInstanced hook (SV_VertexID does not include the start vertex).
+    c->Draw(kQuads * 6, 0);
+    c->DrawInstanced(6, 1, 0, 0);
+    ID3D11ShaderResourceView* none[8] = {};
+    c->PSSetShaderResources(0, 8, none);
+    c->OMSetRenderTargets(0, nullptr, nullptr);
+}
+
+// The state before the forward pass: outer's color and depth as left, focus's clones with another color and an
+// occluder in the top left quarter of its depth.
+void MakeStart() {
+    ID3D11DeviceContext* c = g_s.ctx;
+    c->ClearRenderTargetView(g_s.game.rtv.Get(), kOuterColor);
+    c->ClearDepthStencilView(g_s.game.dsv.Get(), D3D11_CLEAR_DEPTH, kDepthLeft, 0);
+    c->ClearRenderTargetView(g_s.focus.rtv.Get(), kFocusColor);
+    c->ClearDepthStencilView(g_s.focus.dsv.Get(), D3D11_CLEAR_DEPTH, kDepthLeft, 0);
+    c->OMSetRenderTargets(0, nullptr, g_s.focus.dsv.Get());
+    D3D11_VIEWPORT vp{0, 0, (float)kFW, (float)kFH, 0, 1};
+    c->RSSetViewports(1, &vp);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    c->IASetInputLayout(nullptr);
+    c->OMSetDepthStencilState(g_s.ds.Get(), 0);
+    c->RSSetState(g_s.rs.Get());
+    c->VSSetShader(g_s.vsOcc.Get(), nullptr, 0);
+    c->PSSetShader(nullptr, nullptr, 0);
+    c->Draw(4, 0);
+    c->OMSetRenderTargets(0, nullptr, nullptr);
+}
+
+void Save() {
+    ID3D11Texture2D* src[4] = {g_s.game.color.Get(), g_s.game.depth.Get(), g_s.focus.color.Get(), g_s.focus.depth.Get()};
+    for (int i = 0; i < 4; ++i) {
+        D3D11_TEXTURE2D_DESC d{};
+        src[i]->GetDesc(&d);
+        g_s.dev->CreateTexture2D(&d, nullptr, &g_s.init[i]);
+        g_s.ctx->CopyResource(g_s.init[i].Get(), src[i]);
+    }
+}
+void Restore() {
+    ID3D11Texture2D* dst[4] = {g_s.game.color.Get(), g_s.game.depth.Get(), g_s.focus.color.Get(), g_s.focus.depth.Get()};
+    for (int i = 0; i < 4; ++i) g_s.ctx->CopyResource(dst[i], g_s.init[i].Get());
+}
+
+// The fake clones module.
+ID3D11Texture2D* CloneOf(ID3D11Resource* r) {
+    if (r == g_s.game.color.Get()) return g_s.focus.color.Get();
+    if (r == g_s.game.depth.Get()) return g_s.focus.depth.Get();
+    if (r == g_s.game.gt0.Get()) return g_s.focus.gt0.Get();
+    if (r == g_s.game.gt2.Get()) return g_s.focus.gt2.Get();
+    return nullptr;
+}
+bool JitterOf(float out[2]) {
+    out[0] = kJitter[0];
+    out[1] = kJitter[1];
+    return true;
+}
+
+// One texture as raw texels (8 bytes for RGBA16F, 4 for R32).
+std::vector<uint64_t> Read(ID3D11Texture2D* src) {
+    D3D11_TEXTURE2D_DESC d{};
+    src->GetDesc(&d);
+    ComPtr<ID3D11Texture2D> st = Tex(d.Width, d.Height, d.Format, 0);
+    std::vector<uint64_t> px;
+    if (!st) return px;
+    g_s.ctx->CopySubresourceRegion(st.Get(), 0, 0, 0, 0, src, 0, nullptr);
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (FAILED(g_s.ctx->Map(st.Get(), 0, D3D11_MAP_READ, 0, &m))) return px;
+    const size_t texel = d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ? 8 : 4;
+    px.resize((size_t)d.Width * d.Height);
+    for (UINT y = 0; y < d.Height; ++y)
+        for (UINT x = 0; x < d.Width; ++x) {
+            uint64_t v = 0;
+            memcpy(&v, (const uint8_t*)m.pData + (size_t)y * m.RowPitch + x * texel, texel);
+            px[(size_t)y * d.Width + x] = v;
+        }
+    g_s.ctx->Unmap(st.Get(), 0);
+    return px;
+}
+
+float Half(uint32_t h) {
+    const uint32_t s = (h >> 15) & 1, e = (h >> 10) & 31, m = h & 1023;
+    const float v = e == 0 ? m / 1024.0f * std::pow(2.0f, -14.0f) : (1 + m / 1024.0f) * std::pow(2.0f, (float)e - 15);
+    return s ? -v : v;
+}
+float MaxHalfDiff(uint64_t a, uint64_t b) {
+    float d = 0;
+    for (int i = 0; i < 4; ++i)
+        d = std::max(d, std::fabs(Half((uint32_t)(a >> (16 * i)) & 0xFFFF) - Half((uint32_t)(b >> (16 * i)) & 0xFFFF)));
+    return d;
+}
+float AsFloat(uint64_t v) {
+    float f;
+    const uint32_t u = (uint32_t)v;
+    memcpy(&f, &u, 4);
+    return f;
+}
+
+using TaskFn = void(__fastcall*)(void*);
+void* g_vtPhase3[32];
+void* g_vtFocus[32];
+void* g_vtDummy[32];
+struct FakeTask {
+    void** vt;
+};
+int g_finish = 0;
+void __fastcall FakeFinish(void*) { ++g_finish; }
+void __fastcall OuterExecute(void* task) {
+    DrawForward(g_s.game);
+    (*(TaskFn**)task)[0x38 / 8](task);
+}
+void __fastcall FocusExecute(void* task) {
+    DrawForward(g_s.focus);
+    (*(TaskFn**)task)[0x38 / 8](task);
+}
+void RunTask(FakeTask& t) { (*(TaskFn**)&t)[0x48 / 8](&t); }
+
+}  // namespace
+
+int RunMvrForward() {
+    ComPtr<ID3D11Device> dev;
+    ComPtr<ID3D11DeviceContext> ctx;
+    const bool debugLayer = SUCCEEDED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+                                                        D3D11_CREATE_DEVICE_DEBUG, nullptr, 0, D3D11_SDK_VERSION, &dev,
+                                                        nullptr, &ctx));
+    if (!debugLayer && FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0,
+                                                D3D11_SDK_VERSION, &dev, nullptr, &ctx))) {
+        printf("D3D11CreateDevice failed\n");
+        return 1;
+    }
+    ComPtr<ID3D11InfoQueue> info;
+    if (debugLayer) dev.As(&info);
+    if (!qvfr::sunfx::TestInstall(dev.Get(), ctx.Get()) || !qvfr::mvrvs::TestInstall(dev.Get())) {
+        printf("MVR forward: the hooks could not be installed or NVAPI is not available (not NVIDIA?): SKIPPED\n");
+        return 0;
+    }
+    if (!qvfr::mvrvs::DeviceHasMvr(dev.Get())) {
+        printf("MVR forward: no Multi-View Rendering on this GPU: SKIPPED\n");
+        return 0;
+    }
+    if (!qvfr::mvrps::TestInstall()) {
+        printf("MVR forward: FAIL (the PS module could not be installed)\n");
+        return 1;
+    }
+    g_s.dev = dev.Get();
+    g_s.ctx = ctx.Get();
+    qvfr::mvrvs::TestSetEnabled(true);
+    qvfr::mvrps::TestSetEnabled(true);
+    ComPtr<ID3DBlob> vsCode = Compile("VS", "vs_5_0"), occCode = Compile("VSOcc", "vs_5_0"),
+                     fwdCode = Compile("Fwd", "ps_5_0");
+    if (!vsCode || !occCode || !fwdCode) return 1;
+    bool made =
+        SUCCEEDED(dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &g_s.vs)) &&
+        SUCCEEDED(dev->CreateVertexShader(occCode->GetBufferPointer(), occCode->GetBufferSize(), nullptr, &g_s.vsOcc)) &&
+        SUCCEEDED(dev->CreatePixelShader(fwdCode->GetBufferPointer(), fwdCode->GetBufferSize(), nullptr, &g_s.fwd));
+    const qvfr::mvrps::Info psInfo = qvfr::mvrps::InfoOf(g_s.fwd.Get());
+    const bool shadersOk = made && qvfr::mvrvs::IsPatched(g_s.vs.Get()) && psInfo.kind == qvfr::mvrps::Kind::Patched &&
+                           psInfo.slot[0] == kSlot0 && psInfo.slot[2] == kSlot2 &&
+                           psInfo.slot[1] == qvfr::mvrps::kNoSlot;
+
+    const double sx = 2 / (kX1 - kX0), ox = -(kX1 + kX0) / (kX1 - kX0);
+    const double sy = 2 / (kY1 - kY0), oy = -(kY1 + kY0) / (kY1 - kY0);
+    float po[16], pf[16];
+    OuterProj(po);
+    FocusProj(po, sx, ox, sy, oy, pf);
+    Jitter(po, kJitter[0] / kW, kJitter[1] / kH);
+    Jitter(pf, kJitter[0] / kFW, kJitter[1] / kFH);
+    D3D11_DEPTH_STENCIL_DESC dsd{};
+    dsd.DepthEnable = TRUE;
+    dsd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    dsd.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
+    D3D11_RASTERIZER_DESC rd{};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = TRUE;
+    D3D11_SAMPLER_DESC smp{};
+    smp.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    smp.AddressU = smp.AddressV = smp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    smp.MaxLOD = D3D11_FLOAT32_MAX;
+    made = made && MakeSet(g_s.game, kW, kH, 0, po) && MakeSet(g_s.focus, kFW, kFH, 1, pf) &&
+           SUCCEEDED(dev->CreateDepthStencilState(&dsd, &g_s.ds)) && SUCCEEDED(dev->CreateRasterizerState(&rd, &g_s.rs)) &&
+           SUCCEEDED(dev->CreateSamplerState(&smp, &g_s.point));
+    {  // camera constants at byte 256: projMatrix 1..16 at +128, cameraJitter (0.25, -0.5) at +944
+        std::vector<float> cam(1024, 0.0f);
+        for (int i = 0; i < 16; ++i) cam[(256 + 128) / 4 + i] = (float)(i + 1);
+        cam[(256 + 944) / 4] = 0.25f;
+        cam[(256 + 944) / 4 + 1] = -0.5f;
+        D3D11_BUFFER_DESC cd{4096, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+        D3D11_SUBRESOURCE_DATA ci{cam.data(), 0, 0};
+        made = made && SUCCEEDED(dev->CreateBuffer(&cd, &ci, &g_s.cam12));
+        // worldView: a translation (1, 2, 3) (row vectors); worldViewProj = worldView * P with P = 1..16, so the probe's
+        // worldView^-1 * worldViewProj must give 1..16 again.
+        const float wv[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 2, 3, 1};
+        std::vector<float> obj(116, 0.0f);
+        for (int r = 0; r < 4; ++r)
+            for (int k = 0; k < 4; ++k) {
+                float sum = 0;
+                for (int j = 0; j < 4; ++j) sum += wv[r * 4 + j] * (float)(j * 4 + k + 1);
+                obj[r * 4 + k] = sum;
+            }
+        memcpy(&obj[144 / 4], wv, sizeof(wv));
+        D3D11_BUFFER_DESC od{464, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+        D3D11_SUBRESOURCE_DATA oi{obj.data(), 0, 0};
+        made = made && SUCCEEDED(dev->CreateBuffer(&od, &oi, &g_s.obj13));
+    }
+    if (!made) {
+        printf("MVR forward: D3D11 objects could not be made\n");
+        return 1;
+    }
+
+    // References without the module (MVR off: the patched shaders draw as the originals).
+    MakeStart();
+    Save();
+    const std::vector<uint64_t> startF = Read(g_s.focus.color.Get()), startFD = Read(g_s.focus.depth.Get());
+    DrawForward(g_s.game);
+    const std::vector<uint64_t> refC = Read(g_s.game.color.Get()), refD = Read(g_s.game.depth.Get()),
+                                refH = Read(g_s.game.half.Get());
+    DrawForward(g_s.focus);
+    const std::vector<uint64_t> refFC = Read(g_s.focus.color.Get()), refFD = Read(g_s.focus.depth.Get());
+    Restore();
+
+    if (!HookContext(ctx.Get())) {
+        printf("MVR forward: context hooks could not be installed\n");
+        return 1;
+    }
+    for (void*& p : g_vtPhase3) p = (void*)&FakeFinish;
+    for (void*& p : g_vtDummy) p = (void*)&FakeFinish;
+    g_vtPhase3[0x48 / 8] = (void*)&OuterExecute;
+    memcpy(g_vtFocus, g_vtPhase3, sizeof(g_vtFocus));
+    g_vtFocus[0x48 / 8] = (void*)&FocusExecute;
+    qvfr::mvrpass::TestSetup(ctx.Get(), g_vtDummy, g_vtDummy, &CloneOf, &JitterOf);
+    qvfr::mvrpass::OnFrameStart(true);
+    qvfr::mvrpass::SetWindow(0, true, sx, ox, sy, oy, kW, kH);
+    qvfr::mvrpass::TestForward(g_vtPhase3);
+    // Outer L's CPhase3Render: nothing bound before it (the game binds inside the task).
+    FakeTask outer{g_vtPhase3};
+    const bool outerSkip = qvfr::mvrpass::BeforeTask((uint8_t*)&outer, 0);
+    if (!outerSkip) RunTask(outer);
+    qvfr::mvrpass::AfterTask((uint8_t*)&outer);
+    const qvfr::mvrpass::TestForwardState st = qvfr::mvrpass::TestForwardGet();
+    const std::vector<uint64_t> gC = Read(g_s.game.color.Get()), gD = Read(g_s.game.depth.Get()),
+                                gH = Read(g_s.game.half.Get());
+    const std::vector<uint64_t> fAfter = Read(g_s.focus.color.Get()), fdAfter = Read(g_s.focus.depth.Get());
+    std::vector<uint64_t> oursC, oursD;
+    for (int k = 0; k < st.stashed; ++k) {
+        ID3D11Texture2D* t = qvfr::mvrpass::TestForwardStash(k);
+        if (!t) continue;
+        D3D11_TEXTURE2D_DESC d{};
+        t->GetDesc(&d);
+        (d.Format == DXGI_FORMAT_R32_TYPELESS ? oursD : oursC) = Read(t);
+    }
+    // Focus L's own CPhase3Render (the same class, another object): the module compares after it.
+    FakeTask focus{g_vtPhase3};
+    const bool focusSkip = qvfr::mvrpass::BeforeTask((uint8_t*)&focus, 2);
+    if (!focusSkip) {
+        focus.vt = g_vtFocus;
+        RunTask(focus);
+    }
+    qvfr::mvrpass::AfterTask((uint8_t*)&focus);
+    const qvfr::mvrpass::TestForwardState st2 = qvfr::mvrpass::TestForwardGet();
+    const std::vector<uint64_t> ownC = Read(g_s.focus.color.Get());
+    qvfr::mvrpass::TestEnd();
+    if (refC.empty() || refFC.empty() || gC.empty() || oursC.size() != refFC.size() || oursD.size() != refFD.size()) {
+        printf("MVR forward: FAIL (read-back: ours %zu / %zu px, stashed %d, why: %s)\n", oursC.size(), oursD.size(),
+               st.stashed, st.why.c_str());
+        return 1;
+    }
+
+    int outerC = 0, outerD = 0, outerH = 0, clonesChanged = 0;
+    for (size_t i = 0; i < refC.size(); ++i) {
+        outerC += gC[i] != refC[i];
+        outerD += gD[i] != refD[i];
+    }
+    for (size_t i = 0; i < refH.size() && i < gH.size(); ++i) outerH += gH[i] != refH[i];
+    for (size_t i = 0; i < startF.size(); ++i) clonesChanged += fAfter[i] != startF[i] || fdAfter[i] != startFD[i];
+    // View 1 vs focus's own: covered pixels, the occluder's quarter (the copied-in depth), edge rounding.
+    const uint64_t focusStart = startF[0];  // the copied-in color (top left: the occluder keeps it)
+    int covered = 0, occluded = 0, occOurs = 0, cOff = 0, cBig = 0, dOff = 0, ownOff = 0;
+    float cMax = 0;
+    for (UINT y = 0; y < kFH; ++y)
+        for (UINT x = 0; x < kFW; ++x) {
+            const size_t i = (size_t)y * kFW + x;
+            covered += refFC[i] != focusStart;
+            if (x < kFW / 2 && y < kFH / 2) {
+                occluded += refFC[i] == focusStart;
+                occOurs += oursC[i] == focusStart;
+            }
+            const float d = MaxHalfDiff(oursC[i], refFC[i]);
+            cOff += d > 0;
+            cBig += d > 0.02f;
+            cMax = std::max(cMax, d);
+            dOff += std::fabs(AsFloat(oursD[i]) - AsFloat(refFD[i])) > 1e-5f;
+            ownOff += ownC[i] != refFC[i];
+        }
+
+    int warnings = 0, expected = 0;
+    if (info) {
+        for (UINT64 i = 0, n = info->GetNumStoredMessages(); i < n; ++i) {
+            SIZE_T size = 0;
+            info->GetMessage(i, nullptr, &size);
+            std::vector<char> buf(size);
+            auto* msg = (D3D11_MESSAGE*)buf.data();
+            if (FAILED(info->GetMessage(i, msg, &size)) || msg->Severity > D3D11_MESSAGE_SEVERITY_WARNING) continue;
+            const std::string text(msg->pDescription, strnlen(msg->pDescription, msg->DescriptionByteLength));
+            if (text.find("(SV_RenderTargetArrayIndex,0) as input, but it is not provided") != std::string::npos) {
+                ++expected;
+                continue;
+            }
+            ++warnings;
+            printf("D3D11 debug layer: %s\n", text.c_str());
+        }
+    }
+
+    const int px = (int)(kFW * kFH);
+    const bool countsOk = shadersOk && !outerSkip && st.outerDone && !st.failed && st.stashed == 2 &&
+                          st.draws == 3 && st.plainDraws == 1 && st.psPatchedDraws == 2 && st.srvMisses == 0 &&
+                          st.pauses == 1 && st.pausedDraws == 1 && st.pausedClears == 2 &&
+                          st.copyIns == 2 && st.mapFailures == 0 && st.viewsFailures == 0 && st.copiedBack == 2 &&
+                          !focusSkip && st2.focusDone && ownOff == 0;
+    const bool outerOk = outerC == 0 && outerD == 0 && outerH == 0 && gH.size() == refH.size();
+    const bool focusOk = clonesChanged == 0 && covered > px / 3 && occluded > px / 8 && occOurs == occluded &&
+                         cBig * 100 <= px && dOff * 100 <= px;
+    const bool ok = countsOk && outerOk && focusOk && !warnings;
+    printf("MVR forward: %s; PS %s (globalTexture0 in t%u, globalTexture2 in t%u), VS %s; outer pass %s%s%s, stash %d "
+           "targets, binds %u, copy-ins %u, map failures %u, draws %u (one view %u, patched PS %u, PS slot 3 rebinds "
+           "%u, screen textures without a clone %u), copied back %u, SetMultiViewMode failures %u; paused %u times "
+           "(draws %u, clears %u) (%s)\n",
+           ok ? "PASS" : "FAIL", psInfo.kind == qvfr::mvrps::Kind::Patched ? "patched" : "NOT PATCHED", psInfo.slot[0],
+           psInfo.slot[2], qvfr::mvrvs::IsPatched(g_s.vs.Get()) ? "patched" : "NOT PATCHED",
+           st.outerDone ? "done" : "NOT RUN", st.why.empty() ? "" : ": ", st.why.c_str(), st.stashed, st.binds,
+           st.copyIns, st.mapFailures, st.draws, st.plainDraws, st.psPatchedDraws, st.psCbRebinds, st.srvMisses,
+           st.copiedBack, st.viewsFailures, st.pauses, st.pausedDraws, st.pausedClears, countsOk ? "OK" : "WRONG");
+    printf("  outer vs the pass without MVR: color %d, depth %d, 1/2 size target %d px differ (%s)\n", outerC, outerD,
+           outerH, outerOk ? "OK" : "WRONG");
+    printf("  view 1 vs focus's own pass (%ux%u): %d px covered, occluder quarter %d px kept in own, %d in ours; color "
+           "%d px differ (%d by > 0.02, max %.4f), depth %d px off; clones changed by outer's pass %d px; focus's own "
+           "run %s, %d px off its reference (%s)\n",
+           kFW, kFH, covered, occluded, occOurs, cOff, cBig, cMax, dOff, clonesChanged,
+           st2.focusDone ? "compared" : "NOT COMPARED", ownOff, focusOk ? "OK" : "WRONG");
+    printf("  debug layer %s, %d warnings, %d expected linkage reports\n", debugLayer ? "on" : "not installed", warnings,
+           expected);
+    return ok ? 0 : 1;
+}

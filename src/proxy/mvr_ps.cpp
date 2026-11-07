@@ -61,7 +61,7 @@ uint64_t g_loggedMade = 0;
 std::mutex g_m;
 std::vector<std::pair<std::string, uint64_t>> g_reasons;
 std::shared_mutex g_sm;
-std::unordered_map<void*, Kind> g_shaders;
+std::unordered_map<void*, Info> g_shaders;
 
 void Fail(const char* where, unsigned long code) {
     g_on = false;
@@ -120,8 +120,9 @@ void Refuse(std::atomic<uint64_t>& counter, std::string reason, const void* code
 
 // The patched shader (kind Patched), or null and the kind of the original the caller makes.
 ID3D11PixelShader* MakePatched(ID3D11Device* dev, const void* code, SIZE_T len, ID3D11ClassLinkage* link,
-                               ID3D11PixelShader** out, sunfx::CreatePsFn create, uintptr_t caller, Kind& kind) {
-    kind = Kind::Unknown;
+                               ID3D11PixelShader** out, sunfx::CreatePsFn create, uintptr_t caller, Info& made) {
+    made = Info{};
+    Kind& kind = made.kind;
     if (!code || !len || !out || link) {
         g_other.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
@@ -165,6 +166,8 @@ ID3D11PixelShader* MakePatched(ID3D11Device* dev, const void* code, SIZE_T len, 
     }
     QueryPerformanceCounter(&t1);
     kind = Kind::Patched;
+    for (unsigned k = 0; k < kTextures && k < info.textureRegs.size(); ++k)
+        if (info.textureRegs[k] < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) made.slot[k] = (uint8_t)info.textureRegs[k];
     g_patchUs.fetch_add((uint64_t)Us(t0, t1), std::memory_order_relaxed);
     g_inputs.fetch_add(info.screenInputs, std::memory_order_relaxed);
     g_wrapped.fetch_add(info.wrapped, std::memory_order_relaxed);
@@ -187,16 +190,16 @@ HRESULT CreatePixelShader(ID3D11Device* dev, const void* code, SIZE_T len, ID3D1
                           ID3D11PixelShader** out, sunfx::CreatePsFn create, uintptr_t caller) {
     if (!g_on.load(std::memory_order_relaxed)) return create(dev, code, len, link, out);
     ID3D11PixelShader* ps = nullptr;
-    Kind kind = Kind::Unknown;
-    Protect("CreatePixelShader", [&] { ps = MakePatched(dev, code, len, link, out, create, caller, kind); });
+    Info made;
+    Protect("CreatePixelShader", [&] { ps = MakePatched(dev, code, len, link, out, create, caller, made); });
     HRESULT hr = S_OK;
     if (ps)
         *out = ps;
     else
         hr = create(dev, code, len, link, out);
-    if (SUCCEEDED(hr) && out && *out && kind != Kind::Unknown) {
+    if (SUCCEEDED(hr) && out && *out && made.kind != Kind::Unknown) {
         std::unique_lock lock(g_sm);
-        g_shaders[*out] = kind;
+        g_shaders[*out] = made;
     }
     return hr;
 }
@@ -315,12 +318,16 @@ void OnFrameStart(ID3D11DeviceContext* ctx) {
     });
 }
 
-Kind KindOf(ID3D11PixelShader* ps) {
-    if (!ps) return Kind::Unknown;
+Kind KindOf(ID3D11PixelShader* ps) { return InfoOf(ps).kind; }
+
+Info InfoOf(ID3D11PixelShader* ps) {
+    if (!ps) return Info{};
     std::shared_lock lock(g_sm);
     auto it = g_shaders.find(ps);
-    return it == g_shaders.end() ? Kind::Unknown : it->second;
+    return it == g_shaders.end() ? Info{} : it->second;
 }
+
+bool On() { return g_installed && g_on.load(std::memory_order_relaxed); }
 
 std::string Describe() {
     if (!g_installed) return "MVR PS patch off";

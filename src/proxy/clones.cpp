@@ -1853,6 +1853,9 @@ bool SwappedIn(Set set) {
     return out;
 }
 
+RawScope::RawScope() : prev_(t_internal) { t_internal = true; }
+RawScope::~RawScope() { t_internal = prev_; }
+
 int ListForShot(Set set, ID3D11Resource** out, char (*labels)[64], int max) {
     int n = 0;
     Protect("ListForShot", [&] {

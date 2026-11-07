@@ -2,7 +2,7 @@
 # --xr-layer and --openxr-path test the OpenXR path (xr_smoke.cpp).
 # --shots, --quad-compose, --focus-geometry, --focus-cull and --clones test the proxy's shot, composition, focus geometry,
 # focus culling and clones modules directly, so their sources are compiled in here as well.
-add_executable(qvfr_proxy_smoke main.cpp xr_smoke.cpp sun_fx_smoke.cpp mvr_vs_smoke.cpp mvr_ps_smoke.cpp mvr_pass_smoke.cpp taa_fix_smoke.cpp ../proxy/shots.cpp ../proxy/compose.cpp ../proxy/focus_geometry.cpp
+add_executable(qvfr_proxy_smoke main.cpp xr_smoke.cpp sun_fx_smoke.cpp mvr_vs_smoke.cpp mvr_ps_smoke.cpp mvr_pass_smoke.cpp mvr_forward_smoke.cpp taa_fix_smoke.cpp ../proxy/shots.cpp ../proxy/compose.cpp ../proxy/focus_geometry.cpp
                ../proxy/focus_cull.cpp ../proxy/common.cpp ../proxy/clones.cpp ../proxy/hooks.cpp ../proxy/sysinfo.cpp ../proxy/diag.cpp
                ../proxy/sun_fx.cpp ../proxy/mvr_vs.cpp ../proxy/mvr_ps.cpp ../proxy/mvr_pass.cpp ../proxy/taa_views.cpp ../proxy/gpu.cpp)
 target_include_directories(qvfr_proxy_smoke PRIVATE ../proxy)

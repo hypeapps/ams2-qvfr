@@ -26,6 +26,8 @@ void SetShotFrame(bool shot);
 // Any thread (MVR gate B8): the projection offset the render tasks set in the engine's current frame (SetJitter hook,
 // size-independent: the jitter is offset / render size in NDC). False: not set in this frame or no hook.
 bool FrameJitter(float out[2]);
+// Logs the next `calls` SetJitter calls (any thread): context, offset, frame counter, caller (MVR jitter diagnosis).
+void TraceJitter(int calls);
 void LogStats(bool totals);
 std::string Describe();  // one line for summary.txt
 void Shutdown();         // VR_Shutdown: DLSS features and NGX released
