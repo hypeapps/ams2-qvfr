@@ -171,10 +171,10 @@ void STDMETHODCALLTYPE D_OM(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetVi
     o_om(c, n, rtv, dsv);
 }
 void STDMETHODCALLTYPE D_ClearRtv(ID3D11DeviceContext* c, ID3D11RenderTargetView* v, const FLOAT col[4]) {
-    o_clearRtv(c, qvfr::mvrpass::MapClear(c, v), col);
+    o_clearRtv(c, qvfr::mvrpass::MapClear(c, v, col), col);
 }
 void STDMETHODCALLTYPE D_ClearDsv(ID3D11DeviceContext* c, ID3D11DepthStencilView* v, UINT f, FLOAT d, UINT8 st) {
-    o_clearDsv(c, qvfr::mvrpass::MapClear(c, v), f, d, st);
+    o_clearDsv(c, qvfr::mvrpass::MapClear(c, v, f, d, st), f, d, st);
 }
 
 bool HookContext(ID3D11DeviceContext* c) {

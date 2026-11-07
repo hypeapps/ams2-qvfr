@@ -598,6 +598,7 @@ int RunPsPatchDir(const std::string& dir, const std::string& outDir, bool verbos
     unsigned texCount[32] = {};
     std::map<std::string, int> reasons;
     qvfr::dxbc::MvrPsPatchOptions opt;
+    opt.screenTextures.push_back("GLOBAL_liveTrackTextureMap_tex");  // as the proxy (mvr_ps.h, B9d run 5)
     for (const auto& f : files) {
         std::ifstream in(f, std::ios::binary);
         std::vector<uint8_t> code((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());

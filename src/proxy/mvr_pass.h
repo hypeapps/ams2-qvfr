@@ -71,6 +71,7 @@ void AfterTask(uint8_t* task);  // after the engine's Execute (not after a skipp
 // outer L's group, right
 // before its CPhase3Render (the forward pass that a later step draws with MVR), and the focus group skips them. Only
 // focus L: the focus clones are shared, and outer R's group (which would run focus R's) comes before focus L's group.
+// With mvr_forward (step 3, below) focus R's run in outer R's group as well, with snapshots of the shared clones.
 // The run order of quad's RunTask:
 //   EarlyWanted(eye) -> quad swaps focus's view in and puts focus's clones in -> EarlyBegin(eye, projected) -> the
 //   engine's CBeginEye, CSSAORender, CPhase2Render of the focus group without their Finish -> clones out, view back,
@@ -102,6 +103,33 @@ void EarlyWaited(double ms);                  // time quad waited for the engine
 // lines "MVR forward test shot"). Nothing goes into focus's clones: the frame shows focus's own forward pass.
 // A bind of targets of another size (the game's 1/2 size f9 and its depth) pauses MVR: one view into the game's
 // targets until the next bind with an outer-size target; their clears go to the game's views too.
+// MVR forward, step 3 (docs/mvr.md B9d), [debug] mvr_forward (live, hotkey mvr_modifier + mvr_forward_key; needs
+// mvr_early=1, the PS patch and B8 in skip mode): every frame outer L's and outer R's CPhase3Render run with MVR right
+// after their eye's early run (focus R's SSAO and lights then run early in outer R's group too). At the end of the pass
+// view 1's corners go into focus's clones (colors by copy, the depth by mvr_forward_depth, below), the
+// pass's clears of targets of other sizes (the 1/2 size f9) are repeated on their focus clones, and the focus group
+// skips its CPhase3BuildCommandThread and CPhase3Render (Finish only). A pass with draws that miss view 1 (one view, or
+// into targets of other sizes) leaves the clones alone and the focus group runs its own.
+// The focus clones are shared by both eyes, so the module keeps two snapshots of the clones that the early runs and
+// the forward passes write (noted as they are bound, cleared or filled): before outer R's early run it saves focus L's
+// (snapshot L); at focus L's CBeginEye it saves focus R's and puts focus L's back; at focus R's CBeginEye it puts focus
+// R's back.
+void SetForward(bool on);
+bool GetForward();
+// The depth the live pass leaves in focus's clone ([debug] mvr_forward_depth): 0 as MVR drew it, 1 plus mvr_depth_bias
+// float steps, 2 conservative like the G-buffer stash, 3 (default) as drawn, and while the focus group's velocity pass
+// draws (an R16G16 target with the depth clone bound) a conservative copy (dilate, slope, bias) in its place. 1 and 2
+// thin out the crowd in the stands (a later pass tests the crowd against this depth); with 0 focus's own geometry in
+// the velocity pass misses the nearer MVR depth and the cockpit smears after DLAA while driving (docs/mvr.md B9d runs 3,
+// 4).
+constexpr int kForwardDepthModes = 4;
+void SetForwardDepth(int mode);
+int GetForwardDepth();
+const char* ForwardDepthName(int mode);
+// Quad: the vtable of the focus groups' CPhase3BuildCommandThread (found by class name; 0: none).
+void SetPhase3BuildVtable(uintptr_t vt);
+// A focus group's CBeginEye, after its clones went in (snapshots, above).
+void FocusGroupIn(int eye);
 // Task map of a shot frame or of a map frame (render thread): every task of the eye groups with its draws, binds,
 // clears and the distinct targets it bound, one log line per task that touched the immediate context; `detail` adds
 // the distinct PS shader resources and constant buffers of its draws (resource ids, clones marked).
@@ -112,8 +140,10 @@ void TaskMapEnd();
 // clear instead during the MVR part. MapTargets: false = bind as they are; rtvOut has room for n entries.
 bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv, ID3D11DepthStencilView* dsv,
                 ID3D11RenderTargetView** rtvOut, ID3D11DepthStencilView** dsvOut);
-ID3D11RenderTargetView* MapClear(ID3D11DeviceContext* c, ID3D11RenderTargetView* v);
-ID3D11DepthStencilView* MapClear(ID3D11DeviceContext* c, ID3D11DepthStencilView* v);
+// The clear's values: the live forward pass repeats its clears of other-size targets on their focus clones.
+ID3D11RenderTargetView* MapClear(ID3D11DeviceContext* c, ID3D11RenderTargetView* v, const FLOAT col[4]);
+ID3D11DepthStencilView* MapClear(ID3D11DeviceContext* c, ID3D11DepthStencilView* v, UINT flags, FLOAT depth,
+                                 UINT8 stencil);
 // Draw detours, before the real draw: true = call AfterDraw after it (draw counts in a shot frame only).
 bool BeforeDraw(ID3D11DeviceContext* c);
 void AfterDraw(ID3D11DeviceContext* c);
@@ -150,5 +180,16 @@ struct TestForwardState {
 };
 TestForwardState TestForwardGet();
 ID3D11Texture2D* TestForwardStash(int k);  // the corner of slice 1 of forward target k (not referenced)
+// qvfr_proxy_smoke --mvr-forward, live mode (B9d): after OnFrameStart and SetWindow, the live forward pass of eye L as
+// if focus L's early run had gone (focus L decided to skip, its SSAO and lights done).
+void TestForwardLive(const void* phase3Vtable);
+// As if the eye's early run began now (eye 1: snapshot L first, as EarlyBegin does).
+void TestEarlyMark(int eye);
+struct TestLiveState {
+    unsigned passes = 0, ok = 0, focusSkipped = 0, buildSkipped = 0, otherClears = 0, otherClearMisses = 0;
+    unsigned snapEntries = 0, saves[2] = {}, restores[2] = {}, velBinds = 0;
+    std::string why;  // the latest live pass's failure
+};
+TestLiveState TestLiveGet();
 
 }  // namespace qvfr::mvrpass

@@ -156,10 +156,10 @@ void STDMETHODCALLTYPE D_OM(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetVi
     o_om(c, n, rtv, dsv);
 }
 void STDMETHODCALLTYPE D_ClearRtv(ID3D11DeviceContext* c, ID3D11RenderTargetView* v, const FLOAT col[4]) {
-    o_clearRtv(c, qvfr::mvrpass::MapClear(c, v), col);
+    o_clearRtv(c, qvfr::mvrpass::MapClear(c, v, col), col);
 }
 void STDMETHODCALLTYPE D_ClearDsv(ID3D11DeviceContext* c, ID3D11DepthStencilView* v, UINT f, FLOAT d, UINT8 st) {
-    o_clearDsv(c, qvfr::mvrpass::MapClear(c, v), f, d, st);
+    o_clearDsv(c, qvfr::mvrpass::MapClear(c, v, f, d, st), f, d, st);
 }
 bool HookContext(ID3D11DeviceContext* c) {
     void** vt = *(void***)c;
@@ -225,6 +225,8 @@ bool MakeSet(Set& s, UINT w, UINT h, int k, const float proj[16]) {
            SUCCEEDED(dev->CreateBuffer(&bd, &cam, &s.cam)) && SUCCEEDED(dev->CreateBuffer(&gd, &gi, &s.g));
 }
 
+bool g_halfDraw = true;  // the live mode's pass draws nothing into the 1/2 size target (as the game's, B9c run 2)
+
 // The forward pass of one set into its targets (the game binds them inside the task).
 void DrawForward(const Set& s) {
     ID3D11DeviceContext* c = g_s.ctx;
@@ -257,7 +259,7 @@ void DrawForward(const Set& s) {
     c->PSSetSamplers(0, 1, g_s.point.GetAddressOf());
     c->VSSetShader(g_s.vs.Get(), nullptr, 0);
     c->PSSetShader(g_s.fwd.Get(), nullptr, 0);
-    c->Draw(kQuads * 6, 0);  // the 1/2 size target (one view)
+    if (g_halfDraw) c->Draw(kQuads * 6, 0);  // the 1/2 size target (one view)
     c->OMSetRenderTargets(1, &rtv, s.dsv.Get());
     D3D11_VIEWPORT vp{0, 0, (float)s.w, (float)s.h, 0, 1};
     c->RSSetViewports(1, &vp);
@@ -311,6 +313,8 @@ ID3D11Texture2D* CloneOf(ID3D11Resource* r) {
     if (r == g_s.game.depth.Get()) return g_s.focus.depth.Get();
     if (r == g_s.game.gt0.Get()) return g_s.focus.gt0.Get();
     if (r == g_s.game.gt2.Get()) return g_s.focus.gt2.Get();
+    if (r == g_s.game.half.Get()) return g_s.focus.half.Get();
+    if (r == g_s.game.halfDepth.Get()) return g_s.focus.halfDepth.Get();
     return nullptr;
 }
 bool JitterOf(float out[2]) {
@@ -363,6 +367,7 @@ using TaskFn = void(__fastcall*)(void*);
 void* g_vtPhase3[32];
 void* g_vtFocus[32];
 void* g_vtDummy[32];
+void* g_vtBuild3[32];  // focus's CPhase3BuildCommandThread (live mode)
 struct FakeTask {
     void** vt;
 };
@@ -556,6 +561,104 @@ int RunMvrForward() {
             ownOff += ownC[i] != refFC[i];
         }
 
+    // Live mode (B9d): the same pass, view 1 straight into focus's clones (the depth as MVR drew it here, to compare it
+    // with focus's own), the 1/2 size clears repeated on their clones, focus's CPhase3BuildCommandThread and
+    // CPhase3Render skipped; then the snapshots of the shared clones in the order quad drives them.
+    Restore();
+    const float mark[4] = {0.3f, 0.9f, 0.1f, 1.0f};
+    ctx->ClearRenderTargetView(g_s.focus.halfRtv.Get(), mark);
+    ctx->ClearDepthStencilView(g_s.focus.halfDsv.Get(), D3D11_CLEAR_DEPTH, 0.25f, 0);
+    g_halfDraw = false;
+    for (void*& p : g_vtBuild3) p = (void*)&FakeFinish;
+    qvfr::mvrpass::SetPhase3BuildVtable((uintptr_t)g_vtBuild3);
+    qvfr::mvrpass::TestDepthBias(0, 0.0f, false);
+    qvfr::mvrpass::OnFrameStart(true);
+    qvfr::mvrpass::SetWindow(0, true, sx, ox, sy, oy, kW, kH);
+    qvfr::mvrpass::TestForwardLive(g_vtPhase3);
+    FakeTask outerL{g_vtPhase3};
+    const bool liveOuterSkip = qvfr::mvrpass::BeforeTask((uint8_t*)&outerL, 0);
+    if (!liveOuterSkip) RunTask(outerL);
+    qvfr::mvrpass::AfterTask((uint8_t*)&outerL);
+    const std::vector<uint64_t> lgC = Read(g_s.game.color.Get()), lgD = Read(g_s.game.depth.Get());
+    const std::vector<uint64_t> lC = Read(g_s.focus.color.Get()), lD = Read(g_s.focus.depth.Get()),
+                                lH = Read(g_s.focus.half.Get()), lHD = Read(g_s.focus.halfDepth.Get());
+    // Mode 3 (default): focus's velocity pass (an R16G16 target with the depth clone) gets the conservative copy.
+    ComPtr<ID3D11Texture2D> velTex = Tex(kFW, kFH, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_RENDER_TARGET);
+    ComPtr<ID3D11RenderTargetView> velRtv;
+    if (velTex) dev->CreateRenderTargetView(velTex.Get(), nullptr, &velRtv);
+    qvfr::mvrpass::FocusGroupIn(0);
+    bool velOk = false, plainOk = false;
+    if (velRtv) {
+        ID3D11RenderTargetView* vr = velRtv.Get();
+        ctx->OMSetRenderTargets(1, &vr, g_s.focus.dsv.Get());
+        ComPtr<ID3D11DepthStencilView> got;
+        ctx->OMGetRenderTargets(0, nullptr, &got);
+        ComPtr<ID3D11Resource> gr;
+        if (got) got->GetResource(&gr);
+        velOk = gr && gr.Get() != (ID3D11Resource*)g_s.focus.depth.Get();
+        ID3D11RenderTargetView* fr = g_s.focus.rtv.Get();  // another target with the same depth: as it is
+        ctx->OMSetRenderTargets(1, &fr, g_s.focus.dsv.Get());
+        got.Reset();
+        gr.Reset();
+        ctx->OMGetRenderTargets(0, nullptr, &got);
+        if (got) got->GetResource(&gr);
+        plainOk = gr.Get() == (ID3D11Resource*)g_s.focus.depth.Get();
+        ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    }
+    FakeTask build{g_vtBuild3};
+    const int finishBefore = g_finish;
+    const bool buildSkip = qvfr::mvrpass::BeforeTask((uint8_t*)&build, 2);
+    if (buildSkip) (*(TaskFn**)&build)[0x38 / 8](&build);
+    FakeTask focusL{g_vtPhase3};  // the same class as outer's
+    const bool liveFocusSkip = qvfr::mvrpass::BeforeTask((uint8_t*)&focusL, 2);
+    if (liveFocusSkip) {
+        (*(TaskFn**)&focusL)[0x38 / 8](&focusL);
+    } else {
+        focusL.vt = g_vtFocus;
+        RunTask(focusL);
+    }
+    qvfr::mvrpass::AfterTask((uint8_t*)&focusL);
+    const int finishes = g_finish - finishBefore;
+    // Snapshots: outer R's early run saves focus L's state, then writes focus R's into the shared clones; focus L's
+    // CBeginEye saves focus R's and puts focus L's back; focus R's puts focus R's back.
+    qvfr::mvrpass::TestEarlyMark(1);
+    const float rColor[4] = {0.05f, 0.15f, 0.95f, 1.0f}, rHalf[4] = {0.5f, 0.5f, 0.5f, 0.5f};
+    ctx->ClearRenderTargetView(g_s.focus.rtv.Get(), rColor);
+    ctx->ClearDepthStencilView(g_s.focus.dsv.Get(), D3D11_CLEAR_DEPTH, 0.5f, 0);
+    ctx->ClearRenderTargetView(g_s.focus.halfRtv.Get(), rHalf);
+    const std::vector<uint64_t> rC = Read(g_s.focus.color.Get()), rD = Read(g_s.focus.depth.Get()),
+                                rH = Read(g_s.focus.half.Get());
+    qvfr::mvrpass::FocusGroupIn(0);
+    const bool backL = Read(g_s.focus.color.Get()) == lC && Read(g_s.focus.depth.Get()) == lD &&
+                       Read(g_s.focus.half.Get()) == lH;
+    qvfr::mvrpass::FocusGroupIn(1);
+    const bool backR = Read(g_s.focus.color.Get()) == rC && Read(g_s.focus.depth.Get()) == rD &&
+                       Read(g_s.focus.half.Get()) == rH;
+    const qvfr::mvrpass::TestLiveState lv = qvfr::mvrpass::TestLiveGet();
+    qvfr::mvrpass::TestEnd();
+    qvfr::mvrpass::SetForward(false);
+    qvfr::mvrpass::TestDepthBias(-1, 0.0f, false);
+    const int lpx = (int)(kFW * kFH);
+    int lOuter = 0, lC1 = 0, lCBig = 0, lD1 = 0, lHalf = 0, lHalfD = 0;
+    float lMax = 0;
+    for (size_t i = 0; i < refC.size() && i < lgC.size() && i < lgD.size(); ++i)
+        lOuter += lgC[i] != refC[i] || lgD[i] != refD[i];
+    for (size_t i = 0; i < lC.size() && i < refFC.size(); ++i) {
+        const float d = MaxHalfDiff(lC[i], refFC[i]);
+        lC1 += d > 0;
+        lCBig += d > 0.02f;
+        lMax = std::max(lMax, d);
+        lD1 += std::fabs(AsFloat(lD[i]) - AsFloat(refFD[i])) > 1e-5f;
+    }
+    for (uint64_t v : lH) lHalf += v != 0;  // the pass cleared the 1/2 size target to 0
+    for (uint64_t v : lHD) lHalfD += AsFloat(v) != 1.0f;
+    const bool liveOk = lv.passes == 1 && lv.ok == 1 && !liveOuterSkip && buildSkip && liveFocusSkip && finishes == 2 &&
+                        lv.focusSkipped == 1 && lv.buildSkipped == 1 && lv.otherClears == 2 &&
+                        lv.otherClearMisses == 0 && lC.size() == (size_t)lpx && lOuter == 0 && lCBig * 100 <= lpx &&
+                        lD1 * 100 <= lpx && lHalf == 0 && lHalfD == 0 && lH.size() == (size_t)(kFW / 2) * (kFH / 2) &&
+                        lv.snapEntries == 4 && lv.saves[0] == 1 && lv.saves[1] == 1 && lv.restores[0] == 1 &&
+                        lv.restores[1] == 1 && backL && backR && velOk && plainOk && lv.velBinds == 1;
+
     int warnings = 0, expected = 0;
     if (info) {
         for (UINT64 i = 0, n = info->GetNumStoredMessages(); i < n; ++i) {
@@ -583,7 +686,7 @@ int RunMvrForward() {
     const bool outerOk = outerC == 0 && outerD == 0 && outerH == 0 && gH.size() == refH.size();
     const bool focusOk = clonesChanged == 0 && covered > px / 3 && occluded > px / 8 && occOurs == occluded &&
                          cBig * 100 <= px && dOff * 100 <= px;
-    const bool ok = countsOk && outerOk && focusOk && !warnings;
+    const bool ok = countsOk && outerOk && focusOk && liveOk && !warnings;
     printf("MVR forward: %s; PS %s (globalTexture0 in t%u, globalTexture2 in t%u), VS %s; outer pass %s%s%s, stash %d "
            "targets, binds %u, copy-ins %u, map failures %u, draws %u (one view %u, patched PS %u, PS slot 3 rebinds "
            "%u, screen textures without a clone %u), copied back %u, SetMultiViewMode failures %u; paused %u times "
@@ -600,6 +703,16 @@ int RunMvrForward() {
            "run %s, %d px off its reference (%s)\n",
            kFW, kFH, covered, occluded, occOurs, cOff, cBig, cMax, dOff, clonesChanged,
            st2.focusDone ? "compared" : "NOT COMPARED", ownOff, focusOk ? "OK" : "WRONG");
+    printf("  live (B9d): outer pass %u, into the clones %u%s%s; outer vs without MVR %d px; clones vs focus's own pass: "
+           "color %d px differ (%d by > 0.02, max %.4f), depth %d px off; 1/2 size clone cleared %s (%d / %d px off), "
+           "clears repeated %u (shared %u); focus build %s, CPhase3Render %s (finishes %d); snapshots: %u clones, "
+           "saved L %u / R %u, put back L %u / R %u, focus L's back %s, focus R's back %s; velocity pass on the copy %s "
+           "(binds %u), other targets on the clone %s (%s)\n",
+           lv.passes, lv.ok, lv.why.empty() ? "" : ": ", lv.why.c_str(), lOuter, lC1, lCBig, lMax, lD1,
+           lHalf || lHalfD ? "WRONG" : "ok", lHalf, lHalfD, lv.otherClears, lv.otherClearMisses,
+           buildSkip ? "skipped" : "RUN", liveFocusSkip ? "skipped" : "RUN", finishes, lv.snapEntries, lv.saves[0],
+           lv.saves[1], lv.restores[0], lv.restores[1], backL ? "yes" : "NO", backR ? "yes" : "NO",
+           velOk ? "yes" : "NO", lv.velBinds, plainOk ? "yes" : "NO", liveOk ? "OK" : "WRONG");
     printf("  debug layer %s, %d warnings, %d expected linkage reports\n", debugLayer ? "on" : "not installed", warnings,
            expected);
     return ok ? 0 : 1;

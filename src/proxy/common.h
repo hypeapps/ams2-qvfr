@@ -171,6 +171,17 @@ struct Config {
     // Live, gate B9c (mvr_pass.h): with mvr_early=1 and mvr_ps_patch, a shot also runs outer L's forward pass
     // (CPhase3Render) with MVR and compares view 1 with focus L's own forward pass.
     bool mvrForwardTest = false;
+    // Live, gate B9d (mvr_pass.h): with mvr_early=1 and mvr_ps_patch, every frame outer L's and outer R's forward pass
+    // draws focus's with MVR and the focus groups skip theirs; the hotkey (mvr_modifier + mvr_forward_key; testers:
+    // VK_DELETE) toggles it.
+    bool mvrForward = false;
+    int mvrForwardKey = 0;
+    // Live: the depth the live forward pass leaves in focus's clone (the game's later passes test against it): 0 as MVR
+    // drew it, 1 plus mvr_depth_bias float steps, 2 conservative like the G-buffer stash (dilate, slope, bias), 3 as
+    // drawn with the velocity pass on a conservative copy (mvr_pass.h). The hotkey (mvr_modifier +
+    // mvr_forward_depth_key; testers: VK_PRIOR) cycles them.
+    int mvrForwardDepth = 3;
+    int mvrForwardDepthKey = 0;
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
     bool dlaa = false;                // mode=dlaa (a change needs a restart)

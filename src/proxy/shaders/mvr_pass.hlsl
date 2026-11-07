@@ -68,6 +68,13 @@ float PSMask(float4 pos : SV_Position) : SV_Target {
     return mask.SampleLevel(linearClamp, origin + pos.xy * invSize * scale, 0);
 }
 
+// PSBlit (gate B9d, run 5): a color texture of outer (the live track map) read in the focus window into a focus-size
+// texture, for view 1 of the forward pass: outer UV = origin + focus UV * scale (as PSMask, all four channels).
+Texture2D<float4> colorIn : register(t0);
+float4 PSBlit(float4 pos : SV_Position) : SV_Target {
+    return colorIn.SampleLevel(linearClamp, origin + pos.xy * invSize * scale, 0);
+}
+
 float PSDepthIn(float4 pos : SV_Position) : SV_Depth {
     return depthIn.Load(int3(pos.xy, 0));
 }

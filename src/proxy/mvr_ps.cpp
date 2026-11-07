@@ -141,6 +141,7 @@ ID3D11PixelShader* MakePatched(ID3D11Device* dev, const void* code, SIZE_T len, 
     dxbc::MvrPsPatchOptions opt;
     opt.cbSlot = kCbSlot;
     opt.texBase = kTexBase;
+    opt.screenTextures.push_back(kLiveTrackName);  // texture 5 (B9d run 5)
     std::vector<uint8_t> patched;
     dxbc::MvrPsPatchInfo info;
     std::string err;
@@ -252,14 +253,16 @@ bool Hook(ID3D11Device* dev) {
 void LogLine(const char* what) {
     const uint64_t patched = g_patched.load();
     Log("MVR PS patch stats%s: %s; pixel shaders made %llu: patched %llu (%llu before the first Submit, %.0f us each; "
-        "screen inputs %llu, reads with a branch %llu, of them in UV %llu; globalTexture0..4 in %llu/%llu/%llu/%llu/%llu), "
+        "screen inputs %llu, reads with a branch %llu, of them in UV %llu; globalTexture0..4 and the live track map in "
+        "%llu/%llu/%llu/%llu/%llu/%llu), "
         "not needed %llu, refused %llu, creation failed %llu, device without MVR %llu, proxy's own %llu; other calls "
         "%llu; geometry shaders %llu, writing the array or viewport index %llu",
         what, g_dead ? "STOPPED" : g_on ? "on" : "off", (unsigned long long)g_made.load(), (unsigned long long)patched,
         (unsigned long long)g_beforeSubmit.load(), patched ? (double)g_patchUs.load() / (double)patched : 0.0,
         (unsigned long long)g_inputs.load(), (unsigned long long)g_wrapped.load(), (unsigned long long)g_scaled.load(),
         (unsigned long long)g_tex[0].load(), (unsigned long long)g_tex[1].load(), (unsigned long long)g_tex[2].load(),
-        (unsigned long long)g_tex[3].load(), (unsigned long long)g_tex[4].load(), (unsigned long long)g_notNeeded.load(),
+        (unsigned long long)g_tex[3].load(), (unsigned long long)g_tex[4].load(), (unsigned long long)g_tex[5].load(),
+        (unsigned long long)g_notNeeded.load(),
         (unsigned long long)g_refused.load(), (unsigned long long)g_failed.load(), (unsigned long long)g_noMvr.load(),
         (unsigned long long)g_own.load(), (unsigned long long)g_other.load(), (unsigned long long)g_gsMade.load(),
         (unsigned long long)g_gsLayered.load());

@@ -25,8 +25,12 @@
 namespace qvfr::mvrps {
 
 constexpr unsigned kCbSlot = 3;     // PS constant buffer of the extra view (free in the scene's PS, docs/mvr.md B2)
-constexpr unsigned kTexBase = 21;   // the extra view's globalTexture0..4 (the scene's PS use t0..t20)
-constexpr unsigned kTextures = 5;
+constexpr unsigned kTexBase = 21;   // the extra view's screen textures (the scene's PS use t0..t20)
+// Screen textures: globalTexture0..4 (0..4) and the live track map (5: rubber, dirt and skid marks the eye group's
+// CLiveTrackRender draws at the eye's size; the track's PS sample it at their screen UV, docs/mvr.md B9d run 5).
+constexpr unsigned kTextures = 6;
+constexpr unsigned kLiveTrack = 5;
+constexpr const char* kLiveTrackName = "GLOBAL_liveTrackTextureMap_tex";
 
 // VR_Init in quad mode with the setting on (after sunfx::Install and mvrvs::Install), once per process. False: the
 // module stays off.
@@ -47,7 +51,7 @@ Kind KindOf(ID3D11PixelShader* ps);
 constexpr uint8_t kNoSlot = 0xFF;
 struct Info {
     Kind kind = Kind::Unknown;
-    uint8_t slot[kTextures] = {kNoSlot, kNoSlot, kNoSlot, kNoSlot, kNoSlot};
+    uint8_t slot[kTextures] = {kNoSlot, kNoSlot, kNoSlot, kNoSlot, kNoSlot, kNoSlot};
 };
 Info InfoOf(ID3D11PixelShader* ps);
 bool On();  // installed and not stopped

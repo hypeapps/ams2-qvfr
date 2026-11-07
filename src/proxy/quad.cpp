@@ -298,6 +298,10 @@ bool g_mvrKeyDown = false;
 bool g_mvrModeKeyDown = false;
 int g_mvrEarlyCfg = 0;  // Cfg().mvrEarly last seen (a reload sets the step)
 bool g_mvrEarlyKeyDown = false;
+bool g_mvrForwardCfg = false;  // Cfg().mvrForward last seen (a reload sets it)
+bool g_mvrForwardKeyDown = false;
+int g_mvrFwdDepthCfg = 3;  // Cfg().mvrForwardDepth last seen
+bool g_mvrFwdDepthKeyDown = false;
 bool g_mvrMapKeyDown = false;
 bool g_mapFrame = false;  // a task map with PS resources in this frame (mvr_map_key)
 bool g_mapNext = false;
@@ -494,8 +498,11 @@ void __fastcall RunTask(uint8_t* task) {
     const bool profOn = g_profOn.load(std::memory_order_relaxed);
     const bool mvr = mvrpass::On();
     const ProfTask* prof = profOn || mvr ? ProfFind(task) : nullptr;
-    // MVR forward step 1 (B9a): focus L's SSAO and lights right before outer L's forward pass.
-    if (mvr && prof && prof->group == OuterL && mvrpass::KindOf(task) == mvrpass::Kind::Phase3) EarlyFocus(0);
+    // MVR forward step 1 (B9a): focus L's SSAO and lights right before outer L's forward pass; with the live forward
+    // pass (B9d) focus R's before outer R's too (EarlyWanted decides).
+    if (mvr && prof && (prof->group == OuterL || prof->group == OuterR) &&
+        mvrpass::KindOf(task) == mvrpass::Kind::Phase3)
+        EarlyFocus(prof->group - OuterL);
     // MVR gate B8: a focus group's G-buffer tasks are skipped when outer's pass drew its G-buffer (B9a: and its SSAO
     // and lights after an early run).
     if (mvr && mvrpass::BeforeTask(task, prof ? prof->group : -1)) {
@@ -724,6 +731,13 @@ void BuildProfileLocked() {
             snprintf(e.name, sizeof(e.name), "task@%p", items[i].task);
         ++count[e.group];
     }
+    // MVR forward (B9d): the focus groups' CPhase3BuildCommandThread is skipped with their CPhase3Render (the pair
+    // records and replays the group's buffers); its vtable by class name.
+    uintptr_t build3 = 0;
+    for (size_t i = 0; i < p->n && !build3; ++i)
+        if (p->entries[i].group >= FocusL && !strcmp(p->entries[i].name, "CPhase3BuildCommandThread"))
+            hooks::TryRead(items[i].task, &build3, 8);
+    mvrpass::SetPhase3BuildVtable(build3);
     std::vector<uint32_t> idx(p->n);
     for (uint32_t i = 0; i < p->n; ++i) idx[i] = i;
     std::sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) { return items[a].task < items[b].task; });
@@ -1126,7 +1140,9 @@ void CullLocked(uint8_t* ctx, int group, const uint8_t* cam, const uint8_t* srcE
 // reads the eye tangents straight from the VR device by view - 1 (0x9ce0e8), the passes read the projection from the
 // camera (+0x138, +0x150). The frustum block stays the eye's (built from FOV, a superset of the focus window); focus
 // culling gives the group a draw queue culled for its window.
-void SwapInLocked(uint8_t* ctx, int group, int src, Run& run, bool cull = true) {
+// `early`: the MVR early run inside outer's group (B9a, B9d) renders no image of its own, so focus R needs no outer R
+// copy yet (it is made at outer R's CEndEye, after the run); focus R's own group checks it as always.
+void SwapInLocked(uint8_t* ctx, int group, int src, Run& run, bool cull = true, bool early = false) {
     Swap& s = g_swap;
     memcpy(s.slot, ctx + kCtxSlots + kFocusView * kSlotSize, kSlotSize);
     memcpy(s.block, ctx + kCtxCamBlock + kFocusView * kCamBlockSize, kCamBlockSize);
@@ -1154,7 +1170,7 @@ void SwapInLocked(uint8_t* ctx, int group, int src, Run& run, bool cull = true) 
     // Focus R ends in the right Submit texture, which then is the right eye's only image: without this frame's outer
     // R copy it must stay the plain eye view, not the focus window.
     const Copy& outerR = g_copy[CopyOuterR];
-    if (g_focus.on && !g_focus.projFailed && group == FocusR && (!outerR.frame || !outerR.tex)) {
+    if (g_focus.on && !g_focus.projFailed && group == FocusR && !early && (!outerR.frame || !outerR.tex)) {
         if (!g_focus.noCopyLogged) {
             g_focus.noCopyLogged = true;
             Log("Quad: focus R without the focus projection in frame %llu: no outer R copy (the right eye gets the "
@@ -1382,6 +1398,24 @@ void HandleToolsLocked() {
     if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrEarlyKey, g_mvrEarlyKeyDown)) {
         mvrpass::SetEarly((mvrpass::GetEarly() + 1) % mvrpass::kEarlyModes);
         Log("Quad: MVR early tasks of focus L: %s (hotkey)", mvrpass::EarlyName(mvrpass::GetEarly()));
+    }
+    if (mvrpass::On() && c.mvrForward != g_mvrForwardCfg) {
+        g_mvrForwardCfg = c.mvrForward;
+        mvrpass::SetForward(c.mvrForward);
+        Log("Quad: MVR live forward of both eyes %s (ini)", c.mvrForward ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrForwardKey, g_mvrForwardKeyDown)) {
+        mvrpass::SetForward(!mvrpass::GetForward());
+        Log("Quad: MVR live forward of both eyes %s (hotkey)", mvrpass::GetForward() ? "on" : "off");
+    }
+    if (mvrpass::On() && c.mvrForwardDepth != g_mvrFwdDepthCfg) {
+        g_mvrFwdDepthCfg = c.mvrForwardDepth;
+        mvrpass::SetForwardDepth(c.mvrForwardDepth);
+        Log("Quad: MVR live forward depth %s (ini)", mvrpass::ForwardDepthName(c.mvrForwardDepth));
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrForwardDepthKey, g_mvrFwdDepthKeyDown)) {
+        mvrpass::SetForwardDepth((mvrpass::GetForwardDepth() + 1) % mvrpass::kForwardDepthModes);
+        Log("Quad: MVR live forward depth %s (hotkey)", mvrpass::ForwardDepthName(mvrpass::GetForwardDepth()));
     }
     g_mapFrame = g_mapNext;
     g_mapNext = false;
@@ -1818,6 +1852,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         SwapInLocked(ctx, g, kSourceView[g], r);
         mvrpass::FocusGroup(g - FocusL, r.projected);
         clones::BeginGroup(gpu::Context(), clones::Focus);
+        mvrpass::FocusGroupIn(g - FocusL);  // B9d: this eye's snapshot of the shared focus clones back
         taaviews::BeginGroup(g);
         // The focus window as a part of outer (which covers the whole grid); without the focus projection the
         // group renders outer's view.
@@ -2039,7 +2074,7 @@ void EarlyFocus(int eye) {
             why = "focus's CBeginEye has another context or view";
             return;
         }
-        SwapInLocked(ctx, fg, kSourceView[fg], run, false);
+        SwapInLocked(ctx, fg, kSourceView[fg], run, false, true);
         if (!run.projected) {
             RestoreLocked();
             why = "no focus projection";
@@ -2372,6 +2407,8 @@ void Install() {
             mvrpass::SetJitterSource(&dlaa::FrameJitter);
             mvrpass::Install();
             g_mvrEarlyCfg = Cfg().mvrEarly;  // Install took the setting
+            g_mvrForwardCfg = Cfg().mvrForward;
+            g_mvrFwdDepthCfg = Cfg().mvrForwardDepth;
         }
         else if (Cfg().mvrGbuffer)
             Log("MVR G-buffer: off (needs [debug] mvr_vs_patch=1 and the executor patch)");

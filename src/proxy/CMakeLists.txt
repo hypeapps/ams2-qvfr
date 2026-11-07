@@ -39,7 +39,7 @@ add_custom_command(
 set(QVFR_MVRPASS_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/shaders/mvr_pass.hlsl)
 add_custom_command(
   OUTPUT ${QVFR_SHADER_OUT}/mvr_pass_vs.h ${QVFR_SHADER_OUT}/mvr_pass_depth_ps.h ${QVFR_SHADER_OUT}/mvr_pass_mask_ps.h
-         ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ps.h
+         ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ps.h ${QVFR_SHADER_OUT}/mvr_pass_blit_ps.h
   COMMAND ${CMAKE_COMMAND} -E make_directory ${QVFR_SHADER_OUT}
   COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T vs_5_0 /E VSMain /Vn kMvrPassVS
           /Fh ${QVFR_SHADER_OUT}/mvr_pass_vs.h ${QVFR_MVRPASS_HLSL}
@@ -49,6 +49,8 @@ add_custom_command(
           /Fh ${QVFR_SHADER_OUT}/mvr_pass_mask_ps.h ${QVFR_MVRPASS_HLSL}
   COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T ps_5_0 /E PSDepthIn /Vn kMvrPassDepthInPS
           /Fh ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ps.h ${QVFR_MVRPASS_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T ps_5_0 /E PSBlit /Vn kMvrPassBlitPS
+          /Fh ${QVFR_SHADER_OUT}/mvr_pass_blit_ps.h ${QVFR_MVRPASS_HLSL}
   DEPENDS ${QVFR_MVRPASS_HLSL}
   COMMENT "fxc mvr_pass.hlsl"
   VERBATIM)
@@ -56,7 +58,8 @@ add_custom_command(
 add_library(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT}/compose_vs.h ${QVFR_SHADER_OUT}/compose_ps.h
             ${QVFR_SHADER_OUT}/sun_fx_vs.h ${QVFR_SHADER_OUT}/sun_fx_ps.h ${QVFR_SHADER_OUT}/dlaa_mask_cs.h
             ${QVFR_SHADER_OUT}/dlaa_cockpit_cs.h ${QVFR_SHADER_OUT}/mvr_pass_vs.h ${QVFR_SHADER_OUT}/mvr_pass_depth_ps.h
-            ${QVFR_SHADER_OUT}/mvr_pass_mask_ps.h ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ps.h)
+            ${QVFR_SHADER_OUT}/mvr_pass_mask_ps.h ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ps.h
+            ${QVFR_SHADER_OUT}/mvr_pass_blit_ps.h)
 target_include_directories(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT})
 
 enable_language(ASM_MASM)  # export thunks (generated/thunks.asm)

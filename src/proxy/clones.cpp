@@ -1445,13 +1445,13 @@ void STDMETHODCALLTYPE D_Resolve(ID3D11DeviceContext* c, ID3D11Resource* dst, UI
 void STDMETHODCALLTYPE D_ClearRtv(ID3D11DeviceContext* c, ID3D11RenderTargetView* v, const FLOAT col[4]) {
     v = MapView(c, v, "ClearRenderTargetView", _ReturnAddress());
     if (Watching()) ObserveViews(c, Write, "ClearRenderTargetView", &v, 1, _ReturnAddress());
-    v = mvrpass::MapClear(c, v);  // MVR gate B7: its copy during the test run
+    v = mvrpass::MapClear(c, v, col);  // MVR gate B7: its copy during the test run
     o_clearRtv(c, v, col);
 }
 void STDMETHODCALLTYPE D_ClearDsv(ID3D11DeviceContext* c, ID3D11DepthStencilView* v, UINT f, FLOAT d, UINT8 s) {
     v = MapView(c, v, "ClearDepthStencilView", _ReturnAddress());
     if (Watching()) ObserveViews(c, Write, "ClearDepthStencilView", &v, 1, _ReturnAddress());
-    v = mvrpass::MapClear(c, v);
+    v = mvrpass::MapClear(c, v, f, d, s);
     o_clearDsv(c, v, f, d, s);
 }
 void STDMETHODCALLTYPE D_ClearUavU(ID3D11DeviceContext* c, ID3D11UnorderedAccessView* v, const UINT val[4]) {
