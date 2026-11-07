@@ -34,16 +34,18 @@ bool Seh(const char* where, F&& f) {
 
 // ---------------------------------------------------------------- timestamps
 
-// Marks: frame begin, frame end, then begin and end of every phase.
+// Marks: frame begin, frame end, then begin and end of every phase, then of every span.
 constexpr int kFrameBegin = 0, kFrameEnd = 1;
-constexpr int kMarks = 2 + 2 * kPhases;
+constexpr int kSpanBase = 2 + 2 * kPhases;
+constexpr int kMarks = kSpanBase + 2 * kSpans;
+static_assert(kMarks <= 64, "one bit per mark in Slot::issued");
 constexpr int kSlots = 6;  // frames in flight; at 72 Hz the results are ready after 2 to 3 frames
 constexpr int kReady = 32;
 
 struct Slot {
     ID3D11Query* disjoint = nullptr;
     ID3D11Query* ts[kMarks] = {};
-    uint32_t issued = 0;  // bit per mark set in this frame
+    uint64_t issued = 0;  // bit per mark set in this frame
     uint64_t frame = 0;
     enum State { Free, Open, Pending } state = Free;
 };
@@ -58,6 +60,11 @@ Result g_ready[kReady];
 int g_readyHead = 0, g_readyCount = 0;
 
 const char* const kPhaseNames[kPhases] = {"outer_l", "outer_r", "focus_l", "focus_r", "compose_l", "compose_r"};
+const char* const kSpanNames[kSpans] = {
+    "p1 outer L",   "p1 outer R",   "p1 focus L",    "p1 focus R",    "lights outer L", "lights outer R",
+    "lights focus L", "lights focus R", "p3 outer L", "p3 outer R",   "p3 focus L",     "p3 focus R",
+    "early L",      "early R",      "copy back L",   "copy back R",   "extract L",      "extract R",
+    "mask stash L", "mask stash R", "fill L",        "fill R"};
 
 template <class T>
 void SafeRelease(T*& p) {
@@ -96,8 +103,8 @@ bool CreateQueriesLocked() {
     return true;
 }
 
-float Span(const uint64_t* t, uint32_t issued, int a, int b, double freq) {
-    if (!(issued & (1u << a)) || !(issued & (1u << b)) || t[b] < t[a]) return -1;
+float Ms(const uint64_t* t, uint64_t issued, int a, int b, double freq) {
+    if (!(issued & (1ull << a)) || !(issued & (1ull << b)) || t[b] < t[a]) return -1;
     return (float)((t[b] - t[a]) * 1000.0 / freq);
 }
 
@@ -107,7 +114,7 @@ bool ReadLocked(ID3D11DeviceContext* ctx, Slot& s) {
     if (ctx->GetData(s.disjoint, &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) return false;
     uint64_t t[kMarks] = {};
     for (int m = 0; m < kMarks; ++m) {
-        if (!(s.issued & (1u << m))) continue;
+        if (!(s.issued & (1ull << m))) continue;
         if (ctx->GetData(s.ts[m], &t[m], sizeof(t[m]), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) return false;
     }
     s.state = Slot::Free;
@@ -117,8 +124,10 @@ bool ReadLocked(ID3D11DeviceContext* ctx, Slot& s) {
     }
     Result r;
     r.frame = s.frame;
-    r.frameMs = Span(t, s.issued, kFrameBegin, kFrameEnd, (double)dj.Frequency);
-    for (int p = 0; p < kPhases; ++p) r.phaseMs[p] = Span(t, s.issued, 2 + 2 * p, 3 + 2 * p, (double)dj.Frequency);
+    r.frameMs = Ms(t, s.issued, kFrameBegin, kFrameEnd, (double)dj.Frequency);
+    for (int p = 0; p < kPhases; ++p) r.phaseMs[p] = Ms(t, s.issued, 2 + 2 * p, 3 + 2 * p, (double)dj.Frequency);
+    for (int p = 0; p < kSpans; ++p)
+        r.spanMs[p] = Ms(t, s.issued, kSpanBase + 2 * p, kSpanBase + 1 + 2 * p, (double)dj.Frequency);
     if (!g_firstLogged) {
         g_firstLogged = true;
         Log("GPU timing: first frame %llu read (timestamp frequency %llu Hz), frame %.3f ms",
@@ -136,11 +145,11 @@ bool ReadLocked(ID3D11DeviceContext* ctx, Slot& s) {
 void MarkLocked(int m) {
     if (g_cur < 0 || GetCurrentThreadId() != g_thread) return;
     Slot& s = g_slot[g_cur];
-    if (s.state != Slot::Open || (s.issued & (1u << m))) return;
+    if (s.state != Slot::Open || (s.issued & (1ull << m))) return;
     ID3D11DeviceContext* ctx = g_ctx.load();
     if (!ctx) return;
     ctx->End(s.ts[m]);
-    s.issued |= 1u << m;
+    s.issued |= 1ull << m;
 }
 
 }  // namespace
@@ -185,6 +194,7 @@ bool OnSubmitTexture(void* d3dTexture) {
 }
 
 const char* PhaseName(int p) { return p >= 0 && p < kPhases ? kPhaseNames[p] : "?"; }
+const char* SpanName(int s) { return s >= 0 && s < kSpans ? kSpanNames[s] : "?"; }
 
 bool Enabled() { return Cfg().gpuTiming && g_ctx.load() != nullptr; }
 
@@ -242,6 +252,22 @@ void End(Phase p) {
     Guarded("gpu::End", [&] {
         std::lock_guard lock(g_m);
         MarkLocked(3 + 2 * p);
+    });
+}
+
+void SpanBegin(Span s) {
+    if (!Cfg().gpuTiming || s < 0 || s >= kSpans) return;
+    Guarded("gpu::SpanBegin", [&] {
+        std::lock_guard lock(g_m);
+        MarkLocked(kSpanBase + 2 * s);
+    });
+}
+
+void SpanEnd(Span s) {
+    if (!Cfg().gpuTiming || s < 0 || s >= kSpans) return;
+    Guarded("gpu::SpanEnd", [&] {
+        std::lock_guard lock(g_m);
+        MarkLocked(kSpanBase + 1 + 2 * s);
     });
 }
 

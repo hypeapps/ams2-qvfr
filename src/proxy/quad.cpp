@@ -512,6 +512,22 @@ const ProfTask* ProfFind(uint8_t* task) {
 
 void EarlyFocus(int eye);
 
+// GPU spans of an eye group's render task (gpu.h): its begin and end span, -1 for none.
+struct TaskSpans {
+    int begin = -1, end = -1;
+};
+TaskSpans SpansOf(uint8_t* task, const ProfTask* prof) {
+    if (!prof || prof->group < OuterL || prof->group > FocusR || !gpu::Enabled()) return {};
+    const int g = prof->group - OuterL;
+    switch (mvrpass::KindOf(task)) {
+    case mvrpass::Kind::Phase1: return {gpu::P1OuterL + g, gpu::P1OuterL + g};
+    case mvrpass::Kind::Ssao: return {gpu::LitOuterL + g, -1};
+    case mvrpass::Kind::Phase2: return {-1, gpu::LitOuterL + g};
+    case mvrpass::Kind::Phase3: return {gpu::P3OuterL + g, gpu::P3OuterL + g};
+    default: return {};
+    }
+}
+
 void __fastcall RunTask(uint8_t* task) {
     if (g_skip.load(std::memory_order_relaxed)) {
         if (InSkipSet(task)) {
@@ -530,10 +546,13 @@ void __fastcall RunTask(uint8_t* task) {
     if (mvr && prof && (prof->group == OuterL || prof->group == OuterR) &&
         mvrpass::KindOf(task) == mvrpass::Kind::Phase3)
         EarlyFocus(prof->group - OuterL);
+    const TaskSpans spans = mvr ? SpansOf(task, prof) : TaskSpans{};
+    if (spans.begin >= 0) gpu::SpanBegin((gpu::Span)spans.begin);
     // MVR gate B8: a focus group's G-buffer tasks are skipped when outer's pass drew its G-buffer (B9a: and its SSAO
     // and lights after an early run).
     if (mvr && mvrpass::BeforeTask(task, prof ? prof->group : -1)) {
         (*(ExecuteFn**)task)[kFinishSlot](task);
+        if (spans.end >= 0) gpu::SpanEnd((gpu::Span)spans.end);
         return;
     }
     // Task map of a shot frame: what each task of the eye groups draws and binds.
@@ -545,6 +564,7 @@ void __fastcall RunTask(uint8_t* task) {
     (*(ExecuteFn**)task)[kExecuteSlot](task);
     if (map) mvrpass::TaskMapEnd();
     if (mvr) mvrpass::AfterTask(task);
+    if (spans.end >= 0) gpu::SpanEnd((gpu::Span)spans.end);
     if (profOn) {
         QueryPerformanceCounter(&t1);
         if (prof) {
@@ -2147,6 +2167,8 @@ void EarlyFocus(int eye) {
     }
     LARGE_INTEGER t0{}, t1{};
     QueryPerformanceCounter(&t0);
+    const gpu::Span span = eye ? gpu::EarlyR : gpu::EarlyL;
+    gpu::SpanBegin(span);
     ID3D11DeviceContext* imm = gpu::Context();
     clones::EndGroup(imm);  // outer's (no clones of its own in the game's render size)
     clones::BeginGroup(imm, clones::Focus);
@@ -2165,6 +2187,7 @@ void EarlyFocus(int eye) {
         std::lock_guard lock(g_m);
         if (g_swap.ctx && g_swap.group == fg) RestoreLocked();
     });
+    gpu::SpanEnd(span);
     if (!ran) return;
     ok &= ExecuteOnly(oBegin, o_beginExec);
     QueryPerformanceCounter(&t1);

@@ -191,8 +191,8 @@ double g_runFramesT0 = -1, g_sessionFramesT0 = -1;
 constexpr uint64_t kGpuWait = 8;
 // GPU averages for the periodic stats line.
 struct GpuSums {
-    uint64_t frames = 0, n[gpu::kPhases] = {};
-    double frame = 0, phase[gpu::kPhases] = {};
+    uint64_t frames = 0, n[gpu::kPhases] = {}, spanN[gpu::kSpans] = {};
+    double frame = 0, phase[gpu::kPhases] = {}, span[gpu::kSpans] = {};
 } g_gpuSums;
 
 bool g_frozen = false;
@@ -207,6 +207,7 @@ struct Series {
 struct RunStats {
     Series totalGpu, preGpu, postGpu, compGpu, compCpu, proxyInterval, proxyCpu, wgpBlock;
     Series gpuFrame, gpuPhase[gpu::kPhases], gpuCompose, gpuOther;  // our timestamps (frames.csv)
+    Series gpuSpan[gpu::kSpans];  // spans inside the eye groups (summary only)
     uint64_t proxyRows = 0;
     double proxyFirstMs = -1, proxyLastMs = -1;
     uint64_t frames = 0, dropped = 0, mispresented = 0, reprojCpu = 0, reprojGpu = 0, reprojAny = 0, gazeOk = 0;
@@ -323,6 +324,8 @@ void AccumulateFrame(const ProxyFrame& p, const gpu::Result* g) {
     if (g->frameMs >= 0) r.gpuFrame.Add(g->frameMs);
     for (int k = 0; k < gpu::kPhases; ++k)
         if (g->phaseMs[k] >= 0) r.gpuPhase[k].Add(g->phaseMs[k]);
+    for (int k = 0; k < gpu::kSpans; ++k)
+        if (g->spanMs[k] >= 0) r.gpuSpan[k].Add(g->spanMs[k]);
     if (float c = ComposeMs(*g); c >= 0) r.gpuCompose.Add(c);
     if (float o = OtherMs(*g); o >= 0) r.gpuOther.Add(o);
 }
@@ -347,6 +350,11 @@ void ProcessFrames(uint64_t current) {
                 if (g.phaseMs[k] < 0) continue;
                 ++g_gpuSums.n[k];
                 g_gpuSums.phase[k] += g.phaseMs[k];
+            }
+            for (int k = 0; k < gpu::kSpans; ++k) {
+                if (g.spanMs[k] < 0) continue;
+                ++g_gpuSums.spanN[k];
+                g_gpuSums.span[k] += g.spanMs[k];
             }
         }
     }
@@ -385,7 +393,7 @@ void AccumulateRun(const modern::FrameTiming& t) {
     r.sysLast = t.systemTimeS;
 }
 
-std::string StatLine(const char* name, Series& s, float budget = 0) {
+std::string StatLine(const char* name, Series& s, float budget = 0, int digits = 2) {
     char buf[256];
     if (s.v.empty()) {
         snprintf(buf, sizeof(buf), "%-26s no data", name);
@@ -400,8 +408,8 @@ std::string StatLine(const char* name, Series& s, float budget = 0) {
         sum += x;
         if (budget > 0 && x > budget) ++over;
     }
-    int n = snprintf(buf, sizeof(buf), "%-26s avg %6.2f  p50 %6.2f  p90 %6.2f  p99 %6.2f  max %6.2f ms", name,
-                     sum / v.size(), pct(0.5), pct(0.9), pct(0.99), v.back());
+    int n = snprintf(buf, sizeof(buf), "%-26s avg %6.*f  p50 %6.*f  p90 %6.*f  p99 %6.*f  max %6.*f ms", name, digits,
+                     sum / v.size(), digits, pct(0.5), digits, pct(0.9), digits, pct(0.99), digits, v.back());
     if (budget > 0)
         snprintf(buf + n, sizeof(buf) - n, "  > %.1f ms: %.1f%%", budget, 100.0 * over / v.size());
     return buf;
@@ -508,6 +516,20 @@ void FinishRun(bool aborted) {
         if (!r.gpuPhase[k].v.empty()) lines.push_back(StatLine(phaseLabels[k], r.gpuPhase[k]));
     if (!r.gpuCompose.v.empty()) lines.push_back(StatLine("GPU compose (both eyes)", r.gpuCompose));
     lines.push_back(StatLine("GPU other (frame - phases)", r.gpuOther));
+    bool spanHeader = false;
+    for (int k = 0; k < gpu::kSpans; ++k) {
+        Series& sp = r.gpuSpan[k];
+        if (sp.v.empty()) continue;
+        if (!spanHeader) {
+            spanHeader = true;
+            lines.push_back("GPU spans inside the eye groups (engine tasks and the MVR G-buffer's parts; frames = how "
+                            "many frames had the span):");
+        }
+        char label[64];
+        snprintf(label, sizeof(label), "GPU %s", gpu::SpanName(k));
+        snprintf(buf, sizeof(buf), "%s (%zu frames)", StatLine(label, sp, 0, 3).c_str(), sp.v.size());
+        lines.push_back(buf);
+    }
     if (r.frames) {
         snprintf(buf, sizeof(buf), "Dropped %llu, mispresented %llu, reprojected frames %llu (CPU %llu, GPU %llu)",
                  (unsigned long long)r.dropped, (unsigned long long)r.mispresented, (unsigned long long)r.reprojAny,
@@ -638,6 +660,14 @@ void PeriodicStats(const char* forced = nullptr) {
             "%.2f, compose L %.2f, compose R %.2f ms (-1 = did not run)",
             (unsigned long long)s.frames, s.frame / s.frames, avg(gpu::OuterL), avg(gpu::OuterR), avg(gpu::FocusL),
             avg(gpu::FocusR), avg(gpu::ComposeL), avg(gpu::ComposeR));
+        std::string spans;
+        for (int k = 0; k < gpu::kSpans; ++k) {
+            if (!s.spanN[k]) continue;
+            char b[64];
+            snprintf(b, sizeof(b), "%s%s %.3f", spans.empty() ? "" : ", ", gpu::SpanName(k), s.span[k] / s.spanN[k]);
+            spans += b;
+        }
+        if (!spans.empty()) Log("GPU spans (ms, average of the frames that had them): %s", spans.c_str());
     }
     g_gpuSums = GpuSums{};
     LogCallStats(false);

@@ -1633,6 +1633,9 @@ void EndMvr(ID3D11DeviceContext* c, bool rebind) {
             if (v) v->Release();
         if (ds) ds->Release();
     }
+    // GPU spans (gpu.h) of the G-buffer pass only; the forward pass's parts are B9d's.
+    const bool spans = !p.forward && p.eye >= 0 && p.eye <= 1;
+    if (spans) gpu::SpanBegin(p.eye ? gpu::CopyBackR : gpu::CopyBackL);
     {
         Internal in;
         for (Copy& cp : g_copies) {
@@ -1643,6 +1646,7 @@ void EndMvr(ID3D11DeviceContext* c, bool rebind) {
             ++p.copiedBack;
         }
     }
+    if (spans) gpu::SpanEnd(p.eye ? gpu::CopyBackR : gpu::CopyBackL);
     p.part = PartTail;
     if (p.mapFailures) PassFailed(p, "a target could not be mapped to a copy");
     if (p.viewsFailures) PassFailed(p, "SetMultiViewMode failed");
@@ -1651,7 +1655,9 @@ void EndMvr(ID3D11DeviceContext* c, bool rebind) {
         if (p.forward) {
             if (!p.live) ExtractForward(c);  // the live pass writes focus's clones at the task's end (LiveEnd)
         } else {
+            gpu::SpanBegin(p.eye ? gpu::ExtractR : gpu::ExtractL);
             Extract(c);
+            gpu::SpanEnd(p.eye ? gpu::ExtractR : gpu::ExtractL);
         }
     }
 }
@@ -1874,6 +1880,8 @@ void PassEnd(ID3D11DeviceContext* c) {
     if (p.part == PartMvr) EndMvr(c, true);
     Stash& s = g_stash[p.eye];
     s.nm = 0;
+    const gpu::Span maskSpan = p.eye ? gpu::MaskStashR : gpu::MaskStashL;
+    gpu::SpanBegin(maskSpan);
     // The game binds the G-buffer again after the masks without drawing (run 3): only draws there miss focus.
     if (p.lateDraws) {
         PassFailed(p, "draws into an outer-size target after the masks");
@@ -1914,6 +1922,7 @@ void PassEnd(ID3D11DeviceContext* c) {
         }
         ++s.nm;
     }
+    gpu::SpanEnd(maskSpan);
     s.valid = !p.failed && s.n > 0;
     s.frame = g_frame;
     const Win& win = g_win[p.eye];
@@ -2224,6 +2233,8 @@ const char* Decide(int eye) {
 void Fill(ID3D11DeviceContext* c, int eye, bool depth = true) {
     Stash& s = g_stash[eye];
     bool failed = false;
+    const gpu::Span span = eye ? gpu::FillR : gpu::FillL;
+    gpu::SpanBegin(span);
     Internal in;
     for (int k = 0; k < s.n; ++k) {
         if (s.g[k].depth && !depth) continue;
@@ -2262,6 +2273,7 @@ void Fill(ID3D11DeviceContext* c, int eye, bool depth = true) {
         ++g_st.masks;
         ++g_tot.masks;
     }
+    gpu::SpanEnd(span);
     ++g_st.fills;
     ++g_tot.fills;
     ++g_test.fills;
