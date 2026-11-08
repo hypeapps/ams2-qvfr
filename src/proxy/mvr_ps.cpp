@@ -3,6 +3,7 @@
 #include <intrin.h>
 #include <psapi.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -126,6 +127,10 @@ ID3D11PixelShader* MakePatched(ID3D11Device* dev, const void* code, SIZE_T len, 
     if (!code || !len || !out || link) {
         g_other.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
+    }
+    {
+        const char* b = (const char*)code;
+        made.liveTrack = std::search(b, b + len, kLiveTrackName, kLiveTrackName + strlen(kLiveTrackName)) != b + len;
     }
     g_made.fetch_add(1, std::memory_order_relaxed);
     if (!g_testing && caller >= g_selfBase && caller < g_selfEnd) {

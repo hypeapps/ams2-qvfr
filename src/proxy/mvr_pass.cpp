@@ -684,6 +684,21 @@ uintptr_t g_phase3BuildVt = 0;  // focus's CPhase3BuildCommandThread (quad, by c
 uint64_t g_fwdOk[2] = {};       // the frame whose forward pass of the eye put view 1 into focus's clones
 std::atomic<uint64_t> g_buildRan[2] = {};  // the frame in which focus's CPhase3BuildCommandThread ran (then its
                                             // CPhase3Render runs too: the pair records and replays its buffers)
+// B19 (mvr_pass.h): focus's own live track map skipped.
+uintptr_t g_ltRenderVt = 0, g_ltBuildVt = 0;  // CLiveTrackRender, CLiveTrackBuildCommandThread (quad, by class name)
+bool g_ltOn = true;          // [debug] mvr_livetrack_skip and its hotkey
+bool g_ltStopped = false;    // a draw in a focus group without its map read the map
+bool g_ltMapFrame = false;   // quad: a task map frame
+uint64_t g_ltBuildSkip[2] = {};  // the frame in which focus's CLiveTrackBuildCommandThread was skipped
+std::atomic<int> g_ltWatch{-1};  // the focus group (eye) running now without its map: its draws are checked
+ID3D11PixelShader* g_ltLastPs = nullptr;  // only compared (the latest draw's PS and whether it reads the map)
+bool g_ltLastReads = false;
+struct LtStats {
+    uint64_t skipped[2] = {}, builds[2] = {}, ran[2] = {}, checked = 0, reads = 0;
+    std::vector<Reason> reasons;
+};
+LtStats g_lts, g_ltot;
+std::string g_ltLastWhy;  // the smoke's
 bool g_track = false;           // an early run: the focus clones its tasks bind or clear are noted
 // The engine textures whose focus clones the early runs or the forward passes write (only compared). Focus L and R
 // share the focus clones, and outer R's group writes focus R's results before focus L's group reads focus L's: each
@@ -3392,6 +3407,7 @@ bool Install() {
         g_nativeOn = Cfg().mvrNativeTargets;
         g_msColorSkip = Cfg().mvrMsColorSkip;
         g_msSlices = Cfg().mvrMsSlices;
+        g_ltOn = Cfg().mvrLiveTrackSkip;
         g_installed = true;
         Log("MVR G-buffer: on; outer L's and outer R's G-buffer pass draw the eye's focus too (MVR, view 1 in the "
             "corner of slice 1 of two-slice copies), the focus groups skip CPhase1BuildCommandThread and CPhase1Render "
@@ -3482,6 +3498,7 @@ void OnFrameStart(bool enabled) {
         g_probe = Probe{};
         g_curFocus = -1;
         g_velBound.store(-1, std::memory_order_relaxed);
+        g_ltWatch.store(-1, std::memory_order_relaxed);
         const bool on = enabled && On();
         if (on != g_enabled)
             Log("MVR G-buffer: %s (frame %llu)", on ? "ON" : "OFF (the focus groups run their own pass)",
@@ -3637,9 +3654,31 @@ bool GetMsColorSkip() { return g_msColorSkip; }
 void SetPhase3BuildVtable(uintptr_t vt) { g_phase3BuildVt = vt; }
 
 void FocusGroupIn(int eye) {
+    g_ltWatch.store(-1, std::memory_order_relaxed);
     if (!On() || eye < 0 || eye > 1) return;
     g_curFocus = eye;
 }
+
+void EyeGroupEnd() { g_ltWatch.store(-1, std::memory_order_relaxed); }
+
+void SetLiveTrackVtables(uintptr_t render, uintptr_t build) {
+    if (render == g_ltRenderVt && build == g_ltBuildVt) return;
+    g_ltRenderVt = render;
+    g_ltBuildVt = render ? build : 0;
+    if (!g_installed) return;
+    if (render)
+        Log("MVR live track: focus's CLiveTrackRender found (vtable AMS2AVX.exe+0x%llX, its build %s); skipped with "
+            "the G-buffer and forward from outer: %s",
+            (unsigned long long)(render - hooks::ExeBase()), build ? "found" : "NOT FOUND", g_ltOn ? "on" : "off");
+    else
+        Log("MVR live track: no CLiveTrackRender in the focus groups; focus draws its own map");
+}
+void SetLiveTrackSkip(bool on) {
+    if (on) g_ltStopped = false;
+    g_ltOn = on;
+}
+bool GetLiveTrackSkip() { return g_ltOn; }
+void SetTaskMapFrame(bool on) { g_ltMapFrame = on; }
 
 Kind KindOf(uint8_t* task) {
     uintptr_t vt = 0;
@@ -3852,6 +3891,75 @@ bool Phase3Task(uint8_t* task, int group, bool build) {
     return false;
 }
 
+// B19: why focus's own live track map is drawn in this frame (null: skipped; "": the setting is off).
+const char* LiveTrackWhy(int eye) {
+    if (!g_ltOn) return "";
+    if (g_ltStopped) return "stopped: a draw in a focus group read the map it had skipped";
+    if (!g_enabled) return "MVR G-buffer off (hotkey)";
+    if (g_shot.armed || g_fshot.armed) return "shot frame";
+    if (g_ltMapFrame) return "task map frame";
+    const FocusState& f = g_focus[eye];
+    if (!f.decided || !f.skip || !f.early) return "focus's G-buffer, SSAO and lights not from outer in this frame";
+    if (!g_forwardOn || g_fwdOk[eye] != g_frame) return "focus's forward not from outer in this frame";
+    return nullptr;
+}
+
+// B19: a focus group's CLiveTrackBuildCommandThread (build) or CLiveTrackRender; true = skip it.
+bool LiveTrackTask(int group, bool build) {
+    if (group < kFocusL) return false;
+    const int eye = group - kFocusL;
+    const char* why = LiveTrackWhy(eye);
+    if (build) {
+        if (why) return false;  // the render counts the reason
+        g_ltBuildSkip[eye] = g_frame;
+        ++g_lts.builds[eye];
+        ++g_ltot.builds[eye];
+        return true;
+    }
+    if (why && g_ltBuildSkip[eye] != g_frame) {  // the render replays what the build recorded
+        ++g_lts.ran[eye];
+        ++g_ltot.ran[eye];
+        if (*why) {
+            AddReason(g_lts.reasons, why);
+            AddReason(g_ltot.reasons, why);
+            g_ltLastWhy = why;
+        }
+        return false;
+    }
+    ++g_lts.skipped[eye];
+    ++g_ltot.skipped[eye];
+    if (g_ltot.skipped[eye] == 1)
+        Log("MVR live track: focus %s skips its CLiveTrackBuildCommandThread and CLiveTrackRender (frame %llu; its "
+            "G-buffer and forward read outer's map)", kEye[eye], (unsigned long long)g_frame);
+    g_ltLastPs = nullptr;
+    g_ltLastReads = false;
+    g_ltWatch.store(eye, std::memory_order_relaxed);
+    return true;
+}
+
+// B19: a draw in a focus group that skipped its map; one whose PS reads the map stops the skip.
+void LiveTrackDraw(ID3D11DeviceContext* c) {
+    const int eye = g_ltWatch.load(std::memory_order_relaxed);
+    if (eye < 0 || eye > 1) return;
+    ID3D11PixelShader* ps = nullptr;
+    c->PSGetShader(&ps, nullptr, nullptr);
+    if (ps) ps->Release();  // only compared
+    if (ps != g_ltLastPs) {
+        g_ltLastPs = ps;
+        g_ltLastReads = ps && mvrps::InfoOf(ps).liveTrack;
+    }
+    ++g_lts.checked;
+    ++g_ltot.checked;
+    if (!g_ltLastReads) return;
+    ++g_lts.reads;
+    ++g_ltot.reads;
+    if (g_ltStopped) return;
+    g_ltStopped = true;
+    Log("MVR live track: WARNING: focus %s drew with pixel shader %p, which reads the live track map the group skipped "
+        "(frame %llu); focus draws its own map again from the next frame (mvr_livetrack_skip stopped until it is set on "
+        "again)", kEye[eye], (void*)ps, (unsigned long long)g_frame);
+}
+
 bool BeforeTask(uint8_t* task, int group) {
     if (!On() || !task || group < kOuterL || group > kFocusR) return false;
     uintptr_t vt = 0;
@@ -3869,6 +3977,11 @@ bool BeforeTask(uint8_t* task, int group) {
         Protect("BeforeTask", [&] { skip3 = Phase3Task(task, group, build3); });
         if (skip3 && g_probe.task == task) g_probe = Probe{};
         return skip3;
+    }
+    if (g_ltRenderVt && (vt == g_ltRenderVt || (g_ltBuildVt && vt == g_ltBuildVt))) {
+        bool skipLt = false;
+        Protect("BeforeTask", [&] { skipLt = LiveTrackTask(group, vt == g_ltBuildVt); });
+        return skipLt;
     }
     const bool late = vt == g_ssaoVt || vt == g_phase2Vt;  // after the G-buffer pair: skipped only after an early run
     if (vt != g_phase1Vt && vt != g_buildVt && !late) return false;
@@ -4335,9 +4448,11 @@ static bool VelocityDraw(ID3D11DeviceContext* c, int e) {
 
 bool SkipDraw(ID3D11DeviceContext* c) {
     const int e = g_velBound.load(std::memory_order_relaxed);
-    if (e < 0 || e > 1 || t_internal || c != Imm()) return false;
+    const int lt = g_ltWatch.load(std::memory_order_relaxed);
+    if ((e < 0 && lt < 0) || t_internal || c != Imm()) return false;
     bool skip = false;
-    Protect("SkipDraw", [&] { skip = VelocityDraw(c, e); });
+    if (e >= 0 && e <= 1) Protect("SkipDraw", [&] { skip = VelocityDraw(c, e); });
+    if (!skip && lt >= 0) Protect("SkipDraw", [&] { LiveTrackDraw(c); });  // B19
     return skip;
 }
 
@@ -4466,9 +4581,27 @@ void LogStats(bool totals) {
             g_msSlices ? "on" : "off", (unsigned long long)f.sliceTargets[0], (unsigned long long)f.sliceTargets[1],
             (unsigned long long)f.sliceClears, fr.empty() ? "" : "; not from outer: ", fr.c_str());
     }
+    LtStats& l = totals ? g_ltot : g_lts;
+    if (g_ltRenderVt && (g_ltOn || l.skipped[0] || l.skipped[1] || l.reads)) {
+        std::string lr;
+        for (const Reason& r : l.reasons) {
+            char b[240];
+            snprintf(b, sizeof(b), "%s%s %llu", lr.empty() ? "" : "; ", r.text.c_str(), (unsigned long long)r.n);
+            lr += b;
+        }
+        Log("MVR live track%s (%llu frames, mvr_livetrack_skip %s%s): focus's CLiveTrackRender skipped L %llu / R %llu "
+            "(its build L %llu / R %llu), drawn L %llu / R %llu; draws checked in the groups without their map %llu, "
+            "with a pixel shader that reads it %llu%s%s",
+            totals ? " (session)" : "", (unsigned long long)s.frames, g_ltOn ? "on" : "off",
+            g_ltStopped ? ", STOPPED" : "", (unsigned long long)l.skipped[0], (unsigned long long)l.skipped[1],
+            (unsigned long long)l.builds[0], (unsigned long long)l.builds[1], (unsigned long long)l.ran[0],
+            (unsigned long long)l.ran[1], (unsigned long long)l.checked, (unsigned long long)l.reads,
+            lr.empty() ? "" : "; drawn because: ", lr.c_str());
+    }
     if (!totals) {
         s = Stats{};
         g_fs = FwdStats{};
+        g_lts = LtStats{};
     }
 }
 
@@ -4555,6 +4688,20 @@ void TestEarlyMark(int eye) {
     FocusState& f = g_focus[eye];
     f.decided = f.skip = f.early = f.earlyLights = true;
     g_earlyOk[eye] = g_frame;
+}
+
+TestLiveTrackState TestLiveTrackGet() {
+    TestLiveTrackState t;
+    for (int e = 0; e < 2; ++e) {
+        t.skipped[e] = g_ltot.skipped[e];
+        t.builds[e] = g_ltot.builds[e];
+        t.ran[e] = g_ltot.ran[e];
+    }
+    t.checked = g_ltot.checked;
+    t.reads = g_ltot.reads;
+    t.stopped = g_ltStopped;
+    t.why = g_ltLastWhy;
+    return t;
 }
 
 TestLiveState TestLiveGet() {

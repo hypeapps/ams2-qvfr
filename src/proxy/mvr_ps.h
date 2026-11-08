@@ -52,6 +52,7 @@ constexpr uint8_t kNoSlot = 0xFF;
 struct Info {
     Kind kind = Kind::Unknown;
     uint8_t slot[kTextures] = {kNoSlot, kNoSlot, kNoSlot, kNoSlot, kNoSlot, kNoSlot};
+    bool liveTrack = false;  // reads the live track map (its name in the bytecode; any kind, refused ones too)
 };
 Info InfoOf(ID3D11PixelShader* ps);
 bool On();  // installed and not stopped

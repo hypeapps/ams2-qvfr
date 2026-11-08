@@ -315,6 +315,8 @@ bool g_mvrNativeCfg = true;  // Cfg().mvrNativeTargets last seen
 bool g_mvrNativeKeyDown = false;
 bool g_mvrMsColorSkipCfg = true;  // Cfg().mvrMsColorSkip last seen
 bool g_mvrMsColorSkipKeyDown = false;
+bool g_mvrLiveTrackCfg = true;  // Cfg().mvrLiveTrackSkip last seen
+bool g_mvrLiveTrackKeyDown = false;
 
 // mvr_motion's window source: mvr_pass's maps in uv.
 bool MotionWindows(int eye, mvrmotion::Map* cur, mvrmotion::Map* prev, bool* fromOuter) {
@@ -791,6 +793,15 @@ void BuildProfileLocked() {
         if (p->entries[i].group >= FocusL && !strcmp(p->entries[i].name, "CPhase3BuildCommandThread"))
             hooks::TryRead(items[i].task, &build3, 8);
     mvrpass::SetPhase3BuildVtable(build3);
+    // B19: the focus groups' CLiveTrackRender and CLiveTrackBuildCommandThread (skipped when focus reads outer's map).
+    uintptr_t ltRender = 0, ltBuild = 0;
+    for (size_t i = 0; i < p->n; ++i) {
+        if (p->entries[i].group < FocusL) continue;
+        if (!ltRender && !strcmp(p->entries[i].name, "CLiveTrackRender")) hooks::TryRead(items[i].task, &ltRender, 8);
+        if (!ltBuild && !strcmp(p->entries[i].name, "CLiveTrackBuildCommandThread"))
+            hooks::TryRead(items[i].task, &ltBuild, 8);
+    }
+    mvrpass::SetLiveTrackVtables(ltRender, ltBuild);
     std::vector<uint32_t> idx(p->n);
     for (uint32_t i = 0; i < p->n; ++i) idx[i] = i;
     std::sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) { return items[a].task < items[b].task; });
@@ -1471,6 +1482,15 @@ void HandleToolsLocked() {
         mvrpass::SetMsColorSkip(c.mvrMsColorSkip);
         Log("Quad: MVR multisampled color without copy-in after a depth clear %s (ini)", c.mvrMsColorSkip ? "on" : "off");
     }
+    if (mvrpass::On() && c.mvrLiveTrackSkip != g_mvrLiveTrackCfg) {
+        g_mvrLiveTrackCfg = c.mvrLiveTrackSkip;
+        mvrpass::SetLiveTrackSkip(c.mvrLiveTrackSkip);
+        Log("Quad: MVR focus skips its own live track map %s (ini)", c.mvrLiveTrackSkip ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrLiveTrackSkipKey, g_mvrLiveTrackKeyDown)) {
+        mvrpass::SetLiveTrackSkip(!mvrpass::GetLiveTrackSkip());
+        Log("Quad: MVR focus skips its own live track map %s (hotkey)", mvrpass::GetLiveTrackSkip() ? "on" : "off");
+    }
     if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrMsColorSkipKey, g_mvrMsColorSkipKeyDown)) {
         mvrpass::SetMsColorSkip(!mvrpass::GetMsColorSkip());
         Log("Quad: MVR multisampled color without copy-in after a depth clear %s (hotkey)",
@@ -1531,6 +1551,7 @@ void HandleToolsLocked() {
             mvrpass::GetNativeTargets() ? "on" : "off");
     }
     g_mapFrame = g_mapNext;
+    mvrpass::SetTaskMapFrame(g_mapFrame);
     g_mapNext = false;
     if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrMapKey, g_mvrMapKeyDown)) {
         g_mapNext = true;
@@ -1983,6 +2004,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
 }
 
 void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
+    mvrpass::EyeGroupEnd();  // B19: the group's draws are over
     sunfx::EndGroup();  // before CEndEye's copies and the desktop mirror
     dlaa::EndGroup();
     t_inEndEye = true;
@@ -2536,6 +2558,7 @@ void Install() {
             g_mvrDirectCfg = Cfg().mvrDirectExtract;
             g_mvrNativeCfg = Cfg().mvrNativeTargets;
             g_mvrMsColorSkipCfg = Cfg().mvrMsColorSkip;
+            g_mvrLiveTrackCfg = Cfg().mvrLiveTrackSkip;
             mvrpass::SetVelocityFill(&FillFocusMotion);
         }
         else if (Cfg().mvrGbuffer)

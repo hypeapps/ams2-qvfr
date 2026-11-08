@@ -462,6 +462,8 @@ void* g_vtPhase3[32];
 void* g_vtFocus[32];
 void* g_vtDummy[32];
 void* g_vtBuild3[32];  // focus's CPhase3BuildCommandThread (live mode)
+void* g_vtLtRender[32];  // B19: CLiveTrackRender
+void* g_vtLtBuild[32];   // B19: CLiveTrackBuildCommandThread
 struct FakeTask {
     void** vt;
 };
@@ -1234,6 +1236,44 @@ int RunMvrForward() {
     }
     qvfr::mvrpass::AfterTask((uint8_t*)&focusL);
     const int finishes = g_finish - finishBefore;
+    // B19: focus L's live track map, with its G-buffer and forward from outer (above): build and render skipped, outer's
+    // drawn. Focus L's draws are checked until its CEndEye: a PS without the map counts nothing, the G-buffer PS (it reads
+    // the map) stops the skip, a draw after CEndEye is not checked. Focus R before (no forward from outer for eye R here)
+    // and focus L after the stop draw theirs; the setting turned on again resumes it.
+    for (int i = 0; i < 32; ++i) g_vtLtRender[i] = g_vtLtBuild[i] = (void*)&FakeFinish;
+    qvfr::mvrpass::SetLiveTrackVtables((uintptr_t)g_vtLtRender, (uintptr_t)g_vtLtBuild);
+    qvfr::mvrpass::SetLiveTrackSkip(true);
+    const qvfr::mvrpass::TestLiveTrackState lt0 = qvfr::mvrpass::TestLiveTrackGet();
+    FakeTask ltOuter{g_vtLtRender}, ltBuild{g_vtLtBuild}, ltRender{g_vtLtRender}, ltRenderR{g_vtLtRender},
+        ltAgain{g_vtLtBuild};
+    const bool ltOuterSkip = qvfr::mvrpass::BeforeTask((uint8_t*)&ltOuter, 0);
+    qvfr::mvrpass::TestEarlyMark(1);  // focus R: its G-buffer, SSAO and lights from outer, but no forward
+    qvfr::mvrpass::FocusGroupIn(1);
+    const bool ltRSkip = qvfr::mvrpass::BeforeTask((uint8_t*)&ltRenderR, 3);
+    const qvfr::mvrpass::TestLiveTrackState ltR = qvfr::mvrpass::TestLiveTrackGet();
+    qvfr::mvrpass::EyeGroupEnd();
+    qvfr::mvrpass::FocusGroupIn(0);
+    const bool ltBuildSkip = qvfr::mvrpass::BeforeTask((uint8_t*)&ltBuild, 2);
+    const bool ltRenderSkip = qvfr::mvrpass::BeforeTask((uint8_t*)&ltRender, 2);
+    DrawForward(g_s.focus);
+    const qvfr::mvrpass::TestLiveTrackState ltA = qvfr::mvrpass::TestLiveTrackGet();
+    DrawGbuf(g_s.focus);
+    const qvfr::mvrpass::TestLiveTrackState ltB = qvfr::mvrpass::TestLiveTrackGet();
+    qvfr::mvrpass::EyeGroupEnd();
+    DrawGbuf(g_s.focus);
+    const qvfr::mvrpass::TestLiveTrackState ltC = qvfr::mvrpass::TestLiveTrackGet();
+    // Stopped: the next build runs (the render of this frame stays skipped: its build was).
+    const bool ltAgainSkip = qvfr::mvrpass::BeforeTask((uint8_t*)&ltAgain, 2);
+    const qvfr::mvrpass::TestLiveTrackState ltD = qvfr::mvrpass::TestLiveTrackGet();
+    qvfr::mvrpass::SetLiveTrackSkip(true);
+    const bool ltResumed = !qvfr::mvrpass::TestLiveTrackGet().stopped;
+    qvfr::mvrpass::SetLiveTrackVtables(0, 0);
+    const bool ltOk = !ltOuterSkip && ltBuildSkip && ltRenderSkip && ltA.skipped[0] == lt0.skipped[0] + 1 &&
+                      ltA.builds[0] == lt0.builds[0] + 1 && ltA.checked > lt0.checked && ltA.reads == lt0.reads &&
+                      !ltA.stopped && ltB.reads == lt0.reads + 1 && ltB.checked == ltA.checked + 1 && ltB.stopped &&
+                      ltC.checked == ltB.checked && ltC.reads == ltB.reads && !ltRSkip &&
+                      ltR.ran[1] == lt0.ran[1] + 1 && ltR.why.find("forward") != std::string::npos &&
+                      ltR.skipped[0] == lt0.skipped[0] && !ltAgainSkip && ltD.builds[0] == ltA.builds[0] && ltResumed;
     // The focus clones the pass wrote (color, depth, the 1/2 size target and its depth) are noted for focus R's twins
     // (the twins themselves: qvfr_proxy_smoke --clones).
     const qvfr::mvrpass::TestLiveState lv = qvfr::mvrpass::TestLiveGet();
@@ -1414,8 +1454,16 @@ int RunMvrForward() {
     const bool outerOk = outerC == 0 && outerD == 0 && outerH == 0 && gH.size() == refH.size();
     const bool focusOk = clonesChanged == 0 && covered > px / 3 && occluded > px / 8 && occOurs == occluded &&
                          cBig * 100 <= px && dOff * 100 <= px;
-    const bool ok = countsOk && outerOk && focusOk && liveOk && velSkipOk && gbufOk && nativeOk && msaa.ok && !warnings;
+    const bool ok = countsOk && outerOk && focusOk && liveOk && velSkipOk && gbufOk && nativeOk && msaa.ok && ltOk &&
+                    !warnings;
     printf("%s", msaa.text.c_str());
+    printf("  B19: focus's live track map: outer's drawn %s, focus R without the forward from outer drawn %s (%s); "
+           "focus L's build skipped %s, render skipped %s; draws checked %llu, reads of the map %llu then %llu (stopped "
+           "%s), after CEndEye %llu more checked; after the stop the build runs %s, resumed %s (%s)\n",
+           ltOuterSkip ? "NO" : "yes", ltRSkip ? "NO" : "yes", ltR.why.c_str(), ltBuildSkip ? "yes" : "NO",
+           ltRenderSkip ? "yes" : "NO", ltA.checked - lt0.checked, ltA.reads - lt0.reads, ltB.reads - lt0.reads,
+           ltB.stopped ? "yes" : "NO", ltC.checked - ltB.checked, ltAgainSkip ? "NO" : "yes",
+           ltResumed ? "yes" : "NO", ltOk ? "OK" : "WRONG");
     printf("  B17: live pass with outer's depth as the game's own two-slice array: %s, targets as the arrays %u (before "
            "%u), copied back %u (before %u); outer %d px, focus's clones %d px differ from the live run (%s)\n",
            nlv.ok ? "ok" : "FAILED", nlv.native, lv.native, nlv.copiedBack, lv.copiedBack, nOuter, nFocus,

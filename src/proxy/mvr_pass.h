@@ -174,6 +174,18 @@ void SetNativeTargets(bool on);
 bool GetNativeTargets();
 // Quad: the vtable of the focus groups' CPhase3BuildCommandThread (found by class name; 0: none).
 void SetPhase3BuildVtable(uintptr_t vt);
+// B19 (docs/mvr.md), [debug] mvr_livetrack_skip (live, hotkey mvr_modifier + mvr_livetrack_skip_key): a focus group
+// skips CLiveTrackBuildCommandThread and CLiveTrackRender (its own live track map: rubber, dirt and skid marks at the
+// eye's size) when its G-buffer, SSAO, lights and forward all come from outer's passes in this frame: their shaders
+// read outer's map in the focus window (B9d, B13), so focus's own goes unread. The render replays what the build
+// recorded, so it is skipped whenever the build was. Not in a shot or task map frame. Until the group's CEndEye every
+// draw is checked: one whose pixel shader reads the map (mvrps::Info::liveTrack) stops the skip for the session (log
+// line; the setting or the hotkey turned on again resumes it). Quad gives the vtables (by class name; 0: none).
+void SetLiveTrackVtables(uintptr_t render, uintptr_t build);
+void SetLiveTrackSkip(bool on);
+bool GetLiveTrackSkip();
+void SetTaskMapFrame(bool on);  // quad: a task map frame (mvr_map_key) lists every task, the map's too
+void EyeGroupEnd();             // quad: an eye group's CEndEye, before the engine's
 // A focus group's CBeginEye, after its clones went in (the eye of the velocity pass's depth, above).
 void FocusGroupIn(int eye);
 // Task map of a shot frame or of a map frame (render thread): every task of the eye groups with its draws, binds,
@@ -253,5 +265,12 @@ struct TestLiveState {
     std::string why;  // the latest live pass's failure
 };
 TestLiveState TestLiveGet();
+// B19: the session's live track counters (per eye: renders and builds skipped, renders run) and the stop.
+struct TestLiveTrackState {
+    unsigned long long skipped[2] = {}, builds[2] = {}, ran[2] = {}, checked = 0, reads = 0;
+    bool stopped = false;
+    std::string why;  // the latest reason a render ran
+};
+TestLiveTrackState TestLiveTrackGet();
 
 }  // namespace qvfr::mvrpass

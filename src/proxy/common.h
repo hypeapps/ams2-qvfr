@@ -212,6 +212,11 @@ struct Config {
     // outer R draws focus R into slice 2, and focus's clones of them are slices 1 (focus L) and 2 (focus R) of the
     // array itself (no copy out of the corner).
     bool mvrMsSlices = true;
+    // Live (docs/mvr.md B19, mvr_pass.h): a focus group skips its own live track map (CLiveTrackBuildCommandThread and
+    // CLiveTrackRender) when its G-buffer and forward come from outer. The hotkey (mvr_modifier +
+    // mvr_livetrack_skip_key) toggles it.
+    bool mvrLiveTrackSkip = true;
+    int mvrLiveTrackSkipKey = 0;
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
     bool dlaa = false;                // mode=dlaa (a change needs a restart)
