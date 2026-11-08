@@ -4087,49 +4087,69 @@ void RecordClear(ID3D11View* v, bool depth, const FLOAT* col, UINT flags, FLOAT 
     g_otherClears.push_back(oc);
 }
 
-// B12 step 5: a clear of a three-slice copy in the forward pass goes to slice 0 (the game's view: the array's own
-// view of its kind sees slice 0) and to view 1's slice; the third slice keeps the other eye's focus. True: done so,
-// the caller clears the game's view. The view kinds: 0 RTV, 1 DSV.
-bool ClearOwnSlices(ID3D11DeviceContext* c, ID3D11View* m, ID3D11View* game, const FLOAT* col, UINT flags, FLOAT d,
-                    UINT8 st) {
+// B12 step 5: a clear of a three-slice copy in the forward pass goes to slice 0 and to view 1's slice only; the third
+// slice keeps the other eye's focus. `game`: the view the game clears (its own view of the array, or the copy's view of
+// all slices that the pass read back from the bound state). Returns the view of slice 0 alone for the game's call (view
+// 1's slice is cleared here), or null: clear `game` as it is.
+template <class Desc>
+bool SliceDesc(Desc& d, UINT slice);
+template <>
+bool SliceDesc(D3D11_RENDER_TARGET_VIEW_DESC& d, UINT slice) {
+    switch (d.ViewDimension) {
+    case D3D11_RTV_DIMENSION_TEXTURE2D: {
+        const UINT mip = d.Texture2D.MipSlice;
+        d.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+        d.Texture2DArray = {mip, slice, 1};
+        return true;
+    }
+    case D3D11_RTV_DIMENSION_TEXTURE2DARRAY: d.Texture2DArray.FirstArraySlice = slice; d.Texture2DArray.ArraySize = 1; return true;
+    case D3D11_RTV_DIMENSION_TEXTURE2DMS: d.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY; d.Texture2DMSArray = {slice, 1}; return true;
+    case D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY: d.Texture2DMSArray = {slice, 1}; return true;
+    default: return false;
+    }
+}
+template <>
+bool SliceDesc(D3D11_DEPTH_STENCIL_VIEW_DESC& d, UINT slice) {
+    switch (d.ViewDimension) {
+    case D3D11_DSV_DIMENSION_TEXTURE2D: {
+        const UINT mip = d.Texture2D.MipSlice;
+        d.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+        d.Texture2DArray = {mip, slice, 1};
+        return true;
+    }
+    case D3D11_DSV_DIMENSION_TEXTURE2DARRAY: d.Texture2DArray.FirstArraySlice = slice; d.Texture2DArray.ArraySize = 1; return true;
+    case D3D11_DSV_DIMENSION_TEXTURE2DMS: d.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY; d.Texture2DMSArray = {slice, 1}; return true;
+    case D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY: d.Texture2DMSArray = {slice, 1}; return true;
+    default: return false;
+    }
+}
+
+ID3D11View* ClearOwnSlices(ID3D11DeviceContext* c, ID3D11View* m, ID3D11View* game, const FLOAT* col, UINT flags,
+                           FLOAT d, UINT8 st) {
     const int k = CopyOfView(m);
-    if (k < 0 || !g_copies[k].native || g_copies[k].slices < 3 || !g_copies[k].arr) return false;
+    if (k < 0 || !g_copies[k].native || g_copies[k].slices < 3 || !g_copies[k].arr) return nullptr;
     Copy& cp = g_copies[k];
     ComPtr<ID3D11Resource> gr;
     game->GetResource(&gr);
-    if (gr.Get() != (ID3D11Resource*)cp.arr.Get()) return false;
+    if (gr.Get() != (ID3D11Resource*)cp.arr.Get()) return nullptr;
     const UINT slice = SliceFor(cp);
-    ID3D11View* one = nullptr;
+    ID3D11View *one = nullptr, *zero = nullptr;
     if (!cp.depth) {
-        D3D11_RENDER_TARGET_VIEW_DESC rd{};
-        static_cast<ID3D11RenderTargetView*>(game)->GetDesc(&rd);
-        if (rd.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DMS) {
-            rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY;
-            rd.Texture2DMSArray = {slice, 1};
-        } else if (rd.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D) {
-            const UINT mip = rd.Texture2D.MipSlice;
-            rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
-            rd.Texture2DArray = {mip, slice, 1};
-        } else {
-            return false;
-        }
-        one = CloneViewOf(cp.arr.Get(), 0, &rd, sizeof(rd));
+        D3D11_RENDER_TARGET_VIEW_DESC r1{}, r0{};
+        static_cast<ID3D11RenderTargetView*>(game)->GetDesc(&r1);
+        r0 = r1;
+        if (!SliceDesc(r1, slice) || !SliceDesc(r0, 0)) return nullptr;
+        one = CloneViewOf(cp.arr.Get(), 0, &r1, sizeof(r1));
+        zero = CloneViewOf(cp.arr.Get(), 0, &r0, sizeof(r0));
     } else {
-        D3D11_DEPTH_STENCIL_VIEW_DESC dd{};
-        static_cast<ID3D11DepthStencilView*>(game)->GetDesc(&dd);
-        if (dd.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DMS) {
-            dd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY;
-            dd.Texture2DMSArray = {slice, 1};
-        } else if (dd.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2D) {
-            const UINT mip = dd.Texture2D.MipSlice;
-            dd.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
-            dd.Texture2DArray = {mip, slice, 1};
-        } else {
-            return false;
-        }
-        one = CloneViewOf(cp.arr.Get(), 1, &dd, sizeof(dd));
+        D3D11_DEPTH_STENCIL_VIEW_DESC d1{}, d0{};
+        static_cast<ID3D11DepthStencilView*>(game)->GetDesc(&d1);
+        d0 = d1;
+        if (!SliceDesc(d1, slice) || !SliceDesc(d0, 0)) return nullptr;
+        one = CloneViewOf(cp.arr.Get(), 1, &d1, sizeof(d1));
+        zero = CloneViewOf(cp.arr.Get(), 1, &d0, sizeof(d0));
     }
-    if (!one) return false;
+    if (!one || !zero) return nullptr;
     {
         Internal in;
         clones::RawScope raw;
@@ -4139,7 +4159,7 @@ bool ClearOwnSlices(ID3D11DeviceContext* c, ID3D11View* m, ID3D11View* game, con
             c->ClearRenderTargetView(static_cast<ID3D11RenderTargetView*>(one), col);
     }
     ++g_p.sliceClears;
-    return true;
+    return zero;
 }
 
 ID3D11RenderTargetView* MapClear(ID3D11DeviceContext* c, ID3D11RenderTargetView* v, const FLOAT col[4]) {
@@ -4159,7 +4179,8 @@ ID3D11RenderTargetView* MapClear(ID3D11DeviceContext* c, ID3D11RenderTargetView*
             out = m;
             if (g_p.forward) {
                 FillCopy(c, m, true);  // B12: the clear covers both slices
-                if (ClearOwnSlices(c, m, v, col, 0, 0, 0)) out = v;  // B12 step 5: not the other eye's slice
+                // B12 step 5: not the other eye's slice
+                if (ID3D11View* z = ClearOwnSlices(c, m, v, col, 0, 0, 0)) out = static_cast<ID3D11RenderTargetView*>(z);
             }
         }
     });
@@ -4186,10 +4207,11 @@ ID3D11DepthStencilView* MapClear(ID3D11DeviceContext* c, ID3D11DepthStencilView*
             if (g_p.forward) {
                 D3D11_DEPTH_STENCIL_VIEW_DESC dd{};
                 m->GetDesc(&dd);
-                const bool stencil = dd.Format == DXGI_FORMAT_D24_UNORM_S8_UINT ||
-                                     dd.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
-                FillCopy(c, m, (flags & D3D11_CLEAR_DEPTH) && (!stencil || (flags & D3D11_CLEAR_STENCIL)));
-                if (ClearOwnSlices(c, m, v, nullptr, flags, depth, stencil)) out = v;  // B12 step 5
+                const bool hasStencil = dd.Format == DXGI_FORMAT_D24_UNORM_S8_UINT ||
+                                        dd.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+                FillCopy(c, m, (flags & D3D11_CLEAR_DEPTH) && (!hasStencil || (flags & D3D11_CLEAR_STENCIL)));
+                if (ID3D11View* z = ClearOwnSlices(c, m, v, nullptr, flags, depth, stencil))  // B12 step 5
+                    out = static_cast<ID3D11DepthStencilView*>(z);
             }
         }
     });
