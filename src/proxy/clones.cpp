@@ -1241,12 +1241,13 @@ int BuildArraysLocked(ID3D11DeviceContext* imm) {
         if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&t2)) || !t2) continue;
         const D3D11_TEXTURE2D_DESC d = DescOf(t2);
         t2->Release();
-        if (d.ArraySize != 1 || d.SampleDesc.Count != 1 || d.Usage != D3D11_USAGE_DEFAULT ||
+        // B12: multisampled too (the forward pass's targets with MSAA; views of the engine's kind on an array of 2 see
+        // slice 0, qvfr_mvr_test --views), then with one mip.
+        if (d.ArraySize != 1 || (d.SampleDesc.Count != 1 && d.MipLevels != 1) || d.Usage != D3D11_USAGE_DEFAULT ||
             (d.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE)) {
             if (g_arrLogs < kMaxResetLogs) {
                 ++g_arrLogs;
-                Log("Clones: B17: %s %u x %u fmt %d x%u arr %u gets no two-slice array (only single 2D textures without "
-                    "MSAA)",
+                Log("Clones: B17: %s %u x %u fmt %d x%u arr %u gets no two-slice array (only single 2D textures)",
                     TexName(t), d.Width, d.Height, (int)d.Format, d.SampleDesc.Count, d.ArraySize);
             }
             continue;
@@ -1984,7 +1985,8 @@ bool CopySlice0(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src
     if (ok) {
         const D3D11_TEXTURE2D_DESC dd = DescOf(d2), sd = DescOf(s2);
         ok = dd.Width == sd.Width && dd.Height == sd.Height && dd.MipLevels == sd.MipLevels && dd.ArraySize <= 2 &&
-             sd.ArraySize <= 2 && dd.SampleDesc.Count == 1 && sd.SampleDesc.Count == 1;
+             sd.ArraySize <= 2 && dd.SampleDesc.Count == sd.SampleDesc.Count &&
+             dd.SampleDesc.Quality == sd.SampleDesc.Quality;  // B12: multisampled as a whole subresource
         for (UINT m = 0; ok && m < dd.MipLevels; ++m)
             o_copyRegion(c, dst, D3D11CalcSubresource(m, 0, dd.MipLevels), 0, 0, 0, src,
                          D3D11CalcSubresource(m, 0, sd.MipLevels), nullptr);

@@ -130,6 +130,11 @@ constexpr int kForwardDepthModes = 4;
 void SetForwardDepth(int mode);
 int GetForwardDepth();
 const char* ForwardDepthName(int mode);
+// B12 (docs/mvr.md), [debug] mvr_ms_color_skip (live, hotkey mvr_modifier + mvr_ms_color_skip_key, default on): in the
+// live forward pass a multisampled color target gets no copy of focus's color into slice 1 when the pass cleared its
+// depth first (a multisampled forward pass then shades its color from scratch; AMS2 draws the opaque sky dome first).
+void SetMsColorSkip(bool on);
+bool GetMsColorSkip();
 // B11 (docs/mvr.md), [debug] mvr_velocity_skip (live, hotkey mvr_modifier + mvr_velocity_skip_key), mode 3 only: at the
 // first draw of the focus group's velocity pass (the bind above) the fill source writes the focus view's motion vectors
 // from outer (mvr_motion, B10) into the pass's target, and the pass's draws are skipped (the engine's object loop
@@ -235,6 +240,8 @@ struct TestLiveState {
     unsigned twinEntries = 0, velBinds = 0;  // focus clones noted for focus R's twins
     unsigned velFilled = 0, velSkippedDraws = 0, velDrawn = 0;  // B11
     unsigned native = 0, copiedBack = 0;  // B17: the last live pass's targets that were the game's arrays, copied back
+    // B12, the last live pass: targets copied in from focus's clones, cleared first (no copy-in), multisampled.
+    unsigned copyIns = 0, clearFills = 0, msTargets = 0, colorSkips = 0;  // colorSkips: mvr_ms_color_skip
     std::string why;  // the latest live pass's failure
 };
 TestLiveState TestLiveGet();

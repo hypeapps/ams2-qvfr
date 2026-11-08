@@ -313,6 +313,8 @@ bool g_mvrDirectCfg = true;  // Cfg().mvrDirectExtract last seen
 bool g_mvrDirectKeyDown = false;
 bool g_mvrNativeCfg = true;  // Cfg().mvrNativeTargets last seen
 bool g_mvrNativeKeyDown = false;
+bool g_mvrMsColorSkipCfg = true;  // Cfg().mvrMsColorSkip last seen
+bool g_mvrMsColorSkipKeyDown = false;
 
 // mvr_motion's window source: mvr_pass's maps in uv.
 bool MotionWindows(int eye, mvrmotion::Map* cur, mvrmotion::Map* prev, bool* fromOuter) {
@@ -1464,6 +1466,16 @@ void HandleToolsLocked() {
         mvrpass::SetForwardDepth(c.mvrForwardDepth);
         Log("Quad: MVR live forward depth %s (ini)", mvrpass::ForwardDepthName(c.mvrForwardDepth));
     }
+    if (mvrpass::On() && c.mvrMsColorSkip != g_mvrMsColorSkipCfg) {
+        g_mvrMsColorSkipCfg = c.mvrMsColorSkip;
+        mvrpass::SetMsColorSkip(c.mvrMsColorSkip);
+        Log("Quad: MVR multisampled color without copy-in after a depth clear %s (ini)", c.mvrMsColorSkip ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrMsColorSkipKey, g_mvrMsColorSkipKeyDown)) {
+        mvrpass::SetMsColorSkip(!mvrpass::GetMsColorSkip());
+        Log("Quad: MVR multisampled color without copy-in after a depth clear %s (hotkey)",
+            mvrpass::GetMsColorSkip() ? "on" : "off");
+    }
     if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrForwardDepthKey, g_mvrFwdDepthKeyDown)) {
         mvrpass::SetForwardDepth((mvrpass::GetForwardDepth() + 1) % mvrpass::kForwardDepthModes);
         Log("Quad: MVR live forward depth %s (hotkey)", mvrpass::ForwardDepthName(mvrpass::GetForwardDepth()));
@@ -2523,6 +2535,7 @@ void Install() {
             g_mvrGbufPsCfg = Cfg().mvrGbufferPs;
             g_mvrDirectCfg = Cfg().mvrDirectExtract;
             g_mvrNativeCfg = Cfg().mvrNativeTargets;
+            g_mvrMsColorSkipCfg = Cfg().mvrMsColorSkip;
             mvrpass::SetVelocityFill(&FillFocusMotion);
         }
         else if (Cfg().mvrGbuffer)

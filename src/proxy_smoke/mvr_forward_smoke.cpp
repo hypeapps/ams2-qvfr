@@ -60,12 +60,15 @@ VsOut VS(uint id : SV_VertexID) {
 Texture2D globalTexture0 : register(t3);
 Texture2D<float> globalTexture2 : register(t5);
 SamplerState pointSampler : register(s0);
+// B12: a PS constant buffer bound at an offset (PSSetConstantBuffers1, like the game's _GLOBAL_ of the sky dome): zero at
+// the buffer's start, so a restore without the offset gives a black red channel.
+cbuffer Tint : register(b0) { float4 tint; };
 float4 Fwd(VsOut i) : SV_Target {
     float2 uv = i.scr.xy / i.scr.w;
     int2 p = int2(min(uv * viewportPixelDimensions.zw, viewportPixelDimensions.zw - 1));
     float4 a = globalTexture0.Load(int3(p, 0));
     float4 g = globalTexture2.GatherRed(pointSampler, i.pos.xy * screenSpaceDimensions.zw);
-    return float4(a.x, a.y, dot(g, 0.25), frac(i.vp.x));
+    return float4(a.x * tint.x, a.y, dot(g, 0.25), frac(i.vp.x));
 }
 float4 VSOcc(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2(id & 1, id >> 1);
@@ -81,7 +84,23 @@ float4 Gbuf(VsOut i) : SV_Target {
     float4 m = GLOBAL_liveTrackTextureMap_tex.SampleLevel(pointSampler, uv, 0);
     return float4(m.xy, 0, 1);
 }
+// B12: a multisampled texture's samples side by side (pixel (x, y), sample s at (x * 8 + s, y)) for the read-back.
+float4 VSFull(uint id : SV_VertexID) : SV_Position {
+    float2 uv = float2((id << 1) & 2, id & 2);
+    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+Texture2DMSArray<float4> msColor : register(t0);
+Texture2DMSArray<float> msDepth : register(t0);
+float4 UnpackC(float4 p : SV_Position) : SV_Target {
+    uint2 q = uint2(p.xy);
+    return msColor.Load(int3(q.x / 8, q.y, 0), q.x % 8);
+}
+float UnpackD(float4 p : SV_Position) : SV_Target {
+    uint2 q = uint2(p.xy);
+    return msDepth.Load(int3(q.x / 8, q.y, 0), q.x % 8);
+}
 )";
+constexpr UINT kMs = 8;  // B12: MSAA 8x as the game's High
 
 constexpr UINT kW = 96, kH = 80, kFW = 64, kFH = 48;
 constexpr UINT kQuads = 30;
@@ -144,10 +163,12 @@ struct Scene {
     ComPtr<ID3D11SamplerState> point;
     ComPtr<ID3D11Buffer> cam12;  // the game's camera constants in VS slot 12 at an offset (the jitter probe reads them)
     ComPtr<ID3D11Buffer> obj13;  // object constants in VS slot 13: worldViewProj = worldView * (1..16)
+    ComPtr<ID3D11Buffer> tint0;  // PS slot 0 at byte 256 (1, 1, 1, 1), zero before it (B12)
     Set game, focus;
     ComPtr<ID3D11Texture2D> init[4];  // the start of the pass: game color, depth, focus color, depth
 };
 Scene g_s;
+void BindTint(ID3D11DeviceContext* c);
 
 using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*,
                                                       ID3D11DepthStencilView*);
@@ -285,6 +306,7 @@ void DrawForward(const Set& s) {
     }
     ID3D11Buffer* pcb[2] = {nullptr, s.g.Get()};
     c->PSSetConstantBuffers(0, 2, pcb);
+    BindTint(c);
     c->PSSetShaderResources(kSlot0, 1, s.srv0.GetAddressOf());
     c->PSSetShaderResources(kSlot2, 1, s.srv2.GetAddressOf());
     c->PSSetSamplers(0, 1, g_s.point.GetAddressOf());
@@ -338,8 +360,19 @@ void Restore() {
     for (int i = 0; i < 4; ++i) g_s.ctx->CopyResource(dst[i], g_s.init[i].Get());
 }
 
+// B12: the forward pass with MSAA 8x: its color (RGBA16F with a shader view, as the game's 15454) and depth (R32
+// typeless; outer's without a shader view like the engine's, focus's clone without one either).
+struct MsSet {
+    ComPtr<ID3D11Texture2D> color, depth;
+    ComPtr<ID3D11RenderTargetView> rtv;
+    ComPtr<ID3D11DepthStencilView> dsv;
+};
+MsSet g_msGame, g_msFocus;
+
 // The fake clones module.
 ID3D11Texture2D* CloneOf(ID3D11Resource* r) {
+    if (r && r == g_msGame.color.Get()) return g_msFocus.color.Get();
+    if (r && r == g_msGame.depth.Get()) return g_msFocus.depth.Get();
     if (r == g_s.game.color.Get()) return g_s.focus.color.Get();
     if (r == g_s.game.depth.Get()) return g_s.focus.depth.Get();
     if (r == g_s.game.gt0.Get()) return g_s.focus.gt0.Get();
@@ -448,6 +481,336 @@ void __fastcall GbufExecute(void* task) {
 }
 void RunTask(FakeTask& t) { (*(TaskFn**)&t)[0x48 / 8](&t); }
 
+// ---------------------------------------------------------------- B12: MSAA
+
+ComPtr<ID3D11Texture2D> MsTex(UINT w, UINT h, DXGI_FORMAT f, UINT bind, UINT slices) {
+    D3D11_TEXTURE2D_DESC d{};
+    d.Width = w;
+    d.Height = h;
+    d.MipLevels = 1;
+    d.ArraySize = slices;
+    d.Format = f;
+    d.SampleDesc = {kMs, 0};
+    d.BindFlags = bind;
+    ComPtr<ID3D11Texture2D> t;
+    g_s.dev->CreateTexture2D(&d, nullptr, &t);
+    return t;
+}
+
+// `slices` 2: the game's own two-slice arrays (B17), with views of the engine's kind (they see slice 0).
+bool MakeMsSet(MsSet& m, UINT w, UINT h, UINT depthBind, UINT slices) {
+    m.color = MsTex(w, h, DXGI_FORMAT_R16G16B16A16_FLOAT, D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE, slices);
+    m.depth = MsTex(w, h, DXGI_FORMAT_R32_TYPELESS, D3D11_BIND_DEPTH_STENCIL | depthBind, slices);
+    if (!m.color || !m.depth) return false;
+    D3D11_RENDER_TARGET_VIEW_DESC rv{};
+    rv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMS;
+    D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+    dv.Format = DXGI_FORMAT_D32_FLOAT;
+    dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMS;
+    return SUCCEEDED(g_s.dev->CreateRenderTargetView(m.color.Get(), &rv, &m.rtv)) &&
+           SUCCEEDED(g_s.dev->CreateDepthStencilView(m.depth.Get(), &dv, &m.dsv));
+}
+
+struct MsShaders {
+    ComPtr<ID3D11VertexShader> vs;
+    ComPtr<ID3D11PixelShader> color, depth;
+};
+MsShaders g_msSh;
+
+// B12: PS slot 0 at an offset, as the game binds its constants (the module's passes must restore the range).
+void BindTint(ID3D11DeviceContext* c) {
+    ComPtr<ID3D11DeviceContext1> c1;
+    if (FAILED(c->QueryInterface(IID_PPV_ARGS(&c1)))) return;
+    const UINT first = 16, num = 16;
+    c1->PSSetConstantBuffers1(0, 1, g_s.tint0.GetAddressOf(), &first, &num);
+}
+
+// How the multisampled pass starts: 0 over what the earlier tasks left, 1 binds its targets and clears all of them first
+// (as a game's forward pass may), 2 clears only its depth and first draws an opaque full-screen background without depth
+// writes (AMS2's forward pass with MSAA: the sky dome; mvr_ms_color_skip).
+int g_msMode = 0;
+const float kMsClearColor[4] = {0.05f, 0.15f, 0.25f, 1.0f};
+ComPtr<ID3D11DepthStencilState> g_msBgDs;  // depth test LESS_EQUAL, no writes (the sky dome's)
+ComPtr<ID3D11PixelShader> g_msBgPs;
+
+// The forward pass of `s` (projection, screen textures) into the multisampled targets `m`.
+void DrawForwardMs(const Set& s, const MsSet& m) {
+    ID3D11DeviceContext* c = g_s.ctx;
+    ID3D11RenderTargetView* rtv = m.rtv.Get();
+    c->OMSetRenderTargets(1, &rtv, m.dsv.Get());
+    if (g_msMode == 1) c->ClearRenderTargetView(rtv, kMsClearColor);
+    if (g_msMode != 0) c->ClearDepthStencilView(m.dsv.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+    D3D11_VIEWPORT vp{0, 0, (float)s.w, (float)s.h, 0, 1};
+    c->RSSetViewports(1, &vp);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    c->IASetInputLayout(nullptr);
+    if (g_msMode == 2) {  // the background over every sample (its old color must not matter)
+        c->OMSetDepthStencilState(g_msBgDs.Get(), 0);
+        c->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+        c->RSSetState(g_s.rs.Get());
+        c->VSSetShader(g_msSh.vs.Get(), nullptr, 0);
+        c->PSSetShader(g_msBgPs.Get(), nullptr, 0);
+        c->Draw(3, 0);
+    }
+    c->OMSetDepthStencilState(g_s.ds.Get(), 0);
+    c->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    c->RSSetState(g_s.rs.Get());
+    ID3D11Buffer* vcb[4] = {s.cam.Get(), nullptr, nullptr, nullptr};
+    c->VSSetConstantBuffers(0, 4, vcb);
+    ComPtr<ID3D11DeviceContext1> c1;
+    if (SUCCEEDED(c->QueryInterface(IID_PPV_ARGS(&c1)))) {
+        const UINT first = 16, num = 64;
+        c1->VSSetConstantBuffers1(12, 1, g_s.cam12.GetAddressOf(), &first, &num);
+        c->VSSetConstantBuffers(13, 1, g_s.obj13.GetAddressOf());
+    }
+    ID3D11Buffer* pcb[2] = {nullptr, s.g.Get()};
+    c->PSSetConstantBuffers(0, 2, pcb);
+    BindTint(c);
+    c->PSSetShaderResources(kSlot0, 1, s.srv0.GetAddressOf());
+    c->PSSetShaderResources(kSlot2, 1, s.srv2.GetAddressOf());
+    c->PSSetSamplers(0, 1, g_s.point.GetAddressOf());
+    c->VSSetShader(g_s.vs.Get(), nullptr, 0);
+    c->PSSetShader(g_s.fwd.Get(), nullptr, 0);
+    c->Draw(kQuads * 6, 0);
+    c->DrawInstanced(6, 1, 0, 0);
+    ID3D11ShaderResourceView* none[8] = {};
+    c->PSSetShaderResources(0, 8, none);
+    c->OMSetRenderTargets(0, nullptr, nullptr);
+}
+void __fastcall OuterExecuteMs(void* task) {
+    DrawForwardMs(g_s.game, g_msGame);
+    (*(TaskFn**)task)[0x38 / 8](task);
+}
+void* g_vtPhase3Ms[32];
+
+// Outer's targets as the earlier tasks left them, focus's clones with another color and the occluder in its depth.
+void MakeStartMs() {
+    ID3D11DeviceContext* c = g_s.ctx;
+    c->ClearRenderTargetView(g_msGame.rtv.Get(), kOuterColor);
+    c->ClearDepthStencilView(g_msGame.dsv.Get(), D3D11_CLEAR_DEPTH, kDepthLeft, 0);
+    c->ClearRenderTargetView(g_msFocus.rtv.Get(), kFocusColor);
+    c->ClearDepthStencilView(g_msFocus.dsv.Get(), D3D11_CLEAR_DEPTH, kDepthLeft, 0);
+    c->OMSetRenderTargets(0, nullptr, g_msFocus.dsv.Get());
+    D3D11_VIEWPORT vp{0, 0, (float)kFW, (float)kFH, 0, 1};
+    c->RSSetViewports(1, &vp);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    c->IASetInputLayout(nullptr);
+    c->OMSetDepthStencilState(g_s.ds.Get(), 0);
+    c->RSSetState(g_s.rs.Get());
+    c->VSSetShader(g_s.vsOcc.Get(), nullptr, 0);
+    c->PSSetShader(nullptr, nullptr, 0);
+    c->Draw(4, 0);
+    c->OMSetRenderTargets(0, nullptr, nullptr);
+}
+
+
+
+// Slice `slice` of a multisampled texture, its samples side by side (kMs * width x height texels).
+std::vector<uint64_t> ReadMs(ID3D11Texture2D* t, UINT slice = 0) {
+    std::vector<uint64_t> none;
+    D3D11_TEXTURE2D_DESC d{};
+    t->GetDesc(&d);
+    const bool depth = (d.BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0;
+    ComPtr<ID3D11Texture2D> src = t;
+    if (!(d.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+        D3D11_TEXTURE2D_DESC sd = d;
+        sd.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
+        src.Reset();
+        if (FAILED(g_s.dev->CreateTexture2D(&sd, nullptr, &src))) return none;
+        g_s.ctx->CopyResource(src.Get(), t);
+    }
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = depth ? DXGI_FORMAT_R32_FLOAT : d.Format;
+    sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY;
+    sv.Texture2DMSArray = {slice, 1};
+    ComPtr<ID3D11ShaderResourceView> srv;
+    const DXGI_FORMAT outF = depth ? DXGI_FORMAT_R32_FLOAT : DXGI_FORMAT_R16G16B16A16_FLOAT;
+    ComPtr<ID3D11Texture2D> out = Tex(d.Width * kMs, d.Height, outF, D3D11_BIND_RENDER_TARGET);
+    ComPtr<ID3D11RenderTargetView> rtv;
+    if (!out || FAILED(g_s.dev->CreateShaderResourceView(src.Get(), &sv, &srv)) ||
+        FAILED(g_s.dev->CreateRenderTargetView(out.Get(), nullptr, &rtv)))
+        return none;
+    ID3D11DeviceContext* c = g_s.ctx;
+    ID3D11RenderTargetView* r = rtv.Get();
+    c->OMSetRenderTargets(1, &r, nullptr);
+    D3D11_VIEWPORT vp{0, 0, (float)(d.Width * kMs), (float)d.Height, 0, 1};
+    c->RSSetViewports(1, &vp);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    c->IASetInputLayout(nullptr);
+    c->OMSetDepthStencilState(nullptr, 0);
+    c->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    c->RSSetState(g_s.rs.Get());
+    c->VSSetShader(g_msSh.vs.Get(), nullptr, 0);
+    c->PSSetShader(depth ? g_msSh.depth.Get() : g_msSh.color.Get(), nullptr, 0);
+    c->PSSetShaderResources(0, 1, srv.GetAddressOf());
+    c->Draw(3, 0);
+    ID3D11ShaderResourceView* nsrv = nullptr;
+    c->PSSetShaderResources(0, 1, &nsrv);
+    c->OMSetRenderTargets(0, nullptr, nullptr);
+    return Read(out.Get());
+}
+
+struct MsRun {
+    qvfr::mvrpass::TestLiveState lv;
+    bool ran = false;
+    std::vector<uint64_t> outerC, outerD, focusC, focusD;
+};
+struct MsCheck {
+    bool ok = false, skipped = false;
+    std::string text;
+};
+
+// B12: the live forward pass (B9d) with multisampled targets, three times: (1) the module's copies, the pass draws over
+// what the earlier tasks left (the corner of slice 1 gets focus's clones sample by sample); (2) outer's targets as the
+// game's own two-slice arrays (B17 for MSAA) and a pass that binds and then clears all of them (no copy-in); (3) the
+// copies and a pass that clears only its depth and draws a full-screen background first (the color gets no copy-in,
+// mvr_ms_color_skip). Each: outer's samples bit for bit as the pass without the module, focus's clones per sample as
+// focus's own pass (edges may round).
+MsCheck RunMsaa(double sx, double ox, double sy, double oy) {
+    MsCheck r;
+    ID3D11Device* dev = g_s.dev;
+    ID3D11DeviceContext* ctx = g_s.ctx;
+    ComPtr<ID3DBlob> vsCode = Compile("VSFull", "vs_5_0"), cCode = Compile("UnpackC", "ps_5_0"),
+                     dCode = Compile("UnpackD", "ps_5_0"), bgCode = Compile("Zero", "ps_5_0");
+    D3D11_DEPTH_STENCIL_DESC bgd{};
+    bgd.DepthEnable = TRUE;
+    bgd.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+    bgd.DepthFunc = D3D11_COMPARISON_LESS_EQUAL;
+    UINT q = 0;
+    if (FAILED(dev->CheckMultisampleQualityLevels(DXGI_FORMAT_R16G16B16A16_FLOAT, kMs, &q)) || !q) {
+        r.ok = r.skipped = true;
+        r.text = "no MSAA 8x for RGBA16F: SKIPPED";
+        return r;
+    }
+    MsSet plainGame, arrGame;
+    bool made = vsCode && cCode && dCode &&
+                SUCCEEDED(dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr,
+                                                  &g_msSh.vs)) &&
+                SUCCEEDED(dev->CreatePixelShader(cCode->GetBufferPointer(), cCode->GetBufferSize(), nullptr,
+                                                 &g_msSh.color)) &&
+                SUCCEEDED(dev->CreatePixelShader(dCode->GetBufferPointer(), dCode->GetBufferSize(), nullptr,
+                                                 &g_msSh.depth)) &&
+                bgCode && SUCCEEDED(dev->CreatePixelShader(bgCode->GetBufferPointer(), bgCode->GetBufferSize(), nullptr,
+                                                           &g_msBgPs)) &&
+                SUCCEEDED(dev->CreateDepthStencilState(&bgd, &g_msBgDs)) &&
+                MakeMsSet(plainGame, kW, kH, 0, 1) && MakeMsSet(arrGame, kW, kH, D3D11_BIND_SHADER_RESOURCE, 2) &&
+                MakeMsSet(g_msFocus, kFW, kFH, 0, 1);
+    if (!made) {
+        r.text = "D3D11 objects could not be made: FAIL";
+        return r;
+    }
+    g_msGame = plainGame;
+    MakeStartMs();
+    ComPtr<ID3D11Texture2D> init[4];
+    ID3D11Texture2D* src[4] = {g_msGame.color.Get(), g_msGame.depth.Get(), g_msFocus.color.Get(), g_msFocus.depth.Get()};
+    for (int i = 0; i < 4; ++i) {
+        D3D11_TEXTURE2D_DESC d{};
+        src[i]->GetDesc(&d);
+        dev->CreateTexture2D(&d, nullptr, &init[i]);
+        ctx->CopyResource(init[i].Get(), src[i]);
+    }
+    // The start of the pass in `g` (slice 0 of the arrays) and focus's clones.
+    auto restore = [&](MsSet& g) {
+        ctx->CopySubresourceRegion(g.color.Get(), 0, 0, 0, 0, init[0].Get(), 0, nullptr);
+        ctx->CopySubresourceRegion(g.depth.Get(), 0, 0, 0, 0, init[1].Get(), 0, nullptr);
+        ctx->CopyResource(g_msFocus.color.Get(), init[2].Get());
+        ctx->CopyResource(g_msFocus.depth.Get(), init[3].Get());
+    };
+    // References without the module, for both kinds of pass.
+    constexpr int kRuns = 3;
+    std::vector<uint64_t> refOC[kRuns], refOD[kRuns], refFC[kRuns], refFD[kRuns];
+    for (int k = 0; k < kRuns; ++k) {
+        g_msMode = k;
+        restore(g_msGame);
+        DrawForwardMs(g_s.game, g_msGame);
+        DrawForwardMs(g_s.focus, g_msFocus);
+        refOC[k] = ReadMs(g_msGame.color.Get());
+        refOD[k] = ReadMs(g_msGame.depth.Get());
+        refFC[k] = ReadMs(g_msFocus.color.Get());
+        refFD[k] = ReadMs(g_msFocus.depth.Get());
+    }
+    memcpy(g_vtPhase3Ms, g_vtPhase3, sizeof(g_vtPhase3Ms));
+    g_vtPhase3Ms[0x48 / 8] = (void*)&OuterExecuteMs;
+    static ID3D11Resource* s_arr[2] = {};
+    s_arr[0] = arrGame.color.Get();
+    s_arr[1] = arrGame.depth.Get();
+    MsRun run[kRuns];
+    for (int k = 0; k < kRuns; ++k) {
+        g_msMode = k;
+        g_msGame = k == 1 ? arrGame : plainGame;
+        restore(g_msGame);
+        const qvfr::mvrpass::NativeFn isArr = [](ID3D11Resource* x) { return x && (x == s_arr[0] || x == s_arr[1]); };
+        qvfr::mvrpass::TestNative(k == 1 ? isArr : nullptr, nullptr);
+        qvfr::mvrpass::OnFrameStart(true);
+        qvfr::mvrpass::SetWindow(0, true, sx, ox, sy, oy, kW, kH);
+        qvfr::mvrpass::TestForwardLive(g_vtPhase3Ms);
+        FakeTask t{g_vtPhase3Ms};
+        run[k].ran = !qvfr::mvrpass::BeforeTask((uint8_t*)&t, 0);
+        if (run[k].ran) RunTask(t);
+        qvfr::mvrpass::AfterTask((uint8_t*)&t);
+        run[k].lv = qvfr::mvrpass::TestLiveGet();
+        run[k].outerC = ReadMs(g_msGame.color.Get());
+        run[k].outerD = ReadMs(g_msGame.depth.Get());
+        run[k].focusC = ReadMs(g_msFocus.color.Get());
+        run[k].focusD = ReadMs(g_msFocus.depth.Get());
+        qvfr::mvrpass::TestEnd();
+        qvfr::mvrpass::TestNative(nullptr, nullptr);
+    }
+    g_msMode = 0;
+    g_msGame = MsSet{};
+    const int samples = (int)(kFW * kFH * kMs);
+    bool ok = true;
+    char line[1024];
+    std::string text;
+    for (int k = 0; k < kRuns; ++k) {
+        const MsRun& m = run[k];
+        const qvfr::mvrpass::TestLiveState& lv = m.lv;
+        int outer = 0, cOff = 0, cBig = 0, dOff = 0, covered = 0;
+        float cMax = 0;
+        bool sizes = m.outerC.size() == refOC[k].size() && m.outerD.size() == refOD[k].size() &&
+                     m.focusC.size() == (size_t)samples && m.focusD.size() == (size_t)samples &&
+                     refFC[k].size() == (size_t)samples && refFD[k].size() == (size_t)samples && !refOC[k].empty();
+        if (sizes) {
+            for (size_t i = 0; i < refOC[k].size(); ++i) outer += m.outerC[i] != refOC[k][i] || m.outerD[i] != refOD[k][i];
+            for (int i = 0; i < samples; ++i) {
+                const float d = MaxHalfDiff(m.focusC[i], refFC[k][i]);
+                cOff += d > 0;
+                cBig += d > 0.02f;
+                cMax = std::max(cMax, d);
+                dOff += std::fabs(AsFloat(m.focusD[i]) - AsFloat(refFD[k][i])) > 1e-5f;
+                covered += AsFloat(refFD[k][i]) != (k != 0 ? 1.0f : kDepthLeft);
+            }
+        }
+        const bool counts =
+            m.ran && lv.passes == 1 && lv.ok == 1 && lv.msTargets == 2 &&
+            (k == 0   ? lv.copyIns == 2 && lv.clearFills == 0 && lv.colorSkips == 0 && lv.native == 0 && lv.copiedBack == 2
+             : k == 1 ? lv.copyIns == 0 && lv.clearFills == 2 && lv.colorSkips == 0 && lv.native == 2 && lv.copiedBack == 0
+                      : lv.copyIns == 0 && lv.clearFills == 1 && lv.colorSkips == 1 && lv.native == 0 &&
+                            lv.copiedBack == 2);
+        const bool runOk = sizes && counts && outer == 0 && covered > samples / 3 && cBig * 100 <= samples &&
+                           dOff * 100 <= samples;
+        ok = ok && runOk;
+        snprintf(line, sizeof(line),
+                 "  MSAA %ux (B12) %s: live pass %u, into the clones %u%s%s; targets multisampled %u, copied in %u, "
+                 "cleared first %u, color without copy-in %u, as the game's arrays %u, copied back %u; outer vs without "
+                 "MVR %d samples differ; "
+                 "clones vs focus's own pass (%d samples, %d covered): color %d differ (%d by > 0.02, max %.4f), depth "
+                 "%d off (%s)\n",
+                 kMs,
+                 k == 0   ? "with copies"
+                 : k == 1 ? "as the game's arrays, cleared first"
+                          : "with copies, depth cleared and a background first",
+                 lv.passes, lv.ok, lv.why.empty() ? "" : ": ", lv.why.c_str(), lv.msTargets, lv.copyIns, lv.clearFills,
+                 lv.colorSkips, lv.native,
+                 lv.copiedBack, outer, samples, covered, cOff, cBig, cMax, dOff, runOk ? "OK" : "WRONG");
+        text += line;
+    }
+    r.ok = ok;
+    r.text = text;
+    return r;
+}
+
 }  // namespace
 
 int RunMvrForward() {
@@ -541,6 +904,11 @@ int RunMvrForward() {
         D3D11_BUFFER_DESC od{464, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
         D3D11_SUBRESOURCE_DATA oi{obj.data(), 0, 0};
         made = made && SUCCEEDED(dev->CreateBuffer(&od, &oi, &g_s.obj13));
+        std::vector<float> tint(128, 0.0f);
+        for (int i = 0; i < 4; ++i) tint[256 / 4 + i] = 1.0f;
+        D3D11_BUFFER_DESC td{512, D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+        D3D11_SUBRESOURCE_DATA ti{tint.data(), 0, 0};
+        made = made && SUCCEEDED(dev->CreateBuffer(&td, &ti, &g_s.tint0));
     }
     {  // B13: outer's live track map, a ramp (texel centres hold their UV: bilinear reads give the UV exactly)
         std::vector<float> lt((size_t)kW * kH * 4);
@@ -804,6 +1172,7 @@ int RunMvrForward() {
     const int nOuter = differ(ngC, lgC) + differ(ngD, lgD), nFocus = differ(nC, lC) + differ(nD, lD);
     const bool nativeOk = arrDsv && nlv.passes == 1 && nlv.ok == 1 && nlv.native == 1 && nlv.copiedBack == 1 &&
                           lv.native == 0 && lv.copiedBack == 2 && nOuter == 0 && nFocus == 0;
+    const MsCheck msaa = RunMsaa(sx, ox, sy, oy);  // B12
     qvfr::mvrpass::SetForward(false);
     qvfr::mvrpass::TestDepthBias(-1, 0.0f, false);
     const int lpx = (int)(kFW * kFH);
@@ -855,7 +1224,8 @@ int RunMvrForward() {
             if (!a) continue;
             D3D11_TEXTURE2D_DESC d{};
             a->GetDesc(&d);
-            if (d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && d.Width == kW && d.Height == kH && d.ArraySize == 2)
+            if (d.Format == DXGI_FORMAT_R16G16B16A16_FLOAT && d.Width == kW && d.Height == kH && d.ArraySize == 2 &&
+                d.SampleDesc.Count == 1)  // not the MSAA run's copies (B12)
                 r.s1 = Read(a, 1);
         }
         qvfr::mvrpass::TestEnd();
@@ -925,7 +1295,8 @@ int RunMvrForward() {
     const bool outerOk = outerC == 0 && outerD == 0 && outerH == 0 && gH.size() == refH.size();
     const bool focusOk = clonesChanged == 0 && covered > px / 3 && occluded > px / 8 && occOurs == occluded &&
                          cBig * 100 <= px && dOff * 100 <= px;
-    const bool ok = countsOk && outerOk && focusOk && liveOk && velSkipOk && gbufOk && nativeOk && !warnings;
+    const bool ok = countsOk && outerOk && focusOk && liveOk && velSkipOk && gbufOk && nativeOk && msaa.ok && !warnings;
+    printf("%s", msaa.text.c_str());
     printf("  B17: live pass with outer's depth as the game's own two-slice array: %s, targets as the arrays %u (before "
            "%u), copied back %u (before %u); outer %d px, focus's clones %d px differ from the live run (%s)\n",
            nlv.ok ? "ok" : "FAILED", nlv.native, lv.native, nlv.copiedBack, lv.copiedBack, nOuter, nFocus,

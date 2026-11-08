@@ -78,3 +78,52 @@ float4 PSBlit(float4 pos : SV_Position) : SV_Target {
 float PSDepthIn(float4 pos : SV_Position) : SV_Depth {
     return depthIn.Load(int3(pos.xy, 0));
 }
+
+// MSAA (gate B12): the forward pass's targets are multisampled and D3D11 copies no part of a multisampled texture, so
+// the corner goes in and out sample by sample (SV_SampleIndex: the PS runs per sample and writes that sample only).
+// - PSColorInMs / PSDepthInMs: focus's clone (focus size) into the corner of slice 1 (the copy-in, as PSDepthIn);
+// - PSColorOutMs / PSDepthMs: the corner of slice 1 into focus's clone (the depth with the same choices as PSDepth,
+//   the neighbourhood read in the same sample).
+Texture2DMS<float4> msColorIn : register(t0);
+Texture2DMSArray<float4> msColorArr : register(t0);
+Texture2DMS<float> msDepthIn : register(t0);
+Texture2DMSArray<float> msDepthArr : register(t0);
+
+float4 PSColorInMs(float4 pos : SV_Position, uint s : SV_SampleIndex) : SV_Target {
+    return msColorIn.Load(int2(pos.xy), s);
+}
+
+float4 PSColorOutMs(float4 pos : SV_Position, uint s : SV_SampleIndex) : SV_Target {
+    return msColorArr.Load(int3(pos.xy, 1), s);
+}
+
+float PSDepthInMs(float4 pos : SV_Position, uint s : SV_SampleIndex) : SV_Depth {
+    return msDepthIn.Load(int2(pos.xy), s);
+}
+
+float DepthAtMs(int2 p, uint s) {
+    return msDepthArr.Load(int3(clamp(p, int2(0, 0), int2(cornerSize) - 1), 1), s);
+}
+
+float SlopeMs(int2 p, uint s, float d, int2 axis) {
+    const float a = DepthAtMs(p + axis, s), b = DepthAtMs(p - axis, s);
+    const float fa = a < 1.0 ? abs(a - d) : 1.0, fb = b < 1.0 ? abs(d - b) : 1.0;
+    return min(fa, fb);
+}
+
+float PSDepthMs(float4 pos : SV_Position, uint s : SV_SampleIndex) : SV_Depth {
+    const int2 p = int2(pos.xy);
+    float d = DepthAtMs(p, s);
+    if (d >= 1.0) return d;
+    if (dilate) {
+        [unroll] for (int y = -1; y <= 1; ++y)
+            [unroll] for (int x = -1; x <= 1; ++x) d = max(d, DepthAtMs(p + int2(x, y), s));
+        if (d >= 1.0) return d;
+    }
+    float moved = d;
+    if (slopeScale > 0) {
+        const float slope = max(SlopeMs(p, s, d, int2(1, 0)), SlopeMs(p, s, d, int2(0, 1)));
+        moved += slopeScale * (slope < 1.0 ? slope : 0.0);
+    }
+    return min(asfloat(asuint(moved) + biasUlps), 1.0);
+}

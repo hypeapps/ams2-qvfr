@@ -522,8 +522,8 @@ void FinishRun(bool aborted) {
         if (sp.v.empty()) continue;
         if (!spanHeader) {
             spanHeader = true;
-            lines.push_back("GPU spans inside the eye groups (engine tasks and the MVR G-buffer's parts; frames = how "
-                            "many frames had the span):");
+            lines.push_back("GPU spans inside the eye groups (engine tasks, the MVR G-buffer's parts and the forward "
+                            "pass's corners out; frames = how many frames had the span):");
         }
         char label[64];
         snprintf(label, sizeof(label), "GPU %s", gpu::SpanName(k));

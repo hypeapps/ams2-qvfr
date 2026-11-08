@@ -204,6 +204,10 @@ struct Config {
     // of slice 0 in or back). The hotkey (mvr_modifier + mvr_native_key) toggles their use (off: copies as before).
     bool mvrNativeTargets = true;
     int mvrNativeKey = 0;
+    // Live (docs/mvr.md B12, mvr_pass.h): with MSAA the live forward pass skips focus's color copy into slice 1 when it
+    // cleared its depth first. The hotkey (mvr_modifier + mvr_ms_color_skip_key) toggles it.
+    bool mvrMsColorSkip = true;
+    int mvrMsColorSkipKey = 0;
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
     bool dlaa = false;                // mode=dlaa (a change needs a restart)

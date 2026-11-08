@@ -64,7 +64,7 @@ const char* const kSpanNames[kSpans] = {
     "p1 outer L",   "p1 outer R",   "p1 focus L",    "p1 focus R",    "lights outer L", "lights outer R",
     "lights focus L", "lights focus R", "p3 outer L", "p3 outer R",   "p3 focus L",     "p3 focus R",
     "early L",      "early R",      "copy back L",   "copy back R",   "extract L",      "extract R",
-    "mask stash L", "mask stash R", "fill L",        "fill R"};
+    "mask stash L", "mask stash R", "fill L",        "fill R",         "fwd out L",      "fwd out R"};
 
 template <class T>
 void SafeRelease(T*& p) {

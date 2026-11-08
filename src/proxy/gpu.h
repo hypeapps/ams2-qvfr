@@ -41,6 +41,7 @@ enum Span {
     ExtractL, ExtractR,                          // slice 1's corners into the stash (colors and the depth pass)
     MaskStashL, MaskStashR,                      // the masks into the stash
     FillL, FillR,                                // the stash into focus's clones and the masks in the window
+    FwdOutL, FwdOutR,                            // B9d: the live forward pass's corners into focus's clones
     kSpans
 };
 const char* SpanName(int s);  // "p1 outer L", ...

@@ -68,7 +68,8 @@ void WantTwin(ID3D11Resource* original);
 // Render thread: `original`'s focus clone has its twin now.
 bool HasTwin(ID3D11Resource* original);
 // MVR gate B17 (docs/mvr.md): two-slice arrays in place of the engine's own textures. mvr_pass asks for the targets of
-// outer's G-buffer pass; at the next frame start each listed texture whose object still holds it gets a Texture2DArray
+// outer's G-buffer pass (B12: and the multisampled ones of its forward pass, the arrays then multisampled too); at the
+// next frame start each listed texture whose object still holds it gets a Texture2DArray
 // of 2 slices with its description (a depth format also with a shader view bind), slice 0 starting with its contents.
 // The array and views like the engine's on it (a TEXTURE2D view of an array is slice 0) go into the texture object's
 // fields and the render targets' view arrays, so the engine draws and reads slice 0 itself and MVR's view 1 needs no
