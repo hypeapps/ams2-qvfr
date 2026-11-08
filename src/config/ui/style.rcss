@@ -399,6 +399,10 @@ input.numin:focus { border-color: #e2231a; }
 /* ---------------------------------------------------------------- Log page */
 
 .quiet { color: #8d919b; }
+.crop-eyes { display: flex; margin-top: 12dp; }
+.crop-eye { position: relative; width: 46%; height: 128dp; margin-right: 4%; background-color: #050505; border: 1dp #444444; }
+.crop-kept { position: absolute; background-color: #57201d; border: 1dp #e2231a; box-sizing: border-box; }
+.crop-eye span { position: absolute; top: 52dp; width: 100%; text-align: center; color: #ffffff; font-size: 14dp; }
 /* The end of the newest log in its own scroll box (opened at the end, like a terminal). */
 #logbox {
     margin-top: 12dp;

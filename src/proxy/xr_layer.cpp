@@ -18,6 +18,7 @@
 
 #include "common.h"
 #include "diag.h"
+#include "fps_hud.h"
 
 namespace qvfr::xrlayer {
 
@@ -29,6 +30,8 @@ struct Next {
     PFN_xrGetInstanceProperties getInstanceProperties = nullptr;
     PFN_xrGetSystem getSystem = nullptr;
     PFN_xrGetSystemProperties getSystemProperties = nullptr;
+    PFN_xrEnumerateViewConfigurationViews enumerateViews = nullptr;
+    PFN_xrLocateViews locateViews = nullptr;
     PFN_xrCreateSession createSession = nullptr;
     PFN_xrDestroySession destroySession = nullptr;
     PFN_xrBeginSession beginSession = nullptr;
@@ -76,10 +79,15 @@ struct Session {
     double statsMs = 0;
 } g_s;
 int g_sessions = 0;
+fovcrop::Settings g_crop;  // immutable until the next instance; never hot-reload projection/size independently
+bool g_cropSizeLogged = false, g_cropFovLogged = false, g_cropInvalidLogged = false;
 
 std::mutex g_gm;  // the gaze result (read by the proxy on the game's render thread)
 Gaze g_gaze;
 std::atomic<int64_t> g_periodNs{0};  // predictedDisplayPeriod of the last xrWaitFrame
+hud::Dispatch g_hudApi;
+hud::Overlay g_hud;
+bool g_shouldRender = false;
 
 constexpr double kOwnSyncAfterMs = 50;  // no xrSyncActions from OpenComposite for this long: we sync ourselves
 constexpr double kSampleForMs = 60000, kSampleEveryMs = 500;  // gaze samples in the log after the first gaze
@@ -197,6 +205,9 @@ void LogSystem(XrSystemId sys) {
 }
 
 void ResetSession() {
+    g_hud.Stop();  // destroy its swapchain before the session/VIEW space disappear
+    g_shouldRender = false;
+    g_periodNs = 0;
     if (g_next.destroySpace) {
         if (g_s.gazeSpace) g_next.destroySpace(g_s.gazeSpace);
         if (g_s.viewSpace) g_next.destroySpace(g_s.viewSpace);
@@ -368,6 +379,7 @@ XrResult XRAPI_CALL HookDestroyInstance(XrInstance instance) {
         std::lock_guard lock(g_m);
         Log("OpenXR layer: xrDestroyInstance");
         if (g_s.h) LogSessionStats("at instance end");
+        g_hud.Stop();
         g_s = Session{};
         g_set = XR_NULL_HANDLE;
         g_action = XR_NULL_HANDLE;
@@ -414,6 +426,14 @@ XrResult XRAPI_CALL HookCreateSession(XrInstance instance, const XrSessionCreate
                 Log("OpenXR layer: VIEW reference space = %d (%s)", (int)rr, R(rr));
             }
         }
+        ID3D11Device* device = nullptr;
+        for (auto b = gb; b; b = b->next)
+            if (b->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR)
+                device = reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(b)->device;
+        XrSystemProperties props{XR_TYPE_SYSTEM_PROPERTIES};
+        if (info && g_next.getSystemProperties)
+            g_next.getSystemProperties(instance, info->systemId, &props);
+        g_hud.Start(*session, g_s.viewSpace, device, props.graphicsProperties.maxLayerCount, g_hudApi);
     });
     return r;
 }
@@ -543,6 +563,7 @@ XrResult XRAPI_CALL HookWaitFrame(XrSession session, const XrFrameWaitInfo* info
         Guarded("xr WaitFrame", [&] {
             std::lock_guard lock(g_m);
             if (session != g_s.h) return;
+            g_shouldRender = state->shouldRender == XR_TRUE;
             if (g_s.waits++ == 0)
                 Log("OpenXR layer: session %d: first xrWaitFrame, period %.3f ms, shouldRender %d", g_s.number,
                     state->predictedDisplayPeriod / 1e6, state->shouldRender);
@@ -552,13 +573,30 @@ XrResult XRAPI_CALL HookWaitFrame(XrSession session, const XrFrameWaitInfo* info
 }
 
 XrResult XRAPI_CALL HookEndFrame(XrSession session, const XrFrameEndInfo* info) {
+    XrFrameEndInfo withHud{};
+    XrCompositionLayerQuad hudQuad{};
+    std::vector<const XrCompositionLayerBaseHeader*> hudLayers;
+    bool added = false, shouldRender = false;
     Guarded("xr EndFrame", [&] {
         std::lock_guard lock(g_m);
         if (session != g_s.h || !info) return;
+        shouldRender = g_shouldRender;
         ++g_s.endFrames;
         LogEndFrame(info);
+        // A HUD problem must not trip the proxy's global diagnostic kill switch or interrupt the scene.
+        try {
+            added = g_hud.Prepare(info, withHud, hudQuad, hudLayers, NowMs(), g_periodNs.load() / 1e6, shouldRender);
+        } catch (...) { g_hud.Disable("exception while preparing overlay"); }
     });
-    return g_next.endFrame(session, info);
+    const XrResult r = g_next.endFrame(session, added ? &withHud : info);  // exactly one downstream EndFrame
+    {
+        std::lock_guard lock(g_m);
+        if (session == g_s.h) {
+            try { g_hud.Ended(info, r, NowMs(), added, shouldRender); }
+            catch (...) { g_hud.Disable("exception while sampling frames"); }
+        }
+    }
+    return r;
 }
 
 // Session states and interaction profile changes: OpenComposite attaches its action sets only once the session is
@@ -588,6 +626,65 @@ XrResult XRAPI_CALL HookPollEvent(XrInstance instance, XrEventDataBuffer* ev) {
     return r;
 }
 
+// OpenComposite derives both OpenVR projection APIs, the visibility mask coordinates, the gaze map and
+// submitted projection-layer FOVs from these views. Leave poses and xrEndFrame untouched: the compositor
+// must receive the same cropped FOV the game actually rendered, not stretch it over the original FOV.
+XrResult XRAPI_CALL HookEnumerateViews(XrInstance instance, XrSystemId system, XrViewConfigurationType type,
+                                      uint32_t capacity, uint32_t* count, XrViewConfigurationView* views) {
+    const XrResult r = g_next.enumerateViews(instance, system, type, capacity, count, views);
+    if (r != XR_SUCCESS || type != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO || !count || *count != 2 ||
+        capacity < 2 || !views) return r;
+    Guarded("xr FOV crop size", [&] {
+        std::lock_guard lock(g_m);
+        if (!g_crop.Active()) return;
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            auto& v = views[eye];
+            const uint32_t w = v.recommendedImageRectWidth, h = v.recommendedImageRectHeight;
+            v.recommendedImageRectWidth = fovcrop::Dimension(w, g_crop.Width());
+            v.recommendedImageRectHeight = fovcrop::Dimension(h, g_crop.Height());
+            if (!g_cropSizeLogged)
+                Log("FOV crop: eye %u recommended %u x %u -> %u x %u (density preserved; restart required)", eye,
+                    w, h, v.recommendedImageRectWidth, v.recommendedImageRectHeight);
+        }
+        g_cropSizeLogged = true;
+    });
+    return r;
+}
+
+XrResult XRAPI_CALL HookLocateViews(XrSession session, const XrViewLocateInfo* info, XrViewState* state,
+                                   uint32_t capacity, uint32_t* count, XrView* views) {
+    const XrResult r = g_next.locateViews(session, info, state, capacity, count, views);
+    if (r != XR_SUCCESS || !info || info->viewConfigurationType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO ||
+        !count || *count != 2 || capacity < 2 || !views) return r;
+    Guarded("xr FOV crop views", [&] {
+        std::lock_guard lock(g_m);
+        if (!g_crop.Active()) return;
+        XrFovf cropped[2];
+        // Validate both before changing either; some runtimes return zero FOVs during startup.
+        if (!fovcrop::Apply(g_crop, 0, views[0].fov, cropped[0]) ||
+            !fovcrop::Apply(g_crop, 1, views[1].fov, cropped[1])) {
+            if (!g_cropInvalidLogged) {
+                Log("FOV crop: runtime returned invalid/unavailable FOVs; this locate passes through unchanged");
+                g_cropInvalidLogged = true;
+            }
+            return;
+        }
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            const auto original = views[eye].fov;
+            views[eye].fov = cropped[eye];
+            if (!g_cropFovLogged) {
+                constexpr double deg = 57.29577951308232;
+                const auto& f = cropped[eye];
+                Log("FOV crop: eye %u angles L/R/U/D deg %.2f %.2f %.2f %.2f -> %.2f %.2f %.2f %.2f", eye,
+                    original.angleLeft * deg, original.angleRight * deg, original.angleUp * deg,
+                    original.angleDown * deg, f.angleLeft * deg, f.angleRight * deg, f.angleUp * deg, f.angleDown * deg);
+            }
+        }
+        g_cropFovLogged = true;
+    });
+    return r;
+}
+
 struct HookEntry {
     const char* name;
     PFN_xrVoidFunction fn;
@@ -599,6 +696,8 @@ HookEntry* Hooks(size_t& n) {
         {"xrGetInstanceProcAddr", (PFN_xrVoidFunction)HookGetInstanceProcAddr, &g_next.gipa},
         {"xrDestroyInstance", (PFN_xrVoidFunction)HookDestroyInstance, &g_next.destroyInstance},
         {"xrGetSystem", (PFN_xrVoidFunction)HookGetSystem, &g_next.getSystem},
+        {"xrEnumerateViewConfigurationViews", (PFN_xrVoidFunction)HookEnumerateViews, &g_next.enumerateViews},
+        {"xrLocateViews", (PFN_xrVoidFunction)HookLocateViews, &g_next.locateViews},
         {"xrCreateSession", (PFN_xrVoidFunction)HookCreateSession, &g_next.createSession},
         {"xrDestroySession", (PFN_xrVoidFunction)HookDestroySession, &g_next.destroySession},
         {"xrBeginSession", (PFN_xrVoidFunction)HookBeginSession, &g_next.beginSession},
@@ -630,10 +729,19 @@ XrResult XRAPI_CALL HookGetInstanceProcAddr(XrInstance instance, const char* nam
 }
 
 void ResolveNext(XrInstance inst) {
+    Get(inst, "xrEnumerateSwapchainFormats", g_hudApi.formats);
+    Get(inst, "xrCreateSwapchain", g_hudApi.create);
+    Get(inst, "xrDestroySwapchain", g_hudApi.destroy);
+    Get(inst, "xrEnumerateSwapchainImages", g_hudApi.images);
+    Get(inst, "xrAcquireSwapchainImage", g_hudApi.acquire);
+    Get(inst, "xrWaitSwapchainImage", g_hudApi.wait);
+    Get(inst, "xrReleaseSwapchainImage", g_hudApi.release);
     Get(inst, "xrDestroyInstance", g_next.destroyInstance);
     Get(inst, "xrGetInstanceProperties", g_next.getInstanceProperties);
     Get(inst, "xrGetSystem", g_next.getSystem);
     Get(inst, "xrGetSystemProperties", g_next.getSystemProperties);
+    Get(inst, "xrEnumerateViewConfigurationViews", g_next.enumerateViews);
+    Get(inst, "xrLocateViews", g_next.locateViews);
     Get(inst, "xrCreateSession", g_next.createSession);
     Get(inst, "xrDestroySession", g_next.destroySession);
     Get(inst, "xrBeginSession", g_next.beginSession);
@@ -720,6 +828,21 @@ XrResult XRAPI_CALL CreateApiLayerInstance(const XrInstanceCreateInfo* info, con
     g_set = XR_NULL_HANDLE;
     g_action = XR_NULL_HANDLE;
     ResolveNext(g_instance);
+    g_crop = Cfg().fovCrop;
+    g_cropSizeLogged = g_cropFovLogged = g_cropInvalidLogged = false;
+    if (!g_next.enumerateViews || !g_next.locateViews) g_crop.enabled = false;
+    Guarded("xr FOV crop settings", [&] {
+        if (g_crop.Active()) {
+            char summary[192];
+            snprintf(summary, sizeof(summary), "on: top %.0f%% bottom %.0f%% inner %.0f%% outer %.0f%%; image %.0f%% x %.0f%%",
+                     g_crop.top * 100, g_crop.bottom * 100, g_crop.inner * 100, g_crop.outer * 100,
+                     g_crop.Width() * 100, g_crop.Height() * 100);
+            Log("FOV crop: %s", summary);
+            diag::Set("FOV crop", summary);
+        } else {
+            diag::Set("FOV crop", Cfg().fovCrop.Active() ? "unavailable: OpenXR view functions missing" : "off / zero crop");
+        }
+    });
     Guarded("xr CreateInstance (after)", [&] {
         if (g_next.getInstanceProperties) {
             XrInstanceProperties p{XR_TYPE_INSTANCE_PROPERTIES};

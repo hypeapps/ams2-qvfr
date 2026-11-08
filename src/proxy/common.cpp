@@ -1,6 +1,7 @@
 #include "common.h"
 
 #include "presets.h"
+#include "fps_hud.h"
 
 #include <algorithm>
 #include <chrono>
@@ -283,6 +284,18 @@ Config ReadConfig(const fs::path& ini) {
     if (path != "openvr" && path != "openxr") Log("Settings: unknown [runtime] path=\"%s\", using openxr", path.c_str());
     c.openComposite = IniPathValue(ini, L"runtime", L"opencomposite");
     c.openxrLayer = IniInt(ini, L"runtime", L"openxr_layer", 1) != 0;
+    c.fpsHud.enabled = IniInt(ini, L"fps_hud", L"enabled", 0) != 0;
+    c.fpsHud.details = IniInt(ini, L"fps_hud", L"details", 1) != 0;
+    c.fpsHud.hotkey = IniInt(ini, L"fps_hud", L"hotkey", 1) != 0;
+    c.fpsHud.scale = IniFloat(ini, L"fps_hud", L"scale", 1);
+    c.fpsHud.xDegrees = IniFloat(ini, L"fps_hud", L"horizontal", -18);
+    c.fpsHud.yDegrees = IniFloat(ini, L"fps_hud", L"vertical", 12);
+    c.fpsHud = hud::Sanitize(c.fpsHud);
+    c.fovCrop.enabled = IniInt(ini, L"fov_crop", L"enabled", 0) != 0;
+    c.fovCrop.top = fovcrop::Limit(IniFloat(ini, L"fov_crop", L"top", 0));
+    c.fovCrop.bottom = fovcrop::Limit(IniFloat(ini, L"fov_crop", L"bottom", 0));
+    c.fovCrop.inner = fovcrop::Limit(IniFloat(ini, L"fov_crop", L"inner", 0));
+    c.fovCrop.outer = fovcrop::Limit(IniFloat(ini, L"fov_crop", L"outer", 0));
     c.wrap = IniInt(ini, L"proxy", L"wrap", 1) != 0;
     c.firstCalls = IniInt(ini, L"log", L"first_calls", c.firstCalls);
     c.statsIntervalS = IniInt(ini, L"log", L"stats_interval_s", c.statsIntervalS);
@@ -465,6 +478,7 @@ void LoadConfig() {
     NoteIniTime();
     Config c = ReadConfig(ini);
     g_cfg = c;
+    hud::Configure(c.fpsHud);
     Log("Settings %s: [runtime] path=%s opencomposite=\"%s\" openxr_layer=%d", Narrow(ini.wstring()).c_str(),
         c.pathOpenXr ? "openxr" : "openvr", Narrow(c.openComposite).c_str(), c.openxrLayer);
     Log("Settings %s: wrap=%d first_calls=%d stats_interval_s=%d csv_always=%d gpu=%d | benchmark: modifier=0x%X key=0x%X "
@@ -486,6 +500,8 @@ bool ReloadConfig() {
     g_iniTime = a.ftLastWriteTime;
     const Config n = ReadConfig(IniFile());
     Config& c = g_cfg;
+    c.fpsHud = n.fpsHud;
+    hud::Configure(c.fpsHud);
     // Settings that need a restart: the size, projection and hooks are fixed for the VR session.
     std::string restart;
     auto need = [&](bool changed, const char* name) {
@@ -494,6 +510,7 @@ bool ReloadConfig() {
     need(n.pathOpenXr != c.pathOpenXr || n.openComposite != c.openComposite || n.openxrLayer != c.openxrLayer,
          "[runtime]");
     need(n.wrap != c.wrap, "[proxy] wrap");
+    need(n.fovCrop != c.fovCrop, "[fov_crop]");
     need(n.firstCalls != c.firstCalls, "[log] first_calls");
     need(n.csvAlways != c.csvAlways, "[timing] csv_always");
     need(n.gpuTiming != c.gpuTiming, "[timing] gpu");

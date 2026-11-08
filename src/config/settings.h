@@ -7,10 +7,15 @@
 #include <vector>
 
 #include "ini_file.h"
+#include "fov_crop.h"
+#include "fps_hud_data.h"
 
 namespace qvfr::config {
 
 struct Settings {
+    hud::Settings fpsHud;
+    fovcrop::Settings crop;
+    bool openxrLayer = true;
     bool openxr = false;          // [runtime] path
     bool quad = true;             // [quad] mode=quad (anything else: off for the GUI)
     std::string modeText = "quad";
