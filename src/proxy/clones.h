@@ -78,9 +78,17 @@ bool HasTwin(ID3D11Resource* original);
 // texture (or two arrays) copies slice 0 only. Before the engine destroys an object, at a new game size, at VR_Shutdown
 // and on a fault the engine's own values go back. Made arrays drop the clones once: they are made again from the new
 // views (single textures as before). Render thread.
-void WantArray(ID3D11Resource* original);
+// B12 step 5 (docs/mvr.md, [debug] mvr_ms_slices): `slices` 3 for the forward pass's multisampled targets. The focus
+// clone of a three-slice array is then the array itself: focus L's swapped fields and translated views see slice 1,
+// focus R's (its twin) slice 2, in the focus clones' size (the engine's size fields and the viewport check say focus's
+// size; the corner at the top left). No texture of its own, nothing copied when the twin is made.
+void WantArray(ID3D11Resource* original, UINT slices = 2);
 // Any thread, lock-free: `res` is one of these arrays.
 bool IsArray(ID3D11Resource* res);
+// Render thread: the slice of `original`'s array that focus's work of `eye` uses as its clone (1 focus L, 2 focus R
+// with its twin, 1 for focus R before its twin is made), 0 when the focus clone is a texture of its own (or none).
+// w, h: focus's size of the slice clone (when not null and the result is not 0).
+int FocusSlice(ID3D11Resource* original, int eye, uint32_t* w = nullptr, uint32_t* h = nullptr);
 // Any thread: changes whenever the clones are dropped (views kept on old clones would keep them alive).
 uint32_t Generation();
 // Render thread: while one lives, this thread's D3D11 calls pass the clones' hooks as they are (no bind fix, not

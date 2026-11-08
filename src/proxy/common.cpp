@@ -422,6 +422,7 @@ Config ReadConfig(const fs::path& ini) {
     c.mvrNativeKey = IniInt(ini, L"debug", L"mvr_native_key", c.mvrNativeKey);
     c.mvrMsColorSkip = IniInt(ini, L"debug", L"mvr_ms_color_skip", 1) != 0;
     c.mvrMsColorSkipKey = IniInt(ini, L"debug", L"mvr_ms_color_skip_key", c.mvrMsColorSkipKey);
+    c.mvrMsSlices = IniInt(ini, L"debug", L"mvr_ms_slices", 1) != 0;
     if (c.quadMode == QuadMode::Quad)
         Log("Settings: [debug] overlay=%d overlay_modifier=0x%X overlay_key=0x%X freeze_modifier=0x%X freeze_key=0x%X "
             "outer_modifier=0x%X outer_key=0x%X gaze_modifier=0x%X gaze_key=0x%X clones=%d clones_modifier=0x%X "
@@ -433,7 +434,7 @@ Config ReadConfig(const fs::path& ini) {
             "mvr_forward=%d mvr_forward_key=0x%X mvr_forward_depth=%d mvr_forward_depth_key=0x%X mvr_velocity=%d "
             "mvr_velocity_key=0x%X mvr_velocity_skip=%d mvr_velocity_skip_key=0x%X mvr_gbuffer_ps=%d "
             "mvr_gbuffer_ps_key=0x%X mvr_direct_extract=%d mvr_direct_extract_key=0x%X mvr_native_targets=%d "
-            "mvr_native_key=0x%X mvr_ms_color_skip=%d mvr_ms_color_skip_key=0x%X",
+            "mvr_native_key=0x%X mvr_ms_color_skip=%d mvr_ms_color_skip_key=0x%X mvr_ms_slices=%d",
             c.overlay, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey,
             c.gazeKeyMod, c.gazeKey, c.clones, c.clonesKeyMod, c.clonesKey, c.clonesViewportFix, c.clonesBindFix,
             c.shotClones, c.focusCull, c.cullKeyMod, c.cullKey, c.sunEffects, c.sunKeyMod, c.sunKey, c.taaViews,
@@ -442,7 +443,7 @@ Config ReadConfig(const fs::path& ini) {
             c.mvrEarly, c.mvrEarlyKey, c.mvrMapKey, c.mvrShotCompare, c.mvrForwardTest, c.mvrForward,
             c.mvrForwardKey, c.mvrForwardDepth, c.mvrForwardDepthKey, c.mvrVelocity, c.mvrVelocityKey,
             c.mvrVelocitySkip, c.mvrVelocitySkipKey, c.mvrGbufferPs, c.mvrGbufferPsKey, c.mvrDirectExtract,
-            c.mvrDirectExtractKey, c.mvrNativeTargets, c.mvrNativeKey, c.mvrMsColorSkip, c.mvrMsColorSkipKey);
+            c.mvrDirectExtractKey, c.mvrNativeTargets, c.mvrNativeKey, c.mvrMsColorSkip, c.mvrMsColorSkipKey, c.mvrMsSlices);
     const std::string dlaa = IniString(ini, L"dlaa", L"mode", L"off");
     c.dlaa = dlaa == "dlaa";
     if (dlaa != "off" && dlaa != "dlaa") Log("Settings: unknown [dlaa] mode=\"%s\", using off", dlaa.c_str());

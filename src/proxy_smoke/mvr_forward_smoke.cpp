@@ -683,7 +683,7 @@ MsCheck RunMsaa(double sx, double ox, double sy, double oy) {
         r.text = "no MSAA 8x for RGBA16F: SKIPPED";
         return r;
     }
-    MsSet plainGame, arrGame;
+    MsSet plainGame, arrGame, arr3Game;
     bool made = vsCode && cCode && dCode &&
                 SUCCEEDED(dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr,
                                                   &g_msSh.vs)) &&
@@ -695,7 +695,7 @@ MsCheck RunMsaa(double sx, double ox, double sy, double oy) {
                                                            &g_msBgPs)) &&
                 SUCCEEDED(dev->CreateDepthStencilState(&bgd, &g_msBgDs)) &&
                 MakeMsSet(plainGame, kW, kH, 0, 1) && MakeMsSet(arrGame, kW, kH, D3D11_BIND_SHADER_RESOURCE, 2) &&
-                MakeMsSet(g_msFocus, kFW, kFH, 0, 1);
+                MakeMsSet(arr3Game, kW, kH, D3D11_BIND_SHADER_RESOURCE, 3) && MakeMsSet(g_msFocus, kFW, kFH, 0, 1);
     if (!made) {
         r.text = "D3D11 objects could not be made: FAIL";
         return r;
@@ -757,6 +757,83 @@ MsCheck RunMsaa(double sx, double ox, double sy, double oy) {
         qvfr::mvrpass::TestEnd();
         qvfr::mvrpass::TestNative(nullptr, nullptr);
     }
+    // B12 step 5 (mvr_ms_slices): outer's targets as three-slice arrays whose slices 1 and 2 are focus L's and focus
+    // R's clones (the stand-in for clones::FocusSlice). Outer L's live pass, then outer R's in the same frame (same
+    // window), for the two passes that clear (1 all, 2 the depth and a background): slice 0 as without the module after
+    // each, slice 1 (focus L) as focus's own pass after outer R's pass too, slice 2 (focus R) the same; nothing copied
+    // in or out; each pass clears only slice 0 and its own slice.
+    static ID3D11Resource* s_arr3[2] = {};
+    s_arr3[0] = arr3Game.color.Get();
+    s_arr3[1] = arr3Game.depth.Get();
+    struct SliceRun {
+        qvfr::mvrpass::TestLiveState l, r;
+        bool ran[2] = {};
+        std::vector<uint64_t> outerC, outerD, s1C, s1D, s2C, s2D;
+    };
+    constexpr int kSliceRuns = 2;
+    SliceRun srun[kSliceRuns];
+    // The corner of a slice read by ReadMs (samples side by side): kFW x kFH pixels.
+    auto corner = [](const std::vector<uint64_t>& v) {
+        std::vector<uint64_t> out;
+        if (v.size() != (size_t)kW * kMs * kH) return out;
+        for (UINT y = 0; y < kFH; ++y)
+            out.insert(out.end(), v.begin() + (size_t)y * kW * kMs, v.begin() + (size_t)y * kW * kMs + kFW * kMs);
+        return out;
+    };
+    {
+        // Slices 1 and 2 start stale (another color, the far depth).
+        D3D11_RENDER_TARGET_VIEW_DESC rv{};
+        rv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY;
+        rv.Texture2DMSArray = {0, 3};
+        D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+        dv.Format = DXGI_FORMAT_D32_FLOAT;
+        dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY;
+        dv.Texture2DMSArray = {0, 3};
+        ComPtr<ID3D11RenderTargetView> allR;
+        ComPtr<ID3D11DepthStencilView> allD;
+        dev->CreateRenderTargetView(arr3Game.color.Get(), &rv, &allR);
+        dev->CreateDepthStencilView(arr3Game.depth.Get(), &dv, &allD);
+        for (int k = 0; k < kSliceRuns; ++k) {
+            SliceRun& m = srun[k];
+            g_msMode = k + 1;
+            g_msGame = arr3Game;
+            if (allR) ctx->ClearRenderTargetView(allR.Get(), kFocusColor);
+            if (allD) ctx->ClearDepthStencilView(allD.Get(), D3D11_CLEAR_DEPTH, 0.5f, 0);
+            restore(g_msGame);
+            const qvfr::mvrpass::NativeFn isArr = [](ID3D11Resource* x) {
+                return x && (x == s_arr3[0] || x == s_arr3[1]);
+            };
+            const qvfr::mvrpass::SliceFn slice = [](ID3D11Resource* o, int eye, uint32_t* w, uint32_t* h) -> int {
+                if (!o || (o != s_arr3[0] && o != s_arr3[1])) return 0;
+                if (w) *w = kFW;
+                if (h) *h = kFH;
+                return eye == 1 ? 2 : 1;
+            };
+            qvfr::mvrpass::TestNative(isArr, nullptr, slice);
+            qvfr::mvrpass::OnFrameStart(true);
+            qvfr::mvrpass::SetWindow(0, true, sx, ox, sy, oy, kW, kH);
+            qvfr::mvrpass::SetWindow(1, true, sx, ox, sy, oy, kW, kH);
+            qvfr::mvrpass::TestForwardLive(g_vtPhase3Ms);
+            qvfr::mvrpass::TestEarlyMark(1);
+            for (int eye = 0; eye < 2; ++eye) {
+                if (eye == 1) restore(g_msGame);  // outer R starts from what its earlier tasks left in slice 0
+                FakeTask t{g_vtPhase3Ms};
+                m.ran[eye] = !qvfr::mvrpass::BeforeTask((uint8_t*)&t, eye);
+                if (m.ran[eye]) RunTask(t);
+                qvfr::mvrpass::AfterTask((uint8_t*)&t);
+                (eye ? m.r : m.l) = qvfr::mvrpass::TestLiveGet();
+            }
+            m.outerC = ReadMs(g_msGame.color.Get());
+            m.outerD = ReadMs(g_msGame.depth.Get());
+            m.s1C = corner(ReadMs(g_msGame.color.Get(), 1));
+            m.s1D = corner(ReadMs(g_msGame.depth.Get(), 1));
+            m.s2C = corner(ReadMs(g_msGame.color.Get(), 2));
+            m.s2D = corner(ReadMs(g_msGame.depth.Get(), 2));
+            qvfr::mvrpass::TestEnd();
+            qvfr::mvrpass::TestNative(nullptr, nullptr);
+        }
+    }
     g_msMode = 0;
     g_msGame = MsSet{};
     const int samples = (int)(kFW * kFH * kMs);
@@ -804,6 +881,48 @@ MsCheck RunMsaa(double sx, double ox, double sy, double oy) {
                  lv.passes, lv.ok, lv.why.empty() ? "" : ": ", lv.why.c_str(), lv.msTargets, lv.copyIns, lv.clearFills,
                  lv.colorSkips, lv.native,
                  lv.copiedBack, outer, samples, covered, cOff, cBig, cMax, dOff, runOk ? "OK" : "WRONG");
+        text += line;
+    }
+    for (int k = 0; k < kSliceRuns; ++k) {
+        const SliceRun& m = srun[k];
+        const int ref = k + 1;  // the reference pass of the same kind
+        int outer = 0, covered = 0;
+        int cBig[2] = {}, dOff[2] = {};
+        float cMax[2] = {};
+        const std::vector<uint64_t>* sc[2] = {&m.s1C, &m.s2C};
+        const std::vector<uint64_t>* sd[2] = {&m.s1D, &m.s2D};
+        bool sizes = m.outerC.size() == refOC[ref].size() && m.outerD.size() == refOD[ref].size() && !refOC[ref].empty() &&
+                     refFC[ref].size() == (size_t)samples && refFD[ref].size() == (size_t)samples;
+        for (int i = 0; i < 2; ++i) sizes = sizes && sc[i]->size() == (size_t)samples && sd[i]->size() == (size_t)samples;
+        if (sizes) {
+            for (size_t i = 0; i < refOC[ref].size(); ++i)
+                outer += m.outerC[i] != refOC[ref][i] || m.outerD[i] != refOD[ref][i];
+            for (int j = 0; j < samples; ++j) covered += AsFloat(refFD[ref][j]) != 1.0f;
+            for (int i = 0; i < 2; ++i)
+                for (int j = 0; j < samples; ++j) {
+                    const float d = MaxHalfDiff((*sc[i])[j], refFC[ref][j]);
+                    cBig[i] += d > 0.02f;
+                    cMax[i] = std::max(cMax[i], d);
+                    dOff[i] += std::fabs(AsFloat((*sd[i])[j]) - AsFloat(refFD[ref][j])) > 1e-5f;
+                }
+        }
+        const unsigned clears = k == 0 ? 2 : 1;  // run 1 clears the color and the depth, run 2 the depth
+        const bool counts = m.ran[0] && m.ran[1] && m.l.passes == 1 && m.l.ok == 1 && m.r.passes == 2 && m.r.ok == 2 &&
+                            m.l.sliceTargets == 2 && m.r.sliceTargets == 2 && m.l.copyIns == 0 && m.r.copyIns == 0 &&
+                            m.l.sliceClears == clears && m.r.sliceClears == clears && m.l.native == 2 &&
+                            m.r.native == 2 && m.l.copiedBack == 0 && m.r.copiedBack == 0;
+        bool runOk = sizes && counts && outer == 0 && covered > samples / 3;
+        for (int i = 0; i < 2; ++i) runOk = runOk && cBig[i] * 100 <= samples && dOff[i] * 100 <= samples;
+        ok = ok && runOk;
+        snprintf(line, sizeof(line),
+                 "  MSAA %ux three slices (B12 step 5) %s: passes L %u ok %u, then R %u ok %u%s%s; read in their slice "
+                 "L %u / R %u, copied in %u / %u, clears of their own slices %u / %u; slice 0 vs without MVR %d samples "
+                 "differ; vs focus's own pass (%d samples, %d covered): slice 1 (focus L, after outer R's pass) color "
+                 "%d by > 0.02 (max %.4f), depth %d off; slice 2 (focus R) color %d (max %.4f), depth %d (%s)\n",
+                 kMs, k == 0 ? "cleared first" : "depth cleared and a background first", m.l.passes, m.l.ok,
+                 m.r.passes - m.l.passes, m.r.ok - m.l.ok, m.r.why.empty() ? "" : ": ", m.r.why.c_str(),
+                 m.l.sliceTargets, m.r.sliceTargets, m.l.copyIns, m.r.copyIns, m.l.sliceClears, m.r.sliceClears, outer,
+                 samples, covered, cBig[0], cMax[0], dOff[0], cBig[1], cMax[1], dOff[1], runOk ? "OK" : "WRONG");
         text += line;
     }
     r.ok = ok;

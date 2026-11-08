@@ -331,7 +331,7 @@ std::vector<ID3D11Resource*> g_wanted;
 bool IsArrayTarget(ID3D11Resource* r) {
     return r && (r == g_arrT.color.Get() || r == g_arrT.lin.Get() || r == g_arrT.depth.Get());
 }
-void WantArrayTarget(ID3D11Resource* r) {
+void WantArrayTarget(ID3D11Resource* r, UINT) {
     if (std::find(g_wanted.begin(), g_wanted.end(), r) == g_wanted.end()) g_wanted.push_back(r);
 }
 

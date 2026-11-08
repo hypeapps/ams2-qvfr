@@ -87,6 +87,10 @@ struct Tex {
     int views[2] = {};                   // view fields swapped
     ID3D11Texture2D* twin = nullptr;     // focus R's own copy of clone[Focus] (MVR B9d), ours
     bool twinWanted = false;             // made at the next frame start
+    // B12 step 5 (mvr_ms_slices): clone[Focus] (and the twin) is res itself, a three-slice array of ours: focus L's
+    // views see slice `slice`, the twin's slice + 1, in focus's size sw x sh. 0: a texture of its own.
+    int slice = 0;
+    uint32_t sw = 0, sh = 0;
 };
 struct Rt {
     uint8_t* obj = nullptr;
@@ -219,11 +223,14 @@ std::unordered_map<void*, ID3D11Texture2D*> g_arrRes;  // replaced engine textur
 constexpr size_t kPlainCache = 4096;
 void* g_arrPlain[kPlainCache] = {};
 void ClearPlain() { memset(g_arrPlain, 0, sizeof(g_arrPlain)); }
-std::vector<ID3D11Resource*> g_arrWant;           // asked for since the last frame start (only compared)
+std::vector<std::pair<ID3D11Resource*, UINT>> g_arrWant;  // asked for since the last frame start (only compared),
+                                                          // with the slices
 std::atomic<ID3D11Resource*> g_arrList[kMaxArrays] = {};  // the arrays, for IsArray on any thread
 std::atomic<bool> g_arrOn{false};
 std::atomic<uint64_t> g_arrCopies{0}, g_arrCopiesTot{0};  // CopyResource with an array turned into slice 0 copies
 std::vector<void*> g_arrCallers;                  // logged callers of a replaced texture's own views
+std::vector<void*> g_sliceResCallers;             // B12 step 5: logged callers of a slice clone as a resource
+uint64_t g_sliceRes = 0, g_sliceResTot = 0;
 int g_arrLogs = 0;
 uint64_t g_arrMade = 0;                            // arrays made in this process
 
@@ -341,6 +348,10 @@ double Megabytes(const D3D11_TEXTURE2D_DESC& d) {
         px += (double)std::max(1u, d.Width >> m) * std::max(1u, d.Height >> m);
     return px * d.ArraySize * std::max(1u, d.SampleDesc.Count) * BitsPerPixel(d.Format) / 8.0 / (1024.0 * 1024.0);
 }
+
+D3D11_TEXTURE2D_DESC DescOf(ID3D11Texture2D* t);
+// A clone's or twin's own memory (a slice of the engine's array has none).
+double CloneMb(const Tex& t, ID3D11Texture2D* c);
 
 D3D11_TEXTURE2D_DESC DescOf(ID3D11Texture2D* t) {
     D3D11_TEXTURE2D_DESC d{};
@@ -503,6 +514,8 @@ void DropClonesLocked() {
         if (t.twin) g_grave.push_back(t.twin);
         t.twin = nullptr;
         t.twinWanted = false;
+        t.slice = 0;
+        t.sw = t.sh = 0;
     }
     for (auto& [obj, r] : g_rt) r.views[0] = r.views[1] = 0;
     g_byClone.clear();
@@ -553,9 +566,66 @@ void ResetLocked(const char* why) {
 
 uint32_t MipSize(uint32_t s, UINT mip) { return std::max(1u, s >> std::min(mip, 31u)); }
 
+// B12 step 5: a view description turned into one of slice `slice` alone (a 2D or 2D multisample view, or an array
+// view of them). False: a kind without slices.
+bool OneSlice(D3D11_SHADER_RESOURCE_VIEW_DESC& d, UINT slice) {
+    switch (d.ViewDimension) {
+    case D3D11_SRV_DIMENSION_TEXTURE2D: {
+        const D3D11_TEX2D_SRV t = d.Texture2D;
+        d.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        d.Texture2DArray = {t.MostDetailedMip, t.MipLevels, slice, 1};
+        return true;
+    }
+    case D3D11_SRV_DIMENSION_TEXTURE2DARRAY: d.Texture2DArray.FirstArraySlice = slice; d.Texture2DArray.ArraySize = 1; return true;
+    case D3D11_SRV_DIMENSION_TEXTURE2DMS: d.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY; d.Texture2DMSArray = {slice, 1}; return true;
+    case D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY: d.Texture2DMSArray = {slice, 1}; return true;
+    default: return false;
+    }
+}
+bool OneSlice(D3D11_RENDER_TARGET_VIEW_DESC& d, UINT slice) {
+    switch (d.ViewDimension) {
+    case D3D11_RTV_DIMENSION_TEXTURE2D: {
+        const UINT mip = d.Texture2D.MipSlice;
+        d.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+        d.Texture2DArray = {mip, slice, 1};
+        return true;
+    }
+    case D3D11_RTV_DIMENSION_TEXTURE2DARRAY: d.Texture2DArray.FirstArraySlice = slice; d.Texture2DArray.ArraySize = 1; return true;
+    case D3D11_RTV_DIMENSION_TEXTURE2DMS: d.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY; d.Texture2DMSArray = {slice, 1}; return true;
+    case D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY: d.Texture2DMSArray = {slice, 1}; return true;
+    default: return false;
+    }
+}
+bool OneSlice(D3D11_DEPTH_STENCIL_VIEW_DESC& d, UINT slice) {
+    switch (d.ViewDimension) {
+    case D3D11_DSV_DIMENSION_TEXTURE2D: {
+        const UINT mip = d.Texture2D.MipSlice;
+        d.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+        d.Texture2DArray = {mip, slice, 1};
+        return true;
+    }
+    case D3D11_DSV_DIMENSION_TEXTURE2DARRAY: d.Texture2DArray.FirstArraySlice = slice; d.Texture2DArray.ArraySize = 1; return true;
+    case D3D11_DSV_DIMENSION_TEXTURE2DMS: d.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY; d.Texture2DMSArray = {slice, 1}; return true;
+    case D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY: d.Texture2DMSArray = {slice, 1}; return true;
+    default: return false;
+    }
+}
+bool OneSlice(D3D11_UNORDERED_ACCESS_VIEW_DESC& d, UINT slice) {
+    switch (d.ViewDimension) {
+    case D3D11_UAV_DIMENSION_TEXTURE2D: {
+        const UINT mip = d.Texture2D.MipSlice;
+        d.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2DARRAY;
+        d.Texture2DArray = {mip, slice, 1};
+        return true;
+    }
+    case D3D11_UAV_DIMENSION_TEXTURE2DARRAY: d.Texture2DArray.FirstArraySlice = slice; d.Texture2DArray.ArraySize = 1; return true;
+    default: return false;
+    }
+}
+
 // A view with v's description on `tex` (the caller owns it), or null with the result in *hrOut. `mip`: a target
-// view's mip, else -1.
-IUnknown* ViewLike(ID3D11Device* dev, void* v, ID3D11Texture2D* tex, int& mip, HRESULT* hrOut) {
+// view's mip, else -1. `slice` > 0 (B12 step 5): the view sees that slice of the array `tex` alone.
+IUnknown* ViewLike(ID3D11Device* dev, void* v, ID3D11Texture2D* tex, int& mip, HRESULT* hrOut, UINT slice = 0) {
     IUnknown* u = static_cast<IUnknown*>(v);
     IUnknown* out = nullptr;
     HRESULT hr = E_NOINTERFACE;
@@ -568,7 +638,8 @@ IUnknown* ViewLike(ID3D11Device* dev, void* v, ID3D11Texture2D* tex, int& mip, H
         D3D11_SHADER_RESOURCE_VIEW_DESC d{};
         srv->GetDesc(&d);
         srv->Release();
-        hr = dev->CreateShaderResourceView(tex, &d, (ID3D11ShaderResourceView**)&out);
+        hr = slice && !OneSlice(d, slice) ? E_INVALIDARG
+                                          : dev->CreateShaderResourceView(tex, &d, (ID3D11ShaderResourceView**)&out);
     } else if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D11RenderTargetView), (void**)&rtv)) && rtv) {
         D3D11_RENDER_TARGET_VIEW_DESC d{};
         rtv->GetDesc(&d);
@@ -576,7 +647,8 @@ IUnknown* ViewLike(ID3D11Device* dev, void* v, ID3D11Texture2D* tex, int& mip, H
         mip = d.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D        ? (int)d.Texture2D.MipSlice
               : d.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY ? (int)d.Texture2DArray.MipSlice
                                                                       : 0;
-        hr = dev->CreateRenderTargetView(tex, &d, (ID3D11RenderTargetView**)&out);
+        hr = slice && !OneSlice(d, slice) ? E_INVALIDARG
+                                          : dev->CreateRenderTargetView(tex, &d, (ID3D11RenderTargetView**)&out);
     } else if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D11DepthStencilView), (void**)&dsv)) && dsv) {
         D3D11_DEPTH_STENCIL_VIEW_DESC d{};
         dsv->GetDesc(&d);
@@ -584,12 +656,14 @@ IUnknown* ViewLike(ID3D11Device* dev, void* v, ID3D11Texture2D* tex, int& mip, H
         mip = d.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2D        ? (int)d.Texture2D.MipSlice
               : d.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2DARRAY ? (int)d.Texture2DArray.MipSlice
                                                                       : 0;
-        hr = dev->CreateDepthStencilView(tex, &d, (ID3D11DepthStencilView**)&out);
+        hr = slice && !OneSlice(d, slice) ? E_INVALIDARG
+                                          : dev->CreateDepthStencilView(tex, &d, (ID3D11DepthStencilView**)&out);
     } else if (SUCCEEDED(u->QueryInterface(__uuidof(ID3D11UnorderedAccessView), (void**)&uav)) && uav) {
         D3D11_UNORDERED_ACCESS_VIEW_DESC d{};
         uav->GetDesc(&d);
         uav->Release();
-        hr = dev->CreateUnorderedAccessView(tex, &d, (ID3D11UnorderedAccessView**)&out);
+        hr = slice && !OneSlice(d, slice) ? E_INVALIDARG
+                                          : dev->CreateUnorderedAccessView(tex, &d, (ID3D11UnorderedAccessView**)&out);
     }
     if (FAILED(hr)) out = nullptr;
     if (!out && SUCCEEDED(hr)) hr = E_FAIL;
@@ -598,17 +672,25 @@ IUnknown* ViewLike(ID3D11Device* dev, void* v, ID3D11Texture2D* tex, int& mip, H
 }
 
 // A view with v's description on `clone` (owned in g_owned), or null (logged). `mip`: a target view's mip, else -1.
-IUnknown* MakeViewLocked(ID3D11Device* dev, void* v, ID3D11Texture2D* clone, const Tex& t, int& mip) {
+// `slice` > 0: a slice clone's view (B12 step 5).
+IUnknown* MakeViewLocked(ID3D11Device* dev, void* v, ID3D11Texture2D* clone, const Tex& t, int& mip, UINT slice = 0) {
     HRESULT hr = S_OK;
-    IUnknown* out = ViewLike(dev, v, clone, mip, &hr);
+    IUnknown* out = ViewLike(dev, v, clone, mip, &hr, slice);
     if (!out) {
         const D3D11_TEXTURE2D_DESC cd = DescOf(clone);
-        Log("Clones: cannot clone view %p of %s on its %u x %u clone with %u mips (0x%08lX)", v, TexName(t), cd.Width,
-            cd.Height, cd.MipLevels, (unsigned long)hr);
+        Log("Clones: cannot clone view %p of %s on its %u x %u clone with %u mips (slice %u, 0x%08lX)", v, TexName(t),
+            cd.Width, cd.Height, cd.MipLevels, slice, (unsigned long)hr);
         return nullptr;
     }
     g_owned.push_back(out);
     return out;
+}
+
+// B12 step 5: the slice a view of `clone` sees: t's slice for focus's clone, the next one for the twin, 0 for a clone
+// of its own.
+UINT SliceOfLocked(const Tex& t, ID3D11Texture2D* clone, bool twin) {
+    if (!t.slice || (ID3D11Resource*)clone != t.res) return 0;
+    return (UINT)(twin ? t.slice + 1 : t.slice);
 }
 
 // A view of `clone` made for the engine's view v: noted as v's translation back, and with its sizes for the viewport
@@ -616,7 +698,11 @@ IUnknown* MakeViewLocked(ID3D11Device* dev, void* v, ID3D11Texture2D* clone, con
 void NoteViewLocked(SetState& s, void* v, IUnknown* out, ID3D11Texture2D* clone, const Tex& t, int mip) {
     s.back[out] = v;
     if (mip >= 0) {
-        const D3D11_TEXTURE2D_DESC cd = DescOf(clone);
+        D3D11_TEXTURE2D_DESC cd = DescOf(clone);
+        if (t.slice && (ID3D11Resource*)clone == t.res) {  // B12 step 5: the corner of a slice in focus's size
+            cd.Width = t.sw;
+            cd.Height = t.sh;
+        }
         Target& tg = s.targets[out];
         tg = {MipSize(cd.Width, mip), MipSize(cd.Height, mip), MipSize(t.desc.Width, mip), MipSize(t.desc.Height, mip)};
         memcpy(tg.name, t.name, sizeof(tg.name));
@@ -628,7 +714,7 @@ void NoteViewLocked(SetState& s, void* v, IUnknown* out, ID3D11Texture2D* clone,
 void* CloneViewLocked(SetState& s, ID3D11Device* dev, void* v, ID3D11Texture2D* clone, const Tex& t) {
     if (auto it = s.fwd.find(v); it != s.fwd.end()) return it->second;
     int mip = -1;
-    IUnknown* out = MakeViewLocked(dev, v, clone, t, mip);
+    IUnknown* out = MakeViewLocked(dev, v, clone, t, mip, SliceOfLocked(t, clone, false));
     if (!out) return nullptr;
     s.fwd[v] = out;
     NoteViewLocked(s, v, out, clone, t, mip);
@@ -640,7 +726,7 @@ void* TwinViewLocked(ID3D11Device* dev, void* v, void* cv, const Tex& t) {
     if (auto it = g_twin.find(cv); it != g_twin.end()) return it->second;
     if (!t.twin) return nullptr;
     int mip = -1;
-    IUnknown* out = MakeViewLocked(dev, v, t.twin, t, mip);
+    IUnknown* out = MakeViewLocked(dev, v, t.twin, t, mip, SliceOfLocked(t, t.twin, true));
     if (!out) return nullptr;
     g_twin[cv] = out;
     NoteViewLocked(g_set[Focus], v, out, t.twin, t, mip);
@@ -681,11 +767,27 @@ struct Zeros {
     }
 };
 
+// B12 step 5: t's texture is an array of ours with three slices (mvr_ms_slices) of one mip, at least d's size.
+ID3D11Texture2D* SliceArrayLocked(const Tex& t, const D3D11_TEXTURE2D_DESC& d) {
+    for (const ArrRec& a : g_arrs) {
+        if ((ID3D11Resource*)a.arr != t.res) continue;
+        const D3D11_TEXTURE2D_DESC ad = DescOf(a.arr);
+        if (ad.ArraySize >= 3 && ad.MipLevels == 1 && d.MipLevels == 1 && d.Width <= ad.Width && d.Height <= ad.Height &&
+            d.Format == ad.Format && d.SampleDesc.Count == ad.SampleDesc.Count)
+            return a.arr;
+    }
+    return nullptr;
+}
+
+double CloneMb(const Tex& t, ID3D11Texture2D* c) {
+    return !c || (t.slice && (ID3D11Resource*)c == t.res) ? 0.0 : Megabytes(DescOf(c));
+}
+
 bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
     SetState& s = g_set[si];
     bool ok = true;
     Zeros zeros;
-    int zeroed = 0, notZeroed = 0;
+    int zeroed = 0, notZeroed = 0, sliced = 0;
     for (auto& [obj, t] : g_tex) {
         if (!CloneWanted(t, si)) continue;
         D3D11_TEXTURE2D_DESC d = t.desc;
@@ -695,14 +797,26 @@ bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
         d.MiscFlags &= ~(UINT)(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
                                D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_GDI_COMPATIBLE);
         ID3D11Texture2D* c = nullptr;
-        const D3D11_SUBRESOURCE_DATA* init = zeros.For(d);
-        HRESULT hr = init ? dev->CreateTexture2D(&d, init, &c) : E_INVALIDARG;
-        if (SUCCEEDED(hr) && c) {
-            ++zeroed;
+        HRESULT hr = S_OK;
+        if (ID3D11Texture2D* arr = si == Focus ? SliceArrayLocked(t, d) : nullptr) {
+            // B12 step 5: focus's clone is slice 1 of the array (the twin slice 2), its corner in focus's size.
+            c = arr;
+            c->AddRef();  // the clone's reference, released like a clone of its own
+            t.slice = 1;
+            t.sw = d.Width;
+            t.sh = d.Height;
+            ++sliced;
         } else {
-            c = nullptr;
-            hr = dev->CreateTexture2D(&d, nullptr, &c);
-            ++notZeroed;
+            t.slice = 0;
+            const D3D11_SUBRESOURCE_DATA* init = zeros.For(d);
+            hr = init ? dev->CreateTexture2D(&d, init, &c) : E_INVALIDARG;
+            if (SUCCEEDED(hr) && c) {
+                ++zeroed;
+            } else {
+                c = nullptr;
+                hr = dev->CreateTexture2D(&d, nullptr, &c);
+                ++notZeroed;
+            }
         }
         if (FAILED(hr) || !c) {
             Log("Clones: cannot create the %s clone of %s (%u x %u fmt %d x%u, 0x%08lX)", kSetNames[si], TexName(t),
@@ -712,7 +826,7 @@ bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
         }
         t.clone[si] = c;
         g_byClone[c] = obj;
-        mb += Megabytes(d);
+        mb += t.slice ? 0.0 : Megabytes(d);
         ++clones;
         AddEntry(s, obj, obj + kTexRes, 8, (uint64_t)t.res, (uint64_t)c);
         if (t.sizeField)
@@ -775,8 +889,11 @@ bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
     if (mixed)
         Log("Clones: %d render targets have views of both cloned and shared textures for %s (sizes may not match)",
             mixed, kSetNames[si]);
-    Log("Clones: %s: %d clones start at zero, %d without initial data (multisampled, or refused with it)",
-        kSetNames[si], zeroed, notZeroed);
+    Log("Clones: %s: %d clones start at zero, %d without initial data (multisampled, or refused with it)%s",
+        kSetNames[si], zeroed, notZeroed,
+        sliced ? (", " + std::to_string(sliced) + " are slices of three-slice arrays (B12 step 5: no memory of "
+                  "their own, focus L slice 1, focus R slice 2)").c_str()
+               : "");
     return ok;
 }
 
@@ -795,7 +912,10 @@ void LogListLocked() {
         char clones[96] = "";
         size_t n = 0;
         for (int s = 0; s < 2; ++s)
-            if (t->clone[s]) {
+            if (t->clone[s] && s == Focus && t->slice)
+                n += snprintf(clones + n, sizeof(clones) - n, " -> %s %u x %u, slice %d of the array", kSetNames[s],
+                              t->sw, t->sh, t->slice);
+            else if (t->clone[s]) {
                 const D3D11_TEXTURE2D_DESC d = DescOf(t->clone[s]);
                 n += snprintf(clones + n, sizeof(clones) - n, " -> %s %u x %u", kSetNames[s], d.Width, d.Height);
             }
@@ -874,7 +994,11 @@ void BuildTwinsLocked(ID3D11DeviceContext* imm) {
         if (!c) continue;
         const D3D11_TEXTURE2D_DESC d = DescOf(c);
         ID3D11Texture2D* tw = nullptr;
-        if (FAILED(dev->CreateTexture2D(&d, nullptr, &tw)) || !tw) {
+        const bool slice = t.slice && (ID3D11Resource*)c == t.res;  // B12 step 5: the twin is the next slice
+        if (slice) {
+            tw = c;
+            tw->AddRef();
+        } else if (FAILED(dev->CreateTexture2D(&d, nullptr, &tw)) || !tw) {
             ++failed;
             if (g_twinLogs < kMaxResetLogs) {
                 ++g_twinLogs;
@@ -901,12 +1025,14 @@ void BuildTwinsLocked(ID3D11DeviceContext* imm) {
             ++failed;
             continue;
         }
-        t_internal = true;
-        imm->CopyResource(tw, c);
-        t_internal = false;
+        if (!slice) {
+            t_internal = true;
+            imm->CopyResource(tw, c);
+            t_internal = false;
+            g_twin[c] = tw;
+            mb += Megabytes(d);
+        }
         g_byClone[tw] = obj;
-        g_twin[c] = tw;
-        mb += Megabytes(d);
         views += (int)mine.size();
         ++made;
     }
@@ -918,7 +1044,7 @@ void BuildTwinsLocked(ID3D11DeviceContext* imm) {
         for (auto& [obj, t] : g_tex)
             if (t.twin) {
                 ++total;
-                all += Megabytes(DescOf(t.twin));
+                all += CloneMb(t, t.twin);
             }
         Log("Clones: focus R's own clones: %d new twins (%.0f MB, %d views), %zu in all (%.0f MB)%s", made, mb, views,
             total, all, failed ? "; some FAILED (see above)" : "");
@@ -1223,14 +1349,14 @@ ID3D11Resource* ArrResLocked(ID3D11Resource* r, const char* method, void* caller
 
 // The arrays asked for since the last frame start, made and written into the engine objects. Returns the number made.
 int BuildArraysLocked(ID3D11DeviceContext* imm) {
-    std::vector<ID3D11Resource*> want;
+    std::vector<std::pair<ID3D11Resource*, UINT>> want;
     want.swap(g_arrWant);
     ID3D11Device* dev = nullptr;
     imm->GetDevice(&dev);
     if (!dev) return 0;
     int made = 0, failed = 0, views = 0, rtViews = 0;
     double mb = 0;
-    for (ID3D11Resource* res : want) {
+    for (auto [res, slices] : want) {
         auto bt = g_byRes.find(res);
         if (bt == g_byRes.end() || g_arrRes.count(res) || (int)g_arrs.size() >= kMaxArrays) continue;
         uint8_t* obj = bt->second;
@@ -1253,7 +1379,7 @@ int BuildArraysLocked(ID3D11DeviceContext* imm) {
             continue;
         }
         D3D11_TEXTURE2D_DESC ad = d;
-        ad.ArraySize = 2;
+        ad.ArraySize = slices >= 3 && d.MipLevels == 1 ? 3 : 2;  // B12 step 5: three for the multisampled forward
         ad.MiscFlags &= ~(UINT)(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
                                 D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_GDI_COMPATIBLE);
         if ((ad.BindFlags & D3D11_BIND_DEPTH_STENCIL) && DepthTypeless(ad.Format))
@@ -1262,8 +1388,8 @@ int BuildArraysLocked(ID3D11DeviceContext* imm) {
         a.obj = obj;
         if (FAILED(dev->CreateTexture2D(&ad, nullptr, &a.arr)) || !a.arr) {
             ++failed;
-            Log("Clones: B17: cannot create the two-slice array of %s (%u x %u fmt %d)", TexName(t), d.Width, d.Height,
-                (int)d.Format);
+            Log("Clones: B17: cannot create the %u-slice array of %s (%u x %u fmt %d)", ad.ArraySize, TexName(t),
+                d.Width, d.Height, (int)d.Format);
             continue;
         }
         a.old = res;
@@ -1341,9 +1467,11 @@ int BuildArraysLocked(ID3D11DeviceContext* imm) {
         double all = 0;
         for (const ArrRec& a : g_arrs) all += a.mb;
         g_arrMade += made;
+        int three = 0;
+        for (const ArrRec& a : g_arrs) three += DescOf(a.arr).ArraySize >= 3;
         Log("Clones: B17: %d two-slice arrays in place of the engine's textures (%.0f MB; %d texture views, %d render "
-            "target views replaced)%s; %zu in all (%.0f MB)",
-            made, mb, views, rtViews, failed ? ", some FAILED (see above)" : "", g_arrs.size(), all);
+            "target views replaced)%s; %zu in all (%.0f MB), %d of them with three slices (B12 step 5)",
+            made, mb, views, rtViews, failed ? ", some FAILED (see above)" : "", g_arrs.size(), all, three);
     }
     if (made) TranslateLocked(imm, g_arrView);
     return made;
@@ -1652,12 +1780,24 @@ ID3D11Resource* MapResLocked(ID3D11Resource* r, const char* method, void* caller
             }
         auto it = g_byRes.find(r);
         if (it == g_byRes.end() || !g_tex[it->second].clone[g_cur]) return r;
+        const Tex& t = g_tex[it->second];
+        if (g_cur == Focus && t.slice) {  // B12 step 5: the array itself, so the call sees slice 0, not focus's
+            ++g_sliceRes;
+            if (g_sliceResCallers.size() < kMaxCallerLogs &&
+                std::find(g_sliceResCallers.begin(), g_sliceResCallers.end(), caller) == g_sliceResCallers.end()) {
+                g_sliceResCallers.push_back(caller);
+                Log("Clones: B12 slices: a focus group's %s from %s takes %s, whose focus clone is slice %d of its "
+                    "array, as a resource (the call sees slice 0, not focus's)",
+                    method, Where(caller).c_str(), TexName(t), eye == 1 && t.twin ? t.slice + 1 : t.slice);
+            }
+            return r;
+        }
         NoteFixLocked(true, method, caller, r, true, false);
-        return (ID3D11Resource*)ForEye(g_tex[it->second].clone[g_cur], eye);
+        return (ID3D11Resource*)ForEye(t.clone[g_cur], eye);
     }
     if (live == LiveBack) {
         auto it = g_byClone.find(r);
-        if (it == g_byClone.end()) return r;
+        if (it == g_byClone.end() || g_tex[it->second].res == r) return r;  // B12 step 5: a slice clone's array
         NoteFixLocked(false, method, caller, r, true, false);
         return g_tex[it->second].res;
     }
@@ -1984,8 +2124,8 @@ bool CopySlice0(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src
     bool ok = d2 && s2;
     if (ok) {
         const D3D11_TEXTURE2D_DESC dd = DescOf(d2), sd = DescOf(s2);
-        ok = dd.Width == sd.Width && dd.Height == sd.Height && dd.MipLevels == sd.MipLevels && dd.ArraySize <= 2 &&
-             sd.ArraySize <= 2 && dd.SampleDesc.Count == sd.SampleDesc.Count &&
+        ok = dd.Width == sd.Width && dd.Height == sd.Height && dd.MipLevels == sd.MipLevels && dd.ArraySize <= 3 &&
+             sd.ArraySize <= 3 && dd.SampleDesc.Count == sd.SampleDesc.Count &&
              dd.SampleDesc.Quality == sd.SampleDesc.Quality;  // B12: multisampled as a whole subresource
         for (UINT m = 0; ok && m < dd.MipLevels; ++m)
             o_copyRegion(c, dst, D3D11CalcSubresource(m, 0, dd.MipLevels), 0, 0, 0, src,
@@ -2457,14 +2597,33 @@ bool HasTwin(ID3D11Resource* original) {
     return out;
 }
 
-void WantArray(ID3D11Resource* original) {
+void WantArray(ID3D11Resource* original, UINT slices) {
     if (!original || IsArrayFast(original)) return;
     Protect("WantArray", [&] {
         std::lock_guard lock(g_cm);
         if (g_failed || !g_installed || g_arrRes.count(original) || !g_byRes.count(original)) return;
         if ((int)(g_arrs.size() + g_arrWant.size()) >= kMaxArrays) return;
-        if (std::find(g_arrWant.begin(), g_arrWant.end(), original) == g_arrWant.end()) g_arrWant.push_back(original);
+        for (const auto& w : g_arrWant)
+            if (w.first == original) return;
+        g_arrWant.emplace_back(original, slices);
     });
+}
+
+int FocusSlice(ID3D11Resource* original, int eye, uint32_t* w, uint32_t* h) {
+    int out = 0;
+    if (!original) return out;
+    Protect("FocusSlice", [&] {
+        std::lock_guard lock(g_cm);
+        if (g_failed || g_phase != Ready || g_dirty) return;
+        auto it = g_byRes.find(original);
+        if (it == g_byRes.end()) return;
+        const Tex& t = g_tex[it->second];
+        if (!t.slice || !t.clone[Focus]) return;
+        out = eye == 1 && t.twin ? t.slice + 1 : t.slice;
+        if (w) *w = t.sw;
+        if (h) *h = t.sh;
+    });
+    return out;
 }
 
 bool IsArray(ID3D11Resource* res) { return res && g_arrOn.load(std::memory_order_acquire) && IsArrayFast(res); }
@@ -2498,7 +2657,7 @@ int ListForShot(Set set, ID3D11Resource** out, char (*labels)[64], int max) {
         std::lock_guard lock(g_cm);
         std::vector<const Tex*> list;
         for (auto& [obj, t] : g_tex)
-            if (t.clone[set]) list.push_back(&t);
+            if (t.clone[set] && !(set == Focus && t.slice)) list.push_back(&t);  // B12 step 5: a slice has no texture
         std::sort(list.begin(), list.end(), [](const Tex* a, const Tex* b) {
             if (a->desc.Width != b->desc.Width) return a->desc.Width > b->desc.Width;
             if (a->desc.Format != b->desc.Format) return a->desc.Format < b->desc.Format;
@@ -2529,14 +2688,14 @@ std::string Describe() {
             for (int s = 0; s < 2; ++s)
                 if (t.clone[s]) {
                     ++clones[s];
-                    mb[s] += Megabytes(DescOf(t.clone[s]));
+                    mb[s] += CloneMb(t, t.clone[s]);
                 }
         int twins = 0;
         double twinMb = 0;
         for (auto& [obj, t] : g_tex)
             if (t.twin) {
                 ++twins;
-                twinMb += Megabytes(DescOf(t.twin));
+                twinMb += CloneMb(t, t.twin);
             }
         char sets[2][128];
         for (int s = 0; s < 2; ++s) {
@@ -2591,6 +2750,13 @@ void LogStats(bool totals) {
                 totals ? " (session total)" : "", g_arrs.size(), (unsigned long long)g_arrMade,
                 (unsigned long long)c.arrFix, (unsigned long long)c.arrLazy,
                 (unsigned long long)(totals ? g_arrCopiesTot.load() : copies));
+        const uint64_t sliceRes = g_sliceRes;
+        g_sliceResTot += sliceRes;
+        g_sliceRes = 0;
+        if (sliceRes || (totals && g_sliceResTot))
+            Log("Clones B12 slices%s: focus groups took a slice clone's array as a resource %llu times (copies, "
+                "resolves: they see slice 0)",
+                totals ? " (session total)" : "", (unsigned long long)(totals ? g_sliceResTot : sliceRes));
         if (c.swaps[0] || c.swaps[1] || c.lists || c.changed)
             Log("Clones stats%s: %s, groups with clones outer %llu focus %llu (with focus R's twins %llu, %zu views and "
                 "textures twinned), %llu with bound views translated, %llu "
@@ -2676,8 +2842,12 @@ TestState TestGet() {
     s.bindsToClone = g_c.fixFwd + g_ctot.fixFwd;
     s.bindsToOriginal = g_c.fixBack + g_ctot.fixBack;
     s.lazyViews = g_c.lazy + g_ctot.lazy;
-    for (auto& [obj, t] : g_tex) s.twins += t.twin ? 1 : 0;
-    s.twinViews = (int)g_twin.size() - s.twins;
+    int twinTex = 0;  // twins with a texture of their own (in g_twin; a slice clone's twin has none, B12 step 5)
+    for (auto& [obj, t] : g_tex) {
+        s.twins += t.twin ? 1 : 0;
+        twinTex += t.twin && t.clone[Focus] && g_twin.count(t.clone[Focus]) ? 1 : 0;
+    }
+    s.twinViews = (int)g_twin.size() - twinTex;
     s.arrays = (int)g_arrs.size();
     s.arrayFixes = g_c.arrFix + g_ctot.arrFix;
     s.arrayLazy = g_c.arrLazy + g_ctot.arrLazy;

@@ -1459,9 +1459,140 @@ int RunClones() {
     st = cl::TestGet();
     expect(st.arrays == 0 && !cl::IsArray(arrTex), "B17: no array left");
     cl::Shutdown();
-    printf("Clones check %s: %d wrong (focus smaller %d, outer smaller %d, two-slice arrays %d); %d translations, "
-           "original pixel 0x%08X, clone pixel 0x%08X\n",
-           bad ? "FAILED" : "OK", bad, bad1, bad2 - bad1, bad - bad2, translated1, pxA, pxClone);
+    const int bad3 = bad;
+
+    // Scenario 4 (MVR B12 step 5): a three-slice array whose slices 1 and 2 are focus L's and focus R's clone. H: eye
+    // size, written by outer and focus, its RTV at +0x80, a second RTV in a render target's array.
+    cl::SetSizes(64, 48, 64, 48, 32, 24);
+    ID3D11Texture2D* texH = tex(64, 48);
+    ID3D11RenderTargetView *rtvH = rtv(texH), *rtvH2 = rtv(texH);
+    static const char* const names4[] = {"Fake H", "Fake RT H"};
+    FakeObj H, RH;
+    H.at<void*>(0x58) = texH;
+    H.at<void*>(0x80) = rtvH;
+    H.at<const char*>(0xf0) = names4[0];
+    H.at<uint16_t>(0x68) = 64;
+    H.at<uint16_t>(0x6a) = 48;
+    void* arrH[1] = {rtvH2};
+    RH.at<uint16_t>(0x24) = 64;
+    RH.at<uint16_t>(0x26) = 48;
+    RH.at<uint16_t>(0x66) = 1;
+    RH.at<void**>(0x78) = arrH;
+    RH.at<const char*>(0xb8) = names4[1];
+    cl::TestRegister(false, &H);
+    cl::TestRegister(true, &RH);
+    for (int f = 0; f < 17; ++f) {
+        cl::OnFrameStart(ctx, true);
+        if (f == 16) break;
+        cl::BeginGroup(ctx, cl::Outer);
+        ctx->ClearRenderTargetView(rtvH, green);
+        cl::EndGroup(ctx);
+        cl::BeginGroup(ctx, cl::Focus);
+        ctx->ClearRenderTargetView(H.at<ID3D11RenderTargetView*>(0x80), blue);
+        cl::EndGroup(ctx);
+    }
+    expect(cl::TestGet().phase == 2 && cl::TestGet().clones[1] == 1, "slices: ready with H's focus clone");
+    cl::WantArray(texH, 3);
+    cl::OnFrameStart(ctx, true);
+    ID3D11Texture2D* arr3 = H.at<ID3D11Texture2D*>(0x58);
+    expect(arr3 != texH && cl::IsArray(arr3) && arraySize(arr3) == 3 && size(arr3) == size(texH),
+           "slices: H's texture replaced by a three-slice array of its size");
+    uint32_t sw = 0, shh = 0;
+    expect(cl::CloneOf(arr3, cl::Focus) == arr3 && cl::FocusSlice(arr3, 0, &sw, &shh) == 1 && sw == 32 && shh == 24 &&
+               cl::FocusSlice(arr3, 1) == 1,
+           "slices: focus's clone is slice 1 of the array (32 x 24), focus R shares it before its twin");
+    // Slice k's pixel (0, 0).
+    auto slicePixel = [&](ID3D11Texture2D* t, UINT k) {
+        D3D11_TEXTURE2D_DESC d{};
+        t->GetDesc(&d);
+        d.ArraySize = 1;
+        d.Usage = D3D11_USAGE_STAGING;
+        d.BindFlags = 0;
+        d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ID3D11Texture2D* s = nullptr;
+        uint32_t px = 0;
+        if (SUCCEEDED(dev->CreateTexture2D(&d, nullptr, &s))) {
+            cl::RawScope raw;
+            ctx->CopySubresourceRegion(s, 0, 0, 0, 0, t, D3D11CalcSubresource(0, k, d.MipLevels), nullptr);
+            D3D11_MAPPED_SUBRESOURCE m{};
+            if (SUCCEEDED(ctx->Map(s, 0, D3D11_MAP_READ, 0, &m))) {
+                px = *(const uint32_t*)m.pData;
+                ctx->Unmap(s, 0);
+            }
+            s->Release();
+        }
+        return px;
+    };
+    auto rtvSlice = [](void* v) {
+        D3D11_RENDER_TARGET_VIEW_DESC d{};
+        if (v) static_cast<ID3D11RenderTargetView*>(v)->GetDesc(&d);
+        return d.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY && d.Texture2DArray.ArraySize == 1
+                   ? (int)d.Texture2DArray.FirstArraySlice
+                   : -1;
+    };
+    ctx->ClearRenderTargetView(H.at<ID3D11RenderTargetView*>(0x80), green);  // slice 0 (outside the groups)
+    // The array's own view bound and a viewport of the original set before the group: slice 1 at focus's size in it.
+    ID3D11RenderTargetView* hOwn = H.at<ID3D11RenderTargetView*>(0x80);
+    ctx->OMSetRenderTargets(1, &hOwn, nullptr);
+    viewport(64, 48);
+    cl::BeginGroup(ctx, cl::Focus);
+    ID3D11RenderTargetView* hBound = nullptr;
+    ctx->OMGetRenderTargets(1, &hBound, nullptr);
+    expect(rtvSlice(hBound) == 1 && boundViewport() == std::make_pair(32.0f, 24.0f),
+           "slices: the bound view goes to slice 1, the original's viewport scaled to focus's size");
+    if (hBound) hBound->Release();
+    ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    void* hRtv = H.at<void*>(0x80);
+    expect(cl::TestGet().swapped && H.at<void*>(0x58) == arr3 && resOf(hRtv) == arr3 && rtvSlice(hRtv) == 1 &&
+               rtvSlice(arrH[0]) == 1 && H.at<uint16_t>(0x68) == 32 && RH.at<uint16_t>(0x24) == 32,
+           "slices: focus L's fields hold the array, views of slice 1 and focus's size");
+    ctx->ClearRenderTargetView((ID3D11RenderTargetView*)hRtv, blue);
+    cl::EndGroup(ctx);
+    expect(H.at<void*>(0x58) == arr3 && rtvSlice(H.at<void*>(0x80)) == -1 && H.at<uint16_t>(0x68) == 64,
+           "slices: the array's own views back after the focus group");
+    expect(slicePixel(arr3, 0) == 0xFF00FF00u && slicePixel(arr3, 1) == 0xFFFF0000u,
+           "slices: focus L's clear in slice 1, slice 0 kept");
+    // Focus R's twin: slice 2, no texture, nothing copied.
+    cl::WantTwin(arr3);
+    cl::OnFrameStart(ctx, true);
+    expect(cl::HasTwin(arr3) && cl::FocusSlice(arr3, 1) == 2 && cl::FocusSlice(arr3, 0) == 1 &&
+               cl::TestGet().twinViews == 2 && cl::TestGet().twins == 1,
+           "slices: focus R's twin is slice 2 (two views)");
+    cl::SetFocusEye(1);
+    expect(cl::CloneOf(arr3, cl::Focus) == arr3, "slices: eye 1's clone is the array too");
+    cl::BeginGroup(ctx, cl::Focus);
+    expect(rtvSlice(H.at<void*>(0x80)) == 2 && rtvSlice(arrH[0]) == 2 && H.at<uint16_t>(0x68) == 32,
+           "slices: focus R's fields hold views of slice 2");
+    ctx->ClearRenderTargetView(H.at<ID3D11RenderTargetView*>(0x80), red);
+    // A view the engine keeps elsewhere (the array's slice 0 RTV) goes to focus R's slice.
+    ID3D11RenderTargetView* mappedH[8] = {};
+    ID3D11DepthStencilView* mappedHd = nullptr;
+    ID3D11RenderTargetView* keptH = rtv(arr3);
+    const bool mappedHok = cl::MapTargets(ctx, 1, &keptH, nullptr, mappedH, &mappedHd, nullptr);
+    expect(mappedHok && rtvSlice(mappedH[0]) == 2, "slices: a view kept outside the fields goes to slice 2 for focus R");
+    cl::EndGroup(ctx);
+    cl::SetFocusEye(0);
+    expect(slicePixel(arr3, 0) == 0xFF00FF00u && slicePixel(arr3, 1) == 0xFFFF0000u &&
+               slicePixel(arr3, 2) == 0xFF0000FFu,
+           "slices: focus R's clear in slice 2, slices 0 and 1 kept");
+    // An outer group binds the array's own views (slice 0) as they are.
+    cl::BeginGroup(ctx, cl::Outer);
+    ID3D11RenderTargetView* mappedO[8] = {};
+    ID3D11DepthStencilView* mappedOd = nullptr;
+    const bool mappedOk2 = cl::MapTargets(ctx, 1, &keptH, nullptr, mappedO, &mappedOd, nullptr);
+    expect(!mappedOk2 || mappedO[0] == keptH, "slices: an outer group's bind of the array stays slice 0");
+    cl::EndGroup(ctx);
+    keptH->Release();
+    cl::TestDestroy(true, &RH);
+    cl::TestDestroy(false, &H);
+    expect(H.at<void*>(0x58) == texH && H.at<void*>(0x80) == rtvH, "slices: H's texture and views back at its destroy");
+    cl::OnFrameStart(ctx, true);
+    expect(cl::TestGet().arrays == 0 && !cl::IsArray(arr3), "slices: no array left");
+    cl::Shutdown();
+    printf("Clones check %s: %d wrong (focus smaller %d, outer smaller %d, two-slice arrays %d, three-slice arrays %d); "
+           "%d translations, original pixel 0x%08X, clone pixel 0x%08X\n",
+           bad ? "FAILED" : "OK", bad, bad1, bad2 - bad1, bad3 - bad2, bad - bad3, translated1, pxA, pxClone);
+    for (IUnknown* u : {(IUnknown*)texH, (IUnknown*)rtvH, (IUnknown*)rtvH2}) u->Release();
     for (IUnknown* u : {(IUnknown*)texG, (IUnknown*)srvG, (IUnknown*)rtvG, (IUnknown*)rtvG2, (IUnknown*)rtvGX,
                         (IUnknown*)texS1})
         u->Release();

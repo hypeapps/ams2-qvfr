@@ -392,12 +392,16 @@ void WriteBuffer(Gpu& g, ID3D11Buffer* b, const void* data, size_t bytes) {
     }
 }
 
-NvAPI_Status SetMultiView(Gpu& g, int views, bool independentViewportMask, bool offsetsPerView) {
+// `offsets`: each view's render target array index (null: view v in slice v when offsetsPerView).
+NvAPI_Status SetMultiView(Gpu& g, int views, bool independentViewportMask, bool offsetsPerView,
+                          const int* offsets = nullptr) {
     NV_MULTIVIEW_PARAMS p = {};
     p.version = NV_MULTIVIEW_PARAMS_VER;
     p.numViews = static_cast<NvU32>(views);
     for (int v = 0; v < NV_MULTIVIEW_MAX_SUPPORTED_VIEWS; ++v)
-        p.renderTargetIndexOffset[v] = offsetsPerView ? static_cast<NvU32>(v) : 0;
+        p.renderTargetIndexOffset[v] = offsets && v < views ? static_cast<NvU32>(offsets[v])
+                                       : offsetsPerView     ? static_cast<NvU32>(v)
+                                                            : 0;
     p.independentViewportMaskEnable = independentViewportMask ? 1 : 0;
     return NvAPI_D3D_SetMultiViewMode(g.ctx.Get(), &p);
 }
@@ -551,6 +555,10 @@ struct CaseCfg {
     ViewIdMode idMode;
     bool enableMvr;  // false: MVR shaders, but multi-view mode stays off (only view 0 must appear)
     VsKind vs = VsKind::Hlsl;
+    // B12 step 4 feasibility: more slices than views and each view's slice (renderTargetIndexOffset); slices no view
+    // writes must stay empty. 0 / null: one slice per view, view v in slice v.
+    int slices = 0;
+    const int* offsets = nullptr;
 };
 
 constexpr int kW = 256, kH = 256;
@@ -566,7 +574,8 @@ bool DrawCase(Gpu& g, const CaseCfg& c, std::vector<std::vector<uint32_t>>& img,
         Log("  shader creation failed\n");
         return false;
     }
-    if (!MakeTarget(g, c.viewportMask ? kW * c.views : kW, kH, c.viewportMask ? 1 : c.views, c.samples, t)) {
+    if (!MakeTarget(g, c.viewportMask ? kW * c.views : kW, kH, c.viewportMask ? 1 : c.slices ? c.slices : c.views,
+                    c.samples, t)) {
         Log("  target creation failed\n");
         return false;
     }
@@ -602,7 +611,7 @@ bool DrawCase(Gpu& g, const CaseCfg& c, std::vector<std::vector<uint32_t>>& img,
     g.ctx->ClearRenderTargetView(t.all.Get(), clear);
 
     if (c.enableMvr) {
-        NvAPI_Status st = SetMultiView(g, c.views, c.viewportMask, !c.viewportMask);
+        NvAPI_Status st = SetMultiView(g, c.views, c.viewportMask, !c.viewportMask, c.offsets);
         if (st != NVAPI_OK) Log("  NvAPI_D3D_SetMultiViewMode: %s\n", NvErr(st).c_str());
     }
     g.ctx->Draw(6, 0);
@@ -632,15 +641,24 @@ bool RunCase(Gpu& g, const CaseCfg& c) {
         return false;
     }
     bool ok = true;
+    std::vector<bool> written(img.size(), false);
     for (int v = 0; v < c.views; ++v) {
         std::set<int> ids;
-        const int slice = c.viewportMask ? 0 : v;
+        const int slice = c.viewportMask ? 0 : c.offsets ? c.offsets[v] : v;
+        if (slice < 0 || slice >= static_cast<int>(img.size())) {
+            Log("  view %d: slice %d out of the target -> WRONG\n", v, slice);
+            ok = false;
+            continue;
+        }
+        written[slice] = true;
         const Box got = MeasureBox(img[slice], t.w, c.viewportMask ? v * kW : 0, kW, kH, ids);
         const Box exp = (c.enableMvr || v == 0) ? ExpectedBox(kViews[v], kW, kH) : Box{};
         const bool boxOk = Near(got, exp);
+        // SV_RenderTargetArrayIndex reads the slice the view goes to (renderTargetIndexOffset), other ids the view.
+        const int wantId = c.idMode == ViewIdMode::RtIndex ? slice : v;
         const bool idOk = c.idMode == ViewIdMode::None ? true
                           : exp.empty                  ? ids.empty()
-                                                       : (ids.size() == 1 && *ids.begin() == v);
+                                                       : (ids.size() == 1 && *ids.begin() == wantId);
         std::string idStr;
         for (int id : ids) idStr += (idStr.empty() ? "" : ",") + std::to_string(id);
         Log("  view %d: expected [%d,%d)x[%d,%d)%s, got [%d,%d)x[%d,%d)%s -> box %s, view id seen {%s} -> %s\n", v,
@@ -648,6 +666,13 @@ bool RunCase(Gpu& g, const CaseCfg& c) {
             got.empty ? " (empty)" : "", boxOk ? "OK" : "WRONG", idStr.c_str(), idOk ? "OK" : "WRONG");
         ok = ok && boxOk;
         ok = ok && idOk;
+    }
+    for (size_t s = 0; s < img.size() && !c.viewportMask; ++s) {
+        if (written[s]) continue;
+        size_t lit = 0;
+        for (uint32_t px : img[s]) lit += px != 0;
+        Log("  slice %zu (no view): %zu pixels written -> %s\n", s, lit, lit == 0 ? "OK" : "WRONG");
+        ok = ok && lit == 0;
     }
     if (c.vs != VsKind::Hlsl) {
         // The patched shader must give exactly the image of the HLSL MVR shader with the same pixel shader output.
@@ -1594,6 +1619,7 @@ int main(int argc, char** argv) {
         return RunPatchDir(g, patchDir, static_cast<uint32_t>(ArgInt(argc, argv, "--patch-slot", 3)),
                            ArgStr(argc, argv, "--patch-out"), HasArg(argc, argv, "--patch-clip"));
 
+    static const int kOff02[2] = {0, 2}, kOff21[2] = {2, 1};
     // Correctness, simplest first. Every case gets a fresh device, so a GPU hang in one does not hide the others.
     const CaseCfg cases[] = {
         {"MVR shader, mode off", 2, false, 1, ViewIdMode::None, false},
@@ -1614,6 +1640,13 @@ int main(int argc, char** argv) {
         {"B4 patched VS, 4 views, MSAA 8x", 4, false, 8, ViewIdMode::RtIndex, true, VsKind::PatchedPlain},
         {"B4 patched branchy VS, 2 views", 2, false, 1, ViewIdMode::RtIndex, true, VsKind::PatchedBranchy},
         {"B4 patched branchy VS, 4 views, MSAA 8x", 4, false, 8, ViewIdMode::RtIndex, true, VsKind::PatchedBranchy},
+        {"B12 view 1 in slice 2 of 3 (offsets 0, 2)", 2, false, 1, ViewIdMode::RtIndex, true, VsKind::Hlsl, 3, kOff02},
+        {"B12 view 1 in slice 2 of 3 (offsets 0, 2), MSAA 8x", 2, false, 8, ViewIdMode::RtIndex, true, VsKind::Hlsl, 3,
+         kOff02},
+        {"B12 patched VS, view 1 in slice 2 of 3, MSAA 8x", 2, false, 8, ViewIdMode::RtIndex, true, VsKind::PatchedPlain,
+         3, kOff02},
+        {"B12 view 0 in slice 2, view 1 in slice 1 (offsets 2, 1)", 2, false, 1, ViewIdMode::RtIndex, true, VsKind::Hlsl,
+         3, kOff21},
     };
     const int only = ArgInt(argc, argv, "--case", -1);
     const bool includeHang = HasArg(argc, argv, "--include-hang");

@@ -135,6 +135,11 @@ const char* ForwardDepthName(int mode);
 // depth first (a multisampled forward pass then shades its color from scratch; AMS2 draws the opaque sky dome first).
 void SetMsColorSkip(bool on);
 bool GetMsColorSkip();
+// B12 step 5 (docs/mvr.md), [debug] mvr_ms_slices (restart only, default on): the multisampled forward targets become
+// three-slice arrays (clones::WantArray with 3), whose slices 1 and 2 are focus L's and focus R's clones of them
+// (clones.h). Outer L's live pass draws view 1 into slice 1, outer R's into slice 2 (renderTargetIndexOffset), each
+// clears only slice 0 and its own slice, and neither copies anything into or out of the slice: focus's group reads it
+// there.
 // B11 (docs/mvr.md), [debug] mvr_velocity_skip (live, hotkey mvr_modifier + mvr_velocity_skip_key), mode 3 only: at the
 // first draw of the focus group's velocity pass (the bind above) the fill source writes the focus view's motion vectors
 // from outer (mvr_motion, B10) into the pass's target, and the pass's draws are skipped (the engine's object loop
@@ -197,8 +202,10 @@ void Shutdown();             // VR_Shutdown: textures released
 using CloneFn = ID3D11Texture2D* (*)(ID3D11Resource* original);
 // B17 in the smoke: stand-ins for clones::IsArray and clones::WantArray (null: the clones module).
 using NativeFn = bool (*)(ID3D11Resource* res);
-using WantArrayFn = void (*)(ID3D11Resource* res);
-void TestNative(NativeFn isArray, WantArrayFn want);
+using WantArrayFn = void (*)(ID3D11Resource* res, UINT slices);
+// B12 step 5: stand-in for clones::FocusSlice (null: no slice clones).
+using SliceFn = int (*)(ID3D11Resource* original, int eye, uint32_t* w, uint32_t* h);
+void TestNative(NativeFn isArray, WantArrayFn want, SliceFn slice = nullptr);
 void TestSetup(ID3D11DeviceContext* ctx, const void* phase1Vtable, const void* buildVtable, CloneFn clone,
                JitterFn jitter);
 struct TestState {
@@ -242,6 +249,7 @@ struct TestLiveState {
     unsigned native = 0, copiedBack = 0;  // B17: the last live pass's targets that were the game's arrays, copied back
     // B12, the last live pass: targets copied in from focus's clones, cleared first (no copy-in), multisampled.
     unsigned copyIns = 0, clearFills = 0, msTargets = 0, colorSkips = 0;  // colorSkips: mvr_ms_color_skip
+    unsigned sliceTargets = 0, sliceClears = 0;  // B12 step 5, the last live pass: targets read in their slice, clears
     std::string why;  // the latest live pass's failure
 };
 TestLiveState TestLiveGet();

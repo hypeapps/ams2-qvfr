@@ -208,6 +208,10 @@ struct Config {
     // cleared its depth first. The hotkey (mvr_modifier + mvr_ms_color_skip_key) toggles it.
     bool mvrMsColorSkip = true;
     int mvrMsColorSkipKey = 0;
+    // Restart only (docs/mvr.md B12 step 5, mvr_pass.h): with MSAA the forward pass's targets become three-slice arrays,
+    // outer R draws focus R into slice 2, and focus's clones of them are slices 1 (focus L) and 2 (focus R) of the
+    // array itself (no copy out of the corner).
+    bool mvrMsSlices = true;
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
     bool dlaa = false;                // mode=dlaa (a change needs a restart)

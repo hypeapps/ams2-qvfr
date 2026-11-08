@@ -41,6 +41,9 @@ Analyzed binaries are data: run the scripts with `-I` and never execute anything
   DXBC disassembly and bytecode (`.dxbc`), plus a per-draw shader list; same environment as `rdc_dump.py`.
 - `renderdoc/rdc_events.py`: every API call with its parameters in chosen event ranges (`RDC_RANGES=a-b;c-d`), for
   comparing what two passes bind and set; same environment as `rdc_dump.py`.
+- `renderdoc/rdc_usage.py`: every use of chosen resources (`RDC_RES=id;id`, optional `RDC_RANGES`) with the event and the
+  kind of use (target, shader resource, clear, copy), e.g. whether anything reads a target after its pass; same
+  environment as `rdc_dump.py`.
 
 Example:
 
