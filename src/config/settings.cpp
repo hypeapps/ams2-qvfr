@@ -66,6 +66,7 @@ Settings Read(const IniFile& ini) {
     s.gazeMod = ParseInt(ini.GetOr("debug", "gaze_modifier", ""), 0xA3);
     s.warningBox = ParseInt(ini.GetOr("log", "warning_box", ""), 1) != 0;
     s.overlay = ParseInt(ini.GetOr("debug", "overlay", ""), 0) != 0;
+    s.mvr = ini.GetOr("mvr", "mode", "mvr") != "off";
     s.dlaa = ini.GetOr("dlaa", "mode", "off") == "dlaa";
     // The GUI offers j, k, l and m; "default" (or empty) is NVIDIA's choice for DLAA, which is K.
     s.dlaaPreset = ini.GetOr("dlaa", "preset", "k");
@@ -122,6 +123,7 @@ const std::vector<KeyRef>& RestartKeys() {
         {"quad", "vertical_focus_section", "focus height"},
         {"quad", "horizontal_fixed_section", "focus width without eye tracking"},
         {"quad", "vertical_fixed_section", "focus height without eye tracking"},
+        {"mvr", "mode", "NVIDIA Multi-View Rendering on/off"},
         {"dlaa", "mode", "NVIDIA DLAA on/off"},
         {"timing", "csv_always", "CSV for the whole session"},
         {"timing", "gpu", "GPU timestamps"},

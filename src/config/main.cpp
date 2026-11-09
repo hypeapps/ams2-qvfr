@@ -461,7 +461,10 @@ void BindModel(Rml::Context* ctx) {
                    const Rml::String p = v.Get<Rml::String>();
                    if ((p == "openxr") != g.s.openxr) Set("runtime", "path", p);
                });
-    // --- Anti-aliasing: NVIDIA DLAA ([dlaa], docs/dlaa.md). The DLL row on the Files page depends on the mode.
+    // --- Rendering: NVIDIA Multi-View Rendering ([mvr], docs/mvr.md).
+    toggle("mvr", [] { return g.s.mvr; }, [](bool on) { Set("mvr", "mode", on ? "mvr" : "off"); });
+    rs("rs_mvr", [](const Settings& a, const Settings& b) { return a.mvr != b.mvr; });
+    // --- Rendering: NVIDIA DLAA ([dlaa], docs/dlaa.md). The DLL row on the Files page depends on the mode.
     toggle("dlaa", [] { return g.s.dlaa; }, [](bool on) {
         Set("dlaa", "mode", on ? "dlaa" : "off");
         CheckNow();

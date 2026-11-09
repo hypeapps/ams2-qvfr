@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -21,8 +22,14 @@
 #include "dlaa.h"
 #include "focus_cull.h"
 #include "focus_geometry.h"
+#include "fwd_rec.h"
 #include "gpu.h"
+#include "hook_prof.h"
 #include "hooks.h"
+#include "mvr_motion.h"
+#include "mvr_pass.h"
+#include "mvr_ps.h"
+#include "mvr_vs.h"
 #include "shots.h"
 #include "sun_fx.h"
 #include "taa_views.h"
@@ -41,6 +48,8 @@ constexpr size_t kSlotSize = 0x18;
 constexpr size_t kCtxCamBlock = 0x190;   // per view camera data; the camera functor fills views 0..2 once per frame
 constexpr size_t kCamBlockSize = 0x1a0;
 constexpr size_t kCtxQuery = 0x70c;      // per view lighting environment index (CLightingEnvManager), stride 4
+// The draw queue the eye groups read (queue copy 0x9c1970): u32 count, then begin and cursor of its entries.
+constexpr size_t kCtxQueueCount = 0x69c, kCtxQueueBegin = 0x6a0, kCtxQueueCursor = 0x6a8;
 constexpr int kFocusView = 2;            // the view number the focus groups run as
 constexpr size_t kAppType = 0x8;         // app singleton: type (5 or 7..9 with a VR device)
 constexpr size_t kAppVr = 0xe0;          // app singleton: engine VR device (_BVROpen)
@@ -104,6 +113,9 @@ shots::Pair g_shotPairs[] = {
     {OuterL, kComposed + 0, "outer L vs composed L"},
     {OuterR, kComposed + 1, "outer R vs composed R"},
 };
+constexpr int kMvrPairs = 8;  // MVR gate B7 (mvr_pass.h): two per target
+shots::Pair g_allPairs[std::size(g_shotPairs) + kMvrPairs];
+int g_allPairCount = 0;
 
 // Builder patch: three eye loop iterations instead of one, and the group array moved to free stack slots
 // ([rsp+0x58] is a loop temporary, so the original array has room for one group only).
@@ -212,6 +224,12 @@ struct Stats {
     uint64_t cullFrames = 0, cullOnFrames = 0;  // culled / with culling on and the focus projection in both groups
     double cullMs[2] = {};                      // gather + processor + queue copy per focus group
     double setEye = 0, setFocus[2] = {}, queueEye = 0, queueFocus[2] = {};
+    // O2 step 2 (mvr_empty_queue): focus groups that got an empty draw queue, the entries taken out, groups that drew
+    // their own passes (queue kept) and queues the engine refilled before CEndEye (not put back).
+    uint64_t eqEmptied[2] = {}, eqEntries[2] = {}, eqOwn[2] = {}, eqRefilled = 0;
+    // O2 step 3 (mvr_velocity_record_skip): focus groups whose forward recording was armed, recordings seen, velocity
+    // submits kept and skipped, groups that kept the velocity sub-passes, armed groups without outer's vectors.
+    uint64_t vrArmed[2] = {}, vrSeen[2] = {}, vrKept = 0, vrSkipped[2] = {}, vrOwn[2] = {}, vrNoFill = 0;
 };
 
 // Focus window for this VR session (M4.3, M7.2): the game gets the render size and the full projection (outer), the
@@ -250,6 +268,7 @@ double g_firstFocusMs = -1;
 int g_detailLeft = 3;
 bool g_outLogged[kGroups] = {};
 Stats g_st, g_tot;
+double g_lastWindowMs[kGroups] = {};  // the eye groups' CPU per full frame of the latest stats interval
 bool g_shotFrame = false;
 bool g_autoShotDone = false;
 bool g_keyWasDown = false;
@@ -287,6 +306,58 @@ bool g_clonesKeyDown = false;
 bool g_cullOn = true;
 bool g_cullCfg = true;
 bool g_cullKeyDown = false;
+bool g_mvrOn = true;  // MVR gate B8 (the hotkey switches; mvr_gbuffer=1 installs it)
+bool g_mvrKeyDown = false;
+bool g_mvrModeKeyDown = false;
+int g_mvrEarlyCfg = 0;  // Cfg().mvrEarly last seen (a reload sets the step)
+bool g_mvrEarlyKeyDown = false;
+bool g_mvrForwardCfg = false;  // Cfg().mvrForward last seen (a reload sets it)
+bool g_mvrForwardKeyDown = false;
+int g_mvrFwdDepthCfg = 3;  // Cfg().mvrForwardDepth last seen
+bool g_mvrFwdDepthKeyDown = false;
+bool g_mvrVelocityCfg = true;  // Cfg().mvrVelocity last seen (a reload sets it)
+bool g_mvrVelocityKeyDown = false;
+bool g_mvrVelSkipCfg = true;  // Cfg().mvrVelocitySkip last seen
+bool g_mvrVelSkipKeyDown = false;
+bool g_mvrGbufPsCfg = true;  // Cfg().mvrGbufferPs last seen
+bool g_mvrGbufPsKeyDown = false;
+bool g_mvrDirectCfg = true;  // Cfg().mvrDirectExtract last seen
+bool g_mvrDirectKeyDown = false;
+bool g_mvrNativeCfg = true;  // Cfg().mvrNativeTargets last seen
+bool g_mvrNativeKeyDown = false;
+bool g_mvrMsColorSkipCfg = true;  // Cfg().mvrMsColorSkip last seen
+bool g_mvrMsColorSkipKeyDown = false;
+bool g_mvrLiveTrackCfg = true;  // Cfg().mvrLiveTrackSkip last seen
+bool g_mvrLiveTrackKeyDown = false;
+
+// mvr_motion's window source: mvr_pass's maps in uv.
+bool MotionWindows(int eye, mvrmotion::Map* cur, mvrmotion::Map* prev, bool* fromOuter) {
+    double c[4], p[4];
+    if (!mvrpass::MotionWindows(eye, c, p, fromOuter)) return false;
+    *cur = mvrmotion::FromClip(c[0], c[1], c[2], c[3]);
+    *prev = mvrmotion::FromClip(p[0], p[1], p[2], p[3]);
+    return true;
+}
+
+// mvr_pass's velocity fill (B11): mvr_motion writes into the focus velocity pass's target, except in a shot frame
+// (the shot compares mvr_motion's vectors with the velocity pass's).
+bool FillFocusMotion(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Texture2D* target,
+                     const char** why) {
+    if (g_shotFrame) {
+        *why = "shot frame";
+        return false;
+    }
+    return mvrmotion::FillFocus(c, eye, depth, target, dlaa::Frame(), why);
+}
+bool g_mvrMapKeyDown = false;
+bool g_mapFrame = false;  // a task map with PS resources in this frame (mvr_map_key)
+bool g_mapNext = false;
+// MVR forward step 1 (B9a): each eye group's CSSAORender and CPhase2Render (null when the graph has none or two).
+struct EyeTasks {
+    uint8_t* ssao = nullptr;
+    uint8_t* phase2 = nullptr;
+};
+EyeTasks g_eyeTasks[kGroups];  // under g_m, from BuildProfileLocked
 // Crepuscular rays and lens flares of the focus views from outer (sun_fx.h): setting and hotkey.
 bool g_sunOn = true;
 bool g_sunCfg = true;
@@ -295,6 +366,8 @@ bool g_sunKeyDown = false;
 bool g_taaOn = true;
 bool g_taaCfg = true;
 bool g_taaKeyDown = false;
+bool g_motionFixCfg = true;  // Cfg().taaMotionFix last seen
+bool g_motionFixKeyDown = false;
 struct Cull {
     bool failed = false;  // off until the next builder call
     int misses = 0;       // focus groups in a row without culling (checks failed)
@@ -433,6 +506,7 @@ struct ProfTask {
     int group = -1;
     int order = 0;  // build order (its add-task call)
     bool begin = false;  // the group's CBeginEye: its calls are the group's frames
+    bool fwdBuild = false;  // the group's CForwardBuildCommandThread (O2 steps 2 and 3)
     char name[48] = "";
     mutable std::atomic<uint64_t> ticks{0}, calls{0};
     mutable std::atomic<uint64_t> gapTicks{0};  // render thread: from the end of its previous task to this one's start
@@ -447,6 +521,30 @@ struct Profile {
 std::atomic<const Profile*> g_profile{nullptr};
 std::vector<const Profile*> g_profRetired;
 std::atomic<bool> g_profOn{false};
+bool g_hookProfCfg = false;  // [debug] hook_profile as last applied
+bool g_profCfg = false;      // [debug] task_profile as last applied
+bool g_mapCacheCfg = true;   // [debug] clones_map_cache as last applied
+bool g_bindSkipCfg = true;   // [debug] mvr_bind_skip as last applied
+int g_stateTrackCfg = 1;     // [debug] mvr_state_track as last applied
+bool g_emptyQueue = false;     // O2 step 2, [debug] mvr_empty_queue (live)
+bool g_emptyQueueCfg = false;  // as last applied from the ini
+// The queue a focus group emptied, put back at its CEndEye.
+struct EmptiedQueue {
+    uint8_t* ctx = nullptr;  // null = none
+    int group = -1;
+    uint32_t count = 0;
+    uint64_t begin = 0, cursor = 0;
+};
+EmptiedQueue g_eq;
+bool g_eqLogged = false, g_eqFailLogged = false;
+const char* g_eqWhy = "";  // the latest reason a focus group kept its queue
+bool g_qbOn = false, g_qbCfg = false;  // O2 step 3, [debug] queue_breakdown (live) and as last applied
+unsigned g_qbWant = 0;  // groups (bits) whose next forward build logs the breakdown
+bool g_vrOn = false, g_vrCfg = false;  // O2 step 3, [debug] mvr_velocity_record_skip (live) and as last applied
+bool g_vrStopped = false;              // an armed group got no outer vectors: off until the setting goes on again
+bool g_vrLogged = false;
+int g_vrEye = -1;                      // the focus eye armed for its forward recording
+const char* g_vrWhy = "";              // the latest reason a focus group kept its velocity sub-passes
 std::atomic<DWORD> g_renderTid{0};  // the thread that runs CBeginEye
 thread_local int64_t t_lastEnd = 0;  // end of the latest task this thread ran (with the profile on)
 int64_t g_qpcFreq = 0;
@@ -459,21 +557,267 @@ const ProfTask* ProfFind(uint8_t* task) {
     return &p->entries[p->entry[it - p->tasks.begin()]];
 }
 
+void EarlyFocus(int eye);
+
+// GPU spans of an eye group's render task (gpu.h): its begin and end span, -1 for none.
+struct TaskSpans {
+    int begin = -1, end = -1;
+};
+TaskSpans SpansOf(uint8_t* task, const ProfTask* prof) {
+    if (!prof || prof->group < OuterL || prof->group > FocusR || !gpu::Enabled()) return {};
+    const int g = prof->group - OuterL;
+    switch (mvrpass::KindOf(task)) {
+    case mvrpass::Kind::Phase1: return {gpu::P1OuterL + g, gpu::P1OuterL + g};
+    case mvrpass::Kind::Ssao: return {gpu::LitOuterL + g, -1};
+    case mvrpass::Kind::Phase2: return {-1, gpu::LitOuterL + g};
+    case mvrpass::Kind::Phase3: return {gpu::P3OuterL + g, gpu::P3OuterL + g};
+    default: return {};
+    }
+}
+
+// O2 step 2 (docs/mvr_optimizations.md), [debug] mvr_empty_queue (diagnosis, live): a focus group whose G-buffer,
+// SSAO, lights and forward all come from outer's passes in this frame gets an empty draw queue right before its
+// CForwardBuildCommandThread, so focus's forward and velocity pass record no objects (focus loses its transparent
+// objects: a measurement only). The queue copy clears it the same way (count 0, cursor at begin); the entries stay in
+// memory and the count and the cursor go back at the group's CEndEye, unless the engine refilled the queue by then.
+void EmptyQueueLocked(int group) {
+    if (!g_emptyQueue || group < FocusL || group > FocusR || g_fault.load(std::memory_order_relaxed)) return;
+    const int eye = group - FocusL;
+    const char* why = mvrpass::FromOuterWhy(eye);
+    if (!why && (!g_swap.ctx || g_swap.group != group)) why = "no view swap in the group";
+    if (!why && g_eq.ctx) why = "an earlier queue not put back yet";
+    if (why) {
+        ++g_st.eqOwn[eye];
+        g_eqWhy = why;
+        return;
+    }
+    uint8_t* ctx = g_swap.ctx;
+    uint32_t count = 0;
+    uint64_t begin = 0, cursor = 0;
+    const bool read = hooks::TryRead(ctx + kCtxQueueCount, &count, 4) &&
+                      hooks::TryRead(ctx + kCtxQueueBegin, &begin, 8) &&
+                      hooks::TryRead(ctx + kCtxQueueCursor, &cursor, 8);
+    const uint64_t bytes = cursor - begin;
+    if (!read || !begin || cursor < begin || (count && (bytes % count || bytes / count < 8 || bytes / count > 64)) ||
+        (!count && bytes)) {
+        ++g_st.eqOwn[eye];
+        g_eqWhy = "the draw queue does not look like count, begin, cursor";
+        if (!g_eqFailLogged) {
+            g_eqFailLogged = true;
+            Log("Quad: WARNING: %s draw queue left as it is (frame %llu): count %u, begin 0x%llX, cursor 0x%llX",
+                kGroupNames[group], (unsigned long long)g_frameNo, count, (unsigned long long)begin,
+                (unsigned long long)cursor);
+        }
+        return;
+    }
+    g_eq = {ctx, group, count, begin, cursor};
+    *(uint32_t*)(ctx + kCtxQueueCount) = 0;
+    *(uint64_t*)(ctx + kCtxQueueCursor) = begin;
+    ++g_st.eqEmptied[eye];
+    g_st.eqEntries[eye] += count;
+    if (!g_eqLogged) {
+        g_eqLogged = true;
+        Log("Quad: %s draw queue emptied before CForwardBuildCommandThread (frame %llu): %u entries of %llu B (O2 step "
+            "2, mvr_empty_queue: focus draws no transparent objects)",
+            kGroupNames[group], (unsigned long long)g_frameNo, count,
+            (unsigned long long)(count ? bytes / count : 0));
+    }
+}
+
+// O2 step 3 (diagnosis), [debug] queue_breakdown: the draw queue a forward pass records from, by kind. An entry
+// (queue copy 0x9c1970, leaf 0x15c6030) is {u16 layer, u16 0, u32 pad, object*, u64 param}; the forward pass
+// (0x9cf790) walks the queue once per sub-pass and picks entries by the object's virtual +0xa0 (type 3 or not) and
+// the object's flags +0x10 bit 35. Kinds: object vtable (RVA in the exe), layer, flags +0x10 bits 35 and 8 and the
+// object's stage-0 skip byte +0x4b (device submit 0x15dbd50). The vtables' +0xa0 is read in Ghidra afterwards.
+void QueueBreakdownLocked(uint8_t* ctx, int group) {
+    uint32_t count = 0;
+    uint64_t begin = 0, cursor = 0;
+    if (!hooks::TryRead(ctx + kCtxQueueCount, &count, 4) || !hooks::TryRead(ctx + kCtxQueueBegin, &begin, 8) ||
+        !hooks::TryRead(ctx + kCtxQueueCursor, &cursor, 8) || cursor < begin || (cursor - begin) / 24 != count ||
+        (cursor - begin) % 24 || count > 100000) {
+        Log("Quad queue breakdown (%s, frame %llu): queue not readable (count %u, begin 0x%llX, cursor 0x%llX)",
+            kGroupNames[group], (unsigned long long)g_frameNo, count, (unsigned long long)begin,
+            (unsigned long long)cursor);
+        return;
+    }
+    struct Entry {
+        uint16_t layer, zero;
+        uint32_t pad;
+        uint64_t obj, param;
+    };
+    std::vector<Entry> q(count);
+    if (count && !hooks::TryRead((const void*)begin, q.data(), count * sizeof(Entry))) {
+        Log("Quad queue breakdown (%s): entries not readable", kGroupNames[group]);
+        return;
+    }
+    const uintptr_t base = (uintptr_t)GetModuleHandleW(nullptr);
+    std::map<uint64_t, uint32_t> kinds;  // key: vtable RVA << 32 | layer << 8 | bits
+    std::unordered_set<uint64_t> objects;
+    uint32_t bad = 0, b35 = 0, b8 = 0, skip0 = 0;
+    for (const Entry& e : q) {
+        uint8_t o[0x50];
+        if (!e.obj || !hooks::TryRead((const void*)e.obj, o, sizeof(o))) {
+            ++bad;
+            continue;
+        }
+        objects.insert(e.obj);
+        uint64_t vt, flags;
+        memcpy(&vt, o, 8);
+        memcpy(&flags, o + 0x10, 8);
+        const uint32_t rva = vt >= base && vt - base < 0x80000000ull ? (uint32_t)(vt - base) : 0xffffffffu;
+        const unsigned bits = (unsigned)((flags >> 35) & 1) | (unsigned)((flags >> 8) & 1) << 1 | (o[0x4b] ? 4u : 0u);
+        b35 += bits & 1;
+        b8 += (bits >> 1) & 1;
+        skip0 += (bits >> 2) & 1;
+        ++kinds[(uint64_t)rva << 32 | (uint64_t)e.layer << 8 | bits];
+    }
+    std::vector<std::pair<uint64_t, uint32_t>> v(kinds.begin(), kinds.end());
+    std::stable_sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+    Log("Quad queue breakdown (%s, frame %llu): %u entries, %zu objects, %zu kinds, unreadable %u; flags +0x10 bit 35 "
+        "%u, bit 8 %u, skip byte +0x4b %u; kinds as vtable/layer/bits (1 = bit 35, 2 = bit 8, 4 = +0x4b): count",
+        kGroupNames[group], (unsigned long long)g_frameNo, count, objects.size(), v.size(), bad, b35, b8, skip0);
+    char line[1024];
+    size_t len = 0;
+    int n = 0;
+    for (size_t i = 0; i < v.size() && i < 48; ++i) {
+        const uint64_t k = v[i].first;
+        len += snprintf(line + len, sizeof(line) - len, "%s0x%X/%u/%u: %u", n ? ", " : "", (unsigned)(k >> 32),
+                        (unsigned)((k >> 8) & 0xffff), (unsigned)(k & 0xff), v[i].second);
+        if (++n == 8 || i + 1 == v.size() || i + 1 == 48) {
+            Log("Quad queue breakdown (%s):   %s", kGroupNames[group], line);
+            len = 0;
+            n = 0;
+        }
+    }
+}
+
+// O2 step 3, [debug] mvr_velocity_record_skip (live): a focus group whose G-buffer, forward and velocity come from
+// outer in this frame (B11 filled the velocity pass from outer in the previous frame too) has its forward recording
+// armed: its velocity sub-passes submit only until the first draw (fwd_rec.h). Checked at the group's CEndEye.
+void VelocityRecordLocked(int group) {
+    if (group < FocusL || group > FocusR) return;
+    const int eye = group - FocusL;
+    if (!g_vrOn || g_fault.load(std::memory_order_relaxed)) return;
+    const char* why = g_vrStopped ? "stopped: an armed group got no outer vectors" : mvrpass::FromOuterWhy(eye);
+    if (!why && !mvrpass::VelocityFilled(eye, true)) why = "the velocity pass did not get outer's vectors last frame";
+    if (g_vrEye >= 0) {  // a group whose CEndEye did not end its arming
+        fwdrec::Disarm();
+        g_vrEye = -1;
+    }
+    if (!why && !fwdrec::Arm(eye, &why) && !why) why = "not armed";
+    if (why) {
+        ++g_st.vrOwn[eye];
+        g_vrWhy = why;
+        return;
+    }
+    g_vrEye = eye;
+    ++g_st.vrArmed[eye];
+}
+
+// At a focus group's CEndEye: what its armed recording did. Velocity submits skipped while the velocity pass did not
+// get outer's vectors would leave focus without motion vectors: the skip stops until the setting goes on again.
+void VelocityRecordEndLocked(int group) {
+    if (g_vrEye < 0 || group != FocusL + g_vrEye) return;
+    const int eye = g_vrEye;
+    g_vrEye = -1;
+    const fwdrec::Result r = fwdrec::Disarm();
+    if (!r.armed) return;
+    if (r.seen) ++g_st.vrSeen[eye];
+    g_st.vrKept += r.kept;
+    g_st.vrSkipped[eye] += r.skipped;
+    const bool filled = mvrpass::VelocityFilled(eye, false);
+    if (r.skipped && !filled) {
+        ++g_st.vrNoFill;
+        if (!g_vrStopped) {
+            g_vrStopped = true;
+            Log("Quad: WARNING: %s skipped %u velocity submits of its forward recording, but its velocity pass did not "
+                "get outer's vectors (frame %llu, %u kept, %u recorded); mvr_velocity_record_skip stopped until it is set "
+                "on again", kGroupNames[group], r.skipped, (unsigned long long)g_frameNo, r.kept, r.drew);
+        }
+    }
+    if (!g_vrLogged && r.seen) {
+        g_vrLogged = true;
+        Log("Quad: %s forward recording without its velocity sub-passes (frame %llu): velocity submits kept %u (recorded "
+            "%u), skipped %u; velocity pass from outer %s",
+            kGroupNames[group], (unsigned long long)g_frameNo, r.kept, r.drew, r.skipped, filled ? "yes" : "NO");
+    }
+}
+
+// A CForwardBuildCommandThread is about to run: the breakdown when one is due, then the empty queue and the velocity
+// recording skip (focus groups).
+void ForwardBuild(uint8_t* task, int group) {
+    std::lock_guard lock(g_m);
+    if (g_qbOn && group >= OuterL && group <= FocusR && (g_qbWant & (1u << group))) {
+        g_qbWant &= ~(1u << group);
+        uint8_t* ctx = nullptr;
+        if (hooks::TryRead(task + kTaskCtx, &ctx, 8) && ctx) QueueBreakdownLocked(ctx, group);
+    }
+    EmptyQueueLocked(group);
+    VelocityRecordLocked(group);
+}
+
+// At a focus group's CEndEye: the queue EmptyQueueLocked cleared gets its count and cursor back.
+void EmptyQueueRestoreLocked(int group) {
+    EmptiedQueue& q = g_eq;
+    if (!q.ctx || q.group != group) return;
+    uint32_t count = 1;
+    uint64_t begin = 0, cursor = 0;
+    if (hooks::TryRead(q.ctx + kCtxQueueCount, &count, 4) && hooks::TryRead(q.ctx + kCtxQueueBegin, &begin, 8) &&
+        hooks::TryRead(q.ctx + kCtxQueueCursor, &cursor, 8) && !count && begin == q.begin && cursor == q.begin) {
+        *(uint64_t*)(q.ctx + kCtxQueueCursor) = q.cursor;
+        *(uint32_t*)(q.ctx + kCtxQueueCount) = q.count;
+    } else {
+        ++g_st.eqRefilled;
+    }
+    q = EmptiedQueue{};
+}
+
 void __fastcall RunTask(uint8_t* task) {
+    hookprof::Scope hprof(hookprof::KTask);
     if (g_skip.load(std::memory_order_relaxed)) {
         if (InSkipSet(task)) {
             g_skipped.fetch_add(1, std::memory_order_relaxed);
             g_lastSkipped.store(task, std::memory_order_relaxed);
+            hookprof::Orig o;
             (*(ExecuteFn**)task)[kFinishSlot](task);  // what the skipped Execute would have ended with
             return;
         }
         g_lastRun.store(task, std::memory_order_relaxed);
     }
     const bool profOn = g_profOn.load(std::memory_order_relaxed);
-    const ProfTask* prof = profOn ? ProfFind(task) : nullptr;
+    const bool mvr = mvrpass::On();
+    const ProfTask* prof = profOn || mvr ? ProfFind(task) : nullptr;
+    // MVR forward step 1 (B9a): focus L's SSAO and lights right before outer L's forward pass; with the live forward
+    // pass (B9d) focus R's before outer R's too (EarlyWanted decides).
+    if (mvr && prof && (prof->group == OuterL || prof->group == OuterR) &&
+        mvrpass::KindOf(task) == mvrpass::Kind::Phase3) {
+        hookprof::Orig o;  // the moved focus tasks (their D3D11 detours count on their own)
+        EarlyFocus(prof->group - OuterL);
+    }
+    const TaskSpans spans = mvr ? SpansOf(task, prof) : TaskSpans{};
+    if (spans.begin >= 0) gpu::SpanBegin((gpu::Span)spans.begin);
+    if (mvr && prof && prof->fwdBuild) ForwardBuild(task, prof->group);
+    // MVR gate B8: a focus group's G-buffer tasks are skipped when outer's pass drew its G-buffer (B9a: and its SSAO
+    // and lights after an early run).
+    if (mvr && mvrpass::BeforeTask(task, prof ? prof->group : -1)) {
+        hookprof::Orig o;
+        (*(ExecuteFn**)task)[kFinishSlot](task);
+        if (spans.end >= 0) gpu::SpanEnd((gpu::Span)spans.end);
+        return;
+    }
+    // Task map of a shot frame: what each task of the eye groups draws and binds.
+    const bool map = mvr && prof && (g_shotFrame || g_mapFrame) &&
+                     GetCurrentThreadId() == g_renderTid.load(std::memory_order_relaxed);
+    if (map) mvrpass::TaskMapBegin(kGroupNames[prof->group], prof->name, g_mapFrame);
     LARGE_INTEGER t0{}, t1{};
     if (profOn) QueryPerformanceCounter(&t0);
-    (*(ExecuteFn**)task)[kExecuteSlot](task);
+    {
+        hookprof::Orig o;
+        (*(ExecuteFn**)task)[kExecuteSlot](task);
+    }
+    if (map) mvrpass::TaskMapEnd();
+    if (mvr) mvrpass::AfterTask(task);
+    if (spans.end >= 0) gpu::SpanEnd((gpu::Span)spans.end);
     if (profOn) {
         QueryPerformanceCounter(&t1);
         if (prof) {
@@ -592,6 +936,7 @@ void PublishProfile(const Profile* p) {
 void ClearGroups() {
     PublishSkipSet(nullptr);
     PublishProfile(nullptr);
+    for (EyeTasks& e : g_eyeTasks) e = EyeTasks{};
 }
 
 using TaskNameFn = const char*(__fastcall*)(void*);
@@ -662,6 +1007,18 @@ void BuildProfileLocked() {
                 taken.insert(t);
                 items.push_back({t, g, -1});
             }
+    for (EyeTasks& e : g_eyeTasks) e = EyeTasks{};
+    bool twice[kGroups] = {};
+    for (const Item& it : items) {
+        const mvrpass::Kind k = mvrpass::KindOf((uint8_t*)it.task);
+        uint8_t** slot = k == mvrpass::Kind::Ssao ? &g_eyeTasks[it.group].ssao
+                         : k == mvrpass::Kind::Phase2 ? &g_eyeTasks[it.group].phase2 : nullptr;
+        if (!slot) continue;
+        if (*slot) twice[it.group] = true;
+        *slot = (uint8_t*)it.task;
+    }
+    for (int g = 0; g < kGroups; ++g)
+        if (twice[g]) g_eyeTasks[g] = EyeTasks{};  // not one task of each: no early run for that group
     p->n = items.size();
     p->entries = std::make_unique<ProfTask[]>(p->n);
     size_t count[kGroups] = {};
@@ -672,8 +1029,25 @@ void BuildProfileLocked() {
         e.begin = items[i].task == g_graph.begin[e.group];
         if (!TaskClassName(items[i].task, e.name, sizeof(e.name)))
             snprintf(e.name, sizeof(e.name), "task@%p", items[i].task);
+        e.fwdBuild = !strcmp(e.name, "CForwardBuildCommandThread");
         ++count[e.group];
     }
+    // MVR forward (B9d): the focus groups' CPhase3BuildCommandThread is skipped with their CPhase3Render (the pair
+    // records and replays the group's buffers); its vtable by class name.
+    uintptr_t build3 = 0;
+    for (size_t i = 0; i < p->n && !build3; ++i)
+        if (p->entries[i].group >= FocusL && !strcmp(p->entries[i].name, "CPhase3BuildCommandThread"))
+            hooks::TryRead(items[i].task, &build3, 8);
+    mvrpass::SetPhase3BuildVtable(build3);
+    // B19: the focus groups' CLiveTrackRender and CLiveTrackBuildCommandThread (skipped when focus reads outer's map).
+    uintptr_t ltRender = 0, ltBuild = 0;
+    for (size_t i = 0; i < p->n; ++i) {
+        if (p->entries[i].group < FocusL) continue;
+        if (!ltRender && !strcmp(p->entries[i].name, "CLiveTrackRender")) hooks::TryRead(items[i].task, &ltRender, 8);
+        if (!ltBuild && !strcmp(p->entries[i].name, "CLiveTrackBuildCommandThread"))
+            hooks::TryRead(items[i].task, &ltBuild, 8);
+    }
+    mvrpass::SetLiveTrackVtables(ltRender, ltBuild);
     std::vector<uint32_t> idx(p->n);
     for (uint32_t i = 0; i < p->n; ++i) idx[i] = i;
     std::sort(idx.begin(), idx.end(), [&](uint32_t a, uint32_t b) { return items[a].task < items[b].task; });
@@ -1076,7 +1450,9 @@ void CullLocked(uint8_t* ctx, int group, const uint8_t* cam, const uint8_t* srcE
 // reads the eye tangents straight from the VR device by view - 1 (0x9ce0e8), the passes read the projection from the
 // camera (+0x138, +0x150). The frustum block stays the eye's (built from FOV, a superset of the focus window); focus
 // culling gives the group a draw queue culled for its window.
-void SwapInLocked(uint8_t* ctx, int group, int src, Run& run) {
+// `early`: the MVR early run inside outer's group (B9a, B9d) renders no image of its own, so focus R needs no outer R
+// copy yet (it is made at outer R's CEndEye, after the run); focus R's own group checks it as always.
+void SwapInLocked(uint8_t* ctx, int group, int src, Run& run, bool cull = true, bool early = false) {
     Swap& s = g_swap;
     memcpy(s.slot, ctx + kCtxSlots + kFocusView * kSlotSize, kSlotSize);
     memcpy(s.block, ctx + kCtxCamBlock + kFocusView * kCamBlockSize, kCamBlockSize);
@@ -1104,7 +1480,7 @@ void SwapInLocked(uint8_t* ctx, int group, int src, Run& run) {
     // Focus R ends in the right Submit texture, which then is the right eye's only image: without this frame's outer
     // R copy it must stay the plain eye view, not the focus window.
     const Copy& outerR = g_copy[CopyOuterR];
-    if (g_focus.on && !g_focus.projFailed && group == FocusR && (!outerR.frame || !outerR.tex)) {
+    if (g_focus.on && !g_focus.projFailed && group == FocusR && !early && (!outerR.frame || !outerR.tex)) {
         if (!g_focus.noCopyLogged) {
             g_focus.noCopyLogged = true;
             Log("Quad: focus R without the focus projection in frame %llu: no outer R copy (the right eye gets the "
@@ -1140,7 +1516,7 @@ void SwapInLocked(uint8_t* ctx, int group, int src, Run& run) {
             memcpy(s.camProj, cam + kCamProj, kMatSize);
             s.cam = cam;
             memcpy(cam + kCamProj, data + kEyeProj, kMatSize);
-            CullLocked(ctx, group, cam, srcEye, data, run);
+            if (cull) CullLocked(ctx, group, cam, srcEye, data, run);
         }
     }
     if (!proj) memcpy(data, srcEye, kVrEyeSize);
@@ -1149,6 +1525,21 @@ void SwapInLocked(uint8_t* ctx, int group, int src, Run& run) {
         run.eyeSwapped = true;
     }
     run.projected = proj;
+}
+
+// MVR gate B8: this frame's focus window of eye i as the map from outer's clip space that FocusEyeData puts into the
+// focus projection.
+void MvrWindowLocked(int i) {
+    if (!mvrpass::On()) return;
+    const bool valid = g_focus.on && !g_focus.projFailed;
+    const focus::Eye& e = WindowEyeLocked(i);
+    if (!valid || e.fr == e.fl || e.fb == e.ft) {
+        mvrpass::SetWindow(i, false, 1, 0, 1, 0, 0, 0);
+        return;
+    }
+    const double sx = (e.r - e.l) / (double)(e.fr - e.fl), ox = ((e.r + e.l) - (e.fr + e.fl)) / (double)(e.fr - e.fl);
+    const double sy = (e.b - e.t) / (double)(e.fb - e.ft), oy = ((e.b + e.t) - (e.fb + e.ft)) / (double)(e.fb - e.ft);
+    mvrpass::SetWindow(i, true, sx, ox, sy, oy, g_focus.gameW, g_focus.gameH);
 }
 
 void RestoreLocked() {
@@ -1290,9 +1681,42 @@ void HandleToolsLocked() {
         g_clonesOn = !g_clonesOn;
         Log("Quad: clones %s (hotkey)", g_clonesOn ? "on" : "off");
     }
-    if (c.taskProfile != g_profOn.load()) {
+    if (c.taskProfile != g_profCfg) {  // on a change only: a benchmark sequence step may switch it
+        g_profCfg = c.taskProfile;
         g_profOn = c.taskProfile;
         Log("Quad: task CPU profile %s (ini)", c.taskProfile ? "on" : "off");
+    }
+    if (c.clonesMapCache != g_mapCacheCfg) {
+        g_mapCacheCfg = c.clonesMapCache;
+        clones::SetMapCache(c.clonesMapCache);  // logs it
+    }
+    if (mvrpass::On() && c.mvrBindSkip != g_bindSkipCfg) {
+        g_bindSkipCfg = c.mvrBindSkip;
+        mvrpass::SetBindSkip(c.mvrBindSkip);
+        Log("Quad: MVR draws bind t21..t26 only when they changed %s (ini)", c.mvrBindSkip ? "on" : "off");
+    }
+    if (mvrpass::On() && c.mvrStateTrack != g_stateTrackCfg) {
+        g_stateTrackCfg = c.mvrStateTrack;
+        mvrpass::SetStateTrack(c.mvrStateTrack);  // logs it
+    }
+    if (c.mvrVelocityRecordSkip != g_vrCfg) {
+        g_vrCfg = g_vrOn = c.mvrVelocityRecordSkip;
+        if (g_vrOn) g_vrStopped = false;
+        Log("Quad: focus's forward recording without its velocity sub-passes %s (ini)", g_vrOn ? "on" : "off");
+    }
+    if (c.queueBreakdown != g_qbCfg) {
+        g_qbCfg = g_qbOn = c.queueBreakdown;
+        g_qbWant = g_qbOn ? (1u << OuterL) | (1u << FocusL) : 0;
+        Log("Quad: draw queue breakdown of the forward pass %s (ini; O2 step 3 diagnosis)", g_qbOn ? "on" : "off");
+    }
+    if (c.mvrEmptyQueue != g_emptyQueueCfg) {
+        g_emptyQueueCfg = g_emptyQueue = c.mvrEmptyQueue;
+        Log("Quad: focus groups with G-buffer and forward from outer get an empty draw queue %s (ini; O2 step 2 "
+            "diagnosis, focus draws no transparent objects)", g_emptyQueue ? "on" : "off");
+    }
+    if (c.hookProfile != g_hookProfCfg) {  // on a change only: a benchmark sequence step may switch it
+        g_hookProfCfg = c.hookProfile;
+        hookprof::SetOn(c.hookProfile);  // logs it
     }
     if (c.focusCull != g_cullCfg) {
         g_cullCfg = c.focusCull;
@@ -1304,6 +1728,122 @@ void HandleToolsLocked() {
         Log("Quad: focus culling %s (hotkey)%s", g_cullOn ? "on" : "off",
             g_cullFault ? "; STOPPED for this session after an engine fault" : g_cull.failed ? "; off after failed checks "
             "until the next track load" : "");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrKey, g_mvrKeyDown)) {
+        g_mvrOn = !g_mvrOn;
+        Log("Quad: MVR G-buffer %s (hotkey)", g_mvrOn ? "on" : "off");
+    }
+    if (mvrpass::On() && c.mvrEarly != g_mvrEarlyCfg) {
+        g_mvrEarlyCfg = c.mvrEarly;
+        mvrpass::SetEarly(c.mvrEarly);
+        Log("Quad: MVR early tasks of focus L: %s (ini)", mvrpass::EarlyName(c.mvrEarly));
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrEarlyKey, g_mvrEarlyKeyDown)) {
+        mvrpass::SetEarly((mvrpass::GetEarly() + 1) % mvrpass::kEarlyModes);
+        Log("Quad: MVR early tasks of focus L: %s (hotkey)", mvrpass::EarlyName(mvrpass::GetEarly()));
+    }
+    if (mvrpass::On() && c.mvrForward != g_mvrForwardCfg) {
+        g_mvrForwardCfg = c.mvrForward;
+        mvrpass::SetForward(c.mvrForward);
+        Log("Quad: MVR live forward of both eyes %s (ini)", c.mvrForward ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrForwardKey, g_mvrForwardKeyDown)) {
+        mvrpass::SetForward(!mvrpass::GetForward());
+        Log("Quad: MVR live forward of both eyes %s (hotkey)", mvrpass::GetForward() ? "on" : "off");
+    }
+    if (mvrpass::On() && c.mvrForwardDepth != g_mvrFwdDepthCfg) {
+        g_mvrFwdDepthCfg = c.mvrForwardDepth;
+        mvrpass::SetForwardDepth(c.mvrForwardDepth);
+        Log("Quad: MVR live forward depth %s (ini)", mvrpass::ForwardDepthName(c.mvrForwardDepth));
+    }
+    if (mvrpass::On() && c.mvrMsColorSkip != g_mvrMsColorSkipCfg) {
+        g_mvrMsColorSkipCfg = c.mvrMsColorSkip;
+        mvrpass::SetMsColorSkip(c.mvrMsColorSkip);
+        Log("Quad: MVR multisampled color without copy-in after a depth clear %s (ini)", c.mvrMsColorSkip ? "on" : "off");
+    }
+    if (mvrpass::On() && c.mvrLiveTrackSkip != g_mvrLiveTrackCfg) {
+        g_mvrLiveTrackCfg = c.mvrLiveTrackSkip;
+        mvrpass::SetLiveTrackSkip(c.mvrLiveTrackSkip);
+        Log("Quad: MVR focus skips its own live track map %s (ini)", c.mvrLiveTrackSkip ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrLiveTrackSkipKey, g_mvrLiveTrackKeyDown)) {
+        mvrpass::SetLiveTrackSkip(!mvrpass::GetLiveTrackSkip());
+        Log("Quad: MVR focus skips its own live track map %s (hotkey)", mvrpass::GetLiveTrackSkip() ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrMsColorSkipKey, g_mvrMsColorSkipKeyDown)) {
+        mvrpass::SetMsColorSkip(!mvrpass::GetMsColorSkip());
+        Log("Quad: MVR multisampled color without copy-in after a depth clear %s (hotkey)",
+            mvrpass::GetMsColorSkip() ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrForwardDepthKey, g_mvrFwdDepthKeyDown)) {
+        mvrpass::SetForwardDepth((mvrpass::GetForwardDepth() + 1) % mvrpass::kForwardDepthModes);
+        Log("Quad: MVR live forward depth %s (hotkey)", mvrpass::ForwardDepthName(mvrpass::GetForwardDepth()));
+    }
+    if (mvrpass::On() && c.mvrVelocity != g_mvrVelocityCfg) {
+        g_mvrVelocityCfg = c.mvrVelocity;
+        mvrmotion::SetEnabled(c.mvrVelocity);
+        Log("Quad: MVR focus motion vectors from outer %s (ini)", c.mvrVelocity ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrVelocityKey, g_mvrVelocityKeyDown)) {
+        mvrmotion::SetEnabled(!mvrmotion::Enabled());
+        Log("Quad: MVR focus motion vectors from outer %s (hotkey)", mvrmotion::Enabled() ? "on" : "off");
+    }
+    if (mvrpass::On() && c.mvrVelocitySkip != g_mvrVelSkipCfg) {
+        g_mvrVelSkipCfg = c.mvrVelocitySkip;
+        mvrpass::SetVelocitySkip(c.mvrVelocitySkip);
+        Log("Quad: MVR focus velocity pass skipped with outer's vectors %s (ini)", c.mvrVelocitySkip ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrVelocitySkipKey, g_mvrVelSkipKeyDown)) {
+        mvrpass::SetVelocitySkip(!mvrpass::GetVelocitySkip());
+        Log("Quad: MVR focus velocity pass skipped with outer's vectors %s (hotkey)",
+            mvrpass::GetVelocitySkip() ? "on" : "off");
+    }
+    if (mvrpass::On() && c.mvrGbufferPs != g_mvrGbufPsCfg) {
+        g_mvrGbufPsCfg = c.mvrGbufferPs;
+        mvrpass::SetGbufferPs(c.mvrGbufferPs);
+        Log("Quad: MVR G-buffer pixel shaders with view 1's rows and live track map %s (ini)",
+            c.mvrGbufferPs ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrGbufferPsKey, g_mvrGbufPsKeyDown)) {
+        mvrpass::SetGbufferPs(!mvrpass::GetGbufferPs());
+        Log("Quad: MVR G-buffer pixel shaders with view 1's rows and live track map %s (hotkey)",
+            mvrpass::GetGbufferPs() ? "on" : "off");
+    }
+    if (mvrpass::On() && c.mvrDirectExtract != g_mvrDirectCfg) {
+        g_mvrDirectCfg = c.mvrDirectExtract;
+        mvrpass::SetDirectExtract(c.mvrDirectExtract);
+        Log("Quad: MVR G-buffer corners straight into focus's clones %s (ini)", c.mvrDirectExtract ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrDirectExtractKey, g_mvrDirectKeyDown)) {
+        mvrpass::SetDirectExtract(!mvrpass::GetDirectExtract());
+        Log("Quad: MVR G-buffer corners straight into focus's clones %s (hotkey)",
+            mvrpass::GetDirectExtract() ? "on" : "off");
+    }
+    if (mvrpass::On() && c.mvrNativeTargets != g_mvrNativeCfg) {
+        g_mvrNativeCfg = c.mvrNativeTargets;
+        mvrpass::SetNativeTargets(c.mvrNativeTargets);
+        Log("Quad: MVR targets as the game's own two-slice arrays %s (ini)", c.mvrNativeTargets ? "on" : "off");
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrNativeKey, g_mvrNativeKeyDown)) {
+        mvrpass::SetNativeTargets(!mvrpass::GetNativeTargets());
+        Log("Quad: MVR targets as the game's own two-slice arrays %s (hotkey; off: copies of slice 0 in and back)",
+            mvrpass::GetNativeTargets() ? "on" : "off");
+    }
+    g_mapFrame = g_mapNext;
+    mvrpass::SetTaskMapFrame(g_mapFrame);
+    g_mapNext = false;
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrMapKey, g_mvrMapKeyDown)) {
+        g_mapNext = true;
+        Log("Quad: MVR task map with PS resources in the next frame (hotkey; early tasks: %s)",
+            mvrpass::EarlyName(mvrpass::GetEarly()));
+    }
+    if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrModeKey, g_mvrModeKeyDown)) {
+        using M = mvrpass::Mode;
+        const M now = mvrpass::GetMode();
+        const M next = now == M::Skip ? M::SkipRaw : now == M::SkipRaw ? M::NoDepth
+                       : now == M::NoDepth ? M::OuterOnly : M::Skip;
+        mvrpass::SetMode(next);
+        Log("Quad: MVR G-buffer mode %s (hotkey)", mvrpass::ModeName(next));
     }
     if (c.sunEffects != g_sunCfg) {
         g_sunCfg = c.sunEffects;
@@ -1322,6 +1862,15 @@ void HandleToolsLocked() {
     if (Pressed(c.taaViewsKeyMod, c.taaViewsKey, g_taaKeyDown)) {
         g_taaOn = !g_taaOn;
         Log("Quad: own TAA state of the focus views %s (hotkey)", g_taaOn ? "on" : "off");
+    }
+    if (c.taaMotionFix != g_motionFixCfg) {
+        g_motionFixCfg = c.taaMotionFix;
+        taaviews::SetMotionFix(c.taaMotionFix);
+        Log("Quad: focus TAA history kept while the image moves %s (ini)", c.taaMotionFix ? "on" : "off");
+    }
+    if (Pressed(c.taaViewsKeyMod, c.taaMotionFixKey, g_motionFixKeyDown)) {
+        taaviews::SetMotionFix(!taaviews::GetMotionFix());
+        Log("Quad: focus TAA history kept while the image moves %s (hotkey)", taaviews::GetMotionFix() ? "on" : "off");
     }
     if (Pressed(c.freezeKeyMod, c.freezeKey, g_freezeKeyDown)) {
         g_gazeFrozen = !g_gazeFrozen;
@@ -1379,13 +1928,25 @@ void HandleShotLocked() {
         c.shotClones ? clones::ListForShot(clones::Focus, g_dumpRes, g_dumpNames, kShotImages - kShotFixed) : 0;
     for (int i = 0; i < dumps; ++i) g_shotNames[kShotFixed + i] = g_dumpNames[i];
     g_shotCount = kShotFixed + dumps;
+    g_allPairCount = (int)std::size(g_shotPairs);
+    std::copy(std::begin(g_shotPairs), std::end(g_shotPairs), g_allPairs);
+    if (gpu::Context() && g_graph.ok && !shots::Active()) {
+        // MVR gate B7: its images after the clones' (outer L's G-buffer pass once more with MVR in this frame).
+        int pairs = 0;
+        g_shotCount += mvrpass::PrepareShot(g_shotNames, g_shotCount, kShotImages - g_shotCount,
+                                            g_allPairs + g_allPairCount, kMvrPairs, &pairs);
+        g_allPairCount += pairs;
+    }
     if (!gpu::Context() || !g_graph.ok) {
         Log("Quad: shot (%s) skipped: no focus groups or no D3D11 device yet", why);
-    } else if (!shots::Begin(g_shotNames, g_shotCount, g_shotPairs, (int)std::size(g_shotPairs))) {
+    } else if (!shots::Begin(g_shotNames, g_shotCount, g_allPairs, g_allPairCount)) {
+        mvrpass::CancelShot();
         Log("Quad: shot (%s) skipped: the previous one is still being written", why);
     } else {
         g_shotFrame = true;
         Log("Quad: shot (%s) in frame %llu", why, (unsigned long long)g_frameNo + 1);
+        // MVR jitter diagnosis (B9c): which contexts set which projection offset in the shot frame.
+        if (c.dlaa && c.mvrForwardTest) dlaa::TraceJitter(64);
     }
 }
 
@@ -1680,6 +2241,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         int g = Find(g_graph.begin, task);
         if (g < 0) return;
         g_renderTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        hookprof::SetGroup(g);
         if (g_swap.ctx) {  // the previous group did not end
             ++g_st.lateRestores;
             RestoreLocked();
@@ -1690,11 +2252,15 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         g_began |= 1u << g;
         gpu::Begin((gpu::Phase)g);  // the groups and the GPU phases have the same order
         dlaa::BeginGroup(g);        // its own DLSS history per eye group
+        // The eye of this group's focus work (outer R's group runs focus R's early tasks and forward pass): focus R's
+        // clones are its twins (B9d).
+        clones::SetFocusEye(g == OuterR || g == FocusR ? 1 : 0);
         if (!g_graph.ok) return;
         // The groups run in build order; a task without its predecessors in this frame is a stale address (the race
         // graph is gone and the menu reuses the memory).
         const unsigned before = (1u << g) - 1;
         if ((g_ended & before) != before) return;
+        if (g < FocusL) MvrWindowLocked(g);
         if (g < FocusL) {
             clones::BeginGroup(gpu::Context(), clones::Outer);
             sunfx::BeginGroup(g, 0, 0, 1, 1);
@@ -1710,7 +2276,9 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         int view = *(int*)((uint8_t*)task + kTaskView);
         if (!ctx || view != kFocusView) return;
         SwapInLocked(ctx, g, kSourceView[g], r);
+        mvrpass::FocusGroup(g - FocusL, r.projected);
         clones::BeginGroup(gpu::Context(), clones::Focus);
+        mvrpass::FocusGroupIn(g - FocusL);
         taaviews::BeginGroup(g);
         // The focus window as a part of outer (which covers the whole grid); without the focus projection the
         // group renders outer's view.
@@ -1725,6 +2293,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
 }
 
 void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
+    mvrpass::EyeGroupEnd();  // B19: the group's draws are over
     sunfx::EndGroup();  // before CEndEye's copies and the desktop mirror
     dlaa::EndGroup();
     t_inEndEye = true;
@@ -1738,6 +2307,8 @@ void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
         std::lock_guard lock(g_m);
         int g = Find(g_graph.end, task);
         if (g < 0) return;
+        EmptyQueueRestoreLocked(g);
+        VelocityRecordEndLocked(g);
         if (g_swap.ctx && g_swap.group == g) RestoreLocked();
         clones::EndGroup(gpu::Context());  // no-op without its BeginGroup
         taaviews::EndGroup();              // no-op without its BeginGroup
@@ -1764,8 +2335,218 @@ void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
             if (g == FocusL && Cfg().quadCompose) CopyLocked(CopyFocusL, res);
         }
     });
+    hookprof::SetGroup(-1);
     if (res) res->Release();
     return r;
+}
+
+// ---------------------------------------------------------------- MVR forward step 1 (B9a)
+
+void __fastcall NoFinish(void*) {}
+
+// A leaf task's Execute without its Finish: Execute ends with `jmp [vtable+0x38]`, so for the call the task gets a copy
+// of its vtable whose slot 7 returns. The executor still runs the task later, and the proxy then skips it (Finish
+// only), so the group's scheduler sees it once. `fn`: the Execute to call (a detour's original), else vtable +0x48.
+constexpr int kVtCopy = 16;
+bool ExecuteOnly(uint8_t* task, Fn4 fn) {
+    void** vt = *(void***)task;
+    void* copy[kVtCopy];
+    if (!hooks::TryRead(vt, copy, sizeof(copy))) return false;
+    copy[kFinishSlot] = (void*)&NoFinish;
+    bool ok = true;
+    *(void***)task = copy;
+    __try {
+        if (fn)
+            fn(task, nullptr, nullptr, nullptr);
+        else
+            ((ExecuteFn)vt[kExecuteSlot])(task);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = false;
+    }
+    *(void***)task = vt;
+    return ok;
+}
+
+// The engine's command buffer recording (Ghidra, 2026-11-07): a *BuildCommandThread task queues each recording through
+// device+0x558 (a queue per worker at device+0xe1d0 + k * 0x30: u16 counters at +0x2 and +0xa, index mask at +0x24;
+// k = 0 is the shared one) and releases its dependents at once (0xcde2e0, state 3), so the render thread goes on while
+// workers 1..n-1 (n at device+0xf190) record. A worker takes a job by clearing its bit in device+0xe1c0 and sets it
+// again when done; the command buffer (vtable 0x2111cb8) has +0x98 set while it records, and its replaying task waits
+// for it (+0x60). Recordings read the engine objects' D3D11 views and sizes, so they must not run while the proxy has
+// focus's clones in those objects: a recording of outer's then holds clone views (B9a run 3, mode 3 flickered).
+constexpr uintptr_t kEngineDevice = 0x2684ea0;  // DAT_142684ea0: pointer to the engine device (RVA)
+constexpr size_t kDevWorkers = 0xf190, kDevIdle = 0xe1c0, kDevQueues = 0xe1d0, kDevQueueStride = 0x30;
+constexpr size_t kQueueA = 0x2, kQueueB = 0xa, kQueueMask = 0x24;
+constexpr uintptr_t kCmdBufVtable = 0x2111cb8;
+constexpr size_t kCmdBufBusy = 0x98;
+constexpr size_t kCtxBufFirst = 0x7e0, kCtxBufEnd = 0x8b8;  // the render context's command buffers (0x7d96f0)
+constexpr double kWorkerWaitMs = 2.0;
+
+// True when no recording is queued or running; `why` gets the reason when the state cannot be read.
+bool EngineIdle(uint8_t* ctx, const char** why) {
+    uint8_t* dev = nullptr;
+    uint32_t n = 0, idle = 0;
+    if (!hooks::TryRead((void*)(hooks::ExeBase() + kEngineDevice), &dev, 8) || !dev ||
+        !hooks::TryRead(dev + kDevWorkers, &n, 4) || n < 1 || n > 32 || !hooks::TryRead(dev + kDevIdle, &idle, 4)) {
+        *why = "the engine's worker state is unreadable";
+        return false;
+    }
+    for (uint32_t k = 0; k < n; ++k) {
+        uint8_t* q = dev + kDevQueues + k * kDevQueueStride;
+        uint16_t a = 0, b = 0;
+        uint32_t mask = 0;
+        if (!hooks::TryRead(q + kQueueA, &a, 2) || !hooks::TryRead(q + kQueueB, &b, 2) ||
+            !hooks::TryRead(q + kQueueMask, &mask, 4)) {
+            *why = "the engine's worker state is unreadable";
+            return false;
+        }
+        if (((uint32_t)a - (uint32_t)b) & mask) return false;  // queued
+        if (k && !(idle & (1u << k))) return false;            // worker k busy
+    }
+    const uintptr_t vt = hooks::ExeBase() + kCmdBufVtable;
+    for (size_t off = kCtxBufFirst; off < kCtxBufEnd; off += 8) {
+        uint8_t* buf = nullptr;
+        uintptr_t bvt = 0;
+        uint8_t busy = 0;
+        if (!hooks::TryRead(ctx + off, &buf, 8) || !buf || !hooks::TryRead(buf, &bvt, 8) || bvt != vt) continue;
+        if (hooks::TryRead(buf + kCmdBufBusy, &busy, 1) && busy) return false;
+    }
+    return true;
+}
+
+// Waits up to kWorkerWaitMs for EngineIdle. False: still busy (or unreadable, `why`).
+bool WaitEngineIdle(uint8_t* ctx, const char** why, double* waitedMs) {
+    LARGE_INTEGER t0{}, t{};
+    QueryPerformanceCounter(&t0);
+    const int64_t limit = (int64_t)(kWorkerWaitMs * g_qpcFreq / 1000.0);
+    for (unsigned i = 0;; ++i) {
+        const char* w = nullptr;
+        const bool idle = EngineIdle(ctx, &w);
+        QueryPerformanceCounter(&t);
+        *waitedMs = g_qpcFreq ? (t.QuadPart - t0.QuadPart) * 1000.0 / g_qpcFreq : 0;
+        if (idle) return true;
+        if (w) {
+            *why = w;
+            return false;
+        }
+        if (t.QuadPart - t0.QuadPart > limit) {
+            *why = "the engine's workers still recording after 2 ms";
+            return false;
+        }
+        if (i > 64)
+            SwitchToThread();
+        else
+            YieldProcessor();
+    }
+}
+
+// Render thread, inside RunTask right before outer's CPhase3Render (eye 0 only, mvr_pass.h): focus's view is swapped
+// in as its CBeginEye detour does (without the focus culling: the G-buffer pass it culls is skipped), focus's clones go
+// in, the stash goes into them, then the focus group's CBeginEye, CSSAORender and CPhase2Render run without Finish;
+// afterwards outer's clones state, view and CBeginEye (view number, eye target, global slot 0x13) come back.
+void EarlyFocus(int eye) {
+    if (!mvrpass::EarlyWanted(eye)) return;
+    const int og = OuterL + eye, fg = FocusL + eye;
+    uint8_t *fBegin = nullptr, *oBegin = nullptr, *ssao = nullptr, *phase2 = nullptr;
+    const char* why = nullptr;
+    Run run{};
+    // No recording may run while focus's view and clones are in (above).
+    {
+        uint8_t* octx = nullptr;
+        Safe("early focus (context)", [&] {
+            std::lock_guard lock(g_m);
+            if (g_graph.begin[og]) octx = *(uint8_t**)((uint8_t*)g_graph.begin[og] + kTaskCtx);
+        });
+        double waited = 0;
+        if (!octx) why = "no eye groups";
+        else if (!WaitEngineIdle(octx, &why, &waited)) {
+            if (!why) why = "the engine's workers busy";
+        }
+        mvrpass::EarlyWaited(waited);
+        if (why) {
+            mvrpass::EarlyRefused(eye, why);
+            return;
+        }
+    }
+    Safe("early focus (swap)", [&] {
+        std::lock_guard lock(g_m);
+        fBegin = (uint8_t*)g_graph.begin[fg];
+        oBegin = (uint8_t*)g_graph.begin[og];
+        ssao = g_eyeTasks[fg].ssao;
+        phase2 = g_eyeTasks[fg].phase2;
+        if (!g_graph.ok || !fBegin || !oBegin) {
+            why = "no eye groups";
+            return;
+        }
+        if (!ssao || !phase2) {
+            why = "the focus group has no single CSSAORender and CPhase2Render";
+            return;
+        }
+        if (!(g_began & (1u << og)) || (g_began & (1u << fg))) {
+            why = "outer's group not running or focus's already begun";
+            return;
+        }
+        if (!g_focus.on || g_frameSkip) {
+            why = "no focus window or outer only";
+            return;
+        }
+        if (g_swap.ctx) {
+            why = "a view swap is active";
+            return;
+        }
+        if (!clones::IsReady()) {
+            why = "the clones are not ready";
+            return;
+        }
+        uint8_t* ctx = *(uint8_t**)(fBegin + kTaskCtx);
+        const int view = *(int*)(fBegin + kTaskView);
+        if (!ctx || view != kFocusView || ctx != *(uint8_t**)(oBegin + kTaskCtx)) {
+            why = "focus's CBeginEye has another context or view";
+            return;
+        }
+        SwapInLocked(ctx, fg, kSourceView[fg], run, false, true);
+        if (!run.projected) {
+            RestoreLocked();
+            why = "no focus projection";
+        }
+    });
+    if (g_fault.load(std::memory_order_relaxed)) why = "proxy fault";
+    if (why) {
+        mvrpass::EarlyRefused(eye, why);
+        return;
+    }
+    LARGE_INTEGER t0{}, t1{};
+    QueryPerformanceCounter(&t0);
+    const gpu::Span span = eye ? gpu::EarlyR : gpu::EarlyL;
+    gpu::SpanBegin(span);
+    ID3D11DeviceContext* imm = gpu::Context();
+    clones::EndGroup(imm);  // outer's (no clones of its own in the game's render size)
+    clones::BeginGroup(imm, clones::Focus);
+    bool ran = false, ok = true;
+    if (mvrpass::GetEarly() == 3) {  // diagnosis: the swap and both CBeginEye, no task moved
+        ran = true;
+        ok = ExecuteOnly(fBegin, o_beginExec);
+    } else if (mvrpass::EarlyBegin(eye, run.projected)) {
+        ran = true;
+        ok = ExecuteOnly(fBegin, o_beginExec) && ExecuteOnly(ssao, nullptr) &&
+             (mvrpass::GetEarly() != 1 || ExecuteOnly(phase2, nullptr));
+    }
+    clones::EndGroup(imm);
+    clones::BeginGroup(imm, clones::Outer);
+    Guard("early focus (restore)", [&] {
+        std::lock_guard lock(g_m);
+        if (g_swap.ctx && g_swap.group == fg) RestoreLocked();
+    });
+    gpu::SpanEnd(span);
+    if (!ran) return;
+    ok &= ExecuteOnly(oBegin, o_beginExec);
+    QueryPerformanceCounter(&t1);
+    mvrpass::EarlyEnd(eye, g_qpcFreq ? (t1.QuadPart - t0.QuadPart) * 1000.0 / g_qpcFreq : 0, ok);
+    if (!ok) {
+        mvrpass::SetEarly(0);
+        Log("Quad: MVR early SSAO and lights: ENGINE FAULT in an early task (frame %llu); the step is off",
+            (unsigned long long)g_frameNo);
+    }
 }
 
 // ---------------------------------------------------------------- D3D11 detour
@@ -1779,6 +2560,7 @@ constexpr int kSlotOMSetRenderTargets = 33;  // ID3D11DeviceContext vtable (d3d1
 // (0xdb7ab0), then draws the desktop mirror (3440 x 1440 in the first M4.2 run), so only the first bind counts.
 void STDMETHODCALLTYPE D_OMSetRenderTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv,
                                             ID3D11DepthStencilView* dsv) {
+    hookprof::Scope prof(hookprof::KTargets);
     void* caller = _ReturnAddress();
     // Clones' bind fix: a pass with its own views of a cloned target binds the clone.
     ID3D11RenderTargetView* trtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
@@ -1787,9 +2569,19 @@ void STDMETHODCALLTYPE D_OMSetRenderTargets(ID3D11DeviceContext* c, UINT n, ID3D
         rtv = trtv;
         dsv = tdsv;
     }
+    // MVR gate B8: outer's G-buffer pass binds two-slice copies.
+    ID3D11RenderTargetView* mrtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
+    ID3D11DepthStencilView* mdsv = nullptr;
+    if (n <= D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT && mvrpass::MapTargets(c, n, rtv, dsv, mrtv, &mdsv)) {
+        rtv = mrtv;
+        dsv = mdsv;
+    }
     if (t_inEndEye && !t_endRes && n && rtv && rtv[0] && c == gpu::Context())
         rtv[0]->GetResource(&t_endRes);
-    o_omSetRt(c, n, rtv, dsv);
+    {
+        hookprof::Orig o;
+        o_omSetRt(c, n, rtv, dsv);
+    }
     clones::OnOMSetRenderTargets(c, n, rtv, dsv, caller);
     sunfx::OnSetTargets(c, n, rtv);
     taaviews::OnSetTargets(c, n, rtv);
@@ -1823,6 +2615,27 @@ void LogStatsLocked(const Stats& s, const char* what) {
               g_cullOn ? "on" : "off", (unsigned long long)s.cullFrames, (unsigned long long)s.cullOnFrames,
         s.cullMs[0] / c, s.cullMs[1] / c, s.setEye / c, s.setFocus[0] / c, s.setFocus[1] / c, s.queueEye / c,
         s.queueFocus[0] / c, s.queueFocus[1] / c);
+    if (g_emptyQueue || s.eqEmptied[0] || s.eqEmptied[1] || s.eqOwn[0] || s.eqOwn[1]) {
+        Log("Quad empty focus queue%s (O2 step 2, mvr_empty_queue %s): focus groups emptied before "
+            "CForwardBuildCommandThread L %llu / R %llu (entries %.0f / %.0f per group), kept their queue L %llu / R "
+            "%llu (latest reason: %s), refilled before CEndEye %llu",
+            what, g_emptyQueue ? "on" : "off", (unsigned long long)s.eqEmptied[0], (unsigned long long)s.eqEmptied[1],
+            s.eqEntries[0] / (double)std::max<uint64_t>(1, s.eqEmptied[0]),
+            s.eqEntries[1] / (double)std::max<uint64_t>(1, s.eqEmptied[1]), (unsigned long long)s.eqOwn[0],
+            (unsigned long long)s.eqOwn[1], *g_eqWhy ? g_eqWhy : "none", (unsigned long long)s.eqRefilled);
+    }
+    if (g_vrOn || s.vrArmed[0] || s.vrArmed[1]) {
+        const double armed = (double)std::max<uint64_t>(1, s.vrArmed[0] + s.vrArmed[1]);
+        Log("Quad focus forward recording%s (O2 step 3, mvr_velocity_record_skip %s%s): armed L %llu / R %llu, "
+            "recordings seen L %llu / R %llu, velocity submits skipped per group L %.0f / R %.0f (kept %.1f), own "
+            "velocity sub-passes L %llu / R %llu (latest reason: %s), armed without outer's vectors %llu",
+            what, g_vrOn ? "on" : "off", g_vrStopped ? ", STOPPED" : "", (unsigned long long)s.vrArmed[0],
+            (unsigned long long)s.vrArmed[1], (unsigned long long)s.vrSeen[0], (unsigned long long)s.vrSeen[1],
+            s.vrSkipped[0] / (double)std::max<uint64_t>(1, s.vrArmed[0]),
+            s.vrSkipped[1] / (double)std::max<uint64_t>(1, s.vrArmed[1]), s.vrKept / armed,
+            (unsigned long long)s.vrOwn[0], (unsigned long long)s.vrOwn[1], *g_vrWhy ? g_vrWhy : "none",
+            (unsigned long long)s.vrNoFill);
+    }
 }
 
 void AddStats(Stats& a, const Stats& b) {
@@ -1852,7 +2665,19 @@ void AddStats(Stats& a, const Stats& b) {
         a.cullMs[i] += b.cullMs[i];
         a.setFocus[i] += b.setFocus[i];
         a.queueFocus[i] += b.queueFocus[i];
+        a.eqEmptied[i] += b.eqEmptied[i];
+        a.eqEntries[i] += b.eqEntries[i];
+        a.eqOwn[i] += b.eqOwn[i];
     }
+    a.eqRefilled += b.eqRefilled;
+    for (int i = 0; i < 2; ++i) {
+        a.vrArmed[i] += b.vrArmed[i];
+        a.vrSeen[i] += b.vrSeen[i];
+        a.vrSkipped[i] += b.vrSkipped[i];
+        a.vrOwn[i] += b.vrOwn[i];
+    }
+    a.vrKept += b.vrKept;
+    a.vrNoFill += b.vrNoFill;
 }
 
 // Shot rectangles for the focus window of both eyes. Outer views cover the whole grid at the size outer L rendered at in
@@ -2030,6 +2855,15 @@ void Install() {
         if (g_patched) clones::InstallEngineHooks();
         // Sun effects: the shader creation hook must be in place before the game makes its effect shaders.
         if (g_patched) sunfx::Install();
+        // MVR gate B6: the vertex shader hook must be in place before the game makes its scene shaders.
+        const bool mvrVs = g_patched && Cfg().mvrVsPatch && mvrvs::Install();
+        // MVR gate B9b: the pixel shader patch runs in the sun effects hook and needs NVAPI from mvr_vs.
+        if (g_patched && Cfg().mvrPsPatch) {
+            if (mvrVs)
+                mvrps::Install();
+            else
+                Log("MVR PS patch: off (needs [debug] mvr_vs_patch=1)");
+        }
         // TAA views: the target helper hook must be in place before the game makes its TAA (track load).
         if (g_patched) taaviews::Install();
         // Quad <-> outer only needs the focus tasks from the builder's "add task" calls and the executor patch.
@@ -2038,6 +2872,27 @@ void Install() {
         if (g_execPatched) StartStallWatch();
         else if (g_patched)
             Log("Quad: no add-task hook; no quad <-> outer only switch");
+        // MVR gate B8: needs the patched VS (mvr_vs) and the executor thunk (it skips the focus groups' pass).
+        if (Cfg().mvrGbuffer && g_execPatched && Cfg().mvrVsPatch) {
+            mvrpass::SetJitterSource(&dlaa::FrameJitter);
+            mvrpass::Install();
+            fwdrec::Install();  // O2 step 3 (mvr_velocity_record_skip); logs it
+            g_mvrEarlyCfg = Cfg().mvrEarly;  // Install took the setting
+            g_mvrForwardCfg = Cfg().mvrForward;
+            g_mvrFwdDepthCfg = Cfg().mvrForwardDepth;
+            g_mvrVelocityCfg = Cfg().mvrVelocity;
+            mvrmotion::SetEnabled(Cfg().mvrVelocity);
+            mvrmotion::SetWindowSource(&MotionWindows);
+            g_mvrVelSkipCfg = Cfg().mvrVelocitySkip;  // Install took the setting
+            g_mvrGbufPsCfg = Cfg().mvrGbufferPs;
+            g_mvrDirectCfg = Cfg().mvrDirectExtract;
+            g_mvrNativeCfg = Cfg().mvrNativeTargets;
+            g_mvrMsColorSkipCfg = Cfg().mvrMsColorSkip;
+            g_mvrLiveTrackCfg = Cfg().mvrLiveTrackSkip;
+            mvrpass::SetVelocityFill(&FillFocusMotion);
+        }
+        else if (Cfg().mvrGbuffer)
+            Log("MVR G-buffer: off (needs [debug] mvr_vs_patch=1 and the executor patch)");
         Log("Quad: focus culling %s (scene gather, processor and queue copy %s)", Cfg().focusCull ? "on" : "off",
             focus_cull::Available() ? "found" : "NOT FOUND: culling stays off");
     });
@@ -2045,12 +2900,18 @@ void Install() {
     g_follow = g_followCfg = Cfg().followGaze;
     g_clonesOn = g_clonesCfg = Cfg().clones;
     g_cullOn = g_cullCfg = Cfg().focusCull;
+    g_emptyQueue = g_emptyQueueCfg = Cfg().mvrEmptyQueue;
+    g_qbOn = g_qbCfg = Cfg().queueBreakdown;
+    g_vrOn = g_vrCfg = Cfg().mvrVelocityRecordSkip;
+    g_qbWant = g_qbOn ? (1u << OuterL) | (1u << FocusL) : 0;
     g_sunOn = g_sunCfg = Cfg().sunEffects;
     g_taaOn = g_taaCfg = Cfg().taaViews;
+    g_motionFixCfg = Cfg().taaMotionFix;
+    taaviews::SetMotionFix(g_motionFixCfg);
     LARGE_INTEGER qf{};
     QueryPerformanceFrequency(&qf);
     g_qpcFreq = qf.QuadPart;
-    g_profOn = Cfg().taskProfile;
+    g_profOn = g_profCfg = Cfg().taskProfile;
     g_on = g_installed;
 }
 
@@ -2076,9 +2937,12 @@ void OnFrameStart() {
         ++g_frameNo;
         g_frameT0 = NowMs();
         HandleToolsLocked();
+        mvrpass::OnFrameStart(g_mvrOn);  // reports the comparison of the previous shot frame
         HandleShotLocked();
         clones::OnFrameStart(gpu::Context(), g_clonesOn && g_focus.on);
         sunfx::OnFrameStart(gpu::Context(), g_sunOn && g_focus.on && !g_frameSkip);
+        mvrvs::OnFrameStart(gpu::Context());
+        mvrps::OnFrameStart(gpu::Context());
         taaviews::OnFrameStart(g_taaOn && !g_frameSkip, g_shotFrame);
         dlaa::SetShotFrame(g_shotFrame);
     });
@@ -2198,6 +3062,7 @@ void OnSubmitBegin(vr::EVREye eye, const vr::Texture_t* tex) {
         Log("Quad: D3D11 hook %s (OMSetRenderTargets, finds the texture each CEndEye writes)",
             g_d3dHooked ? "installed" : "FAILED");
         if (g_d3dHooked) clones::InstallD3DHooks(imm);
+        if (g_d3dHooked) mvrpass::InstallD3DHooks(imm);
     });
 }
 
@@ -2297,12 +3162,134 @@ void LogStats(bool totals) {
         if (!g_st.frames && !g_tot.frames) return;
         AddStats(g_tot, g_st);
         LogStatsLocked(totals ? g_tot : g_st, totals ? " (session total)" : "");
-        if (!totals) LogProfileLocked(g_st);
+        if (!totals) {
+            LogProfileLocked(g_st);
+            if (g_qbOn) g_qbWant = (1u << OuterL) | (1u << FocusL);
+            double groupMs[kGroups] = {};
+            for (int g = 0; g < kGroups; ++g) groupMs[g] = g_st.full ? g_st.cpuMs[g] / g_st.full : 0;
+            hookprof::LogStats(groupMs);
+            memcpy(g_lastWindowMs, groupMs, sizeof(groupMs));
+        }
         g_st = Stats{};
         clones::LogStats(totals);
         sunfx::LogStats(totals);
+        mvrvs::LogStats(totals);
+        mvrps::LogStats(totals);
+        mvrpass::LogStats(totals);
         taaviews::LogStats(totals);
     });
+}
+
+void LastWindowCpu(double groupMs[4]) {
+    std::lock_guard lock(g_m);
+    memcpy(groupMs, g_lastWindowMs, sizeof(g_lastWindowMs));
+}
+
+// ---------------------------------------------------------------- benchmark sequence switches
+
+namespace {
+
+struct Switch {
+    const char* name;
+    bool mvr;  // needs the MVR pass installed
+    int lo, hi;
+    int (*get)();
+    void (*set)(int);
+};
+
+const Switch kSwitches[] = {
+    {"mvr", true, 0, 1, [] { return (int)g_mvrOn; }, [](int v) { g_mvrOn = v != 0; }},
+    {"focus_cull", false, 0, 1, [] { return (int)g_cullOn; }, [](int v) { g_cullOn = v != 0; }},
+    {"sun_effects", false, 0, 1, [] { return (int)g_sunOn; }, [](int v) { g_sunOn = v != 0; }},
+    {"taa_views", false, 0, 1, [] { return (int)g_taaOn; }, [](int v) { g_taaOn = v != 0; }},
+    {"taa_motion_fix", false, 0, 1, [] { return (int)taaviews::GetMotionFix(); },
+     [](int v) { taaviews::SetMotionFix(v != 0); }},
+    {"outer_only", false, 0, 1, [] { return (int)g_userOuter; }, [](int v) { g_userOuter = v != 0; }},
+    {"task_profile", false, 0, 1, [] { return (int)g_profOn.load(); }, [](int v) { g_profOn = v != 0; }},
+    {"clones_map_cache", false, 0, 1, [] { return (int)clones::GetMapCache(); },
+     [](int v) { clones::SetMapCache(v != 0); }},
+    {"hook_profile", false, 0, 1, [] { return (int)hookprof::On(); }, [](int v) { hookprof::SetOn(v != 0); }},
+    {"mvr_early", true, 0, mvrpass::kEarlyModes - 1, [] { return mvrpass::GetEarly(); },
+     [](int v) { mvrpass::SetEarly(v); }},
+    {"mvr_mode", true, 0, (int)mvrpass::Mode::Overwrite, [] { return (int)mvrpass::GetMode(); },
+     [](int v) { mvrpass::SetMode((mvrpass::Mode)v); }},
+    {"mvr_forward", true, 0, 1, [] { return (int)mvrpass::GetForward(); }, [](int v) { mvrpass::SetForward(v != 0); }},
+    {"mvr_forward_depth", true, 0, mvrpass::kForwardDepthModes - 1, [] { return mvrpass::GetForwardDepth(); },
+     [](int v) { mvrpass::SetForwardDepth(v); }},
+    {"mvr_ms_color_skip", true, 0, 1, [] { return (int)mvrpass::GetMsColorSkip(); },
+     [](int v) { mvrpass::SetMsColorSkip(v != 0); }},
+    {"mvr_livetrack_skip", true, 0, 1, [] { return (int)mvrpass::GetLiveTrackSkip(); },
+     [](int v) { mvrpass::SetLiveTrackSkip(v != 0); }},
+    {"mvr_velocity", true, 0, 1, [] { return (int)mvrmotion::Enabled(); }, [](int v) { mvrmotion::SetEnabled(v != 0); }},
+    {"mvr_velocity_skip", true, 0, 1, [] { return (int)mvrpass::GetVelocitySkip(); },
+     [](int v) { mvrpass::SetVelocitySkip(v != 0); }},
+    {"mvr_gbuffer_ps", true, 0, 1, [] { return (int)mvrpass::GetGbufferPs(); },
+     [](int v) { mvrpass::SetGbufferPs(v != 0); }},
+    {"mvr_direct_extract", true, 0, 1, [] { return (int)mvrpass::GetDirectExtract(); },
+     [](int v) { mvrpass::SetDirectExtract(v != 0); }},
+    {"mvr_bind_skip", true, 0, 1, [] { return (int)mvrpass::GetBindSkip(); },
+     [](int v) { mvrpass::SetBindSkip(v != 0); }},
+    {"mvr_state_track", true, 0, mvrpass::kStateTrackModes - 1, [] { return mvrpass::GetStateTrack(); },
+     [](int v) { mvrpass::SetStateTrack(v); }},
+    {"mvr_native_targets", true, 0, 1, [] { return (int)mvrpass::GetNativeTargets(); },
+     [](int v) { mvrpass::SetNativeTargets(v != 0); }},
+    {"mvr_empty_queue", true, 0, 1, [] { return (int)g_emptyQueue; }, [](int v) { g_emptyQueue = v != 0; }},
+    {"mvr_velocity_record_skip", true, 0, 1, [] { return (int)g_vrOn; }, [](int v) {
+         g_vrOn = v != 0;
+         if (g_vrOn) g_vrStopped = false;
+     }},
+    {"queue_breakdown", false, 0, 1, [] { return (int)g_qbOn; }, [](int v) {
+         g_qbOn = v != 0;
+         g_qbWant = g_qbOn ? (1u << OuterL) | (1u << FocusL) : 0;
+     }},
+};
+
+const Switch* FindSwitch(const std::string& name, std::string* why) {
+    for (const Switch& s : kSwitches) {
+        if (name != s.name) continue;
+        if (s.mvr && !mvrpass::On()) {
+            if (why) *why = name + ": MVR is not installed ([debug] mvr_gbuffer=1)";
+            return nullptr;
+        }
+        return &s;
+    }
+    if (why) {
+        *why = "unknown switch \"" + name + "\" (known:";
+        for (const Switch& s : kSwitches) *why += std::string(" ") + s.name;
+        *why += ")";
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+bool GetSwitch(const std::string& name, int& value, std::string* why) {
+    bool ok = false;
+    Safe("GetSwitch", [&] {
+        std::lock_guard lock(g_m);
+        if (const Switch* s = FindSwitch(name, why)) {
+            value = s->get();
+            ok = true;
+        }
+    });
+    return ok;
+}
+
+bool SetSwitch(const std::string& name, int value, std::string* why) {
+    bool ok = false;
+    Safe("SetSwitch", [&] {
+        std::lock_guard lock(g_m);
+        const Switch* s = FindSwitch(name, why);
+        if (!s) return;
+        if (value < s->lo || value > s->hi) {
+            if (why) *why = name + "=" + std::to_string(value) + ": out of range " + std::to_string(s->lo) + ".." +
+                            std::to_string(s->hi);
+            return;
+        }
+        s->set(value);
+        ok = true;
+    });
+    return ok;
 }
 
 std::string Describe() {
@@ -2333,11 +3320,11 @@ std::string Describe() {
                            : g_cull.failed ? "focus culling off after failed checks"
                            : g_cullOn      ? "focus culling on"
                                            : "focus culling off";
-        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s, %s, %s, %s, %s%s",
+        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s, %s, %s, %s, %s, %s, %s, %s%s",
                  g_installed ? "engine hooks on" : "engine hooks off", g_patched ? "on" : "off",
                  g_graph.ok ? "running" : "not running", focus, view, cull, clones::Describe().c_str(),
-                 sunfx::Describe().c_str(), taaviews::Describe().c_str(),
-                 g_fault ? ", stopped after an exception" : "");
+                 sunfx::Describe().c_str(), taaviews::Describe().c_str(), mvrvs::Describe().c_str(),
+                 mvrps::Describe().c_str(), mvrpass::Describe().c_str(), g_fault ? ", stopped after an exception" : "");
     });
     return buf;
 }
@@ -2370,6 +3357,7 @@ void Shutdown() {
         clones::Shutdown();
         sunfx::Shutdown();
         taaviews::Shutdown();
+        mvrpass::Shutdown();
         shots::Cancel();
         g_shotFrame = false;
         g_skip = false;

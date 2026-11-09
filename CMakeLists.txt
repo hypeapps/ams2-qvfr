@@ -22,6 +22,8 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 add_subdirectory(third_party)
 add_subdirectory(src/gaze_test)
+add_subdirectory(src/dxbc)
 add_subdirectory(src/proxy)
 add_subdirectory(src/proxy_smoke)
 add_subdirectory(src/config)
+add_subdirectory(src/mvr_test)

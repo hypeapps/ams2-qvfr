@@ -15,7 +15,9 @@
 #include "common.h"
 #include "diag.h"
 #include "gpu.h"
+#include "hook_prof.h"
 #include "hooks.h"
+#include "mvr_motion.h"
 #include "sun_fx.h"
 #include "sysinfo.h"
 
@@ -127,6 +129,7 @@ uint32_t g_jitCounter = 0xFFFFFFFFu;
 uint32_t g_jitCtx = 0;
 uint64_t g_setCalls = 0, g_setNonzero = 0, g_lastSetCalls = 0, g_lastSetNonzero = 0;
 int g_setLogs = 0;
+std::atomic<int> g_traceLeft{0};  // TraceJitter: further SetJitter calls to log
 bool g_faultLogged = false;
 thread_local bool t_inside = false;  // inside our evaluation
 
@@ -268,6 +271,7 @@ void DropNgxLocked() {
         SafeRelease(s.tex);
     }
     g_scratch.clear();
+    mvrmotion::Release();
     SafeRelease(g_cockpitCs);
     SafeRelease(g_cockpitCb);
     g_cockpitCbBits = 0;
@@ -350,10 +354,12 @@ bool InitNgx(ID3D11DeviceContext* c) {
     return true;
 }
 
-// A texture we own that matches `like` (size, mips, array) in format `fmt` with the given bind flags.
+// A single texture we own that matches `like` (size, mips) in format `fmt` with the given bind flags. Always one slice:
+// DLSS takes 2D textures, and an engine target may be a two-slice array (MVR B17, clones.h), whose CopyResource into
+// it copies slice 0.
 ID3D11Texture2D* ScratchFor(const D3D11_TEXTURE2D_DESC& like, DXGI_FORMAT fmt, UINT bind) {
     for (Scratch& s : g_scratch)
-        if (s.tex && s.w == like.Width && s.h == like.Height && s.mips == like.MipLevels && s.arr == like.ArraySize &&
+        if (s.tex && s.w == like.Width && s.h == like.Height && s.mips == like.MipLevels && s.arr == 1 &&
             s.fmt == fmt && s.bind == bind)
             return s.tex;
     if (g_scratch.size() >= 12) {
@@ -366,7 +372,7 @@ ID3D11Texture2D* ScratchFor(const D3D11_TEXTURE2D_DESC& like, DXGI_FORMAT fmt, U
     d.Width = like.Width;
     d.Height = like.Height;
     d.MipLevels = like.MipLevels;
-    d.ArraySize = like.ArraySize;
+    d.ArraySize = 1;
     d.Format = fmt;
     d.SampleDesc.Count = 1;
     d.Usage = D3D11_USAGE_DEFAULT;
@@ -822,10 +828,11 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
                 Log("DLAA: TAA inputs differ in size or are multisampled; the game's TAA for this draw");
                 return;
             }
-        // DLSS reads typed resources: a typeless engine texture is copied into a typed one first.
+        // DLSS reads typed 2D resources: a typeless engine texture (or a two-slice array, MVR B17) is copied into a typed
+        // single one first.
         ID3D11Resource* in[3] = {};
         for (int i = 0; i < 3; ++i) {
-            if (!IsTypeless(d[i].Format)) {
+            if (!IsTypeless(d[i].Format) && d[i].ArraySize == 1) {
                 in[i] = tex[i];
                 continue;
             }
@@ -871,7 +878,10 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             outUav = UavFor(out);
             if (!taaSrv || !outUav) return;  // the game's TAA result stays everywhere
             c->CopyResource(taaCopy, tex[3]);
-            const uint32_t bits = CockpitTaaNow() >= 2 ? 0x0A : 0x08;  // stencil high byte: 0x08 displays, 0x02 car
+            // Stencil high byte: 0x88 displays and mirrors, 0x86 the rest of the player's car (both 0x80). Testing any
+            // single bit took more: 0x08 is also in the trees (0x1A) and the sky (0x28), whose soft leaf edges then came
+            // from the game's TAA and thinned out while the head moved (docs/dlaa-trees.md).
+            const uint32_t bits = CockpitTaaNow() >= 2 ? 0x80 : 0x88;
             if (bits != g_cockpitCbBits) {
                 const uint32_t v[4] = {bits, 0, 0, 0};
                 c->UpdateSubresource(g_cockpitCb, 0, nullptr, v, 0, 0);
@@ -911,6 +921,17 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
         Protect("evaluate", [&] {
             f = FeatureFor(c, view, (uintptr_t)tex[2], w, h);
             if (!f) return;
+            // MVR (mvr_motion.h): outer's motion vectors kept per eye, the focus views' made from them.
+            ID3D11Resource* mv = in[2];
+            if (view >= 1) {
+                const int eye = (view - 1) & 1;
+                const bool shot = g_shot.load(std::memory_order_relaxed);
+                if (view <= 2)
+                    mvrmotion::StoreOuter(c, eye, (ID3D11Texture2D*)in[2], (ID3D11Texture2D*)in[0], frame, shot);
+                else if (ID3D11Texture2D* m = mvrmotion::ForFocus(c, eye, (ID3D11Texture2D*)in[0],
+                                                                  (ID3D11Texture2D*)in[2], w, h, frame, shot))
+                    mv = m;
+            }
             if (mask) {
                 c->CSSetShader(g_maskCs, nullptr, 0);
                 c->CSSetConstantBuffers(0, 1, &g_maskCb);
@@ -929,7 +950,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             e.Feature.pInColor = in[1];
             e.Feature.pInOutput = out;
             e.pInDepth = in[0];
-            e.pInMotionVectors = in[2];
+            e.pInMotionVectors = mv;
             e.InJitterOffsetX = j[0] * Cfg().dlaaJitterScaleX;
             e.InJitterOffsetY = j[1] * Cfg().dlaaJitterScaleY;
             e.InRenderSubrectDimensions.Width = w;
@@ -1059,8 +1080,12 @@ void After(ID3D11DeviceContext* c) {
 }
 
 void STDMETHODCALLTYPE D_DrawIndexed(ID3D11DeviceContext* c, UINT n, UINT start, INT base) {
+    hookprof::Scope prof(hookprof::KDraw);
     if (Replace(c, n)) return;
-    o_drawIndexed(c, n, start, base);
+    {
+        hookprof::Orig o;
+        o_drawIndexed(c, n, start, base);
+    }
     After(c);
 }
 
@@ -1115,12 +1140,24 @@ void __fastcall D_SetJitter(void* dev, const float* offset, uint32_t ctx) {
             g_jitCounter = counter;
             g_jitCtx = ctx;
         }
-        if (g_setLogs < 8) {  // one frame's worth: which tasks set and clear the offset
+        const bool trace = g_traceLeft.load(std::memory_order_relaxed) > 0 && g_traceLeft.fetch_sub(1) > 0;
+        if (g_setLogs < 8 || trace) {  // one frame's worth: which tasks set and clear the offset
             ++g_setLogs;
             Log("DLAA: SetJitter #%d: context %u, (%.4f, %.4f), frame counter %u, from AMS2AVX.exe+0x%llX", g_setLogs, ctx,
                 v[0], v[1], counter, (unsigned long long)((uintptr_t)ret - hooks::ExeBase()));
         }
     });
+}
+
+bool FrameJitterRead(float out[2]) {
+    void* dev = nullptr;
+    uint32_t counter = 0;
+    if (!g_devGlobal || !hooks::TryRead(g_devGlobal, &dev, sizeof(dev)) || !dev ||
+        !hooks::TryRead((const uint8_t*)dev + kFrameCounterOffset, &counter, sizeof(counter)) || counter != g_jitCounter)
+        return false;
+    out[0] = g_jit[0];
+    out[1] = g_jit[1];
+    return true;
 }
 
 void __fastcall D_Locks(void* taa, void* src, void* normal, uint32_t ctx, void* camera, uint64_t a6, int view) {
@@ -1245,6 +1282,7 @@ void LogStats(bool totals) {
             (unsigned long long)g_maskEvals, (unsigned long long)g_expEvals, (unsigned long long)g_cockpitEvals);
 #endif
     if (Cfg().quadMode != QuadMode::Quad) return;
+    mvrmotion::LogStats(totals);
     std::string views;
     for (int v = 1; v < kViews; ++v) {
         const uint64_t n = g_viewEvals[v].load();
@@ -1257,6 +1295,17 @@ void LogStats(bool totals) {
     Log("DLAA%s: DLSS evaluations per view: %s; outside the eye groups %llu in the session",
         totals ? " (session total)" : "", views.c_str(), (unsigned long long)g_viewEvals[0].load());
 }
+
+void TraceJitter(int calls) { g_traceLeft.store(calls); }
+
+bool FrameJitter(float out[2]) {
+    bool ok = false;
+    if (!g_installed || !o_setJitter) return ok;
+    Protect("FrameJitter", [&] { ok = FrameJitterRead(out); });
+    return ok;
+}
+
+uint64_t Frame() { return g_frame.load(); }
 
 void SetShotFrame(bool shot) {
 #ifdef QVFR_HAVE_DLSS

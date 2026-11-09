@@ -27,6 +27,8 @@ struct Settings {
     int gazeKey = 0x75, gazeMod = 0xA3;
     bool warningBox = true;
     bool overlay = false;  // [debug] overlay: the gaze and the blend edges drawn in the game
+    // [mvr] (docs/mvr.md): NVIDIA Multi-View Rendering of the focus views in outer's passes
+    bool mvr = true;                 // mode=mvr, anything but off (restart)
     // [dlaa] (docs/dlaa.md): NVIDIA DLAA instead of the game's TAA
     bool dlaa = false;               // mode=dlaa (restart)
     std::string dlaaPreset = "k";    // j, k, l, m ("default" reads as k, NVIDIA's DLAA default)

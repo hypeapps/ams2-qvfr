@@ -11,6 +11,7 @@
 // owns the D3D11 DrawIndexed hook then (sun_fx), and DLAA's check runs from it.
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace qvfr::dlaa {
@@ -23,6 +24,13 @@ void BeginGroup(int group);
 void EndGroup();
 // Quad frame start: true in a shot frame (right Ctrl + F10); each view's TAA resolve is then measured once (log).
 void SetShotFrame(bool shot);
+// DLAA's frame counter (advanced in OnFrameStart; mvr_motion keys outer's copies by it).
+uint64_t Frame();
+// Any thread (MVR gate B8): the projection offset the render tasks set in the engine's current frame (SetJitter hook,
+// size-independent: the jitter is offset / render size in NDC). False: not set in this frame or no hook.
+bool FrameJitter(float out[2]);
+// Logs the next `calls` SetJitter calls (any thread): context, offset, frame counter, caller (MVR jitter diagnosis).
+void TraceJitter(int calls);
 void LogStats(bool totals);
 std::string Describe();  // one line for summary.txt
 void Shutdown();         // VR_Shutdown: DLSS features and NGX released

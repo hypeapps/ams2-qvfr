@@ -296,6 +296,8 @@ Config ReadConfig(const fs::path& ini) {
     c.benchFreezePose = IniInt(ini, L"benchmark", L"freeze_pose", 1) != 0;
     c.benchBeep = IniInt(ini, L"benchmark", L"beep", 1) != 0;
     c.benchAutoStartS = IniFloat(ini, L"benchmark", L"auto_start_s", 0.0f);
+    c.benchSequence = Narrow(IniPathValue(ini, L"benchmark", L"sequence"));
+    c.benchSettleS = IniFloat(ini, L"benchmark", L"settle_s", c.benchSettleS);
     c.gazeRead = IniInt(ini, L"gaze", L"read", 1) != 0;
     std::string mode = IniString(ini, L"experiment", L"mode", L"off");
     if (mode == "focus") {
@@ -387,20 +389,80 @@ Config ReadConfig(const fs::path& ini) {
     c.taaViews = IniInt(ini, L"debug", L"taa_views", 1) != 0;
     c.taaViewsKeyMod = IniInt(ini, L"debug", L"taa_views_modifier", c.taaViewsKeyMod);
     c.taaViewsKey = IniInt(ini, L"debug", L"taa_views_key", c.taaViewsKey);
+    c.taaMotionFix = IniInt(ini, L"debug", L"taa_motion_fix", 1) != 0;
+    c.taaMotionFixKey = IniInt(ini, L"debug", L"taa_motion_fix_key", c.taaMotionFixKey);
     c.taskProfile = IniInt(ini, L"debug", L"task_profile", 0) != 0;
+    c.hookProfile = IniInt(ini, L"debug", L"hook_profile", 0) != 0;
+    c.clonesMapCache = IniInt(ini, L"debug", L"clones_map_cache", 1) != 0;
+    c.mvrBindSkip = IniInt(ini, L"debug", L"mvr_bind_skip", 1) != 0;
+    c.mvrStateTrack = std::clamp(IniInt(ini, L"debug", L"mvr_state_track", 1), 0, 2);
     c.clonesViewportFix = IniInt(ini, L"debug", L"clones_viewport_fix", 1) != 0;
     c.clonesBindFix = IniInt(ini, L"debug", L"clones_bind_fix", 1) != 0;
     c.shotClones = IniInt(ini, L"debug", L"shot_clones", 0) != 0;
+    const std::string mvr = IniString(ini, L"mvr", L"mode", L"mvr");
+    c.mvr = mvr != "off";
+    if (mvr != "off" && mvr != "mvr") Log("Settings: unknown [mvr] mode=\"%s\", using mvr", mvr.c_str());
+    c.mvrVsPatch = c.mvr && IniInt(ini, L"debug", L"mvr_vs_patch", 1) != 0;
+    c.mvrPsPatch = c.mvr && IniInt(ini, L"debug", L"mvr_ps_patch", 1) != 0;
+    c.mvrGbuffer = c.mvr && IniInt(ini, L"debug", L"mvr_gbuffer", 1) != 0;
+    c.mvrKeyMod = IniInt(ini, L"debug", L"mvr_modifier", c.mvrKeyMod);
+    c.mvrKey = IniInt(ini, L"debug", L"mvr_key", c.mvrKey);
+    c.mvrJitterFix = IniInt(ini, L"debug", L"mvr_jitter_fix", 1) != 0;
+    c.mvrModeKey = IniInt(ini, L"debug", L"mvr_mode_key", IniInt(ini, L"debug", L"mvr_late_key", c.mvrModeKey));
+    c.mvrDepthBias = std::clamp(IniInt(ini, L"debug", L"mvr_depth_bias", c.mvrDepthBias), 0, 1 << 20);
+    c.mvrDepthSlope = std::clamp(IniFloat(ini, L"debug", L"mvr_depth_slope", c.mvrDepthSlope), 0.0f, 16.0f);
+    c.mvrDepthDilate = IniInt(ini, L"debug", L"mvr_depth_dilate", c.mvrDepthDilate ? 1 : 0) != 0;
+    c.mvrEarly = std::clamp(IniInt(ini, L"debug", L"mvr_early", 1), 0, 5);
+    c.mvrEarlyKey = IniInt(ini, L"debug", L"mvr_early_key", c.mvrEarlyKey);
+    c.mvrMapKey = IniInt(ini, L"debug", L"mvr_map_key", c.mvrMapKey);
+    c.mvrShotCompare = IniInt(ini, L"debug", L"mvr_shot_compare", 0) != 0;
+    c.mvrForwardTest = IniInt(ini, L"debug", L"mvr_forward_test", 0) != 0;
+    c.mvrForward = IniInt(ini, L"debug", L"mvr_forward", 1) != 0;
+    c.mvrForwardKey = IniInt(ini, L"debug", L"mvr_forward_key", c.mvrForwardKey);
+    c.mvrForwardDepth = std::clamp(IniInt(ini, L"debug", L"mvr_forward_depth", 3), 0, 3);
+    c.mvrForwardDepthKey = IniInt(ini, L"debug", L"mvr_forward_depth_key", c.mvrForwardDepthKey);
+    c.mvrVelocity = IniInt(ini, L"debug", L"mvr_velocity", 1) != 0;
+    c.mvrVelocityKey = IniInt(ini, L"debug", L"mvr_velocity_key", c.mvrVelocityKey);
+    c.mvrVelocitySkip = IniInt(ini, L"debug", L"mvr_velocity_skip", 1) != 0;
+    c.mvrVelocitySkipKey = IniInt(ini, L"debug", L"mvr_velocity_skip_key", c.mvrVelocitySkipKey);
+    c.mvrGbufferPs = IniInt(ini, L"debug", L"mvr_gbuffer_ps", 1) != 0;
+    c.mvrGbufferPsKey = IniInt(ini, L"debug", L"mvr_gbuffer_ps_key", c.mvrGbufferPsKey);
+    c.mvrDirectExtract = IniInt(ini, L"debug", L"mvr_direct_extract", 1) != 0;
+    c.mvrDirectExtractKey = IniInt(ini, L"debug", L"mvr_direct_extract_key", c.mvrDirectExtractKey);
+    c.mvrNativeTargets = IniInt(ini, L"debug", L"mvr_native_targets", 1) != 0;
+    c.mvrNativeKey = IniInt(ini, L"debug", L"mvr_native_key", c.mvrNativeKey);
+    c.mvrMsColorSkip = IniInt(ini, L"debug", L"mvr_ms_color_skip", 1) != 0;
+    c.mvrMsColorSkipKey = IniInt(ini, L"debug", L"mvr_ms_color_skip_key", c.mvrMsColorSkipKey);
+    c.mvrMsSlices = IniInt(ini, L"debug", L"mvr_ms_slices", 1) != 0;
+    c.mvrLiveTrackSkip = IniInt(ini, L"debug", L"mvr_livetrack_skip", 1) != 0;
+    c.mvrLiveTrackSkipKey = IniInt(ini, L"debug", L"mvr_livetrack_skip_key", c.mvrLiveTrackSkipKey);
+    c.mvrEmptyQueue = IniInt(ini, L"debug", L"mvr_empty_queue", 0) != 0;
+    c.queueBreakdown = IniInt(ini, L"debug", L"queue_breakdown", 0) != 0;
+    c.mvrVelocityRecordSkip = IniInt(ini, L"debug", L"mvr_velocity_record_skip", 1) != 0;
     if (c.quadMode == QuadMode::Quad)
         Log("Settings: [debug] overlay=%d overlay_modifier=0x%X overlay_key=0x%X freeze_modifier=0x%X freeze_key=0x%X "
             "outer_modifier=0x%X outer_key=0x%X gaze_modifier=0x%X gaze_key=0x%X clones=%d clones_modifier=0x%X "
             "clones_key=0x%X clones_viewport_fix=%d clones_bind_fix=%d shot_clones=%d focus_cull=%d cull_modifier=0x%X "
             "cull_key=0x%X sun_effects=%d sun_effects_modifier=0x%X sun_effects_key=0x%X taa_views=%d "
-            "taa_views_modifier=0x%X taa_views_key=0x%X task_profile=%d",
+            "taa_views_modifier=0x%X taa_views_key=0x%X taa_motion_fix=%d taa_motion_fix_key=0x%X task_profile=%d "
+            "hook_profile=%d clones_map_cache=%d mvr_bind_skip=%d mvr_state_track=%d mvr_vs_patch=%d "
+            "mvr_ps_patch=%d mvr_gbuffer=%d mvr_modifier=0x%X mvr_key=0x%X mvr_jitter_fix=%d mvr_mode_key=0x%X mvr_depth_bias=%d mvr_depth_slope=%.3f mvr_depth_dilate=%d "
+            "mvr_early=%d mvr_early_key=0x%X mvr_map_key=0x%X mvr_shot_compare=%d mvr_forward_test=%d "
+            "mvr_forward=%d mvr_forward_key=0x%X mvr_forward_depth=%d mvr_forward_depth_key=0x%X mvr_velocity=%d "
+            "mvr_velocity_key=0x%X mvr_velocity_skip=%d mvr_velocity_skip_key=0x%X mvr_gbuffer_ps=%d "
+            "mvr_gbuffer_ps_key=0x%X mvr_direct_extract=%d mvr_direct_extract_key=0x%X mvr_native_targets=%d "
+            "mvr_native_key=0x%X mvr_ms_color_skip=%d mvr_ms_color_skip_key=0x%X mvr_ms_slices=%d "
+            "mvr_livetrack_skip=%d mvr_livetrack_skip_key=0x%X mvr_empty_queue=%d queue_breakdown=%d mvr_velocity_record_skip=%d",
             c.overlay, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey,
             c.gazeKeyMod, c.gazeKey, c.clones, c.clonesKeyMod, c.clonesKey, c.clonesViewportFix, c.clonesBindFix,
             c.shotClones, c.focusCull, c.cullKeyMod, c.cullKey, c.sunEffects, c.sunKeyMod, c.sunKey, c.taaViews,
-            c.taaViewsKeyMod, c.taaViewsKey, c.taskProfile);
+            c.taaViewsKeyMod, c.taaViewsKey, c.taaMotionFix, c.taaMotionFixKey, c.taskProfile, c.hookProfile, c.clonesMapCache, c.mvrBindSkip, c.mvrStateTrack, c.mvrVsPatch, c.mvrPsPatch, c.mvrGbuffer, c.mvrKeyMod, c.mvrKey,
+            c.mvrJitterFix, c.mvrModeKey, c.mvrDepthBias, c.mvrDepthSlope, c.mvrDepthDilate,
+            c.mvrEarly, c.mvrEarlyKey, c.mvrMapKey, c.mvrShotCompare, c.mvrForwardTest, c.mvrForward,
+            c.mvrForwardKey, c.mvrForwardDepth, c.mvrForwardDepthKey, c.mvrVelocity, c.mvrVelocityKey,
+            c.mvrVelocitySkip, c.mvrVelocitySkipKey, c.mvrGbufferPs, c.mvrGbufferPsKey, c.mvrDirectExtract,
+            c.mvrDirectExtractKey, c.mvrNativeTargets, c.mvrNativeKey, c.mvrMsColorSkip, c.mvrMsColorSkipKey, c.mvrMsSlices,
+            c.mvrLiveTrackSkip, c.mvrLiveTrackSkipKey, c.mvrEmptyQueue, c.queueBreakdown, c.mvrVelocityRecordSkip);
     const std::string dlaa = IniString(ini, L"dlaa", L"mode", L"off");
     c.dlaa = dlaa == "dlaa";
     if (dlaa != "off" && dlaa != "dlaa") Log("Settings: unknown [dlaa] mode=\"%s\", using off", dlaa.c_str());
@@ -468,12 +530,13 @@ void LoadConfig() {
     Log("Settings %s: [runtime] path=%s opencomposite=\"%s\" openxr_layer=%d", Narrow(ini.wstring()).c_str(),
         c.pathOpenXr ? "openxr" : "openvr", Narrow(c.openComposite).c_str(), c.openxrLayer);
     Log("Settings %s: wrap=%d first_calls=%d stats_interval_s=%d csv_always=%d gpu=%d | benchmark: modifier=0x%X key=0x%X "
-        "delay_s=%.1f duration_s=%.1f freeze_pose=%d beep=%d auto_start_s=%.1f | gaze read=%d | experiment: mode=%s "
+        "delay_s=%.1f duration_s=%.1f freeze_pose=%d beep=%d auto_start_s=%.1f settle_s=%.1f sequence=\"%s\" | gaze read=%d | "
+        "experiment: mode=%s "
         "focus_size=%.3f center=(%.3f, %.3f) pad=%d",
         Narrow(ini.wstring()).c_str(), c.wrap, c.firstCalls, c.statsIntervalS, c.csvAlways, c.gpuTiming, c.benchKeyMod,
         c.benchKey,
-        c.benchDelayS, c.benchDurationS, c.benchFreezePose, c.benchBeep, c.benchAutoStartS, c.gazeRead,
-        ExpModeName(c.expMode), c.expFocusSize, c.expCenterX, c.expCenterY, c.expPad);
+        c.benchDelayS, c.benchDurationS, c.benchFreezePose, c.benchBeep, c.benchAutoStartS, c.benchSettleS,
+        c.benchSequence.c_str(), c.gazeRead, ExpModeName(c.expMode), c.expFocusSize, c.expCenterX, c.expCenterY, c.expPad);
 }
 
 bool ReloadConfig() {
@@ -511,6 +574,10 @@ bool ReloadConfig() {
          "[quad] *_section");
     need(n.probeFrames != c.probeFrames || n.probeEngine != c.probeEngine || n.probeD3D != c.probeD3D, "[quad] probe_*");
     need(n.dlaa != c.dlaa, "[dlaa] mode");
+    need(n.mvr != c.mvr, "[mvr] mode");
+    need(n.mvrVsPatch != c.mvrVsPatch, "[debug] mvr_vs_patch");
+    need(n.mvrPsPatch != c.mvrPsPatch, "[debug] mvr_ps_patch");
+    need(n.mvrGbuffer != c.mvrGbuffer, "[debug] mvr_gbuffer");
     c.dlaaPreset = n.dlaaPreset;
     c.dlaaJitterScaleX = n.dlaaJitterScaleX;
     c.dlaaJitterScaleY = n.dlaaJitterScaleY;
@@ -535,6 +602,8 @@ bool ReloadConfig() {
     c.benchDurationS = n.benchDurationS;
     c.benchFreezePose = n.benchFreezePose;
     c.benchBeep = n.benchBeep;
+    c.benchSequence = n.benchSequence;
+    c.benchSettleS = n.benchSettleS;
     c.gazeRead = n.gazeRead;
     c.focusOffsetX = n.focusOffsetX;
     c.focusOffsetY = n.focusOffsetY;
@@ -576,20 +645,59 @@ bool ReloadConfig() {
     c.taaViews = n.taaViews;
     c.taaViewsKeyMod = n.taaViewsKeyMod;
     c.taaViewsKey = n.taaViewsKey;
+    c.taaMotionFix = n.taaMotionFix;
+    c.taaMotionFixKey = n.taaMotionFixKey;
     c.taskProfile = n.taskProfile;
+    c.hookProfile = n.hookProfile;
+    c.clonesMapCache = n.clonesMapCache;
+    c.mvrBindSkip = n.mvrBindSkip;
+    c.mvrStateTrack = n.mvrStateTrack;
+    c.mvrKeyMod = n.mvrKeyMod;
+    c.mvrKey = n.mvrKey;
+    c.mvrJitterFix = n.mvrJitterFix;
+    c.mvrModeKey = n.mvrModeKey;
+    c.mvrDepthBias = n.mvrDepthBias;
+    c.mvrDepthSlope = n.mvrDepthSlope;
+    c.mvrDepthDilate = n.mvrDepthDilate;
+    c.mvrEarly = n.mvrEarly;
+    c.mvrEarlyKey = n.mvrEarlyKey;
+    c.mvrMapKey = n.mvrMapKey;
+    c.mvrShotCompare = n.mvrShotCompare;
+    c.mvrForwardTest = n.mvrForwardTest;
+    c.mvrForward = n.mvrForward;
+    c.mvrForwardKey = n.mvrForwardKey;
+    c.mvrForwardDepth = n.mvrForwardDepth;
+    c.mvrForwardDepthKey = n.mvrForwardDepthKey;
+    c.mvrVelocity = n.mvrVelocity;
+    c.mvrVelocityKey = n.mvrVelocityKey;
+    c.mvrVelocitySkip = n.mvrVelocitySkip;
+    c.mvrVelocitySkipKey = n.mvrVelocitySkipKey;
+    c.mvrGbufferPs = n.mvrGbufferPs;
+    c.mvrGbufferPsKey = n.mvrGbufferPsKey;
+    c.mvrDirectExtract = n.mvrDirectExtract;
+    c.mvrDirectExtractKey = n.mvrDirectExtractKey;
+    c.mvrNativeTargets = n.mvrNativeTargets;
+    c.mvrNativeKey = n.mvrNativeKey;
+    c.mvrMsColorSkip = n.mvrMsColorSkip;
+    c.mvrMsColorSkipKey = n.mvrMsColorSkipKey;
+    c.mvrLiveTrackSkip = n.mvrLiveTrackSkip;
+    c.mvrLiveTrackSkipKey = n.mvrLiveTrackSkipKey;
+    c.mvrEmptyQueue = n.mvrEmptyQueue;
+    c.queueBreakdown = n.queueBreakdown;
+    c.mvrVelocityRecordSkip = n.mvrVelocityRecordSkip;
     Log("Settings reloaded (live): stats_interval_s=%d | benchmark modifier=0x%X key=0x%X delay_s=%.1f duration_s=%.1f "
         "freeze_pose=%d beep=%d | gaze read=%d | quad focus_offset=(%.3f, %.3f) fixed_offset=(%.3f, %.3f) "
         "smoothen_focus_view_edges=%.3f%s follow_gaze=%d gaze_hold_s=%.2f compose=%d margin_px=%d shot_modifier=0x%X "
         "shot_key=0x%X shot_auto_s=%.1f | debug overlay=%d clones=%d clones_viewport_fix=%d clones_bind_fix=%d "
-        "shot_clones=%d focus_cull=%d sun_effects=%d taa_views=%d task_profile=%d keys 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, "
-        "0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X%s%s",
+        "shot_clones=%d focus_cull=%d sun_effects=%d taa_views=%d task_profile=%d hook_profile=%d mvr_jitter_fix=%d mvr_early=%d mvr_shot_compare=%d mvr_forward_test=%d mvr_forward=%d keys 0x%X+0x%X, "
+        "0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X, 0x%X+0x%X%s%s",
         c.statsIntervalS, c.benchKeyMod, c.benchKey, c.benchDelayS, c.benchDurationS, c.benchFreezePose, c.benchBeep,
         c.gazeRead, c.focusOffsetX, c.focusOffsetY, c.fixedOffsetX, c.fixedOffsetY, c.smoothen,
         c.legacyEdge ? " (pre-M7 feather_px instead)" : "", c.followGaze, c.gazeHoldS, c.quadCompose, c.quadMarginPx,
         c.shotKeyMod, c.shotKey, c.shotAutoS, c.overlay, c.clones, c.clonesViewportFix, c.clonesBindFix, c.shotClones,
-        c.focusCull, c.sunEffects, c.taaViews, c.taskProfile, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey,
-        c.outerKeyMod, c.outerKey, c.gazeKeyMod, c.gazeKey, c.clonesKeyMod, c.clonesKey, c.cullKeyMod, c.cullKey,
-        c.sunKeyMod, c.sunKey, c.taaViewsKeyMod, c.taaViewsKey,
+        c.focusCull, c.sunEffects, c.taaViews, c.taskProfile, c.hookProfile, c.mvrJitterFix, c.mvrEarly, c.mvrShotCompare, c.mvrForwardTest, c.mvrForward, c.overlayKeyMod, c.overlayKey,
+        c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey, c.gazeKeyMod, c.gazeKey, c.clonesKeyMod, c.clonesKey,
+        c.cullKeyMod, c.cullKey, c.sunKeyMod, c.sunKey, c.taaViewsKeyMod, c.taaViewsKey, c.mvrKeyMod, c.mvrKey,
         restart.empty() ? "" : "; CHANGED BUT NEEDS A GAME RESTART: ", restart.c_str());
     return true;
 }

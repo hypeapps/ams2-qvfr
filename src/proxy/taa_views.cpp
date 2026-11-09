@@ -4,14 +4,17 @@
 
 #include <d3d11_1.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include "common.h"
+#include "dxbc.h"
 #include "gpu.h"
 #include "hooks.h"
 #include "sysinfo.h"
@@ -116,6 +119,28 @@ std::atomic<uint64_t> g_objFixed{0};
 int g_dumpCount = 0;
 int g_dumpVelocity = 0;  // object velocity draws dumped in this group
 constexpr const char* kGroupName[4] = {"outer L", "outer R", "focus L", "focus R"};
+std::atomic<int> g_group{-1};  // eye group running (render thread), -1 outside them
+
+// The focus views' TAA history while the image moves (docs/dlaa-trees.md). The engine's resolve PS weighs its history
+// by the motion in its view's units: w = 1 - sat((|velocity_uv * (1600, 900)| - 16) * 0.1), and pixels without the
+// stencil bit 0x02 (the sky among them) get about 0.95 * w (cameraRotationFactor about 0.02 at w = 0). Above 1% of the
+// view per frame the TAA keeps the current frame only. Alpha-tested leaves get their soft edge (the sky pixels next to
+// them) from the jittered frames, so they thinned out while the history dropped. A focus view spans about a third of
+// the eye's angle and follows the gaze, so it passed the threshold at a third of outer's head speed and with every eye
+// movement. The focus groups draw the resolve with a copy of the shader whose literal (1600, 900, 160, 90) is 0: the
+// weight stays as at rest (the neighbourhood clip of the history stays, as for the bit 0x02 pixels' fixed 0.75).
+constexpr float kTaaMotion[4] = {1600.0f, 900.0f, 160.0f, 90.0f};
+struct ResolveCode {
+    void* ps = nullptr;         // the engine's resolve PS (compared only)
+    std::vector<uint8_t> code;  // its bytecode
+    ID3D11PixelShader* patched = nullptr;
+    bool failed = false;
+};
+std::mutex g_resolveM;
+ResolveCode g_resolveCode[4];  // under g_resolveM (normally one)
+std::atomic<bool> g_motionFix{true};
+std::atomic<uint64_t> g_motionFixed{0};
+ID3D11PixelShader* g_psRestore = nullptr;  // render thread: the engine's resolve PS, bound again after the draw
 
 void SetState(const char* s) { snprintf(g_state, sizeof(g_state), "%s", s); }
 
@@ -312,6 +337,7 @@ void OnFrameStart(bool enabled, bool dump) {
     g_dumpFrame = dump;
     g_dumping = -1;
     g_fixOn = enabled;
+    g_group = -1;
     Protect("frame", [&] {
         std::lock_guard lock(g_m);
         if (g_sw.on) {
@@ -324,6 +350,7 @@ void OnFrameStart(bool enabled, bool dump) {
 
 void BeginGroup(int group) {
     if (!g_installed || g_dead.load(std::memory_order_relaxed)) return;
+    g_group = group;
     if (g_dumpFrame && (group == 1 || group == 2)) {
         g_dumpCount = 0;
         g_dumpVelocity = 0;
@@ -392,6 +419,7 @@ void BeginGroup(int group) {
 void EndGroup() {
     if (!g_installed || g_dead.load(std::memory_order_relaxed)) return;
     g_dumping = -1;
+    g_group = -1;
     Protect("EndGroup", [&] {
         std::lock_guard lock(g_m);
         RestoreLocked();
@@ -649,6 +677,65 @@ int TaaKind(ID3D11DeviceContext* c, UINT& w, UINT& h) {
     return kind;
 }
 
+// In a focus group the TAA resolve draws with its copy that keeps the history while the image moves (kTaaMotion). The
+// copy is made on first use per engine shader.
+void SwapResolveShader(ID3D11DeviceContext* c) {
+    const int g = g_group.load(std::memory_order_relaxed);
+    if (!g_motionFix.load(std::memory_order_relaxed) || (g != 2 && g != 3) || g_psRestore) return;
+    ID3D11PixelShader* ps = nullptr;
+    c->PSGetShader(&ps, nullptr, nullptr);
+    if (!ps) return;
+    ID3D11PixelShader* patched = nullptr;
+    std::vector<uint8_t> code;  // the engine shader's code when its copy is still to be made
+    {
+        std::lock_guard lock(g_resolveM);
+        for (auto& r : g_resolveCode) {
+            if (r.ps != ps) continue;
+            if (!r.patched && !r.failed) {
+                r.failed = true;  // one try
+                code = r.code;
+            }
+            patched = r.patched;
+            break;
+        }
+    }
+    if (!code.empty()) {
+        // Made without g_resolveM: CreatePixelShader goes through the hooks to OnPixelShaderMade, which takes it (a
+        // second lock on this thread throws).
+        const float zero[4] = {};
+        std::vector<uint8_t> out;
+        const int n = dxbc::ReplaceImmediate4(code.data(), code.size(), kTaaMotion, zero, out);
+        ID3D11Device* dev = nullptr;
+        c->GetDevice(&dev);
+        ID3D11PixelShader* made = nullptr;
+        if (n != 1 || !dev || FAILED(dev->CreatePixelShader(out.data(), out.size(), nullptr, &made))) made = nullptr;
+        if (dev) dev->Release();
+        {
+            std::lock_guard lock(g_resolveM);
+            for (auto& r : g_resolveCode) {
+                if (r.ps != ps) continue;
+                if (!r.patched) {
+                    r.patched = made;
+                    r.failed = !made;
+                    made = nullptr;
+                }
+                patched = r.patched;
+                break;
+            }
+        }
+        if (made) made->Release();  // the engine shader went meanwhile
+        Log("TAA views: focus TAA resolve that keeps its history while the image moves: %s",
+            patched ? "made" : n == 1 ? "shader not made" : "motion constant not found once");
+    }
+    if (!patched) {
+        ps->Release();
+        return;  // not the known resolve shader, or its copy failed
+    }
+    c->PSSetShader(patched, nullptr, 0);
+    g_psRestore = ps;  // keeps the reference until AfterDraw
+    g_motionFixed.fetch_add(1, std::memory_order_relaxed);
+}
+
 void FixDraw(ID3D11DeviceContext* c) {
     UINT w = 0, h = 0;
     const int kind = TaaKind(c, w, h);
@@ -676,6 +763,7 @@ void FixDraw(ID3D11DeviceContext* c) {
     g_fx.num = num;
     c->PSSetConstantBuffers(0, 1, &g_fx.cb);
     g_fixed[kind].fetch_add(1, std::memory_order_relaxed);
+    if (kind == 0) SwapResolveShader(c);
     for (auto& l : g_fixLogged) {
         if (l[0] == (uint32_t)kind + 1 && l[1] == w && l[2] == h) break;
         if (l[0]) continue;
@@ -763,11 +851,17 @@ bool OnDraw(ID3D11DeviceContext* c, bool indexed, UINT count) {
         if (fixing && indexed && count == 6) Protect("viewportScale fix", [&] { FixDraw(c); });
     }
     if (fixing && g_velBound && g_pf.on) Protect("object velocity fix", [&] { FixObjectVelocity(c); });
-    return g_fx.restore || g_fx.restore12;
+    return g_fx.restore || g_fx.restore12 || g_psRestore;
 }
 
 void AfterDraw(ID3D11DeviceContext* c) {
     (void)c;
+    if (g_psRestore)
+        Protect("resolve shader restore", [&] {
+            g_fx.c1->PSSetShader(g_psRestore, nullptr, 0);
+            g_psRestore->Release();
+            g_psRestore = nullptr;
+        });
     if (g_fx.restore)
         Protect("viewportScale restore", [&] {
             g_fx.c1->PSSetConstantBuffers1(0, 1, &g_fx.buf, &g_fx.first, &g_fx.num);
@@ -806,6 +900,45 @@ void TestSetPrevFocus(const float proj[16], const float viewProj[16]) {
 
 uint64_t TestObjectDraws() { return g_objFixed.load(); }
 
+void OnPixelShaderMade(ID3D11PixelShader* ps, const void* code, size_t len) {
+    if (!ps || !code) return;
+    // The TAA resolve: its motion constant (as an immediate operand) and the name of cameraRotationFactor.
+    const uint8_t* b = (const uint8_t*)code;
+    uint8_t pat[20];
+    const uint32_t tok = 0x00004002u;
+    memcpy(pat, &tok, 4);
+    memcpy(pat + 4, kTaaMotion, 16);
+    static const char kName[] = "cameraRotationFactor";
+    const bool resolve = std::search(b, b + len, pat, pat + 20) != b + len &&
+                         std::search(b, b + len, kName, kName + sizeof(kName) - 1) != b + len;
+    std::lock_guard lock(g_resolveM);
+    for (auto& r : g_resolveCode)
+        if (r.ps == ps) {  // a new shader at the address of a released one
+            if (r.patched) r.patched->Release();
+            r = ResolveCode{};
+        }
+    if (!resolve) return;
+    ResolveCode* slot = nullptr;
+    for (auto& r : g_resolveCode)
+        if (!r.ps) {
+            slot = &r;
+            break;
+        }
+    if (!slot) {
+        Log("TAA views: a fifth TAA resolve pixel shader (%p): the focus views keep the game's history weight there",
+            (void*)ps);
+        return;
+    }
+    slot->ps = ps;
+    slot->code.assign(b, b + len);
+    Log("TAA views: the game made its TAA resolve pixel shader (%p, %zu bytes)", (void*)ps, len);
+}
+
+void SetMotionFix(bool on) { g_motionFix = on; }
+bool GetMotionFix() { return g_motionFix.load(); }
+void TestSetGroup(int group) { g_group = group; }
+uint64_t TestMotionFixed() { return g_motionFixed.load(); }
+
 void TestEnableFix(ID3D11DeviceContext* c, bool on) {
     g_testCtx = c;
     g_fixOn = on;
@@ -832,8 +965,10 @@ void LogStats(bool totals) {
     g_tot.late += g_st.late;
     const Stats& s = totals ? g_tot : g_st;
     Log("TAA views%s: viewportScale fix: %llu resolve and %llu locks draws so far; focus object velocity draws with "
-        "the focus view's previous matrices %llu", totals ? " (session total)" : "", (unsigned long long)g_fixed[0].load(),
-        (unsigned long long)g_fixed[1].load(), (unsigned long long)g_objFixed.load());
+        "the focus view's previous matrices %llu; focus resolves keeping the history while the image moves %llu (%s)",
+        totals ? " (session total)" : "", (unsigned long long)g_fixed[0].load(), (unsigned long long)g_fixed[1].load(),
+        (unsigned long long)g_objFixed.load(), (unsigned long long)g_motionFixed.load(),
+        g_motionFix.load() ? "on" : "off");
     if (s.swaps[0] || s.swaps[1] || s.noCopies || s.changed || s.late)
         Log("TAA views stats%s: own TAA state in focus L/R groups %llu/%llu (slot 2 matrices updated in %llu/%llu), "
             "groups without copies %llu, fields changed by the engine %llu, late restores %llu",

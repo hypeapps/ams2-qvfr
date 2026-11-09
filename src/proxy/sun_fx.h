@@ -17,6 +17,7 @@
 
 #include <d3d11.h>
 
+#include <cstdint>
 #include <string>
 
 namespace qvfr::sunfx {
@@ -41,6 +42,23 @@ using DrawReplaceFn = bool (*)(ID3D11DeviceContext* c, UINT count);
 using InsideFn = bool (*)();
 using AfterFn = void (*)(ID3D11DeviceContext* c);
 bool SetDrawReplace(DrawReplaceFn replace, InsideFn inside, AfterFn after);
+
+// MVR pixel shader patch (mvr_ps.h): one hook per D3D11 function, so the game's pixel shaders made through this module's
+// CreatePixelShader hook go through create(..., original, caller) instead of the original function (`caller`: the
+// return address of the game's call). False: the hook is not in place.
+using CreatePsFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, const void*, SIZE_T, ID3D11ClassLinkage*,
+                                               ID3D11PixelShader**);
+using CreatePsFilterFn = HRESULT (*)(ID3D11Device* dev, const void* code, SIZE_T len, ID3D11ClassLinkage* link,
+                                     ID3D11PixelShader** out, CreatePsFn original, uintptr_t caller);
+bool SetCreatePsFilter(CreatePsFilterFn create);
+
+// O1 step 3 (MVR draws): the pixel shader bound on `c` without PSGetShader when this module's PSSetShader hook saw the
+// immediate context's latest set since the latest NewPsEpoch (else read back once and kept for the epoch). Not
+// referenced: valid while bound. Render thread. MVR starts an epoch at each pass's begin: a state change the hook does
+// not see (DLSS's SwapDeviceContextState back) never runs inside a pass.
+void NewPsEpoch();
+ID3D11PixelShader* CurrentPs(ID3D11DeviceContext* c);
+uint64_t PsReads();  // CurrentPs calls that read the shader back, so far
 
 std::string Describe();      // one part of the summary line
 void LogStats(bool totals);  // a stats line, with the session totals at the end

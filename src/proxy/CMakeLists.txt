@@ -36,10 +36,51 @@ add_custom_command(
   DEPENDS ${QVFR_DLAA_HLSL}
   COMMENT "fxc dlaa.hlsl"
   VERBATIM)
+set(QVFR_MVRPASS_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/shaders/mvr_pass.hlsl)
+add_custom_command(
+  OUTPUT ${QVFR_SHADER_OUT}/mvr_pass_vs.h ${QVFR_SHADER_OUT}/mvr_pass_depth_ps.h ${QVFR_SHADER_OUT}/mvr_pass_mask_ps.h
+         ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ps.h ${QVFR_SHADER_OUT}/mvr_pass_blit_ps.h
+         ${QVFR_SHADER_OUT}/mvr_pass_color_in_ms_ps.h ${QVFR_SHADER_OUT}/mvr_pass_color_out_ms_ps.h
+         ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ms_ps.h ${QVFR_SHADER_OUT}/mvr_pass_depth_ms_ps.h
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${QVFR_SHADER_OUT}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T vs_5_0 /E VSMain /Vn kMvrPassVS
+          /Fh ${QVFR_SHADER_OUT}/mvr_pass_vs.h ${QVFR_MVRPASS_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T ps_5_0 /E PSDepth /Vn kMvrPassDepthPS
+          /Fh ${QVFR_SHADER_OUT}/mvr_pass_depth_ps.h ${QVFR_MVRPASS_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T ps_5_0 /E PSMask /Vn kMvrPassMaskPS
+          /Fh ${QVFR_SHADER_OUT}/mvr_pass_mask_ps.h ${QVFR_MVRPASS_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T ps_5_0 /E PSDepthIn /Vn kMvrPassDepthInPS
+          /Fh ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ps.h ${QVFR_MVRPASS_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T ps_5_0 /E PSBlit /Vn kMvrPassBlitPS
+          /Fh ${QVFR_SHADER_OUT}/mvr_pass_blit_ps.h ${QVFR_MVRPASS_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T ps_5_0 /E PSColorInMs /Vn kMvrPassColorInMsPS
+          /Fh ${QVFR_SHADER_OUT}/mvr_pass_color_in_ms_ps.h ${QVFR_MVRPASS_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T ps_5_0 /E PSColorOutMs /Vn kMvrPassColorOutMsPS
+          /Fh ${QVFR_SHADER_OUT}/mvr_pass_color_out_ms_ps.h ${QVFR_MVRPASS_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T ps_5_0 /E PSDepthInMs /Vn kMvrPassDepthInMsPS
+          /Fh ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ms_ps.h ${QVFR_MVRPASS_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T ps_5_0 /E PSDepthMs /Vn kMvrPassDepthMsPS
+          /Fh ${QVFR_SHADER_OUT}/mvr_pass_depth_ms_ps.h ${QVFR_MVRPASS_HLSL}
+  DEPENDS ${QVFR_MVRPASS_HLSL}
+  COMMENT "fxc mvr_pass.hlsl"
+  VERBATIM)
+set(QVFR_MVRMOTION_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/shaders/mvr_motion.hlsl)
+add_custom_command(
+  OUTPUT ${QVFR_SHADER_OUT}/mvr_motion_cs.h
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${QVFR_SHADER_OUT}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSFocusMotion /Vn kMvrMotionCS
+          /Fh ${QVFR_SHADER_OUT}/mvr_motion_cs.h ${QVFR_MVRMOTION_HLSL}
+  DEPENDS ${QVFR_MVRMOTION_HLSL}
+  COMMENT "fxc mvr_motion.hlsl"
+  VERBATIM)
 # Linking this target gives the include directory and builds the headers first (proxy and smoke test).
 add_library(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT}/compose_vs.h ${QVFR_SHADER_OUT}/compose_ps.h
             ${QVFR_SHADER_OUT}/sun_fx_vs.h ${QVFR_SHADER_OUT}/sun_fx_ps.h ${QVFR_SHADER_OUT}/dlaa_mask_cs.h
-            ${QVFR_SHADER_OUT}/dlaa_cockpit_cs.h)
+            ${QVFR_SHADER_OUT}/dlaa_cockpit_cs.h ${QVFR_SHADER_OUT}/mvr_pass_vs.h ${QVFR_SHADER_OUT}/mvr_pass_depth_ps.h
+            ${QVFR_SHADER_OUT}/mvr_pass_mask_ps.h ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ps.h
+            ${QVFR_SHADER_OUT}/mvr_pass_blit_ps.h ${QVFR_SHADER_OUT}/mvr_pass_color_in_ms_ps.h
+            ${QVFR_SHADER_OUT}/mvr_pass_color_out_ms_ps.h ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ms_ps.h
+            ${QVFR_SHADER_OUT}/mvr_pass_depth_ms_ps.h ${QVFR_SHADER_OUT}/mvr_motion_cs.h)
 target_include_directories(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT})
 
 enable_language(ASM_MASM)  # export thunks (generated/thunks.asm)
@@ -52,11 +93,13 @@ add_library(qvfr_proxy SHARED
   experiment.cpp
   focus_geometry.cpp
   focus_cull.cpp
+  fwd_rec.cpp
   compose.cpp
   gpu.cpp
   callers.cpp
   clones.cpp
   hooks.cpp
+  hook_prof.cpp
   probe.cpp
   quad.cpp
   shots.cpp
@@ -67,10 +110,14 @@ add_library(qvfr_proxy SHARED
   xr_layer.cpp
   sysinfo.cpp
   sun_fx.cpp
+  mvr_ps.cpp
+  mvr_vs.cpp
+  mvr_pass.cpp
+  mvr_motion.cpp
   taa_views.cpp
   common.cpp
 )
-target_link_libraries(qvfr_proxy PRIVATE qvfr_shaders openvr_0912 openxr_headers minhook bcrypt version psapi shell32 ole32 windowscodecs)
+target_link_libraries(qvfr_proxy PRIVATE qvfr_shaders qvfr_dxbc nvapi openvr_0912 openxr_headers minhook bcrypt version psapi shell32 ole32 windowscodecs)
 target_compile_definitions(qvfr_proxy PRIVATE VR_API_EXPORT)
 # /EHa instead of the default /EHsc: an SEH fault caught by Guarded/Safe then unwinds C++ objects (lock_guard),
 # so no mutex stays locked after a fault in our code. Directory scope: only this target is built here.

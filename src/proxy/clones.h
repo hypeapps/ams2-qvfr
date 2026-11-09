@@ -52,12 +52,85 @@ void OnOMSetRenderTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView
                           ID3D11DepthStencilView* dsv, void* caller);
 // The engine's texture behind a clone, or `res` itself (a group's output may be the clone of a Submit texture).
 void* Original(void* res);
+// Render thread (MVR gate B8): the clone of the engine's texture `res` in `set` (not referenced; valid until the next
+// frame start), null when it has none or the clones are not ready.
+ID3D11Texture2D* CloneOf(ID3D11Resource* res, Set set);
+// Render thread: a group of `set` runs now with its clones in the engine objects.
+bool SwappedIn(Set set);
+// Focus R's own clones (MVR gate B9d). Focus L and R share one set of clones; a focus clone that outer's groups write
+// for an eye before the focus groups run (the early SSAO and lights, the live forward pass) gets a second texture, the
+// twin, for focus R. While eye 1 is chosen, focus's swap, CloneOf(…, Focus) and the bind fix give the twin in its place
+// (clones without a twin stay shared). Original() of a twin is the engine's texture.
+// Render thread, at the start of each eye group: the focus eye of the work that follows (0 L, 1 R).
+void SetFocusEye(int eye);
+// Render thread: `original`'s focus clone gets a twin at the next frame start (no-op without a focus clone).
+void WantTwin(ID3D11Resource* original);
+// Render thread: `original`'s focus clone has its twin now.
+bool HasTwin(ID3D11Resource* original);
+// MVR gate B17 (docs/mvr.md): two-slice arrays in place of the engine's own textures. mvr_pass asks for the targets of
+// outer's G-buffer pass (B12: and the multisampled ones of its forward pass, the arrays then multisampled too); at the
+// next frame start each listed texture whose object still holds it gets a Texture2DArray
+// of 2 slices with its description (a depth format also with a shader view bind), slice 0 starting with its contents.
+// The array and views like the engine's on it (a TEXTURE2D view of an array is slice 0) go into the texture object's
+// fields and the render targets' view arrays, so the engine draws and reads slice 0 itself and MVR's view 1 needs no
+// copy back. The engine's own texture and views stay alive: a hooked call that still reaches them (a view kept outside
+// the objects) goes to the array (a view made on it when needed), and CopyResource between an array and a single
+// texture (or two arrays) copies slice 0 only. Before the engine destroys an object, at a new game size, at VR_Shutdown
+// and on a fault the engine's own values go back. Made arrays drop the clones once: they are made again from the new
+// views (single textures as before). Render thread.
+// B12 step 5 (docs/mvr.md, [debug] mvr_ms_slices): `slices` 3 for the forward pass's multisampled targets. The focus
+// clone of a three-slice array is then the array itself: focus L's swapped fields and translated views see slice 1,
+// focus R's (its twin) slice 2, in the focus clones' size (the engine's size fields and the viewport check say focus's
+// size; the corner at the top left). No texture of its own, nothing copied when the twin is made.
+void WantArray(ID3D11Resource* original, UINT slices = 2);
+// Any thread, lock-free: `res` is one of these arrays.
+bool IsArray(ID3D11Resource* res);
+// Render thread: the slice of `original`'s array that focus's work of `eye` uses as its clone (1 focus L, 2 focus R
+// with its twin, 1 for focus R before its twin is made), 0 when the focus clone is a texture of its own (or none).
+// w, h: focus's size of the slice clone (when not null and the result is not 0).
+int FocusSlice(ID3D11Resource* original, int eye, uint32_t* w = nullptr, uint32_t* h = nullptr);
+// Any thread: changes whenever the clones are dropped (views kept on old clones would keep them alive).
+uint32_t Generation();
+// Render thread: while one lives, this thread's D3D11 calls pass the clones' hooks as they are (no bind fix, not
+// observed). The MVR forward test (gate B9c) copies focus's clones inside outer's group, where the bind fix would put
+// the originals in their place.
+class RawScope {
+public:
+    RawScope();
+    ~RawScope();
+    RawScope(const RawScope&) = delete;
+    RawScope& operator=(const RawScope&) = delete;
+
+private:
+    bool prev_;
+};
+// Render thread: the clones are made, wanted in this frame and their list unchanged (a group of a set with clones
+// would get them now). MVR forward step 1 swaps focus's in inside outer's group only then (not while learning).
+bool IsReady();
 // For a shot: up to `max` clones of `set` (not referenced; valid until the next frame start) with a label each
 // ("<set>_NN_<w>x<h>_f<format>_<role>", NN as in the list order of the log). Returns the count.
 int ListForShot(Set set, ID3D11Resource** out, char (*labels)[64], int max);
 
 std::string Describe();      // one part of the summary line
 void LogStats(bool totals);  // a stats line, with the session totals at the end
+// O1 ([debug] clones_map_cache, live): binds whose views all mapped to themselves since the latest change of the maps
+// skip the lock (a cache on the render thread).
+void SetMapCache(bool on);
+bool GetMapCache();
+// O1: PSSetShaderResources calls on the immediate context that reach slot kPsWatchSlot or above (any caller, the
+// proxy's own too), counted: mvr_pass binds its t21..t26 (mvrps::kTexBase) again only when they may have changed.
+constexpr UINT kPsWatchSlot = 21;
+uint32_t PsHighSlotsGen();
+// O1 step 3: the view at PS slot `slot` of context `c` without PSGetShaderResources when the PSSetShaderResources hook
+// saw that slot's latest bind on the immediate context since the latest NewPsViewEpoch (else read back once and kept for
+// the epoch). Not referenced: valid while bound. Render thread. A new epoch at each MVR pass's begin covers any state
+// change the hook does not see (SwapDeviceContextState of DLSS, ClearState), none of which runs inside a pass.
+void NewPsViewEpoch();
+ID3D11ShaderResourceView* PsView(ID3D11DeviceContext* c, UINT slot);
+uint64_t PsViewReads();  // PsView calls that read the slot back, so far
+// qvfr_proxy_smoke --clones: the map cache's binds without and with the lock so far; true while a group watches
+// (learning or proof: no cache).
+bool TestMapCache(uint64_t& hits, uint64_t& locked);
 void Shutdown();             // VR_Shutdown: originals back, clones released, lists cleared (hooks stay)
 
 // qvfr_proxy_smoke --clones: fake engine objects without the engine hooks.
@@ -71,6 +144,9 @@ struct TestState {
     bool swapped = false;
     uint64_t cloneUses = 0, leaks = 0, translated = 0, viewportsFixed = 0, viewportMismatches = 0;
     uint64_t bindsToClone = 0, bindsToOriginal = 0, lazyViews = 0;
+    int twins = 0, twinViews = 0;
+    int arrays = 0;  // B17
+    uint64_t arrayFixes = 0, arrayLazy = 0, arrayCopies = 0;
 };
 TestState TestGet();
 

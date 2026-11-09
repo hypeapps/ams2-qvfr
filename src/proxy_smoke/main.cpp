@@ -33,6 +33,22 @@
 //   --sun-fx                          without SteamVR and without the proxy DLL: the proxy's sun effects module (outer's
 //                                     effect draws repeated into its accumulation, focus's replaced by the pass, at an
 //                                     effect draw and at the anchor, module off) on a D3D11 device (sun_fx_smoke.cpp)
+//   --mvr-vs                          without SteamVR and without the proxy DLL: the proxy's MVR vertex shader patch
+//                                     (hook, NVAPI creation, image unchanged with MVR off, view 1 with MVR on, refusal)
+//                                     on an NVIDIA D3D11 device (mvr_vs_smoke.cpp)
+//   --mvr-ps                          without SteamVR and without the proxy DLL: the proxy's MVR pixel shader patch
+//                                     (through the sun effects hook, kinds, image unchanged, refusal, layered GS count)
+//                                     on an NVIDIA D3D11 device (mvr_ps_smoke.cpp)
+//   --mvr-pass                        without SteamVR and without the proxy DLL: gate B7's test run (a fake task run
+//                                     once more with MVR into two-slice copies, view 1 = the focus window in the corner
+//                                     of slice 1 against the focus projection) on an NVIDIA D3D11 device
+//                                     (mvr_pass_smoke.cpp)
+//   --mvr-forward                     without SteamVR and without the proxy DLL: gate B9c's forward test (a fake
+//                                     CPhase3Render with MVR, view 1 against focus's own forward pass; the patched VS
+//                                     and PS, the copy-in of focus's clones) on an NVIDIA D3D11 device
+//                                     (mvr_forward_smoke.cpp)
+//   --mvr-motion                      without SteamVR and without the proxy DLL: the focus motion vectors from outer's
+//                                     (B10) against a clip-space reference on a D3D11 device (mvr_motion_smoke.cpp)
 //   --xr-layer                        without SteamVR: the proxy DLL as an OpenXR API layer between a fake loader and a
 //                                     fake runtime (extension, gaze set in attach and sync, own sync, gaze, 2 sessions)
 //   --openxr-path                     [runtime] path=openxr with the Valve DLL as the backend: loader environment,
@@ -65,9 +81,16 @@
 #include "compose.h"
 
 int RunSunFx();  // sun_fx_smoke.cpp
+int RunMvrVs();  // mvr_vs_smoke.cpp
+int RunMvrPs();  // mvr_ps_smoke.cpp
+int RunMvrPass();  // mvr_pass_smoke.cpp
+int RunMvrForward();  // mvr_forward_smoke.cpp
 int RunTaaFix();  // taa_fix_smoke.cpp
+int RunMvrMotion();  // mvr_motion_smoke.cpp
 #include "focus_cull.h"
 #include "focus_geometry.h"
+#include "fwd_rec.h"
+#include "hook_prof.h"
 #include "hooks.h"
 #include "shots.h"
 #include "xr_smoke.h"
@@ -1205,6 +1228,102 @@ int RunClones() {
     expect(boundRtv == rtvA, "bound RTV translated back");
     if (boundRtv) boundRtv->Release();
     ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    // Focus R's twins (MVR B9d): A's focus clone gets a twin at the next frame start, with a twin of each focus view of
+    // the clone; with eye 1 focus's swap, CloneOf and the bind fix give the twin (B stays shared), with eye 0 the clone.
+    cl::WantTwin(texA);
+    expect(!cl::HasTwin(texA), "no twin before the frame start");
+    cl::OnFrameStart(ctx, true);
+    st = cl::TestGet();
+    expect(cl::HasTwin(texA) && !cl::HasTwin(texB) && st.twins == 1 && st.twinViews == 5,
+           "A's twin with 5 views (SRV and RTV fields, the render target's two arrays, view X)");
+    cl::SetFocusEye(1);
+    ID3D11Texture2D* twinA = cl::CloneOf(texA, cl::Focus);
+    expect(twinA && twinA != cloneA && size(twinA) == size(cloneA) && cl::CloneOf(texB, cl::Focus) == cloneB,
+           "eye 1: CloneOf gives A's twin and B's shared clone");
+    expect(cl::Original(twinA) == texA, "Original() of a twin");
+    expect(twinA && pixel(twinA) == pixel(cloneA), "the twin starts with the clone's contents");
+    cl::BeginGroup(ctx, cl::Focus);
+    ID3D11ShaderResourceView* twinSrvA = A.at<ID3D11ShaderResourceView*>(0x70);
+    expect(A.at<void*>(0x58) == twinA && twinSrvA != cloneSrvA && twinSrvA != srvA && B.at<void*>(0x58) == cloneB &&
+               arr78[0] != rtvA2 && A.at<uint16_t>(0x68) == 32,
+           "eye 1 swap: A's twin and its views in the fields, B's shared clone");
+    ctx->ClearRenderTargetView((ID3D11RenderTargetView*)arr78[0], red);
+    ID3D11RenderTargetView* mappedR[8] = {};
+    ID3D11DepthStencilView* mappedDsvR = nullptr;
+    cl::MapTargets(ctx, 1, &rtvX, nullptr, mappedR, &mappedDsvR, nullptr);
+    ID3D11Resource* mappedResR = nullptr;
+    if (mappedR[0]) mappedR[0]->GetResource(&mappedResR);
+    expect(twinA && mappedResR == twinA, "eye 1: a view kept outside the fields goes to the twin");
+    if (mappedResR) mappedResR->Release();
+    cl::EndGroup(ctx);
+    expect(A.at<void*>(0x58) == texA && A.at<void*>(0x70) == srvA && arr78[0] == rtvA2 && B.at<void*>(0x58) == texB,
+           "originals back after the eye 1 group");
+    expect(twinA && pixel(twinA) == 0xFF0000FFu && pixel(cloneA) == 0xFF00FF00u,
+           "eye 1 wrote the twin (red), the clone kept eye 0's (green)");
+    cl::SetFocusEye(0);
+    expect(cl::CloneOf(texA, cl::Focus) == cloneA, "eye 0: CloneOf gives the shared clone");
+    cl::BeginGroup(ctx, cl::Focus);
+    expect(A.at<void*>(0x58) == cloneA && A.at<void*>(0x70) == cloneSrvA, "eye 0 swap: the shared clone");
+    cl::EndGroup(ctx);
+    cl::BeginGroup(ctx, cl::Outer);
+    ctx->PSSetShaderResources(0, 1, &twinSrvA);
+    back = nullptr;
+    ctx->PSGetShaderResources(0, 1, &back);
+    expect(back == srvA, "a twin's view bound in an outer group goes back to the original");
+    if (back) back->Release();
+    cl::EndGroup(ctx);
+    ctx->PSSetShaderResources(0, 2, none);
+    // O1 map cache (after the proof groups): in a focus group C's view (no clone) bound twice, the second time without the lock; then A's
+    // original view with C's (translated: never from the cache) and C's again (from the cache).
+    {
+        uint64_t h0 = 0, m0 = 0, h1 = 0, m1 = 0;
+        bool watching = true;
+        for (int g = 0; g < 400 && watching; ++g) {  // past the proof groups (240)
+            if (g % 2 == 0) cl::OnFrameStart(ctx, true);
+            cl::BeginGroup(ctx, cl::Focus);
+            watching = cl::TestMapCache(h0, m0);
+            if (watching) cl::EndGroup(ctx);
+        }
+        ID3D11ShaderResourceView* cv[1] = {srvC};
+        ctx->PSSetShaderResources(1, 1, cv);
+        ctx->PSSetShaderResources(1, 1, cv);
+        ID3D11ShaderResourceView* av[2] = {srvA, srvC};
+        ctx->PSSetShaderResources(0, 2, av);
+        ID3D11ShaderResourceView* got[2] = {};
+        ctx->PSGetShaderResources(0, 2, got);
+        const bool translated = got[0] == A.at<ID3D11ShaderResourceView*>(0x70) && got[1] == srvC;
+        for (auto* g : got)
+            if (g) g->Release();
+        ctx->PSSetShaderResources(1, 1, cv);
+        cl::TestMapCache(h1, m1);
+        // O1 step 3: PsView in a new epoch: slot 1 bound since (the hook's view, no read-back), slot 0 bound before
+        // (read back once, then kept), both as PSGetShaderResources gives them.
+        {
+            cl::NewPsViewEpoch();
+            ctx->PSSetShaderResources(1, 1, cv);
+            const uint64_t r0 = cl::PsViewReads();
+            ID3D11ShaderResourceView* v1 = cl::PsView(ctx, 1);
+            const uint64_t r1 = cl::PsViewReads();
+            ID3D11ShaderResourceView* v0 = cl::PsView(ctx, 0);
+            ID3D11ShaderResourceView* v0b = cl::PsView(ctx, 0);
+            const uint64_t r2 = cl::PsViewReads();
+            ID3D11ShaderResourceView* real[2] = {};
+            ctx->PSGetShaderResources(0, 2, real);
+            expect(v1 == real[1] && v0 == real[0] && v0b == v0 && v0 && v1 && r1 == r0 && r2 == r1 + 1,
+                   "PsView: the hook's view of slot 1, slot 0 read back once");
+            printf("Clones PsView: slot 1 %s (read back %llu), slot 0 %s (read back %llu)\n",
+                   v1 == real[1] ? "ok" : "WRONG", (unsigned long long)(r1 - r0), v0 == real[0] ? "ok" : "WRONG",
+                   (unsigned long long)(r2 - r1));
+            for (auto* r : real)
+                if (r) r->Release();
+        }
+        cl::EndGroup(ctx);
+        expect(translated, "map cache: A's original view still translated to its clone");
+        expect(watching || (h1 - h0 == 2 && m1 - m0 == 2),
+               "map cache: C's view bound again without the lock (2 of 4 binds), A's through the lock");
+        printf("Clones map cache: %s group, binds without the lock %llu, locked %llu\n", watching ? "watching" : "plain",
+               (unsigned long long)(h1 - h0), (unsigned long long)(m1 - m0));
+    }
     // An object destroyed inside a focus group gets its originals back at once; the list is watched again.
     cl::OnFrameStart(ctx, true);
     cl::BeginGroup(ctx, cl::Focus);
@@ -1278,9 +1397,258 @@ int RunClones() {
     expect(!cl::TestGet().swapped && P.at<void*>(0x58) == texP, "focus group at the game size: no swap");
     cl::EndGroup(ctx);
     cl::Shutdown();
-    printf("Clones check %s: %d wrong (focus smaller %d, outer smaller %d); %d translations, original pixel 0x%08X, "
-           "clone pixel 0x%08X\n",
-           bad ? "FAILED" : "OK", bad, bad1, bad - bad1, translated1, pxA, pxClone);
+    const int bad2 = bad;
+
+    // Scenario 3 (MVR B17): a two-slice array in place of an engine texture. G: eye size, written by outer and focus,
+    // its SRV at +0x70 and RTV at +0x80, a second RTV in a render target's array, a view X the engine keeps elsewhere.
+    for (int k = 0; k < 4; ++k) {
+        devSize(k)[0] = devInit[k][0];
+        devSize(k)[1] = devInit[k][1];
+        devDirty(k) = 0;
+    }
+    post.at<int32_t>(0x100) = 64;
+    post.at<int32_t>(0x104) = 48;
+    cl::SetSizes(64, 48, 64, 48, 32, 24);
+    ID3D11Texture2D* texG = tex(64, 48);
+    ID3D11ShaderResourceView* srvG = srv(texG);
+    ID3D11RenderTargetView *rtvG = rtv(texG), *rtvG2 = rtv(texG), *rtvGX = rtv(texG);
+    static const char* const names3[] = {"Fake G", "Fake RT G"};
+    FakeObj G, RG;
+    G.at<void*>(0x58) = texG;
+    G.at<void*>(0x70) = srvG;
+    G.at<void*>(0x80) = rtvG;
+    G.at<const char*>(0xf0) = names3[0];
+    G.at<uint16_t>(0x68) = 64;
+    G.at<uint16_t>(0x6a) = 48;
+    void* arrG[1] = {rtvG2};
+    RG.at<uint16_t>(0x24) = 64;
+    RG.at<uint16_t>(0x26) = 48;
+    RG.at<uint16_t>(0x66) = 1;
+    RG.at<void**>(0x78) = arrG;
+    RG.at<const char*>(0xb8) = names3[1];
+    cl::TestRegister(false, &G);
+    cl::TestRegister(true, &RG);
+    for (int f = 0; f < 17; ++f) {
+        cl::OnFrameStart(ctx, true);
+        if (f == 16) break;
+        cl::BeginGroup(ctx, cl::Outer);
+        ctx->ClearRenderTargetView(rtvG, green);
+        cl::EndGroup(ctx);
+        cl::BeginGroup(ctx, cl::Focus);
+        ctx->ClearRenderTargetView(G.at<ID3D11RenderTargetView*>(0x80), blue);
+        cl::EndGroup(ctx);
+    }
+    st = cl::TestGet();
+    expect(st.phase == 2 && st.clones[1] == 1, "B17: ready with G's focus clone");
+    ctx->ClearRenderTargetView(rtvG, red);  // the contents slice 0 starts with
+    auto arraySize = [](ID3D11Texture2D* t) {
+        D3D11_TEXTURE2D_DESC d{};
+        if (t) t->GetDesc(&d);
+        return d.ArraySize;
+    };
+    auto resOf = [](void* v) {
+        ID3D11Resource* r = nullptr;
+        static_cast<ID3D11View*>(v)->GetResource(&r);
+        if (r) r->Release();
+        return (void*)r;
+    };
+    cl::WantArray(texG);
+    expect(!cl::IsArray(G.at<ID3D11Resource*>(0x58)), "B17: no array before the frame start");
+    cl::OnFrameStart(ctx, true);
+    ID3D11Texture2D* arrTex = G.at<ID3D11Texture2D*>(0x58);
+    expect(arrTex != texG && cl::IsArray(arrTex) && arraySize(arrTex) == 2 && size(arrTex) == size(texG),
+           "B17: G's texture replaced by a two-slice array of its size");
+    ID3D11ShaderResourceView* srvArr = G.at<ID3D11ShaderResourceView*>(0x70);
+    ID3D11RenderTargetView* rtvArr = G.at<ID3D11RenderTargetView*>(0x80);
+    expect(srvArr != srvG && rtvArr != rtvG && arrG[0] != rtvG2 && resOf(srvArr) == arrTex && resOf(rtvArr) == arrTex &&
+               resOf(arrG[0]) == arrTex,
+           "B17: the field views and the render target's view are views of the array");
+    D3D11_RENDER_TARGET_VIEW_DESC rvd{};
+    rtvArr->GetDesc(&rvd);
+    expect(rvd.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D, "B17: the array's views keep the engine's TEXTURE2D");
+    expect(pixel(arrTex) == 0xFF0000FFu, "B17: slice 0 starts with the texture's contents (red)");
+    st = cl::TestGet();
+    ID3D11Texture2D* cloneG = cl::CloneOf(arrTex, cl::Focus);
+    expect(st.arrays == 1 && st.phase == 2 && st.clones[1] == 1 && cloneG && arraySize(cloneG) == 1 &&
+               size(cloneG) == std::make_pair(32u, 24u),
+           "B17: one array, focus's clone made again (single, 32 x 24)");
+    // Outside the groups: a clear through view X goes to slice 0 of the array; the old texture keeps red.
+    ctx->ClearRenderTargetView(rtvGX, green);
+    uint32_t oldPx = 0;
+    {
+        cl::RawScope raw;
+        oldPx = pixel(texG);
+    }
+    expect(pixel(arrTex) == 0xFF00FF00u && oldPx == 0xFF0000FFu, "B17: a view kept elsewhere clears the array");
+    st = cl::TestGet();
+    expect(st.arrayLazy == 1 && st.arrayFixes >= 1, "B17: one view made on the array for view X");
+    // A bind of the engine's old SRV gets the array's.
+    ctx->PSSetShaderResources(0, 1, &srvG);
+    ID3D11ShaderResourceView* boundG = nullptr;
+    ctx->PSGetShaderResources(0, 1, &boundG);
+    expect(boundG == srvArr, "B17: the engine's old SRV bound as the array's");
+    if (boundG) boundG->Release();
+    ctx->PSSetShaderResources(0, 2, none);
+    // CopyResource between the array and a single texture copies slice 0.
+    ID3D11Texture2D* texS1 = tex(64, 48);
+    const uint64_t copies0 = cl::TestGet().arrayCopies;
+    ctx->CopyResource(texS1, arrTex);
+    expect(pixel(texS1) == 0xFF00FF00u && cl::TestGet().arrayCopies > copies0, "B17: CopyResource array -> single");
+    // A focus group swaps the clone in; after it the array's views are back.
+    cl::OnFrameStart(ctx, true);
+    cl::BeginGroup(ctx, cl::Focus);
+    expect(cl::TestGet().swapped && G.at<void*>(0x58) == cloneG, "B17: focus group with G's clone");
+    cl::EndGroup(ctx);
+    expect(G.at<void*>(0x58) == arrTex && G.at<void*>(0x70) == srvArr && G.at<void*>(0x80) == rtvArr &&
+               arrG[0] != rtvG2,
+           "B17: the array and its views back after the focus group");
+    // Destroyed objects get the engine's own texture and views back.
+    cl::TestDestroy(true, &RG);
+    expect(arrG[0] == rtvG2, "B17: the render target's view back at its destroy");
+    cl::TestDestroy(false, &G);
+    expect(G.at<void*>(0x58) == texG && G.at<void*>(0x70) == srvG && G.at<void*>(0x80) == rtvG,
+           "B17: G's texture and views back at its destroy");
+    cl::OnFrameStart(ctx, true);
+    st = cl::TestGet();
+    expect(st.arrays == 0 && !cl::IsArray(arrTex), "B17: no array left");
+    cl::Shutdown();
+    const int bad3 = bad;
+
+    // Scenario 4 (MVR B12 step 5): a three-slice array whose slices 1 and 2 are focus L's and focus R's clone. H: eye
+    // size, written by outer and focus, its RTV at +0x80, a second RTV in a render target's array.
+    cl::SetSizes(64, 48, 64, 48, 32, 24);
+    ID3D11Texture2D* texH = tex(64, 48);
+    ID3D11RenderTargetView *rtvH = rtv(texH), *rtvH2 = rtv(texH);
+    static const char* const names4[] = {"Fake H", "Fake RT H"};
+    FakeObj H, RH;
+    H.at<void*>(0x58) = texH;
+    H.at<void*>(0x80) = rtvH;
+    H.at<const char*>(0xf0) = names4[0];
+    H.at<uint16_t>(0x68) = 64;
+    H.at<uint16_t>(0x6a) = 48;
+    void* arrH[1] = {rtvH2};
+    RH.at<uint16_t>(0x24) = 64;
+    RH.at<uint16_t>(0x26) = 48;
+    RH.at<uint16_t>(0x66) = 1;
+    RH.at<void**>(0x78) = arrH;
+    RH.at<const char*>(0xb8) = names4[1];
+    cl::TestRegister(false, &H);
+    cl::TestRegister(true, &RH);
+    for (int f = 0; f < 17; ++f) {
+        cl::OnFrameStart(ctx, true);
+        if (f == 16) break;
+        cl::BeginGroup(ctx, cl::Outer);
+        ctx->ClearRenderTargetView(rtvH, green);
+        cl::EndGroup(ctx);
+        cl::BeginGroup(ctx, cl::Focus);
+        ctx->ClearRenderTargetView(H.at<ID3D11RenderTargetView*>(0x80), blue);
+        cl::EndGroup(ctx);
+    }
+    expect(cl::TestGet().phase == 2 && cl::TestGet().clones[1] == 1, "slices: ready with H's focus clone");
+    cl::WantArray(texH, 3);
+    cl::OnFrameStart(ctx, true);
+    ID3D11Texture2D* arr3 = H.at<ID3D11Texture2D*>(0x58);
+    expect(arr3 != texH && cl::IsArray(arr3) && arraySize(arr3) == 3 && size(arr3) == size(texH),
+           "slices: H's texture replaced by a three-slice array of its size");
+    uint32_t sw = 0, shh = 0;
+    expect(cl::CloneOf(arr3, cl::Focus) == arr3 && cl::FocusSlice(arr3, 0, &sw, &shh) == 1 && sw == 32 && shh == 24 &&
+               cl::FocusSlice(arr3, 1) == 1,
+           "slices: focus's clone is slice 1 of the array (32 x 24), focus R shares it before its twin");
+    // Slice k's pixel (0, 0).
+    auto slicePixel = [&](ID3D11Texture2D* t, UINT k) {
+        D3D11_TEXTURE2D_DESC d{};
+        t->GetDesc(&d);
+        d.ArraySize = 1;
+        d.Usage = D3D11_USAGE_STAGING;
+        d.BindFlags = 0;
+        d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ID3D11Texture2D* s = nullptr;
+        uint32_t px = 0;
+        if (SUCCEEDED(dev->CreateTexture2D(&d, nullptr, &s))) {
+            cl::RawScope raw;
+            ctx->CopySubresourceRegion(s, 0, 0, 0, 0, t, D3D11CalcSubresource(0, k, d.MipLevels), nullptr);
+            D3D11_MAPPED_SUBRESOURCE m{};
+            if (SUCCEEDED(ctx->Map(s, 0, D3D11_MAP_READ, 0, &m))) {
+                px = *(const uint32_t*)m.pData;
+                ctx->Unmap(s, 0);
+            }
+            s->Release();
+        }
+        return px;
+    };
+    auto rtvSlice = [](void* v) {
+        D3D11_RENDER_TARGET_VIEW_DESC d{};
+        if (v) static_cast<ID3D11RenderTargetView*>(v)->GetDesc(&d);
+        return d.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY && d.Texture2DArray.ArraySize == 1
+                   ? (int)d.Texture2DArray.FirstArraySlice
+                   : -1;
+    };
+    ctx->ClearRenderTargetView(H.at<ID3D11RenderTargetView*>(0x80), green);  // slice 0 (outside the groups)
+    // The array's own view bound and a viewport of the original set before the group: slice 1 at focus's size in it.
+    ID3D11RenderTargetView* hOwn = H.at<ID3D11RenderTargetView*>(0x80);
+    ctx->OMSetRenderTargets(1, &hOwn, nullptr);
+    viewport(64, 48);
+    cl::BeginGroup(ctx, cl::Focus);
+    ID3D11RenderTargetView* hBound = nullptr;
+    ctx->OMGetRenderTargets(1, &hBound, nullptr);
+    expect(rtvSlice(hBound) == 1 && boundViewport() == std::make_pair(32.0f, 24.0f),
+           "slices: the bound view goes to slice 1, the original's viewport scaled to focus's size");
+    if (hBound) hBound->Release();
+    ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    void* hRtv = H.at<void*>(0x80);
+    expect(cl::TestGet().swapped && H.at<void*>(0x58) == arr3 && resOf(hRtv) == arr3 && rtvSlice(hRtv) == 1 &&
+               rtvSlice(arrH[0]) == 1 && H.at<uint16_t>(0x68) == 32 && RH.at<uint16_t>(0x24) == 32,
+           "slices: focus L's fields hold the array, views of slice 1 and focus's size");
+    ctx->ClearRenderTargetView((ID3D11RenderTargetView*)hRtv, blue);
+    cl::EndGroup(ctx);
+    expect(H.at<void*>(0x58) == arr3 && rtvSlice(H.at<void*>(0x80)) == -1 && H.at<uint16_t>(0x68) == 64,
+           "slices: the array's own views back after the focus group");
+    expect(slicePixel(arr3, 0) == 0xFF00FF00u && slicePixel(arr3, 1) == 0xFFFF0000u,
+           "slices: focus L's clear in slice 1, slice 0 kept");
+    // Focus R's twin: slice 2, no texture, nothing copied.
+    cl::WantTwin(arr3);
+    cl::OnFrameStart(ctx, true);
+    expect(cl::HasTwin(arr3) && cl::FocusSlice(arr3, 1) == 2 && cl::FocusSlice(arr3, 0) == 1 &&
+               cl::TestGet().twinViews == 2 && cl::TestGet().twins == 1,
+           "slices: focus R's twin is slice 2 (two views)");
+    cl::SetFocusEye(1);
+    expect(cl::CloneOf(arr3, cl::Focus) == arr3, "slices: eye 1's clone is the array too");
+    cl::BeginGroup(ctx, cl::Focus);
+    expect(rtvSlice(H.at<void*>(0x80)) == 2 && rtvSlice(arrH[0]) == 2 && H.at<uint16_t>(0x68) == 32,
+           "slices: focus R's fields hold views of slice 2");
+    ctx->ClearRenderTargetView(H.at<ID3D11RenderTargetView*>(0x80), red);
+    // A view the engine keeps elsewhere (the array's slice 0 RTV) goes to focus R's slice.
+    ID3D11RenderTargetView* mappedH[8] = {};
+    ID3D11DepthStencilView* mappedHd = nullptr;
+    ID3D11RenderTargetView* keptH = rtv(arr3);
+    const bool mappedHok = cl::MapTargets(ctx, 1, &keptH, nullptr, mappedH, &mappedHd, nullptr);
+    expect(mappedHok && rtvSlice(mappedH[0]) == 2, "slices: a view kept outside the fields goes to slice 2 for focus R");
+    cl::EndGroup(ctx);
+    cl::SetFocusEye(0);
+    expect(slicePixel(arr3, 0) == 0xFF00FF00u && slicePixel(arr3, 1) == 0xFFFF0000u &&
+               slicePixel(arr3, 2) == 0xFF0000FFu,
+           "slices: focus R's clear in slice 2, slices 0 and 1 kept");
+    // An outer group binds the array's own views (slice 0) as they are.
+    cl::BeginGroup(ctx, cl::Outer);
+    ID3D11RenderTargetView* mappedO[8] = {};
+    ID3D11DepthStencilView* mappedOd = nullptr;
+    const bool mappedOk2 = cl::MapTargets(ctx, 1, &keptH, nullptr, mappedO, &mappedOd, nullptr);
+    expect(!mappedOk2 || mappedO[0] == keptH, "slices: an outer group's bind of the array stays slice 0");
+    cl::EndGroup(ctx);
+    keptH->Release();
+    cl::TestDestroy(true, &RH);
+    cl::TestDestroy(false, &H);
+    expect(H.at<void*>(0x58) == texH && H.at<void*>(0x80) == rtvH, "slices: H's texture and views back at its destroy");
+    cl::OnFrameStart(ctx, true);
+    expect(cl::TestGet().arrays == 0 && !cl::IsArray(arr3), "slices: no array left");
+    cl::Shutdown();
+    printf("Clones check %s: %d wrong (focus smaller %d, outer smaller %d, two-slice arrays %d, three-slice arrays %d); "
+           "%d translations, original pixel 0x%08X, clone pixel 0x%08X\n",
+           bad ? "FAILED" : "OK", bad, bad1, bad2 - bad1, bad3 - bad2, bad - bad3, translated1, pxA, pxClone);
+    for (IUnknown* u : {(IUnknown*)texH, (IUnknown*)rtvH, (IUnknown*)rtvH2}) u->Release();
+    for (IUnknown* u : {(IUnknown*)texG, (IUnknown*)srvG, (IUnknown*)rtvG, (IUnknown*)rtvG2, (IUnknown*)rtvGX,
+                        (IUnknown*)texS1})
+        u->Release();
     for (IUnknown* u : {(IUnknown*)srvA, (IUnknown*)srvC, (IUnknown*)rtvA, (IUnknown*)rtvA2, (IUnknown*)rtvA3,
                         (IUnknown*)rtvD, (IUnknown*)texA, (IUnknown*)texB, (IUnknown*)texC, (IUnknown*)texD,
                         (IUnknown*)texE, (IUnknown*)rtvX, (IUnknown*)rtvP, (IUnknown*)rtvQ, (IUnknown*)rtvS, (IUnknown*)srvQ,
@@ -1306,10 +1674,16 @@ int main(int argc, char** argv) {
     bool composeTest = false;
     bool clonesTest = false;
     bool sunFxTest = false;
+    bool mvrVsTest = false;
+    bool mvrPsTest = false;
+    bool mvrPassTest = false;
+    bool mvrForwardTest = false;
     bool xrLayerTest = false;
     bool openxrPathTest = false;
     bool openxr = false;
     bool noLayer = false;
+    bool hookProfile = false;
+    std::string sequence;  // --scene: [benchmark] sequence (auto_start_s runs it), settle_s=1
     auto hasValue = [&](int i) { return i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0; };
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--scene")) scene = hasValue(i) ? atof(argv[++i]) : 12.0;
@@ -1323,9 +1697,22 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--quad-compose")) composeTest = true;
         else if (!strcmp(argv[i], "--focus-geometry")) return RunGeometry();
         else if (!strcmp(argv[i], "--focus-cull")) return RunFocusCull();
+        else if (!strcmp(argv[i], "--fwd-rec")) {
+            char text[512];
+            const bool ok = qvfr::fwdrec::SelfTest(text, sizeof(text));
+            printf("%s\n", text);
+            return ok ? 0 : 1;
+        }
         else if (!strcmp(argv[i], "--clones")) clonesTest = true;
         else if (!strcmp(argv[i], "--sun-fx")) sunFxTest = true;
         else if (!strcmp(argv[i], "--taa-fix")) return RunTaaFix();
+        else if (!strcmp(argv[i], "--mvr-motion")) return RunMvrMotion();
+        else if (!strcmp(argv[i], "--mvr-vs")) mvrVsTest = true;
+        else if (!strcmp(argv[i], "--mvr-ps")) mvrPsTest = true;
+        else if (!strcmp(argv[i], "--mvr-pass")) mvrPassTest = true;
+        else if (!strcmp(argv[i], "--mvr-forward")) mvrForwardTest = true;
+        else if (!strcmp(argv[i], "--hook-profile")) hookProfile = true;
+        else if (!strcmp(argv[i], "--sequence") && hasValue(i)) sequence = argv[++i];
         else if (!strcmp(argv[i], "--xr-layer")) xrLayerTest = true;
         else if (!strcmp(argv[i], "--openxr-path")) openxrPathTest = true;
         else if (!strcmp(argv[i], "--openxr")) openxr = true;
@@ -1344,12 +1731,39 @@ int main(int argc, char** argv) {
     SetEnvironmentVariableW(L"QVFR_HOME", home.c_str());
     if (shotsTest) return RunShots(home);
     if (composeTest) return RunCompose();
-    if (clonesTest) return RunClones();
-    if (sunFxTest) return RunSunFx();
+    // --hook-profile with one of the module tests below: the test runs with [debug] hook_profile on (this thread as outer
+    // L's group); the detours must have counted and every scope must have closed.
+    auto profiled = [&](int (*run)()) {
+        if (!hookProfile) return run();
+        qvfr::hookprof::SetOn(true);
+        qvfr::hookprof::SetGroup(0);
+        const int r = run();
+        const uint64_t calls = qvfr::hookprof::TestCalls();
+        const int depth = qvfr::hookprof::TestDepth();
+        const double groupMs[4] = {};
+        qvfr::hookprof::LogStats(groupMs);
+        qvfr::hookprof::SetGroup(-1);
+        qvfr::hookprof::SetOn(false);
+        const bool ok = calls && !depth;
+        printf("Hook profile check %s: %llu detour calls measured, scope depth after the test %d (lines in the proxy "
+               "log)\n", ok ? "OK" : "FAILED", (unsigned long long)calls, depth);
+        return r ? r : ok ? 0 : 5;
+    };
+    if (clonesTest) return profiled(RunClones);
+    if (sunFxTest) return profiled(RunSunFx);
+    if (mvrVsTest) return profiled(RunMvrVs);
+    if (mvrPsTest) return profiled(RunMvrPs);
+    if (mvrPassTest) return profiled(RunMvrPass);
+    if (mvrForwardTest) return profiled(RunMvrForward);
     if (xrLayerTest) return RunXrLayer(ExeDir() / L"proxy" / L"openvr_api.dll", home);
     if (openxrPathTest) return RunOpenXrPath(ExeDir() / L"proxy" / L"openvr_api.dll", home);
     if (FILE* f = _wfopen((home / L"qvfr.ini").c_str(), L"wb")) {
-        fputs(scene > 0 ? kSceneIni : kBackgroundIni, f);
+        std::string base = scene > 0 ? kSceneIni : kBackgroundIni;
+        if (scene > 0 && !sequence.empty()) {  // inside [benchmark]: a second section of that name would not be read
+            const std::string at = "auto_start_s=2\n";
+            base.insert(base.find(at) + at.size(), "sequence=" + sequence + "\nsettle_s=1\n");
+        }
+        fputs(base.c_str(), f);
         if (!experiment.empty()) fprintf(f, "[experiment]\nmode=%s\n%s", experiment.c_str(), center.c_str());
         if (fault > 0) fprintf(f, "[test]\nfault_frames=%d\n", fault);
         if (trace) fputs("[trace]\ncallers=1\ndepth=12\n", f);

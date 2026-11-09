@@ -27,8 +27,8 @@ bool Active();  // between Begin and End
 // Copies src (a 2D texture, one sample) into a new staging texture. Call right after the game wrote it. 8-bit and
 // R10G10B10A2 images are saved as they are; HDR and single-channel formats (R11G11B10, RGBA16F, R16, R32, R8) are
 // mapped to 8 bits (color x / (1 + x) with gamma 2.2, one channel clamped to 0..1, NaN and infinity magenta) and get a
-// line with their value range and the NaN count.
-bool Grab(ID3D11DeviceContext* ctx, ID3D11Resource* src, int index);
+// line with their value range and the NaN count. `slice`: the array slice of a texture array (mip 0).
+bool Grab(ID3D11DeviceContext* ctx, ID3D11Resource* src, int index, UINT slice = 0);
 // At least one frame after the grabs: maps the copies and hands them to the worker thread. Images that were not
 // grabbed are listed in the log.
 void End(ID3D11DeviceContext* ctx);

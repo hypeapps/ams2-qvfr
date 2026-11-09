@@ -43,6 +43,15 @@ void AfterDraw(ID3D11DeviceContext* c);
 // From quad's OMSetRenderTargets detour, after the real call: whether a velocity buffer is bound (object motion vector
 // fix in the focus groups).
 void OnSetTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv);
+// The focus views' TAA history while the image moves (taa_views.cpp, kTaaMotion: the leaves thinned out in the focus
+// area). OnPixelShaderMade from sun_fx's CreatePixelShader detour notes the game's resolve shader; the setting and its
+// hotkey switch the fix.
+void OnPixelShaderMade(ID3D11PixelShader* ps, const void* code, size_t len);
+void SetMotionFix(bool on);
+bool GetMotionFix();
+// qvfr_proxy_smoke --taa-fix: as in eye group `group` (-1: none); resolves drawn with the copy so far.
+void TestSetGroup(int group);
+uint64_t TestMotionFixed();
 // qvfr_proxy_smoke --taa-fix: the fix without the engine hooks, on the test's context.
 void TestEnableFix(ID3D11DeviceContext* c, bool on);
 uint64_t TestFixedDraws();  // resolve and locks draws fixed so far

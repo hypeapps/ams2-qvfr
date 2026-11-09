@@ -6,6 +6,7 @@
 #include <dxgi.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -19,6 +20,7 @@
 #include "dlaa.h"
 #include "experiment.h"
 #include "gpu.h"
+#include "hook_prof.h"
 #include "modern_vr.h"
 #include "quad.h"
 #include "sysinfo.h"
@@ -191,8 +193,8 @@ double g_runFramesT0 = -1, g_sessionFramesT0 = -1;
 constexpr uint64_t kGpuWait = 8;
 // GPU averages for the periodic stats line.
 struct GpuSums {
-    uint64_t frames = 0, n[gpu::kPhases] = {};
-    double frame = 0, phase[gpu::kPhases] = {};
+    uint64_t frames = 0, n[gpu::kPhases] = {}, spanN[gpu::kSpans] = {};
+    double frame = 0, phase[gpu::kPhases] = {}, span[gpu::kSpans] = {};
 } g_gpuSums;
 
 bool g_frozen = false;
@@ -207,6 +209,7 @@ struct Series {
 struct RunStats {
     Series totalGpu, preGpu, postGpu, compGpu, compCpu, proxyInterval, proxyCpu, wgpBlock;
     Series gpuFrame, gpuPhase[gpu::kPhases], gpuCompose, gpuOther;  // our timestamps (frames.csv)
+    Series gpuSpan[gpu::kSpans];  // spans inside the eye groups (summary only)
     uint64_t proxyRows = 0;
     double proxyFirstMs = -1, proxyLastMs = -1;
     uint64_t frames = 0, dropped = 0, mispresented = 0, reprojCpu = 0, reprojGpu = 0, reprojAny = 0, gazeOk = 0;
@@ -323,6 +326,8 @@ void AccumulateFrame(const ProxyFrame& p, const gpu::Result* g) {
     if (g->frameMs >= 0) r.gpuFrame.Add(g->frameMs);
     for (int k = 0; k < gpu::kPhases; ++k)
         if (g->phaseMs[k] >= 0) r.gpuPhase[k].Add(g->phaseMs[k]);
+    for (int k = 0; k < gpu::kSpans; ++k)
+        if (g->spanMs[k] >= 0) r.gpuSpan[k].Add(g->spanMs[k]);
     if (float c = ComposeMs(*g); c >= 0) r.gpuCompose.Add(c);
     if (float o = OtherMs(*g); o >= 0) r.gpuOther.Add(o);
 }
@@ -347,6 +352,11 @@ void ProcessFrames(uint64_t current) {
                 if (g.phaseMs[k] < 0) continue;
                 ++g_gpuSums.n[k];
                 g_gpuSums.phase[k] += g.phaseMs[k];
+            }
+            for (int k = 0; k < gpu::kSpans; ++k) {
+                if (g.spanMs[k] < 0) continue;
+                ++g_gpuSums.spanN[k];
+                g_gpuSums.span[k] += g.spanMs[k];
             }
         }
     }
@@ -385,7 +395,7 @@ void AccumulateRun(const modern::FrameTiming& t) {
     r.sysLast = t.systemTimeS;
 }
 
-std::string StatLine(const char* name, Series& s, float budget = 0) {
+std::string StatLine(const char* name, Series& s, float budget = 0, int digits = 2) {
     char buf[256];
     if (s.v.empty()) {
         snprintf(buf, sizeof(buf), "%-26s no data", name);
@@ -400,22 +410,53 @@ std::string StatLine(const char* name, Series& s, float budget = 0) {
         sum += x;
         if (budget > 0 && x > budget) ++over;
     }
-    int n = snprintf(buf, sizeof(buf), "%-26s avg %6.2f  p50 %6.2f  p90 %6.2f  p99 %6.2f  max %6.2f ms", name,
-                     sum / v.size(), pct(0.5), pct(0.9), pct(0.99), v.back());
+    int n = snprintf(buf, sizeof(buf), "%-26s avg %6.*f  p50 %6.*f  p90 %6.*f  p99 %6.*f  max %6.*f ms", name, digits,
+                     sum / v.size(), digits, pct(0.5), digits, pct(0.9), digits, pct(0.99), digits, v.back());
     if (budget > 0)
         snprintf(buf + n, sizeof(buf) - n, "  > %.1f ms: %.1f%%", budget, 100.0 * over / v.size());
     return buf;
 }
 
-void StartCountdown(const char* why) {
+// Benchmark sequence ([benchmark] sequence): steps run one after another from one hotkey press.
+struct SeqStep {
+    std::string label;
+    std::vector<std::pair<std::string, int>> set;  // switch, value (quad::SetSwitch)
+};
+struct SeqResult {
+    std::string label, dir;
+    bool aborted = false;
+    uint64_t frames = 0;
+    double cpu = 0, cpuP50 = 0, gpu = 0, gpuPhase[4] = {}, groupCpu[4] = {}, hooks[6] = {};
+    bool hooksOn = false;
+};
+bool g_seqOn = false;
+size_t g_seqStep = 0;
+std::vector<SeqStep> g_seq;
+std::vector<std::pair<std::string, int>> g_seqBase;  // every switch of the sequence as it was before it
+std::vector<SeqResult> g_seqRes;
+std::string g_seqStamp;
+double g_countdownS = 0;  // this countdown's length
+
+void StartCountdown(const char* why, double seconds = -1) {
     g_bench = Bench::Countdown;
     g_benchT0 = NowMs();
-    Log("Benchmark: countdown %.1f s (%s). Sit still.", Cfg().benchDelayS, why);
+    g_countdownS = seconds >= 0 ? seconds : Cfg().benchDelayS;
+    Log("Benchmark: countdown %.1f s (%s). Sit still.", g_countdownS, why);
     Beeps({{880, 120}});
 }
 
+void SeqAfterRun(bool aborted, const vr::TrackedDevicePose_t& pose);
+
+void PeriodicStats(const char* forced);
+
 void StartRun(uint32_t newestIndex) {
-    g_runDir = BenchDir() / Widen(LocalTimeStamp() + experiment::RunSuffix() + quad::RunSuffix());
+    PeriodicStats("before the benchmark");  // the counters start with the recording
+    std::string seq;
+    if (g_seqOn && g_seqStep < g_seq.size()) {
+        seq = "_s" + std::to_string(g_seqStep + 1) + "-";
+        for (char ch : g_seq[g_seqStep].label) seq += isalnum((unsigned char)ch) || ch == '-' || ch == '_' ? ch : '-';
+    }
+    g_runDir = BenchDir() / Widen(LocalTimeStamp() + experiment::RunSuffix() + quad::RunSuffix() + seq);
     std::error_code ec;
     fs::create_directories(g_runDir, ec);
     g_runCsv = _wfopen((g_runDir / L"timing.csv").c_str(), L"wb");
@@ -432,7 +473,8 @@ void StartRun(uint32_t newestIndex) {
     g_bench = Bench::Running;
     g_benchT0 = NowMs();
     if (Cfg().benchFreezePose) {
-        g_frozenPose.bPoseIsValid = false;  // OnWaitGetPosesEnd captures the pose from the current frame
+        // OnWaitGetPosesEnd captures the pose from the current frame; a sequence's later steps keep the first one's.
+        if (!(g_seqOn && g_frozen && g_frozenPose.bPoseIsValid)) g_frozenPose.bPoseIsValid = false;
         g_frozen = true;
     }
     Log("Benchmark: recording for %.1f s to %s (constant pose: %s)", Cfg().benchDurationS,
@@ -448,6 +490,8 @@ void StartRun(uint32_t newestIndex) {
 }
 
 void FinishRun(bool aborted) {
+    PeriodicStats(aborted ? "benchmark window (aborted)" : "benchmark window");
+    const vr::TrackedDevicePose_t pose = g_frozenPose;
     g_frozen = false;
     g_frozenPose.bPoseIsValid = false;
     g_bench = Bench::Idle;
@@ -504,6 +548,20 @@ void FinishRun(bool aborted) {
         if (!r.gpuPhase[k].v.empty()) lines.push_back(StatLine(phaseLabels[k], r.gpuPhase[k]));
     if (!r.gpuCompose.v.empty()) lines.push_back(StatLine("GPU compose (both eyes)", r.gpuCompose));
     lines.push_back(StatLine("GPU other (frame - phases)", r.gpuOther));
+    bool spanHeader = false;
+    for (int k = 0; k < gpu::kSpans; ++k) {
+        Series& sp = r.gpuSpan[k];
+        if (sp.v.empty()) continue;
+        if (!spanHeader) {
+            spanHeader = true;
+            lines.push_back("GPU spans inside the eye groups (engine tasks, the MVR G-buffer's parts and the forward "
+                            "pass's corners out; frames = how many frames had the span):");
+        }
+        char label[64];
+        snprintf(label, sizeof(label), "GPU %s", gpu::SpanName(k));
+        snprintf(buf, sizeof(buf), "%s (%zu frames)", StatLine(label, sp, 0, 3).c_str(), sp.v.size());
+        lines.push_back(buf);
+    }
     if (r.frames) {
         snprintf(buf, sizeof(buf), "Dropped %llu, mispresented %llu, reprojected frames %llu (CPU %llu, GPU %llu)",
                  (unsigned long long)r.dropped, (unsigned long long)r.mispresented, (unsigned long long)r.reprojAny,
@@ -523,7 +581,208 @@ void FinishRun(bool aborted) {
         fclose(f);
     }
     for (auto& l : lines) Log("%s", l.c_str());
-    Beeps({{440, 450}});
+    if (!g_seqOn) Beeps({{440, 450}});
+    SeqAfterRun(aborted, pose);
+}
+
+std::string Trim(const std::string& t) {
+    size_t a = t.find_first_not_of(" \t"), b = t.find_last_not_of(" \t");
+    return a == std::string::npos ? std::string() : t.substr(a, b - a + 1);
+}
+
+// "label: switch=value, switch=value | label | ..." (a step without switches runs the state before the sequence).
+bool ParseSequence(const std::string& text, std::vector<SeqStep>& out, std::string& err) {
+    out.clear();
+    size_t pos = 0;
+    while (pos <= text.size()) {
+        size_t bar = text.find('|', pos);
+        if (bar == std::string::npos) bar = text.size();
+        const std::string part = Trim(text.substr(pos, bar - pos));
+        pos = bar + 1;
+        SeqStep st;
+        const size_t colon = part.find(':');
+        st.label = Trim(part.substr(0, colon));
+        if (st.label.empty()) st.label = "step" + std::to_string(out.size() + 1);
+        if (colon != std::string::npos) {
+            std::string rest = part.substr(colon + 1);
+            size_t q = 0;
+            while (q <= rest.size()) {
+                size_t comma = rest.find(',', q);
+                if (comma == std::string::npos) comma = rest.size();
+                const std::string kv = Trim(rest.substr(q, comma - q));
+                q = comma + 1;
+                if (kv.empty()) continue;
+                const size_t eq = kv.find('=');
+                const std::string key = Trim(kv.substr(0, eq));
+                const std::string val = eq == std::string::npos ? "" : Trim(kv.substr(eq + 1));
+                char* end = nullptr;
+                const long v = strtol(val.c_str(), &end, 0);
+                if (key.empty() || val.empty() || !end || *end) {
+                    err = "step \"" + st.label + "\": \"" + kv + "\" is not switch=number";
+                    return false;
+                }
+                st.set.push_back({key, (int)v});
+            }
+        }
+        out.push_back(st);
+    }
+    if (out.empty()) err = "no steps";
+    return !out.empty();
+}
+
+// The state before the sequence, then the step's switches. False (`why`): a switch refused.
+bool ApplyStep(size_t i, std::string& why) {
+    for (const auto& [k, v] : g_seqBase)
+        if (!quad::SetSwitch(k, v, &why)) return false;
+    for (const auto& [k, v] : g_seq[i].set)
+        if (!quad::SetSwitch(k, v, &why)) return false;
+    return true;
+}
+
+std::string StepDesc(size_t i) {
+    std::string d;
+    for (const auto& [k, v] : g_seq[i].set) d += (d.empty() ? "" : ", ") + k + "=" + std::to_string(v);
+    return d.empty() ? "the state before the sequence" : d;
+}
+
+void EndSequence(bool aborted) {
+    std::string why;
+    for (const auto& [k, v] : g_seqBase) quad::SetSwitch(k, v, &why);
+    g_seqOn = false;
+    // Summary: one line per recorded step, deltas against the first.
+    std::vector<std::string> lines;
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "Benchmark sequence %s: %zu of %zu steps recorded; ms per frame (averages), d = against "
+             "step 1; CPU = game CPU WGP->Submit (p50), groups = CPU CBeginEye..CEndEye, hooks = the proxy's own time in "
+             "its hooks ([debug] hook_profile)", aborted ? "ABORTED" : "finished", g_seqRes.size(), g_seq.size());
+    lines.push_back(buf);
+    const SeqResult* first = g_seqRes.empty() ? nullptr : &g_seqRes[0];
+    for (size_t i = 0; i < g_seqRes.size(); ++i) {
+        const SeqResult& r = g_seqRes[i];
+        int n = snprintf(buf, sizeof(buf),
+                         "%zu %-10s %s| frames %llu | CPU %.2f (%.2f) d %+.2f | GPU frame %.2f d %+.2f | groups oL %.2f "
+                         "oR %.2f fL %.2f fR %.2f | GPU oL %.2f oR %.2f fL %.2f fR %.2f",
+                         i + 1, r.label.c_str(), r.aborted ? "(ABORTED) " : "", (unsigned long long)r.frames, r.cpu,
+                         r.cpuP50, r.cpu - first->cpu, r.gpu, r.gpu - first->gpu, r.groupCpu[0], r.groupCpu[1],
+                         r.groupCpu[2], r.groupCpu[3], r.gpuPhase[0], r.gpuPhase[1], r.gpuPhase[2], r.gpuPhase[3]);
+        if (r.hooksOn)
+            n += snprintf(buf + n, sizeof(buf) - n, " | hooks oL %.3f oR %.3f fL %.3f fR %.3f outside %.3f", r.hooks[0],
+                          r.hooks[1], r.hooks[2], r.hooks[3], r.hooks[4]);
+        snprintf(buf + n, sizeof(buf) - n, " | %s", r.dir.c_str());
+        lines.push_back(buf);
+    }
+    const fs::path file = BenchDir() / Widen(g_seqStamp + "_sequence.txt");
+    if (FILE* f = _wfopen(file.c_str(), L"wb")) {
+        fprintf(f, "sequence=%s\n", Cfg().benchSequence.c_str());
+        for (auto& l : lines) fprintf(f, "%s\n", l.c_str());
+        fclose(f);
+    }
+    for (auto& l : lines) Log("%s", l.c_str());
+    Log("Benchmark sequence: switches back as before it; summary in %s", Narrow(file.wstring()).c_str());
+    if (aborted)
+        Beeps({{440, 120}, {440, 120}});
+    else
+        Beeps({{660, 150}, {880, 150}, {1100, 400}});
+}
+
+double Avg(const std::vector<float>& v) {
+    double sum = 0;
+    for (float x : v) sum += x;
+    return v.empty() ? 0 : sum / v.size();
+}
+
+void SeqAfterRun(bool aborted, const vr::TrackedDevicePose_t& pose) {
+    if (!g_seqOn) return;
+    SeqResult res;
+    res.label = g_seq[g_seqStep].label;
+    res.dir = Narrow(g_runDir.filename().wstring());
+    res.aborted = aborted;
+    const RunStats& r = g_run;
+    res.frames = r.proxyRows;
+    res.cpu = Avg(r.proxyCpu.v);
+    if (!r.proxyCpu.v.empty()) {
+        std::vector<float> v = r.proxyCpu.v;
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        res.cpuP50 = v[v.size() / 2];
+    }
+    res.gpu = Avg(r.gpuFrame.v);
+    for (int k = 0; k < 4; ++k) res.gpuPhase[k] = Avg(r.gpuPhase[k].v);
+    quad::LastWindowCpu(res.groupCpu);
+    res.hooksOn = hookprof::LastTotals(res.hooks);
+    g_seqRes.push_back(res);
+    if (aborted) {
+        EndSequence(true);
+        return;
+    }
+    if (++g_seqStep >= g_seq.size()) {
+        EndSequence(false);
+        return;
+    }
+    std::string why;
+    if (!ApplyStep(g_seqStep, why)) {
+        Log("Benchmark sequence: step %zu \"%s\" refused (%s)", g_seqStep + 1, g_seq[g_seqStep].label.c_str(),
+            why.c_str());
+        EndSequence(true);
+        return;
+    }
+    // The same head pose for every step (the countdown keeps it).
+    if (Cfg().benchFreezePose && pose.bPoseIsValid) {
+        g_frozenPose = pose;
+        g_frozen = true;
+    }
+    Log("Benchmark sequence: step %zu/%zu \"%s\": %s", g_seqStep + 1, g_seq.size(), g_seq[g_seqStep].label.c_str(),
+        StepDesc(g_seqStep).c_str());
+    StartCountdown("sequence step", Cfg().benchSettleS);
+}
+
+// Hotkey with [benchmark] sequence set: checks every step (each one applied once, then the state goes back), then
+// starts step 1. False: no sequence.
+bool StartSequence() {
+    const std::string text = Trim(Cfg().benchSequence);
+    if (text.empty()) return false;
+    std::string err;
+    std::vector<SeqStep> steps;
+    if (!ParseSequence(text, steps, err)) {
+        Log("Benchmark sequence: NOT STARTED, [benchmark] sequence: %s", err.c_str());
+        Beeps({{300, 400}});
+        return true;
+    }
+    g_seq = steps;
+    g_seqBase.clear();
+    for (const SeqStep& st : g_seq)
+        for (const auto& kv : st.set) {
+            if (std::any_of(g_seqBase.begin(), g_seqBase.end(), [&](const auto& b) { return b.first == kv.first; }))
+                continue;
+            int v = 0;
+            if (!quad::GetSwitch(kv.first, v, &err)) {
+                Log("Benchmark sequence: NOT STARTED, step \"%s\": %s", st.label.c_str(), err.c_str());
+                Beeps({{300, 400}});
+                return true;
+            }
+            g_seqBase.push_back({kv.first, v});
+        }
+    for (size_t i = 0; i < g_seq.size(); ++i)
+        if (!ApplyStep(i, err)) {
+            std::string ignored;
+            for (const auto& [k, v] : g_seqBase) quad::SetSwitch(k, v, &ignored);
+            Log("Benchmark sequence: NOT STARTED, step \"%s\": %s", g_seq[i].label.c_str(), err.c_str());
+            Beeps({{300, 400}});
+            return true;
+        }
+    g_seqOn = true;
+    g_seqStep = 0;
+    g_seqRes.clear();
+    g_seqStamp = LocalTimeStamp();
+    ApplyStep(0, err);
+    std::string base;
+    for (const auto& [k, v] : g_seqBase) base += (base.empty() ? "" : ", ") + k + "=" + std::to_string(v);
+    Log("Benchmark sequence: %zu steps of %.0f s (settle %.1f s between them), switches before it: %s", g_seq.size(),
+        Cfg().benchDurationS, Cfg().benchSettleS, base.empty() ? "none" : base.c_str());
+    for (size_t i = 0; i < g_seq.size(); ++i)
+        Log("Benchmark sequence:   %zu \"%s\": %s", i + 1, g_seq[i].label.c_str(), StepDesc(i).c_str());
+    Log("Benchmark sequence: step 1/%zu \"%s\"", g_seq.size(), g_seq[0].label.c_str());
+    StartCountdown("sequence, hotkey");
+    return true;
 }
 
 void HandleHotkey(uint32_t newestIndex) {
@@ -536,21 +795,27 @@ void HandleHotkey(uint32_t newestIndex) {
     if (!g_autoStarted && c.benchAutoStartS > 0 && g_firstSubmitMs >= 0 &&
         NowMs() - g_firstSubmitMs >= c.benchAutoStartS * 1000.0 && g_bench == Bench::Idle) {
         g_autoStarted = true;
-        StartCountdown("auto_start_s");
+        if (!StartSequence()) StartCountdown("auto_start_s");
     }
     if (pressed) {
         if (g_bench == Bench::Idle) {
-            StartCountdown("hotkey");
+            if (!StartSequence()) StartCountdown("hotkey");
         } else if (g_bench == Bench::Countdown) {
             g_bench = Bench::Idle;
             Log("Benchmark: countdown cancelled by the hotkey");
-            Beeps({{440, 120}, {440, 120}});
+            if (g_seqOn) {
+                g_frozen = false;
+                g_frozenPose.bPoseIsValid = false;
+                EndSequence(true);
+            } else {
+                Beeps({{440, 120}, {440, 120}});
+            }
         } else {
             FinishRun(true);
         }
         return;
     }
-    if (g_bench == Bench::Countdown && NowMs() - g_benchT0 >= c.benchDelayS * 1000.0) StartRun(newestIndex);
+    if (g_bench == Bench::Countdown && NowMs() - g_benchT0 >= g_countdownS * 1000.0) StartRun(newestIndex);
     if (g_bench == Bench::Running && NowMs() - g_benchT0 >= c.benchDurationS * 1000.0) FinishRun(false);
 }
 
@@ -602,14 +867,18 @@ void EndGazeValue(double now) {
     }
 }
 
-void PeriodicStats() {
+// Every stats_interval_s, and forced around a benchmark recording: at its start (the counters start from zero) and at
+// its end ("benchmark window": the quad task profile, MVR and the other modules' stats cover exactly the recording).
+// The interval waits while a recording runs.
+void PeriodicStats(const char* forced = nullptr) {
     int interval = Cfg().statsIntervalS;
     double now = NowMs();
     if (g_lastStatsMs == 0) g_lastStatsMs = now;
-    if (interval <= 0 || now - g_lastStatsMs < interval * 1000.0) return;
+    if (!forced && (g_bench == Bench::Running || interval <= 0 || now - g_lastStatsMs < interval * 1000.0)) return;
     double sec = (now - g_lastStatsMs) / 1000.0;
     g_lastStatsMs = now;
-    Log("Stats %.0f s: %llu frames (%.1f/s), %llu Submit, %zu/%zu distinct textures (L/R)", sec,
+    Log("Stats %.0f s%s%s: %llu frames (%.1f/s), %llu Submit, %zu/%zu distinct textures (L/R)", sec,
+        forced ? ", " : "", forced ? forced : "",
         (unsigned long long)g_statsFrames, g_statsFrames / sec, (unsigned long long)g_submitsInInterval,
         g_handles[0].size(), g_handles[1].size());
     if (g_gazeCalls) {
@@ -630,6 +899,14 @@ void PeriodicStats() {
             "%.2f, compose L %.2f, compose R %.2f ms (-1 = did not run)",
             (unsigned long long)s.frames, s.frame / s.frames, avg(gpu::OuterL), avg(gpu::OuterR), avg(gpu::FocusL),
             avg(gpu::FocusR), avg(gpu::ComposeL), avg(gpu::ComposeR));
+        std::string spans;
+        for (int k = 0; k < gpu::kSpans; ++k) {
+            if (!s.spanN[k]) continue;
+            char b[64];
+            snprintf(b, sizeof(b), "%s%s %.3f", spans.empty() ? "" : ", ", gpu::SpanName(k), s.span[k] / s.spanN[k]);
+            spans += b;
+        }
+        if (!spans.empty()) Log("GPU spans (ms, average of the frames that had them): %s", spans.c_str());
     }
     g_gpuSums = GpuSums{};
     LogCallStats(false);
@@ -946,6 +1223,7 @@ void OnShutdown() {
     Guarded("frame::OnShutdown", [&] {
         std::lock_guard lock(g_mutex);
         if (g_bench == Bench::Running) FinishRun(true);
+        g_seqOn = false;
         diag::OnShutdown();
         g_bench = Bench::Idle;
         if (g_sessionCsv) {
