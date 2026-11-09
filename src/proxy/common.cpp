@@ -387,6 +387,8 @@ Config ReadConfig(const fs::path& ini) {
     c.taaViews = IniInt(ini, L"debug", L"taa_views", 1) != 0;
     c.taaViewsKeyMod = IniInt(ini, L"debug", L"taa_views_modifier", c.taaViewsKeyMod);
     c.taaViewsKey = IniInt(ini, L"debug", L"taa_views_key", c.taaViewsKey);
+    c.taaMotionFix = IniInt(ini, L"debug", L"taa_motion_fix", 1) != 0;
+    c.taaMotionFixKey = IniInt(ini, L"debug", L"taa_motion_fix_key", c.taaMotionFixKey);
     c.taskProfile = IniInt(ini, L"debug", L"task_profile", 0) != 0;
     c.clonesViewportFix = IniInt(ini, L"debug", L"clones_viewport_fix", 1) != 0;
     c.clonesBindFix = IniInt(ini, L"debug", L"clones_bind_fix", 1) != 0;
@@ -430,7 +432,8 @@ Config ReadConfig(const fs::path& ini) {
             "outer_modifier=0x%X outer_key=0x%X gaze_modifier=0x%X gaze_key=0x%X clones=%d clones_modifier=0x%X "
             "clones_key=0x%X clones_viewport_fix=%d clones_bind_fix=%d shot_clones=%d focus_cull=%d cull_modifier=0x%X "
             "cull_key=0x%X sun_effects=%d sun_effects_modifier=0x%X sun_effects_key=0x%X taa_views=%d "
-            "taa_views_modifier=0x%X taa_views_key=0x%X task_profile=%d mvr_vs_patch=%d "
+            "taa_views_modifier=0x%X taa_views_key=0x%X taa_motion_fix=%d taa_motion_fix_key=0x%X task_profile=%d "
+            "mvr_vs_patch=%d "
             "mvr_ps_patch=%d mvr_gbuffer=%d mvr_modifier=0x%X mvr_key=0x%X mvr_jitter_fix=%d mvr_mode_key=0x%X mvr_depth_bias=%d mvr_depth_slope=%.3f mvr_depth_dilate=%d "
             "mvr_early=%d mvr_early_key=0x%X mvr_map_key=0x%X mvr_shot_compare=%d mvr_forward_test=%d "
             "mvr_forward=%d mvr_forward_key=0x%X mvr_forward_depth=%d mvr_forward_depth_key=0x%X mvr_velocity=%d "
@@ -441,7 +444,7 @@ Config ReadConfig(const fs::path& ini) {
             c.overlay, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey,
             c.gazeKeyMod, c.gazeKey, c.clones, c.clonesKeyMod, c.clonesKey, c.clonesViewportFix, c.clonesBindFix,
             c.shotClones, c.focusCull, c.cullKeyMod, c.cullKey, c.sunEffects, c.sunKeyMod, c.sunKey, c.taaViews,
-            c.taaViewsKeyMod, c.taaViewsKey, c.taskProfile, c.mvrVsPatch, c.mvrPsPatch, c.mvrGbuffer, c.mvrKeyMod, c.mvrKey,
+            c.taaViewsKeyMod, c.taaViewsKey, c.taaMotionFix, c.taaMotionFixKey, c.taskProfile, c.mvrVsPatch, c.mvrPsPatch, c.mvrGbuffer, c.mvrKeyMod, c.mvrKey,
             c.mvrJitterFix, c.mvrModeKey, c.mvrDepthBias, c.mvrDepthSlope, c.mvrDepthDilate,
             c.mvrEarly, c.mvrEarlyKey, c.mvrMapKey, c.mvrShotCompare, c.mvrForwardTest, c.mvrForward,
             c.mvrForwardKey, c.mvrForwardDepth, c.mvrForwardDepthKey, c.mvrVelocity, c.mvrVelocityKey,
@@ -626,6 +629,8 @@ bool ReloadConfig() {
     c.taaViews = n.taaViews;
     c.taaViewsKeyMod = n.taaViewsKeyMod;
     c.taaViewsKey = n.taaViewsKey;
+    c.taaMotionFix = n.taaMotionFix;
+    c.taaMotionFixKey = n.taaMotionFixKey;
     c.taskProfile = n.taskProfile;
     c.mvrKeyMod = n.mvrKeyMod;
     c.mvrKey = n.mvrKey;

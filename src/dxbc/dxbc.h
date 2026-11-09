@@ -45,4 +45,8 @@ Chunk WriteSignature(uint32_t fourcc, const std::vector<SigElement>& elements);
 // Whether an output signature of the shader (OSGN, OSG5 or OSG1) has an element with this system value (D3D_NAME).
 bool HasOutputSystemValue(const void* code, size_t size, uint32_t systemValue);
 
+// A copy of the shader with every 4-component float immediate l(from) of its program replaced by l(to), signed again.
+// Returns the number of immediates replaced (0: `out` untouched).
+int ReplaceImmediate4(const void* code, size_t size, const float from[4], const float to[4], std::vector<uint8_t>& out);
+
 }  // namespace qvfr::dxbc

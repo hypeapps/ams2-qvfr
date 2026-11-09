@@ -354,6 +354,8 @@ bool g_sunKeyDown = false;
 bool g_taaOn = true;
 bool g_taaCfg = true;
 bool g_taaKeyDown = false;
+bool g_motionFixCfg = true;  // Cfg().taaMotionFix last seen
+bool g_motionFixKeyDown = false;
 struct Cull {
     bool failed = false;  // off until the next builder call
     int misses = 0;       // focus groups in a row without culling (checks failed)
@@ -1584,6 +1586,15 @@ void HandleToolsLocked() {
         g_taaOn = !g_taaOn;
         Log("Quad: own TAA state of the focus views %s (hotkey)", g_taaOn ? "on" : "off");
     }
+    if (c.taaMotionFix != g_motionFixCfg) {
+        g_motionFixCfg = c.taaMotionFix;
+        taaviews::SetMotionFix(c.taaMotionFix);
+        Log("Quad: focus TAA history kept while the image moves %s (ini)", c.taaMotionFix ? "on" : "off");
+    }
+    if (Pressed(c.taaViewsKeyMod, c.taaMotionFixKey, g_motionFixKeyDown)) {
+        taaviews::SetMotionFix(!taaviews::GetMotionFix());
+        Log("Quad: focus TAA history kept while the image moves %s (hotkey)", taaviews::GetMotionFix() ? "on" : "off");
+    }
     if (Pressed(c.freezeKeyMod, c.freezeKey, g_freezeKeyDown)) {
         g_gazeFrozen = !g_gazeFrozen;
         Log("Quad: gaze %s (hotkey), NDC L (%.3f, %.3f) R (%.3f, %.3f)%s", g_gazeFrozen ? "FROZEN" : "live",
@@ -2572,6 +2583,8 @@ void Install() {
     g_cullOn = g_cullCfg = Cfg().focusCull;
     g_sunOn = g_sunCfg = Cfg().sunEffects;
     g_taaOn = g_taaCfg = Cfg().taaViews;
+    g_motionFixCfg = Cfg().taaMotionFix;
+    taaviews::SetMotionFix(g_motionFixCfg);
     LARGE_INTEGER qf{};
     QueryPerformanceFrequency(&qf);
     g_qpcFreq = qf.QuadPart;

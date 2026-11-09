@@ -231,4 +231,27 @@ bool HasOutputSystemValue(const void* code, size_t size, uint32_t systemValue) {
     return false;
 }
 
+int ReplaceImmediate4(const void* code, size_t size, const float from[4], const float to[4], std::vector<uint8_t>& out) {
+    std::vector<Chunk> chunks;
+    if (!Parse(code, size, chunks, nullptr)) return 0;
+    Chunk* shex = Find(chunks, FourCC('S', 'H', 'E', 'X'));
+    if (!shex) shex = Find(chunks, FourCC('S', 'H', 'D', 'R'));
+    if (!shex || shex->data.size() < 8) return 0;
+    const size_t n = shex->data.size() / 4;
+    uint32_t* t = reinterpret_cast<uint32_t*>(shex->data.data());
+    uint32_t f[4], r[4];
+    memcpy(f, from, sizeof(f));
+    memcpy(r, to, sizeof(r));
+    int count = 0;
+    // An immediate operand: token 0x00004002 (4 components) and its 4 values; scanned inside the instructions.
+    for (size_t i = 2; i + 4 < n; ++i) {
+        if (t[i] != 0x00004002u || memcmp(&t[i + 1], f, sizeof(f)) != 0) continue;
+        memcpy(&t[i + 1], r, sizeof(r));
+        ++count;
+        i += 4;
+    }
+    if (count) out = Build(chunks);
+    return count;
+}
+
 }  // namespace qvfr::dxbc

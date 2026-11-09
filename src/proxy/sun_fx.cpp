@@ -561,6 +561,7 @@ HRESULT STDMETHODCALLTYPE D_CreatePixelShader(ID3D11Device* dev, const void* cod
                         : o_createPs(dev, code, len, link, out);
     if (SUCCEEDED(hr) && out && *out) {
         Protect("CreatePixelShader", [&] {
+            taaviews::OnPixelShaderMade(*out, code, len);  // the game's TAA resolve (focus motion fix)
             const int k = Classify(code, len);
             if (k >= 0) {
                 SetKind(*out, kKnown[k].kind);

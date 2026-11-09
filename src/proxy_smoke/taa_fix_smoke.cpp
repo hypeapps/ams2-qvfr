@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 #include "sun_fx.h"
 #include "taa_views.h"
@@ -21,14 +22,18 @@
 namespace {
 
 const char kHlsl[] = R"(
-cbuffer G : register(b0) { float4 viewportScale; float velocityRate; float constantRate; float rotation; float pad; };
+cbuffer G : register(b0) { float4 viewportScale; float velocityRate; float constantRate; float cameraRotationFactor; float pad; };
+Texture2D<float2> velTex : register(t3);
 float4 VS(uint id : SV_VertexID) : SV_Position {
     float2 uv = float2((id << 1) & 2, id & 2);
     return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
 }
 float4 Locks(float4 p : SV_Position) : SV_Target { return float4(viewportScale.z / 4096, 0, 0, 1); }
+// Like the game's resolve: the velocity (UV) times the motion constant (1600, 900, 160, 90), here added to z.
 float4 Resolve(float4 p : SV_Position) : SV_Target {
-    return float4(viewportScale.z / 4096, viewportScale.y * 16, constantRate, 1);
+    float4 m = velTex.Load(int3(p.xy, 0)).xyxy * float4(1600, 900, 160, 90);
+    float s = sqrt(dot(m.xy, m.xy)) + sqrt(dot(m.zw, m.zw));
+    return float4(viewportScale.z / 4096, viewportScale.y * 16, constantRate + 0.02 * s, 1);
 }
 cbuffer COMMON_BUFFER2 : register(b12) { float4 common2[61]; };  // prevProjMatrix at 51, prevViewProj at 55
 struct VelOut { float4 p : SV_Position; float2 v : TEXCOORD0; };
@@ -265,6 +270,64 @@ int RunTaaFix() {
     const bool resolveOk = std::fabs(resolveW - kW) < 2 && std::fabs(resolveInvH - 1.0f / kH) < 0.001f &&
                            std::fabs(resolveRate - 0.95f) < 0.02f;
     const uint64_t fixed = qvfr::taaviews::TestFixedDraws();
+    // Focus TAA history while the image moves: velocity (0.02, 0) in UV gives 0.95 + 0.02 * (32 + 3.2) = 1.65 outside
+    // the focus groups; in focus L the copy of the shader has the motion constant at 0, so 0.95, and the engine's
+    // shader is bound again after the draw.
+    float motionOff = 0, motionOn = 0;
+    bool motionPsBack = false;
+    uint64_t motionFixed = 0;
+    {
+        D3D11_TEXTURE2D_DESC d{};
+        d.Width = kW;
+        d.Height = kH;
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.Format = DXGI_FORMAT_R16G16_FLOAT;
+        d.SampleDesc = {1, 0};
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        std::vector<uint32_t> px(kW * kH, 0x251Fu);  // half 0.02 in x, 0 in y
+        D3D11_SUBRESOURCE_DATA sd{px.data(), kW * 4, 0};
+        ID3D11Texture2D* v2 = nullptr;
+        ID3D11ShaderResourceView* v2Srv = nullptr;
+        if (SUCCEEDED(dev->CreateTexture2D(&d, &sd, &v2)) && SUCCEEDED(dev->CreateShaderResourceView(v2, nullptr, &v2Srv))) {
+            ID3D11ShaderResourceView* views[6] = {nullptr, nullptr, nullptr, v2Srv, nullptr, locksSrv};
+            ctx->VSSetShader(vs, nullptr, 0);
+            UINT f = kFirst, n = 16;
+            c1->PSSetConstantBuffers1(0, 1, &big, &f, &n);
+            ctx->OMSetRenderTargets(1, &resolveRtv, nullptr);
+            ctx->PSSetShaderResources(0, 6, views);
+            ctx->PSSetShader(resolvePs, nullptr, 0);
+            ctx->RSSetViewports(1, &vp);
+            uint32_t p0 = 0, p1 = 0;
+            qvfr::taaviews::SetMotionFix(true);
+            qvfr::taaviews::TestSetGroup(-1);
+            ctx->DrawIndexed(6, 0, 0);
+            read(resolveRt, p0);
+            const uint64_t before = qvfr::taaviews::TestMotionFixed();
+            qvfr::taaviews::TestSetGroup(2);
+            ctx->DrawIndexed(6, 0, 0);
+            ID3D11PixelShader* now = nullptr;
+            ctx->PSGetShader(&now, nullptr, nullptr);
+            motionPsBack = now == resolvePs;
+            if (now) now->Release();
+            read(resolveRt, p1);
+            motionFixed = qvfr::taaviews::TestMotionFixed() - before;
+            qvfr::taaviews::TestSetGroup(-1);
+            motionOff = Small(p0 >> 22, 5);
+            motionOn = Small(p1 >> 22, 5);
+            ID3D11ShaderResourceView* unbind[6] = {};
+            ctx->PSSetShaderResources(0, 6, unbind);
+            ID3D11RenderTargetView* noRt = nullptr;
+            ctx->OMSetRenderTargets(1, &noRt, nullptr);
+        }
+        if (v2Srv) v2Srv->Release();
+        if (v2) v2->Release();
+    }
+    const bool motionOk = std::fabs(motionOff - 1.65f) < 0.05f && std::fabs(motionOn - 0.95f) < 0.05f && motionPsBack &&
+                          motionFixed == 1;
+    printf("Focus TAA motion check %s: resolve output %.3f outside the focus groups (1.65), %.3f in focus L (0.95); the "
+           "engine's shader bound again %s; %llu draws with the copy\n",
+           motionOk ? "OK" : "FAILED", motionOff, motionOn, motionPsBack ? "yes" : "NO", (unsigned long long)motionFixed);
     UINT64 warnings = 0;
     if (info) {
         const UINT64 n = info->GetNumStoredMessages();
@@ -279,7 +342,7 @@ int RunTaaFix() {
             free(msg);
         }
     }
-    const bool ok = readOk && locksOk && resolveOk && restored == 2 && fixed == 2 && velOk && warnings == 0;
+    const bool ok = readOk && locksOk && resolveOk && restored == 2 && fixed == 2 && velOk && warnings == 0 && motionOk;
     printf("TAA fix check %s: locks read width %.0f (target %u, the game's cb0 1814), resolve width %.1f, 1/height "
            "%.5f, constant rate %.3f (0.95 in the game's cb0); game binding back after %d of 2 draws; %llu draws "
            "fixed; object velocity in a focus group (%.2f, %.2f) (focus 2, 3), outside (%.2f, %.2f) (game 0.5, 0.25), "

@@ -127,6 +127,11 @@ struct Config {
     bool taaViews = true;
     int taaViewsKeyMod = VK_RCONTROL;
     int taaViewsKey = 0;              // testers: VK_F2
+    // The focus views' TAA resolve keeps its history while the image moves (taa_views.cpp, kTaaMotion: the game's
+    // resolve drops it above 1% of the view per frame, which a focus view passes at a third of outer's head speed and
+    // more with DFR; alpha-tested leaves thinned out). The hotkey (taa_views_modifier + taa_motion_fix_key) switches.
+    bool taaMotionFix = true;
+    int taaMotionFixKey = 0;
     // Execute time of every task of the eye groups, one log line per group with the stats (M9 step 4 diagnostics).
     bool taskProfile = false;
     // A viewport the engine sets for an original while a smaller clone is bound is scaled to the clone (M7.4).
