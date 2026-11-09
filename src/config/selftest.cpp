@@ -58,6 +58,14 @@ int RunSelfTest(const fs::path& dir) {
     Expect(!s.dlaa && s.dlaaPreset == "k" && !s.dlaaAutoExposure && Near(s.dlaaExposure, 0.002f) && s.dlaaKey == 0 &&
                s.dlaaPresetKey == 0,
            "default ini: DLAA off, fixed exposure 0.002, no DLAA hotkeys");
+    Expect(s.mvr, "default ini: NVIDIA Multi-View Rendering on");
+    {
+        IniFile d = ini;
+        d.Set("mvr", "mode", "off");
+        const auto ch = ChangedRestartKeys(ini, d);
+        Expect(!Read(d).mvr && ch.size() == 1 && ch[0] == "NVIDIA Multi-View Rendering on/off",
+               "MVR off needs a restart");
+    }
     {
         IniFile d = ini;
         d.Set("dlaa", "mode", "dlaa");

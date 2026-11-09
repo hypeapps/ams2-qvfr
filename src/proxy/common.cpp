@@ -399,9 +399,12 @@ Config ReadConfig(const fs::path& ini) {
     c.clonesViewportFix = IniInt(ini, L"debug", L"clones_viewport_fix", 1) != 0;
     c.clonesBindFix = IniInt(ini, L"debug", L"clones_bind_fix", 1) != 0;
     c.shotClones = IniInt(ini, L"debug", L"shot_clones", 0) != 0;
-    c.mvrVsPatch = IniInt(ini, L"debug", L"mvr_vs_patch", 0) != 0;
-    c.mvrPsPatch = IniInt(ini, L"debug", L"mvr_ps_patch", 0) != 0;
-    c.mvrGbuffer = IniInt(ini, L"debug", L"mvr_gbuffer", 0) != 0;
+    const std::string mvr = IniString(ini, L"mvr", L"mode", L"mvr");
+    c.mvr = mvr != "off";
+    if (mvr != "off" && mvr != "mvr") Log("Settings: unknown [mvr] mode=\"%s\", using mvr", mvr.c_str());
+    c.mvrVsPatch = c.mvr && IniInt(ini, L"debug", L"mvr_vs_patch", 1) != 0;
+    c.mvrPsPatch = c.mvr && IniInt(ini, L"debug", L"mvr_ps_patch", 1) != 0;
+    c.mvrGbuffer = c.mvr && IniInt(ini, L"debug", L"mvr_gbuffer", 1) != 0;
     c.mvrKeyMod = IniInt(ini, L"debug", L"mvr_modifier", c.mvrKeyMod);
     c.mvrKey = IniInt(ini, L"debug", L"mvr_key", c.mvrKey);
     c.mvrJitterFix = IniInt(ini, L"debug", L"mvr_jitter_fix", 1) != 0;
@@ -409,12 +412,12 @@ Config ReadConfig(const fs::path& ini) {
     c.mvrDepthBias = std::clamp(IniInt(ini, L"debug", L"mvr_depth_bias", c.mvrDepthBias), 0, 1 << 20);
     c.mvrDepthSlope = std::clamp(IniFloat(ini, L"debug", L"mvr_depth_slope", c.mvrDepthSlope), 0.0f, 16.0f);
     c.mvrDepthDilate = IniInt(ini, L"debug", L"mvr_depth_dilate", c.mvrDepthDilate ? 1 : 0) != 0;
-    c.mvrEarly = std::clamp(IniInt(ini, L"debug", L"mvr_early", 0), 0, 5);
+    c.mvrEarly = std::clamp(IniInt(ini, L"debug", L"mvr_early", 1), 0, 5);
     c.mvrEarlyKey = IniInt(ini, L"debug", L"mvr_early_key", c.mvrEarlyKey);
     c.mvrMapKey = IniInt(ini, L"debug", L"mvr_map_key", c.mvrMapKey);
-    c.mvrShotCompare = IniInt(ini, L"debug", L"mvr_shot_compare", 1) != 0;
+    c.mvrShotCompare = IniInt(ini, L"debug", L"mvr_shot_compare", 0) != 0;
     c.mvrForwardTest = IniInt(ini, L"debug", L"mvr_forward_test", 0) != 0;
-    c.mvrForward = IniInt(ini, L"debug", L"mvr_forward", 0) != 0;
+    c.mvrForward = IniInt(ini, L"debug", L"mvr_forward", 1) != 0;
     c.mvrForwardKey = IniInt(ini, L"debug", L"mvr_forward_key", c.mvrForwardKey);
     c.mvrForwardDepth = std::clamp(IniInt(ini, L"debug", L"mvr_forward_depth", 3), 0, 3);
     c.mvrForwardDepthKey = IniInt(ini, L"debug", L"mvr_forward_depth_key", c.mvrForwardDepthKey);
@@ -435,7 +438,7 @@ Config ReadConfig(const fs::path& ini) {
     c.mvrLiveTrackSkipKey = IniInt(ini, L"debug", L"mvr_livetrack_skip_key", c.mvrLiveTrackSkipKey);
     c.mvrEmptyQueue = IniInt(ini, L"debug", L"mvr_empty_queue", 0) != 0;
     c.queueBreakdown = IniInt(ini, L"debug", L"queue_breakdown", 0) != 0;
-    c.mvrVelocityRecordSkip = IniInt(ini, L"debug", L"mvr_velocity_record_skip", 0) != 0;
+    c.mvrVelocityRecordSkip = IniInt(ini, L"debug", L"mvr_velocity_record_skip", 1) != 0;
     if (c.quadMode == QuadMode::Quad)
         Log("Settings: [debug] overlay=%d overlay_modifier=0x%X overlay_key=0x%X freeze_modifier=0x%X freeze_key=0x%X "
             "outer_modifier=0x%X outer_key=0x%X gaze_modifier=0x%X gaze_key=0x%X clones=%d clones_modifier=0x%X "
@@ -571,6 +574,7 @@ bool ReloadConfig() {
          "[quad] *_section");
     need(n.probeFrames != c.probeFrames || n.probeEngine != c.probeEngine || n.probeD3D != c.probeD3D, "[quad] probe_*");
     need(n.dlaa != c.dlaa, "[dlaa] mode");
+    need(n.mvr != c.mvr, "[mvr] mode");
     need(n.mvrVsPatch != c.mvrVsPatch, "[debug] mvr_vs_patch");
     need(n.mvrPsPatch != c.mvrPsPatch, "[debug] mvr_ps_patch");
     need(n.mvrGbuffer != c.mvrGbuffer, "[debug] mvr_gbuffer");

@@ -155,15 +155,18 @@ struct Config {
     // Each shot also saves every focus clone as focus L left it (M7.4 diagnostics; the read-back stalls the game for
     // about 3 s).
     bool shotClones = false;
-    // NVIDIA Multi-View Rendering, gate B6 (mvr_vs.h): the game's vertex shaders patched and made through NVAPI, MVR
-    // off. Not in the default ini (development); a change needs a restart.
-    bool mvrVsPatch = false;
+    // [mvr] mode=mvr (default) or off: NVIDIA Multi-View Rendering (docs/mvr.md). Off turns the three below off; a
+    // change needs a restart. On a graphics card without multi-view support the patches stay off by themselves.
+    bool mvr = true;
+    // NVIDIA Multi-View Rendering, gate B6 (mvr_vs.h): the game's vertex shaders patched and made through NVAPI.
+    // [debug] key for development (with [mvr] mode=mvr); a change needs a restart.
+    bool mvrVsPatch = true;
     // Gate B9b (mvr_ps.h): with mvr_vs_patch, the game's pixel shaders that read screen inputs or screen textures are
-    // patched for an extra MVR view (view 0 draws as before). Not in the default ini; a change needs a restart.
-    bool mvrPsPatch = false;
+    // patched for an extra MVR view (view 0 draws as before). [debug] key; a change needs a restart.
+    bool mvrPsPatch = true;
     // Gate B8 (mvr_pass.h): with mvr_vs_patch, outer's G-buffer pass of each eye draws focus too (MVR, view 1) and
-    // the focus groups skip theirs. Not in the default ini; a change needs a restart. The hotkey switches (live).
-    bool mvrGbuffer = false;
+    // the focus groups skip theirs. [debug] key; a change needs a restart. The hotkey switches (live).
+    bool mvrGbuffer = true;
     int mvrKeyMod = VK_RCONTROL;
     int mvrKey = 0;                   // testers: VK_END
     // Live: view 1's matrix moves outer's TAA jitter to focus's own (else focus gets outer's, scaled; gate B7).
@@ -181,18 +184,18 @@ struct Config {
     // both CBeginEye only, 4 SSAO early and again in the focus group, 5 SSAO early and the G-buffer filled again in the
     // focus group. The hotkey (mvr_modifier + mvr_early_key; testers: VK_HOME) cycles 0..5. mvr_map_key (testers:
     // VK_INSERT): a task map of the next frame in the log.
-    int mvrEarly = 0;
+    int mvrEarly = 1;
     int mvrEarlyKey = 0;
     int mvrMapKey = 0;
     // Live: a shot compares focus L's own G-buffer pass with outer's stash (B8); 0 = the shot shows the frame as it runs.
-    bool mvrShotCompare = true;
+    bool mvrShotCompare = false;
     // Live, gate B9c (mvr_pass.h): with mvr_early=1 and mvr_ps_patch, a shot also runs outer L's forward pass
     // (CPhase3Render) with MVR and compares view 1 with focus L's own forward pass.
     bool mvrForwardTest = false;
     // Live, gate B9d (mvr_pass.h): with mvr_early=1 and mvr_ps_patch, every frame outer L's and outer R's forward pass
     // draws focus's with MVR and the focus groups skip theirs; the hotkey (mvr_modifier + mvr_forward_key; testers:
     // VK_DELETE) toggles it.
-    bool mvrForward = false;
+    bool mvrForward = true;
     int mvrForwardKey = 0;
     // Live: the depth the live forward pass leaves in focus's clone (the game's later passes test against it): 0 as MVR
     // drew it, 1 plus mvr_depth_bias float steps, 2 conservative like the G-buffer stash (dilate, slope, bias), 3 as
@@ -243,7 +246,7 @@ struct Config {
     bool queueBreakdown = false;
     // O2 step 3: focus's forward recording skips its velocity sub-passes' submits after the first draw when its
     // velocity comes from outer (fwd_rec.h).
-    bool mvrVelocityRecordSkip = false;
+    bool mvrVelocityRecordSkip = true;
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
     bool dlaa = false;                // mode=dlaa (a change needs a restart)

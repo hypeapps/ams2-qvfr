@@ -116,8 +116,17 @@
             </div>
 
             <div class="card">
-                <div class="chead"><span class="ctitle">Anti-aliasing</span><span class="icon"></span></div>
+                <div class="chead"><span class="ctitle">Rendering</span><span class="icon"></span></div>
                 <div class="cbody">
+                    <div class="row">
+                        <div class="label">
+                            <div class="name">NVIDIA Multi-View Rendering <span class="tag" data-if="rs_mvr">Game restart needed</span></div>
+                            <div class="desc">The outer view of each eye draws the scene of its sharp area in the same pass, which saves CPU time every frame. NVIDIA GeForce GTX 16 and RTX graphics cards; on others the mod renders as with this off.</div>
+                        </div>
+                        <div class="control">
+                            <div class="switch"><input type="checkbox" data-checked="mvr"/><div class="knob"/></div>
+                        </div>
+                    </div>
                     <div class="banner gaze-warn" data-if="dlaa &amp;&amp; !dlss_dll">
                         <span class="banner-title">nvngx_dlss.dll is missing in x64\qvfr.</span>
                         NVIDIA DLAA cannot start without it, so the game's own TAA stays. Unpack the mod's zip again.

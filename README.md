@@ -86,7 +86,7 @@ mod in `x64\qvfr\`.
 
 - **Requirements:** an NVIDIA RTX graphics card, and in the game's graphics options **TAA on and MSAA off**. Without them
   the game's own anti-aliasing stays.
-- **Turn it on:** `qvfr_config.exe` → **Settings** → **Anti-aliasing** → **NVIDIA DLAA**, then restart the game. Off by
+- **Turn it on:** `qvfr_config.exe` → **Settings** → **Rendering** → **NVIDIA DLAA**, then restart the game. Off by
   default.
 - **DLSS preset:** the DLSS model (J, K, L, M; K is NVIDIA's default for DLAA).
 - **DLSS exposure:** fixed (default 0.002) keeps the brightness of lights and reflections; auto lets DLSS measure it,
