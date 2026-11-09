@@ -15,6 +15,7 @@
 #include "common.h"
 #include "diag.h"
 #include "gpu.h"
+#include "hook_prof.h"
 #include "hooks.h"
 #include "mvr_motion.h"
 #include "sun_fx.h"
@@ -1079,8 +1080,12 @@ void After(ID3D11DeviceContext* c) {
 }
 
 void STDMETHODCALLTYPE D_DrawIndexed(ID3D11DeviceContext* c, UINT n, UINT start, INT base) {
+    hookprof::Scope prof(hookprof::KDraw);
     if (Replace(c, n)) return;
-    o_drawIndexed(c, n, start, base);
+    {
+        hookprof::Orig o;
+        o_drawIndexed(c, n, start, base);
+    }
     After(c);
 }
 

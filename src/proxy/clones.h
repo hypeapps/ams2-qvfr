@@ -113,6 +113,24 @@ int ListForShot(Set set, ID3D11Resource** out, char (*labels)[64], int max);
 
 std::string Describe();      // one part of the summary line
 void LogStats(bool totals);  // a stats line, with the session totals at the end
+// O1 ([debug] clones_map_cache, live): binds whose views all mapped to themselves since the latest change of the maps
+// skip the lock (a cache on the render thread).
+void SetMapCache(bool on);
+bool GetMapCache();
+// O1: PSSetShaderResources calls on the immediate context that reach slot kPsWatchSlot or above (any caller, the
+// proxy's own too), counted: mvr_pass binds its t21..t26 (mvrps::kTexBase) again only when they may have changed.
+constexpr UINT kPsWatchSlot = 21;
+uint32_t PsHighSlotsGen();
+// O1 step 3: the view at PS slot `slot` of context `c` without PSGetShaderResources when the PSSetShaderResources hook
+// saw that slot's latest bind on the immediate context since the latest NewPsViewEpoch (else read back once and kept for
+// the epoch). Not referenced: valid while bound. Render thread. A new epoch at each MVR pass's begin covers any state
+// change the hook does not see (SwapDeviceContextState of DLSS, ClearState), none of which runs inside a pass.
+void NewPsViewEpoch();
+ID3D11ShaderResourceView* PsView(ID3D11DeviceContext* c, UINT slot);
+uint64_t PsViewReads();  // PsView calls that read the slot back, so far
+// qvfr_proxy_smoke --clones: the map cache's binds without and with the lock so far; true while a group watches
+// (learning or proof: no cache).
+bool TestMapCache(uint64_t& hits, uint64_t& locked);
 void Shutdown();             // VR_Shutdown: originals back, clones released, lists cleared (hooks stay)
 
 // qvfr_proxy_smoke --clones: fake engine objects without the engine hooks.

@@ -52,6 +52,14 @@ using CreatePsFilterFn = HRESULT (*)(ID3D11Device* dev, const void* code, SIZE_T
                                      ID3D11PixelShader** out, CreatePsFn original, uintptr_t caller);
 bool SetCreatePsFilter(CreatePsFilterFn create);
 
+// O1 step 3 (MVR draws): the pixel shader bound on `c` without PSGetShader when this module's PSSetShader hook saw the
+// immediate context's latest set since the latest NewPsEpoch (else read back once and kept for the epoch). Not
+// referenced: valid while bound. Render thread. MVR starts an epoch at each pass's begin: a state change the hook does
+// not see (DLSS's SwapDeviceContextState back) never runs inside a pass.
+void NewPsEpoch();
+ID3D11PixelShader* CurrentPs(ID3D11DeviceContext* c);
+uint64_t PsReads();  // CurrentPs calls that read the shader back, so far
+
 std::string Describe();      // one part of the summary line
 void LogStats(bool totals);  // a stats line, with the session totals at the end
 void Shutdown();             // VR_Shutdown: D3D11 objects released (hooks stay)

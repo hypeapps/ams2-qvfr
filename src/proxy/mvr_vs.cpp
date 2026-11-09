@@ -70,6 +70,15 @@ struct ShaderInfo {
 };
 std::shared_mutex g_sm;  // shared for the lookups (gate B8: every VSSetShader of an MVR pass)
 std::unordered_map<void*, ShaderInfo> g_shaders;
+// O1: IsPatchedRt's direct-mapped memo (render thread only); every new shader starts a new generation.
+std::atomic<uint32_t> g_gen{1};
+struct Memo {
+    void* vs = nullptr;
+    uint32_t gen = 0;
+    bool patched = false;
+};
+constexpr size_t kMemo = 2048;
+Memo g_memo[kMemo];
 
 std::string NvErr(NvAPI_Status s) {
     NvAPI_ShortString msg = {};
@@ -254,6 +263,7 @@ HRESULT STDMETHODCALLTYPE D_CreateVertexShader(ID3D11Device* dev, const void* co
         SumText(code, len, info.sum);
         std::unique_lock lock(g_sm);
         g_shaders[*out] = info;
+        g_gen.fetch_add(1, std::memory_order_acq_rel);  // the render thread's memo (IsPatchedRt) looks again
     }
     return hr;
 }
@@ -357,6 +367,18 @@ bool IsPatched(ID3D11VertexShader* vs, char* sum) {
     if (it == g_shaders.end()) return false;
     if (sum) memcpy(sum, it->second.sum, sizeof(it->second.sum));
     return it->second.patched;
+}
+
+bool IsPatchedRt(ID3D11VertexShader* vs) {
+    if (!vs) return false;
+    Memo& m = g_memo[((uintptr_t)vs >> 4) & (kMemo - 1)];
+    const uint32_t gen = g_gen.load(std::memory_order_acquire);  // before the lookup: a shader made meanwhile misses next
+    if (m.vs == vs && m.gen == gen) return m.patched;
+    const bool patched = IsPatched(vs);
+    m.vs = vs;
+    m.gen = gen;
+    m.patched = patched;
+    return patched;
 }
 
 std::string Describe() {

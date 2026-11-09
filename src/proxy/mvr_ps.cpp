@@ -63,6 +63,15 @@ std::mutex g_m;
 std::vector<std::pair<std::string, uint64_t>> g_reasons;
 std::shared_mutex g_sm;
 std::unordered_map<void*, Info> g_shaders;
+// O1: InfoOfRt's direct-mapped memo (render thread only); every new shader starts a new generation.
+std::atomic<uint32_t> g_gen{1};
+struct Memo {
+    void* ps = nullptr;
+    uint32_t gen = 0;
+    Info info;
+};
+constexpr size_t kMemo = 2048;
+Memo g_memo[kMemo];
 
 void Fail(const char* where, unsigned long code) {
     g_on = false;
@@ -206,6 +215,7 @@ HRESULT CreatePixelShader(ID3D11Device* dev, const void* code, SIZE_T len, ID3D1
     if (SUCCEEDED(hr) && out && *out && made.kind != Kind::Unknown) {
         std::unique_lock lock(g_sm);
         g_shaders[*out] = made;
+        g_gen.fetch_add(1, std::memory_order_acq_rel);  // the render thread's memo (InfoOfRt) looks again
     }
     return hr;
 }
@@ -333,6 +343,18 @@ Info InfoOf(ID3D11PixelShader* ps) {
     std::shared_lock lock(g_sm);
     auto it = g_shaders.find(ps);
     return it == g_shaders.end() ? Info{} : it->second;
+}
+
+Info InfoOfRt(ID3D11PixelShader* ps) {
+    if (!ps) return Info{};
+    Memo& m = g_memo[((uintptr_t)ps >> 4) & (kMemo - 1)];
+    const uint32_t gen = g_gen.load(std::memory_order_acquire);  // before the lookup: a shader made meanwhile misses next
+    if (m.ps == ps && m.gen == gen) return m.info;
+    const Info info = InfoOf(ps);
+    m.ps = ps;
+    m.gen = gen;
+    m.info = info;
+    return info;
 }
 
 bool On() { return g_installed && g_on.load(std::memory_order_relaxed); }

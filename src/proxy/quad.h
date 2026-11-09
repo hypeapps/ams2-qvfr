@@ -39,6 +39,14 @@ void OnSubmitBegin(vr::EVREye eye, const vr::Texture_t* tex);  // the first Subm
 const vr::Texture_t* PrepareSubmit(vr::EVREye eye, const vr::Texture_t* tex, const vr::VRTextureBounds_t* bounds,
                                    vr::Texture_t& storage);
 void LogStats(bool totals);
+// The eye groups' CPU per full frame (ms; 0 = none) of the latest stats interval (a benchmark's window after its end).
+void LastWindowCpu(double groupMs[4]);
+// Benchmark sequence ([benchmark] sequence, frame.cpp): the live switches by name, the same as their hotkeys or live
+// ini keys (mvr, focus_cull, sun_effects, taa_views, taa_motion_fix, outer_only, task_profile, mvr_early, mvr_mode,
+// mvr_forward, mvr_forward_depth, mvr_ms_color_skip, mvr_livetrack_skip, mvr_velocity, mvr_velocity_skip,
+// mvr_gbuffer_ps, mvr_direct_extract, mvr_native_targets). False: no such switch, or it is unavailable (`why`).
+bool GetSwitch(const std::string& name, int& value, std::string* why = nullptr);
+bool SetSwitch(const std::string& name, int value, std::string* why = nullptr);
 std::string Describe();   // one line for summary.txt
 const char* RunSuffix();  // "_quad" while the focus groups run, else ""
 void Shutdown();          // VR_Shutdown: hooks off, builder patch removed

@@ -54,6 +54,10 @@ struct Config {
     float benchDurationS = 30.0f;     // recording length
     bool benchFreezePose = true;      // constant head pose for the game while recording
     bool benchBeep = true;            // beeps: countdown start, recording start, end
+    // Developers: steps "label: switch=value, ..." separated by "|"; the hotkey then runs them one after another,
+    // each from the state before the sequence plus its switches (quad::SetSwitch), and restores that state at the end.
+    std::string benchSequence;
+    float benchSettleS = 5.0f;        // a sequence step's wait after its switches (the first step waits delay_s)
     float benchAutoStartS = 0.0f;     // > 0: the benchmark starts by itself this many seconds after the first Submit
     // [gaze]
     bool gazeRead = true;             // read gaze through IVRSystem_026 every frame
@@ -134,6 +138,15 @@ struct Config {
     int taaMotionFixKey = 0;
     // Execute time of every task of the eye groups, one log line per group with the stats (M9 step 4 diagnostics).
     bool taskProfile = false;
+    // The proxy's own CPU time in its D3D11 detours and the task hook, one log line per eye group with the stats
+    // (hook_prof.h, mvr_optimizations O1 step 0 diagnostics).
+    bool hookProfile = false;
+    // O1: binds whose views all map to themselves skip the clones' lock (clones.h SetMapCache).
+    bool clonesMapCache = true;
+    // O1: an MVR draw binds its t21..t26 only when they changed (mvr_pass.h SetBindSkip).
+    bool mvrBindSkip = true;
+    // O1 step 3: where an MVR draw takes its PS state, 0..2 (mvr_pass.h SetStateTrack).
+    int mvrStateTrack = 1;
     // A viewport the engine sets for an original while a smaller clone is bound is scaled to the clone (M7.4).
     bool clonesViewportFix = true;
     // In an eye group with clones every bind, clear and copy of a cloned original goes to its clone, and in the other

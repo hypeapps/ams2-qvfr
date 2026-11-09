@@ -55,6 +55,8 @@ struct Info {
     bool liveTrack = false;  // reads the live track map (its name in the bytecode; any kind, refused ones too)
 };
 Info InfoOf(ID3D11PixelShader* ps);
+// O1: the same from the immediate context's thread only (its draws), without the lock on a hit.
+Info InfoOfRt(ID3D11PixelShader* ps);
 bool On();  // installed and not stopped
 
 std::string Describe();      // one part of the summary line

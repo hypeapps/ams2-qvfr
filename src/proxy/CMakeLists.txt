@@ -98,6 +98,7 @@ add_library(qvfr_proxy SHARED
   callers.cpp
   clones.cpp
   hooks.cpp
+  hook_prof.cpp
   probe.cpp
   quad.cpp
   shots.cpp

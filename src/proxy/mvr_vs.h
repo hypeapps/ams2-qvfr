@@ -33,6 +33,8 @@ bool DeviceHasMvr(ID3D11Device* dev);
 // Any thread: whether `vs` is a patched shader this module gave the game (false for null). `sum`: the DXBC checksum
 // of the shader the game asked for (patched or not, "" when this module did not see it), 40 bytes.
 bool IsPatched(ID3D11VertexShader* vs, char* sum = nullptr);
+// O1: the same from the immediate context's thread only (its VSSetShader), without the lock on a hit.
+bool IsPatchedRt(ID3D11VertexShader* vs);
 
 std::string Describe();      // one part of the summary line
 void LogStats(bool totals);  // a stats line when something changed, and at the end with the refusal reasons

@@ -159,6 +159,17 @@ bool SkipDraw(ID3D11DeviceContext* c);
 // at their screen UV; without it view 1 reads outer's map at another place. A patched PS that also reads globalTexture0..4
 // (none in the capture's G-buffer pass) keeps the game's slot 3 and draws view 1 as before.
 void SetGbufferPs(bool on);
+// O1 ([debug] mvr_bind_skip, live): an MVR draw binds its t21..t26 (forward) or t26 (G-buffer) only when the views
+// differ from its pass's latest bind or a PS bind reached those slots since.
+void SetBindSkip(bool on);
+bool GetBindSkip();
+// O1 step 3 ([debug] mvr_state_track, live): where an MVR draw takes its PS state (the shader, PS slot 3, the views at
+// its screen texture slots). 0 = PS*Get* at every draw; 1 = the hooks' state (sun_fx PSSetShader, clones
+// PSSetShaderResources, this module's PSSetConstantBuffers(1)), valid from each pass's begin; 2 = as 1, checked against
+// PS*Get* (mismatches in the stats line).
+constexpr int kStateTrackModes = 3;
+void SetStateTrack(int mode);
+int GetStateTrack();
 bool GetGbufferPs();
 // B15 (docs/mvr.md), [debug] mvr_direct_extract (live, hotkey mvr_modifier + mvr_direct_extract_key): at the end of the
 // G-buffer pass the corners of slice 1 go straight into focus's clones instead of into the eye's stash (one copy less
@@ -272,5 +283,7 @@ struct TestLiveTrackState {
     std::string why;  // the latest reason a render ran
 };
 TestLiveTrackState TestLiveTrackGet();
+// O1 step 3: the session's draws checked in mvr_state_track 2 and their mismatches (PS, slot 3 and views together).
+void TestStateCheck(unsigned long long& checks, unsigned long long& mismatches);
 
 }  // namespace qvfr::mvrpass

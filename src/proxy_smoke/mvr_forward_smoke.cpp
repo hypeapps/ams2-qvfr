@@ -959,6 +959,8 @@ int RunMvrForward() {
         printf("MVR forward: FAIL (the PS module could not be installed)\n");
         return 1;
     }
+    // O1 step 3: every MVR draw takes its PS state from the hooks and checks it against PS*Get*.
+    qvfr::mvrpass::SetStateTrack(2);
     g_s.dev = dev.Get();
     g_s.ctx = ctx.Get();
     qvfr::mvrvs::TestSetEnabled(true);
@@ -1454,8 +1456,15 @@ int RunMvrForward() {
     const bool outerOk = outerC == 0 && outerD == 0 && outerH == 0 && gH.size() == refH.size();
     const bool focusOk = clonesChanged == 0 && covered > px / 3 && occluded > px / 8 && occOurs == occluded &&
                          cBig * 100 <= px && dOff * 100 <= px;
+    unsigned long long trkChecks = 0, trkMis = 0;
+    qvfr::mvrpass::TestStateCheck(trkChecks, trkMis);
+    const unsigned long long psReads = qvfr::sunfx::PsReads();
+    const bool trackOk = trkChecks > 0 && trkMis == 0;
     const bool ok = countsOk && outerOk && focusOk && liveOk && velSkipOk && gbufOk && nativeOk && msaa.ok && ltOk &&
-                    !warnings;
+                    trackOk && !warnings;
+    printf("  O1 step 3: MVR draws with the PS state from the hooks, checked against PS*Get*: %llu, mismatches %llu; "
+           "PS read back %llu times (%s)\n",
+           trkChecks, trkMis, psReads, trackOk ? "OK" : "WRONG");
     printf("%s", msaa.text.c_str());
     printf("  B19: focus's live track map: outer's drawn %s, focus R without the forward from outer drawn %s (%s); "
            "focus L's build skipped %s, render skipped %s; draws checked %llu, reads of the map %llu then %llu (stopped "

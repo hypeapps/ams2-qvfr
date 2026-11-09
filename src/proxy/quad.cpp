@@ -22,6 +22,7 @@
 #include "focus_cull.h"
 #include "focus_geometry.h"
 #include "gpu.h"
+#include "hook_prof.h"
 #include "hooks.h"
 #include "mvr_motion.h"
 #include "mvr_pass.h"
@@ -257,6 +258,7 @@ double g_firstFocusMs = -1;
 int g_detailLeft = 3;
 bool g_outLogged[kGroups] = {};
 Stats g_st, g_tot;
+double g_lastWindowMs[kGroups] = {};  // the eye groups' CPU per full frame of the latest stats interval
 bool g_shotFrame = false;
 bool g_autoShotDone = false;
 bool g_keyWasDown = false;
@@ -508,6 +510,10 @@ struct Profile {
 std::atomic<const Profile*> g_profile{nullptr};
 std::vector<const Profile*> g_profRetired;
 std::atomic<bool> g_profOn{false};
+bool g_hookProfCfg = false;  // [debug] hook_profile as last applied
+bool g_mapCacheCfg = true;   // [debug] clones_map_cache as last applied
+bool g_bindSkipCfg = true;   // [debug] mvr_bind_skip as last applied
+int g_stateTrackCfg = 1;     // [debug] mvr_state_track as last applied
 std::atomic<DWORD> g_renderTid{0};  // the thread that runs CBeginEye
 thread_local int64_t t_lastEnd = 0;  // end of the latest task this thread ran (with the profile on)
 int64_t g_qpcFreq = 0;
@@ -539,10 +545,12 @@ TaskSpans SpansOf(uint8_t* task, const ProfTask* prof) {
 }
 
 void __fastcall RunTask(uint8_t* task) {
+    hookprof::Scope hprof(hookprof::KTask);
     if (g_skip.load(std::memory_order_relaxed)) {
         if (InSkipSet(task)) {
             g_skipped.fetch_add(1, std::memory_order_relaxed);
             g_lastSkipped.store(task, std::memory_order_relaxed);
+            hookprof::Orig o;
             (*(ExecuteFn**)task)[kFinishSlot](task);  // what the skipped Execute would have ended with
             return;
         }
@@ -554,13 +562,16 @@ void __fastcall RunTask(uint8_t* task) {
     // MVR forward step 1 (B9a): focus L's SSAO and lights right before outer L's forward pass; with the live forward
     // pass (B9d) focus R's before outer R's too (EarlyWanted decides).
     if (mvr && prof && (prof->group == OuterL || prof->group == OuterR) &&
-        mvrpass::KindOf(task) == mvrpass::Kind::Phase3)
+        mvrpass::KindOf(task) == mvrpass::Kind::Phase3) {
+        hookprof::Orig o;  // the moved focus tasks (their D3D11 detours count on their own)
         EarlyFocus(prof->group - OuterL);
+    }
     const TaskSpans spans = mvr ? SpansOf(task, prof) : TaskSpans{};
     if (spans.begin >= 0) gpu::SpanBegin((gpu::Span)spans.begin);
     // MVR gate B8: a focus group's G-buffer tasks are skipped when outer's pass drew its G-buffer (B9a: and its SSAO
     // and lights after an early run).
     if (mvr && mvrpass::BeforeTask(task, prof ? prof->group : -1)) {
+        hookprof::Orig o;
         (*(ExecuteFn**)task)[kFinishSlot](task);
         if (spans.end >= 0) gpu::SpanEnd((gpu::Span)spans.end);
         return;
@@ -571,7 +582,10 @@ void __fastcall RunTask(uint8_t* task) {
     if (map) mvrpass::TaskMapBegin(kGroupNames[prof->group], prof->name, g_mapFrame);
     LARGE_INTEGER t0{}, t1{};
     if (profOn) QueryPerformanceCounter(&t0);
-    (*(ExecuteFn**)task)[kExecuteSlot](task);
+    {
+        hookprof::Orig o;
+        (*(ExecuteFn**)task)[kExecuteSlot](task);
+    }
     if (map) mvrpass::TaskMapEnd();
     if (mvr) mvrpass::AfterTask(task);
     if (spans.end >= 0) gpu::SpanEnd((gpu::Span)spans.end);
@@ -1441,6 +1455,23 @@ void HandleToolsLocked() {
         g_profOn = c.taskProfile;
         Log("Quad: task CPU profile %s (ini)", c.taskProfile ? "on" : "off");
     }
+    if (c.clonesMapCache != g_mapCacheCfg) {
+        g_mapCacheCfg = c.clonesMapCache;
+        clones::SetMapCache(c.clonesMapCache);  // logs it
+    }
+    if (mvrpass::On() && c.mvrBindSkip != g_bindSkipCfg) {
+        g_bindSkipCfg = c.mvrBindSkip;
+        mvrpass::SetBindSkip(c.mvrBindSkip);
+        Log("Quad: MVR draws bind t21..t26 only when they changed %s (ini)", c.mvrBindSkip ? "on" : "off");
+    }
+    if (mvrpass::On() && c.mvrStateTrack != g_stateTrackCfg) {
+        g_stateTrackCfg = c.mvrStateTrack;
+        mvrpass::SetStateTrack(c.mvrStateTrack);  // logs it
+    }
+    if (c.hookProfile != g_hookProfCfg) {  // on a change only: a benchmark sequence step may switch it
+        g_hookProfCfg = c.hookProfile;
+        hookprof::SetOn(c.hookProfile);  // logs it
+    }
     if (c.focusCull != g_cullCfg) {
         g_cullCfg = c.focusCull;
         g_cullOn = c.focusCull;
@@ -1964,6 +1995,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         int g = Find(g_graph.begin, task);
         if (g < 0) return;
         g_renderTid.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        hookprof::SetGroup(g);
         if (g_swap.ctx) {  // the previous group did not end
             ++g_st.lateRestores;
             RestoreLocked();
@@ -2055,6 +2087,7 @@ void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
             if (g == FocusL && Cfg().quadCompose) CopyLocked(CopyFocusL, res);
         }
     });
+    hookprof::SetGroup(-1);
     if (res) res->Release();
     return r;
 }
@@ -2279,6 +2312,7 @@ constexpr int kSlotOMSetRenderTargets = 33;  // ID3D11DeviceContext vtable (d3d1
 // (0xdb7ab0), then draws the desktop mirror (3440 x 1440 in the first M4.2 run), so only the first bind counts.
 void STDMETHODCALLTYPE D_OMSetRenderTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv,
                                             ID3D11DepthStencilView* dsv) {
+    hookprof::Scope prof(hookprof::KTargets);
     void* caller = _ReturnAddress();
     // Clones' bind fix: a pass with its own views of a cloned target binds the clone.
     ID3D11RenderTargetView* trtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT];
@@ -2296,7 +2330,10 @@ void STDMETHODCALLTYPE D_OMSetRenderTargets(ID3D11DeviceContext* c, UINT n, ID3D
     }
     if (t_inEndEye && !t_endRes && n && rtv && rtv[0] && c == gpu::Context())
         rtv[0]->GetResource(&t_endRes);
-    o_omSetRt(c, n, rtv, dsv);
+    {
+        hookprof::Orig o;
+        o_omSetRt(c, n, rtv, dsv);
+    }
     clones::OnOMSetRenderTargets(c, n, rtv, dsv, caller);
     sunfx::OnSetTargets(c, n, rtv);
     taaviews::OnSetTargets(c, n, rtv);
@@ -2839,7 +2876,13 @@ void LogStats(bool totals) {
         if (!g_st.frames && !g_tot.frames) return;
         AddStats(g_tot, g_st);
         LogStatsLocked(totals ? g_tot : g_st, totals ? " (session total)" : "");
-        if (!totals) LogProfileLocked(g_st);
+        if (!totals) {
+            LogProfileLocked(g_st);
+            double groupMs[kGroups] = {};
+            for (int g = 0; g < kGroups; ++g) groupMs[g] = g_st.full ? g_st.cpuMs[g] / g_st.full : 0;
+            hookprof::LogStats(groupMs);
+            memcpy(g_lastWindowMs, groupMs, sizeof(groupMs));
+        }
         g_st = Stats{};
         clones::LogStats(totals);
         sunfx::LogStats(totals);
@@ -2848,6 +2891,109 @@ void LogStats(bool totals) {
         mvrpass::LogStats(totals);
         taaviews::LogStats(totals);
     });
+}
+
+void LastWindowCpu(double groupMs[4]) {
+    std::lock_guard lock(g_m);
+    memcpy(groupMs, g_lastWindowMs, sizeof(g_lastWindowMs));
+}
+
+// ---------------------------------------------------------------- benchmark sequence switches
+
+namespace {
+
+struct Switch {
+    const char* name;
+    bool mvr;  // needs the MVR pass installed
+    int lo, hi;
+    int (*get)();
+    void (*set)(int);
+};
+
+const Switch kSwitches[] = {
+    {"mvr", true, 0, 1, [] { return (int)g_mvrOn; }, [](int v) { g_mvrOn = v != 0; }},
+    {"focus_cull", false, 0, 1, [] { return (int)g_cullOn; }, [](int v) { g_cullOn = v != 0; }},
+    {"sun_effects", false, 0, 1, [] { return (int)g_sunOn; }, [](int v) { g_sunOn = v != 0; }},
+    {"taa_views", false, 0, 1, [] { return (int)g_taaOn; }, [](int v) { g_taaOn = v != 0; }},
+    {"taa_motion_fix", false, 0, 1, [] { return (int)taaviews::GetMotionFix(); },
+     [](int v) { taaviews::SetMotionFix(v != 0); }},
+    {"outer_only", false, 0, 1, [] { return (int)g_userOuter; }, [](int v) { g_userOuter = v != 0; }},
+    {"task_profile", false, 0, 1, [] { return (int)g_profOn.load(); }, [](int v) { g_profOn = v != 0; }},
+    {"clones_map_cache", false, 0, 1, [] { return (int)clones::GetMapCache(); },
+     [](int v) { clones::SetMapCache(v != 0); }},
+    {"hook_profile", false, 0, 1, [] { return (int)hookprof::On(); }, [](int v) { hookprof::SetOn(v != 0); }},
+    {"mvr_early", true, 0, mvrpass::kEarlyModes - 1, [] { return mvrpass::GetEarly(); },
+     [](int v) { mvrpass::SetEarly(v); }},
+    {"mvr_mode", true, 0, (int)mvrpass::Mode::Overwrite, [] { return (int)mvrpass::GetMode(); },
+     [](int v) { mvrpass::SetMode((mvrpass::Mode)v); }},
+    {"mvr_forward", true, 0, 1, [] { return (int)mvrpass::GetForward(); }, [](int v) { mvrpass::SetForward(v != 0); }},
+    {"mvr_forward_depth", true, 0, mvrpass::kForwardDepthModes - 1, [] { return mvrpass::GetForwardDepth(); },
+     [](int v) { mvrpass::SetForwardDepth(v); }},
+    {"mvr_ms_color_skip", true, 0, 1, [] { return (int)mvrpass::GetMsColorSkip(); },
+     [](int v) { mvrpass::SetMsColorSkip(v != 0); }},
+    {"mvr_livetrack_skip", true, 0, 1, [] { return (int)mvrpass::GetLiveTrackSkip(); },
+     [](int v) { mvrpass::SetLiveTrackSkip(v != 0); }},
+    {"mvr_velocity", true, 0, 1, [] { return (int)mvrmotion::Enabled(); }, [](int v) { mvrmotion::SetEnabled(v != 0); }},
+    {"mvr_velocity_skip", true, 0, 1, [] { return (int)mvrpass::GetVelocitySkip(); },
+     [](int v) { mvrpass::SetVelocitySkip(v != 0); }},
+    {"mvr_gbuffer_ps", true, 0, 1, [] { return (int)mvrpass::GetGbufferPs(); },
+     [](int v) { mvrpass::SetGbufferPs(v != 0); }},
+    {"mvr_direct_extract", true, 0, 1, [] { return (int)mvrpass::GetDirectExtract(); },
+     [](int v) { mvrpass::SetDirectExtract(v != 0); }},
+    {"mvr_bind_skip", true, 0, 1, [] { return (int)mvrpass::GetBindSkip(); },
+     [](int v) { mvrpass::SetBindSkip(v != 0); }},
+    {"mvr_state_track", true, 0, mvrpass::kStateTrackModes - 1, [] { return mvrpass::GetStateTrack(); },
+     [](int v) { mvrpass::SetStateTrack(v); }},
+    {"mvr_native_targets", true, 0, 1, [] { return (int)mvrpass::GetNativeTargets(); },
+     [](int v) { mvrpass::SetNativeTargets(v != 0); }},
+};
+
+const Switch* FindSwitch(const std::string& name, std::string* why) {
+    for (const Switch& s : kSwitches) {
+        if (name != s.name) continue;
+        if (s.mvr && !mvrpass::On()) {
+            if (why) *why = name + ": MVR is not installed ([debug] mvr_gbuffer=1)";
+            return nullptr;
+        }
+        return &s;
+    }
+    if (why) {
+        *why = "unknown switch \"" + name + "\" (known:";
+        for (const Switch& s : kSwitches) *why += std::string(" ") + s.name;
+        *why += ")";
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+bool GetSwitch(const std::string& name, int& value, std::string* why) {
+    bool ok = false;
+    Safe("GetSwitch", [&] {
+        std::lock_guard lock(g_m);
+        if (const Switch* s = FindSwitch(name, why)) {
+            value = s->get();
+            ok = true;
+        }
+    });
+    return ok;
+}
+
+bool SetSwitch(const std::string& name, int value, std::string* why) {
+    bool ok = false;
+    Safe("SetSwitch", [&] {
+        std::lock_guard lock(g_m);
+        const Switch* s = FindSwitch(name, why);
+        if (!s) return;
+        if (value < s->lo || value > s->hi) {
+            if (why) *why = name + "=" + std::to_string(value) + ": out of range " + std::to_string(s->lo) + ".." +
+                            std::to_string(s->hi);
+            return;
+        }
+        s->set(value);
+        ok = true;
+    });
+    return ok;
 }
 
 std::string Describe() {

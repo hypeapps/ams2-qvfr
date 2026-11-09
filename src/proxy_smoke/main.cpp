@@ -89,6 +89,7 @@ int RunTaaFix();  // taa_fix_smoke.cpp
 int RunMvrMotion();  // mvr_motion_smoke.cpp
 #include "focus_cull.h"
 #include "focus_geometry.h"
+#include "hook_prof.h"
 #include "hooks.h"
 #include "shots.h"
 #include "xr_smoke.h"
@@ -1271,6 +1272,57 @@ int RunClones() {
     if (back) back->Release();
     cl::EndGroup(ctx);
     ctx->PSSetShaderResources(0, 2, none);
+    // O1 map cache (after the proof groups): in a focus group C's view (no clone) bound twice, the second time without the lock; then A's
+    // original view with C's (translated: never from the cache) and C's again (from the cache).
+    {
+        uint64_t h0 = 0, m0 = 0, h1 = 0, m1 = 0;
+        bool watching = true;
+        for (int g = 0; g < 400 && watching; ++g) {  // past the proof groups (240)
+            if (g % 2 == 0) cl::OnFrameStart(ctx, true);
+            cl::BeginGroup(ctx, cl::Focus);
+            watching = cl::TestMapCache(h0, m0);
+            if (watching) cl::EndGroup(ctx);
+        }
+        ID3D11ShaderResourceView* cv[1] = {srvC};
+        ctx->PSSetShaderResources(1, 1, cv);
+        ctx->PSSetShaderResources(1, 1, cv);
+        ID3D11ShaderResourceView* av[2] = {srvA, srvC};
+        ctx->PSSetShaderResources(0, 2, av);
+        ID3D11ShaderResourceView* got[2] = {};
+        ctx->PSGetShaderResources(0, 2, got);
+        const bool translated = got[0] == A.at<ID3D11ShaderResourceView*>(0x70) && got[1] == srvC;
+        for (auto* g : got)
+            if (g) g->Release();
+        ctx->PSSetShaderResources(1, 1, cv);
+        cl::TestMapCache(h1, m1);
+        // O1 step 3: PsView in a new epoch: slot 1 bound since (the hook's view, no read-back), slot 0 bound before
+        // (read back once, then kept), both as PSGetShaderResources gives them.
+        {
+            cl::NewPsViewEpoch();
+            ctx->PSSetShaderResources(1, 1, cv);
+            const uint64_t r0 = cl::PsViewReads();
+            ID3D11ShaderResourceView* v1 = cl::PsView(ctx, 1);
+            const uint64_t r1 = cl::PsViewReads();
+            ID3D11ShaderResourceView* v0 = cl::PsView(ctx, 0);
+            ID3D11ShaderResourceView* v0b = cl::PsView(ctx, 0);
+            const uint64_t r2 = cl::PsViewReads();
+            ID3D11ShaderResourceView* real[2] = {};
+            ctx->PSGetShaderResources(0, 2, real);
+            expect(v1 == real[1] && v0 == real[0] && v0b == v0 && v0 && v1 && r1 == r0 && r2 == r1 + 1,
+                   "PsView: the hook's view of slot 1, slot 0 read back once");
+            printf("Clones PsView: slot 1 %s (read back %llu), slot 0 %s (read back %llu)\n",
+                   v1 == real[1] ? "ok" : "WRONG", (unsigned long long)(r1 - r0), v0 == real[0] ? "ok" : "WRONG",
+                   (unsigned long long)(r2 - r1));
+            for (auto* r : real)
+                if (r) r->Release();
+        }
+        cl::EndGroup(ctx);
+        expect(translated, "map cache: A's original view still translated to its clone");
+        expect(watching || (h1 - h0 == 2 && m1 - m0 == 2),
+               "map cache: C's view bound again without the lock (2 of 4 binds), A's through the lock");
+        printf("Clones map cache: %s group, binds without the lock %llu, locked %llu\n", watching ? "watching" : "plain",
+               (unsigned long long)(h1 - h0), (unsigned long long)(m1 - m0));
+    }
     // An object destroyed inside a focus group gets its originals back at once; the list is watched again.
     cl::OnFrameStart(ctx, true);
     cl::BeginGroup(ctx, cl::Focus);
@@ -1629,6 +1681,8 @@ int main(int argc, char** argv) {
     bool openxrPathTest = false;
     bool openxr = false;
     bool noLayer = false;
+    bool hookProfile = false;
+    std::string sequence;  // --scene: [benchmark] sequence (auto_start_s runs it), settle_s=1
     auto hasValue = [&](int i) { return i + 1 < argc && strncmp(argv[i + 1], "--", 2) != 0; };
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--scene")) scene = hasValue(i) ? atof(argv[++i]) : 12.0;
@@ -1650,6 +1704,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--mvr-ps")) mvrPsTest = true;
         else if (!strcmp(argv[i], "--mvr-pass")) mvrPassTest = true;
         else if (!strcmp(argv[i], "--mvr-forward")) mvrForwardTest = true;
+        else if (!strcmp(argv[i], "--hook-profile")) hookProfile = true;
+        else if (!strcmp(argv[i], "--sequence") && hasValue(i)) sequence = argv[++i];
         else if (!strcmp(argv[i], "--xr-layer")) xrLayerTest = true;
         else if (!strcmp(argv[i], "--openxr-path")) openxrPathTest = true;
         else if (!strcmp(argv[i], "--openxr")) openxr = true;
@@ -1668,16 +1724,39 @@ int main(int argc, char** argv) {
     SetEnvironmentVariableW(L"QVFR_HOME", home.c_str());
     if (shotsTest) return RunShots(home);
     if (composeTest) return RunCompose();
-    if (clonesTest) return RunClones();
-    if (sunFxTest) return RunSunFx();
-    if (mvrVsTest) return RunMvrVs();
-    if (mvrPsTest) return RunMvrPs();
-    if (mvrPassTest) return RunMvrPass();
-    if (mvrForwardTest) return RunMvrForward();
+    // --hook-profile with one of the module tests below: the test runs with [debug] hook_profile on (this thread as outer
+    // L's group); the detours must have counted and every scope must have closed.
+    auto profiled = [&](int (*run)()) {
+        if (!hookProfile) return run();
+        qvfr::hookprof::SetOn(true);
+        qvfr::hookprof::SetGroup(0);
+        const int r = run();
+        const uint64_t calls = qvfr::hookprof::TestCalls();
+        const int depth = qvfr::hookprof::TestDepth();
+        const double groupMs[4] = {};
+        qvfr::hookprof::LogStats(groupMs);
+        qvfr::hookprof::SetGroup(-1);
+        qvfr::hookprof::SetOn(false);
+        const bool ok = calls && !depth;
+        printf("Hook profile check %s: %llu detour calls measured, scope depth after the test %d (lines in the proxy "
+               "log)\n", ok ? "OK" : "FAILED", (unsigned long long)calls, depth);
+        return r ? r : ok ? 0 : 5;
+    };
+    if (clonesTest) return profiled(RunClones);
+    if (sunFxTest) return profiled(RunSunFx);
+    if (mvrVsTest) return profiled(RunMvrVs);
+    if (mvrPsTest) return profiled(RunMvrPs);
+    if (mvrPassTest) return profiled(RunMvrPass);
+    if (mvrForwardTest) return profiled(RunMvrForward);
     if (xrLayerTest) return RunXrLayer(ExeDir() / L"proxy" / L"openvr_api.dll", home);
     if (openxrPathTest) return RunOpenXrPath(ExeDir() / L"proxy" / L"openvr_api.dll", home);
     if (FILE* f = _wfopen((home / L"qvfr.ini").c_str(), L"wb")) {
-        fputs(scene > 0 ? kSceneIni : kBackgroundIni, f);
+        std::string base = scene > 0 ? kSceneIni : kBackgroundIni;
+        if (scene > 0 && !sequence.empty()) {  // inside [benchmark]: a second section of that name would not be read
+            const std::string at = "auto_start_s=2\n";
+            base.insert(base.find(at) + at.size(), "sequence=" + sequence + "\nsettle_s=1\n");
+        }
+        fputs(base.c_str(), f);
         if (!experiment.empty()) fprintf(f, "[experiment]\nmode=%s\n%s", experiment.c_str(), center.c_str());
         if (fault > 0) fprintf(f, "[test]\nfault_frames=%d\n", fault);
         if (trace) fputs("[trace]\ncallers=1\ndepth=12\n", f);

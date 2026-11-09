@@ -10,6 +10,7 @@
 #include "clones.h"
 #include "common.h"
 #include "gpu.h"
+#include "hook_prof.h"
 #include "hooks.h"
 #include "mvr_pass.h"
 #include "sun_fx_ps.h"  // kSunFxPS (fxc from shaders/sun_fx.hlsl)
@@ -145,6 +146,7 @@ std::atomic<ID3D11DeviceContext*> g_imm{nullptr};
 std::atomic<int> g_group{-1};  // eye group running now (render thread), -1 = none
 bool g_enabled = false;
 std::atomic<bool> g_dead{false};  // a fault, or the game's device is not the hooked one: off for the session
+bool g_ctxHooked = false;  // the context of g_imm calls the hooked functions (CheckContext; CurrentPs)
 bool g_testing = false;
 uint32_t g_gen = 0;
 ID3D11DeviceContext* g_checkedCtx = nullptr;
@@ -157,6 +159,9 @@ float g_origin[2] = {0, 0}, g_scale[2] = {1, 1};
 // Current pixel shader and render target 0 of the immediate context.
 ID3D11PixelShader* g_curPs = nullptr;
 Kind g_curKind = KindNone;
+// O1 step 3 (CurrentPs): g_curPs's epoch (the latest NewPsEpoch when the hook saw it set) and the epoch now.
+uint32_t g_curPsEpoch = 0, g_psEpoch = 1;
+uint64_t g_psReads = 0;
 ID3D11RenderTargetView* g_curRt0 = nullptr;
 // Anchor learning in outer: after an effect draw, the first draw into another target is the anchor's pixel shader.
 ID3D11RenderTargetView* g_sunRtv = nullptr;
@@ -578,44 +583,82 @@ HRESULT STDMETHODCALLTYPE D_CreatePixelShader(ID3D11Device* dev, const void* cod
 
 void STDMETHODCALLTYPE D_PSSetShader(ID3D11DeviceContext* c, ID3D11PixelShader* ps, ID3D11ClassInstance* const* ci,
                                      UINT n) {
-    o_psSet(c, ps, ci, n);
+    hookprof::Scope prof(hookprof::KPsShader);
+    {
+        hookprof::Orig o;
+        o_psSet(c, ps, ci, n);
+    }
     if (c != g_imm.load(std::memory_order_relaxed)) return;
     g_curPs = ps;
     g_curKind = Lookup(ps);
+    g_curPsEpoch = g_psEpoch;
 }
 
 void STDMETHODCALLTYPE D_DrawIndexed(ID3D11DeviceContext* c, UINT count, UINT start, INT base) {
+    hookprof::Scope prof(hookprof::KDraw);
     if (const InsideFn inside = g_drawInside.load(std::memory_order_relaxed); inside && inside()) {
+        hookprof::Orig o;
         o_drawIndexed(c, count, start, base);
         return;
     }
     if (mvrpass::SkipDraw(c)) return;  // B11: a focus velocity pass whose target got outer's vectors
-    if (const DrawReplaceFn replace = g_drawReplace.load(std::memory_order_relaxed); replace && replace(c, count))
-        return;  // DLSS replaced the game's TAA resolve
-    const bool taaFix = taaviews::OnDraw(c, true, count);
+    if (const DrawReplaceFn replace = g_drawReplace.load(std::memory_order_relaxed)) {
+        hookprof::SubScope sp(hookprof::SDlss);
+        if (replace(c, count)) return;  // DLSS replaced the game's TAA resolve
+    }
+    bool taaFix;
+    {
+        hookprof::SubScope sp(hookprof::STaaDraw);
+        taaFix = taaviews::OnDraw(c, true, count);
+    }
     const bool mvr = mvrpass::BeforeDraw(c);
     int g = -1;
     Action a = Forward;
-    if (Active(c, g))
-        Protect("DrawIndexed", [&] { a = OnDraw(c, g, [&] { o_drawIndexed(c, count, start, base); }); });
-    if (a == Forward) o_drawIndexed(c, count, start, base);
+    if (Active(c, g)) {
+        Protect("DrawIndexed", [&] {
+            a = OnDraw(c, g, [&] {
+                hookprof::Orig o;
+                o_drawIndexed(c, count, start, base);
+            });
+        });
+    }
+    if (a == Forward) {
+        hookprof::Orig o;
+        o_drawIndexed(c, count, start, base);
+    }
     if (mvr) mvrpass::AfterDraw(c);
     if (taaFix) taaviews::AfterDraw(c);
     if (const AfterFn after = g_drawAfter.load(std::memory_order_relaxed)) after(c);
 }
 
 void STDMETHODCALLTYPE D_Draw(ID3D11DeviceContext* c, UINT count, UINT start) {
+    hookprof::Scope prof(hookprof::KDraw);
     if (const InsideFn inside = g_drawInside.load(std::memory_order_relaxed); inside && inside()) {
+        hookprof::Orig o;
         o_draw(c, count, start);
         return;
     }
     if (mvrpass::SkipDraw(c)) return;  // B11
-    const bool taaFix = taaviews::OnDraw(c, false, count);
+    bool taaFix;
+    {
+        hookprof::SubScope sp(hookprof::STaaDraw);
+        taaFix = taaviews::OnDraw(c, false, count);
+    }
     const bool mvr = mvrpass::BeforeDraw(c);
     int g = -1;
     Action a = Forward;
-    if (Active(c, g)) Protect("Draw", [&] { a = OnDraw(c, g, [&] { o_draw(c, count, start); }); });
-    if (a == Forward) o_draw(c, count, start);
+    if (Active(c, g)) {
+        Protect("Draw", [&] {
+            a = OnDraw(c, g, [&] {
+                hookprof::Orig o;
+                o_draw(c, count, start);
+            });
+        });
+    }
+    if (a == Forward) {
+        hookprof::Orig o;
+        o_draw(c, count, start);
+    }
     if (mvr) mvrpass::AfterDraw(c);
     if (taaFix) taaviews::AfterDraw(c);
 }
@@ -722,7 +765,8 @@ void OnFrameStart(ID3D11DeviceContext* ctx, bool enabled) {
         }
         if (ctx && ctx != g_checkedCtx && g_installed && !g_testing) {
             g_checkedCtx = ctx;
-            if (!CheckContext(ctx)) g_dead = true;
+            g_ctxHooked = CheckContext(ctx);
+            if (!g_ctxHooked) g_dead = true;
         }
         g_imm.store(ctx, std::memory_order_relaxed);
         if (g_valid[0] && g_valid[1]) ++g_st.outerFrames;
@@ -802,13 +846,36 @@ void Shutdown() {
         g_enabled = false;
         g_imm = nullptr;
         g_checkedCtx = nullptr;
+        g_ctxHooked = false;
         ReleaseObjects();
     });
 }
 
+void NewPsEpoch() { ++g_psEpoch; }
+ID3D11PixelShader* CurrentPs(ID3D11DeviceContext* c) {
+    // The hook sees the game's calls only when its device uses the hooked functions (CheckContext). A fault that stops
+    // the sun effects (g_dead) does not stop the hook.
+    const bool tracked = g_installed && g_ctxHooked && c == g_imm.load(std::memory_order_relaxed);
+    if (tracked && g_curPsEpoch == g_psEpoch) return g_curPs;
+    ID3D11PixelShader* ps = nullptr;
+    c->PSGetShader(&ps, nullptr, nullptr);
+    if (ps) ps->Release();  // the context keeps it bound
+    ++g_psReads;
+    hookprof::Count(hookprof::CPsGet);
+    if (tracked) {
+        g_curPs = ps;
+        g_curKind = Lookup(ps);
+        g_curPsEpoch = g_psEpoch;
+    }
+    return ps;
+}
+uint64_t PsReads() { return g_psReads; }
+
 bool TestInstall(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
     g_testing = true;
     if (!g_installed) g_installed = hooks::Init() && HookAll(dev, ctx);
+    g_imm.store(ctx, std::memory_order_relaxed);  // the PSSetShader hook follows the test context (CurrentPs)
+    g_ctxHooked = g_installed;
     return g_installed;
 }
 

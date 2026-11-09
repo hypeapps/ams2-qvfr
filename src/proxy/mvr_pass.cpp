@@ -17,6 +17,7 @@
 #include "clones.h"
 #include "common.h"
 #include "gpu.h"
+#include "hook_prof.h"
 #include "hooks.h"
 #include "mvr_pass_blit_ps.h"      // kMvrPassBlitPS
 #include "mvr_pass_color_in_ms_ps.h"   // kMvrPassColorInMsPS (B12)
@@ -30,6 +31,7 @@
 #include "mvr_ps.h"
 #include "mvr_ps_patch.h"  // dxbc::kMvrPsMagic
 #include "mvr_vs.h"
+#include "sun_fx.h"
 
 namespace qvfr::mvrpass {
 
@@ -662,6 +664,7 @@ struct SrvClone {
     ComPtr<ID3D11ShaderResourceView> game, clone;  // clone null: the texture has no focus clone
 };
 std::vector<SrvClone> g_srvClones;  // the forward pass's screen texture views on focus's clones
+constexpr size_t kSrvClonesMax = 64;
 char g_fwdLabels[kMaxTargets][96] = {};
 char g_fwdNames[2 * kMaxTargets][32] = {};
 uint64_t g_earlyOk[2] = {};  // the frame of the eye's latest early SSAO and lights run without an engine fault
@@ -802,7 +805,11 @@ bool SetViews(ID3D11DeviceContext* c, NvU32 views) {
     p.numViews = views;
     for (NvU32 i = 0; i < 4; ++i) p.renderTargetIndexOffset[i] = i;
     p.renderTargetIndexOffset[1] = g_p.viewSlice;  // B12 step 5: 2 in outer R's pass on three-slice arrays
-    const NvAPI_Status st = NvAPI_D3D_SetMultiViewMode(c, &p);
+    NvAPI_Status st;
+    {
+        hookprof::SubScope prof(hookprof::SSetViews);
+        st = NvAPI_D3D_SetMultiViewMode(c, &p);
+    }
     if (st == NVAPI_OK) return true;
     if (!g_p.viewsFailures++ && !g_st.viewsFailures)
         Log("MVR G-buffer: NvAPI_D3D_SetMultiViewMode(%u views) %s", (unsigned)views, NvErr(st).c_str());
@@ -1526,8 +1533,140 @@ ID3D11ShaderResourceView* LiveTrackSrv(ID3D11DeviceContext* c, ID3D11ShaderResou
     return m.srv.Get();
 }
 
-// The view of a screen texture on its focus clone, with the game view's description (null: no clone).
-ID3D11ShaderResourceView* CloneSrv(ID3D11ShaderResourceView* v) {
+// O1 step 3 ([debug] mvr_state_track, live): an MVR draw takes the PS state it needs (the shader, PS slot 3, the views
+// at its screen texture slots) from the hooks instead of PS*Get* (each AddRef, Release and the runtime's own work).
+// 0 = PS*Get* at every draw (as before); 1 = from the hooks; 2 = from the hooks, checked against PS*Get* (the read-back
+// is used; mismatches counted and logged). The hooks' state is valid for what they saw since the pass began: each pass
+// starts a new epoch (NewStateEpoch), the first draw that needs a slot not set since reads it back once.
+int g_trackMode = 1;
+bool g_cbTracked = false;  // PSSetConstantBuffers and PSSetConstantBuffers1 hooked
+ID3D11Buffer* g_cb3 = nullptr;  // PS slot 3 of the immediate context as the hooks saw it set (not referenced)
+uint32_t g_cb3Epoch = 0, g_cbEpoch = 1;
+struct TrackStats {
+    uint64_t checks = 0, misPs = 0, misCb = 0, misSrv = 0, cbReads = 0;
+};
+TrackStats g_trk, g_trkTot;
+// The forward pass's latest screen texture view per t21..t25 slot and its focus view (CloneSrv; the game view is held
+// by g_srvClones, so its address stays its own).
+ID3D11ShaderResourceView* g_texIn[mvrps::kTextures] = {};
+ID3D11ShaderResourceView* g_texOut[mvrps::kTextures] = {};
+
+void NewStateEpoch() {
+    sunfx::NewPsEpoch();
+    clones::NewPsViewEpoch();
+    ++g_cbEpoch;
+    memset(g_texIn, 0, sizeof(g_texIn));
+    memset(g_texOut, 0, sizeof(g_texOut));
+}
+// From the PSSetConstantBuffers(1) hooks: a bind on context c from slot `start`, `num` buffers.
+void NotePsCb(ID3D11DeviceContext* c, UINT start, UINT num, ID3D11Buffer* const* b) {
+    if (start > mvrps::kCbSlot || start + num <= mvrps::kCbSlot || c != Imm()) return;
+    g_cb3 = b ? b[mvrps::kCbSlot - start] : nullptr;
+    g_cb3Epoch = g_cbEpoch;
+}
+ID3D11PixelShader* GetPs(ID3D11DeviceContext* c) {
+    ID3D11PixelShader* ps = nullptr;
+    c->PSGetShader(&ps, nullptr, nullptr);
+    if (ps) ps->Release();  // the context keeps it bound
+    return ps;
+}
+ID3D11Buffer* GetCb3(ID3D11DeviceContext* c) {
+    ID3D11Buffer* b = nullptr;
+    c->PSGetConstantBuffers(mvrps::kCbSlot, 1, &b);
+    if (b) b->Release();
+    return b;
+}
+ID3D11ShaderResourceView* GetSrv(ID3D11DeviceContext* c, UINT slot) {
+    ID3D11ShaderResourceView* v = nullptr;
+    c->PSGetShaderResources(slot, 1, &v);
+    if (v) v->Release();
+    return v;
+}
+// The bound PS, PS slot 3 and the view at PS slot `slot` for an MVR draw (not referenced; valid while bound).
+ID3D11PixelShader* DrawPs(ID3D11DeviceContext* c) {
+    if (g_trackMode == 0) {
+        hookprof::Count(hookprof::CPsGet);
+        return GetPs(c);
+    }
+    ID3D11PixelShader* ps = sunfx::CurrentPs(c);
+    if (g_trackMode == 1) return ps;
+    ID3D11PixelShader* real = GetPs(c);
+    ++g_trk.checks;
+    if (real != ps) ++g_trk.misPs;
+    return real;
+}
+ID3D11Buffer* DrawCb3(ID3D11DeviceContext* c) {
+    if (g_trackMode == 0) {
+        hookprof::Count(hookprof::CPsGet);
+        return GetCb3(c);
+    }
+    ID3D11Buffer* b = g_cb3;
+    if (!g_cbTracked || g_cb3Epoch != g_cbEpoch) {
+        b = GetCb3(c);
+        hookprof::Count(hookprof::CPsGet);
+        ++g_trk.cbReads;
+        if (g_cbTracked) {
+            g_cb3 = b;
+            g_cb3Epoch = g_cbEpoch;
+        }
+    }
+    if (g_trackMode == 1) return b;
+    ID3D11Buffer* real = GetCb3(c);
+    if (real != b) ++g_trk.misCb;
+    return real;
+}
+ID3D11ShaderResourceView* DrawSrv(ID3D11DeviceContext* c, UINT slot) {
+    if (g_trackMode == 0) {
+        hookprof::Count(hookprof::CPsGet);
+        return GetSrv(c, slot);
+    }
+    ID3D11ShaderResourceView* v = clones::PsView(c, slot);
+    if (g_trackMode == 1) return v;
+    ID3D11ShaderResourceView* real = GetSrv(c, slot);
+    if (real != v) ++g_trk.misSrv;
+    return real;
+}
+
+// O1: the latest t21..t26 a forward draw bound in this pass (not referenced) and clones::PsHighSlotsGen right after
+// that bind; a draw with the same views and no PS bind at those slots since skips its own (96% of them in the game).
+// The G-buffer pass the same for its t26. Reset at every pass begin.
+static_assert(mvrps::kTexBase >= clones::kPsWatchSlot, "clones must count the binds at t21..t26");
+ID3D11ShaderResourceView* g_lastTex[mvrps::kTextures] = {};
+uint32_t g_lastTexGen = 0;
+bool g_lastTexOk = false;
+bool g_texSkipOn = true;  // [debug] mvr_bind_skip (live)
+void ResetLastTex() {
+    memset(g_lastTex, 0, sizeof(g_lastTex));
+    g_lastTexOk = false;
+    NewStateEpoch();
+}
+// True: these views are bound at t21.. (count `n` from mvrps::kTexBase + first) by this pass's latest bind and nothing
+// bound PS slots there since; else they get bound and noted.
+bool BindTex(ID3D11DeviceContext* c, UINT first, UINT n, ID3D11ShaderResourceView* const* tex) {
+    const bool same = g_texSkipOn && g_lastTexOk && !memcmp(g_lastTex + first, tex, n * sizeof(*tex)) &&
+                      clones::PsHighSlotsGen() == g_lastTexGen;
+    hookprof::Count(hookprof::CTexBind);
+    if (same) {
+        hookprof::Count(hookprof::CTexBindSame);
+        return true;
+    }
+    {
+        Internal in;
+        clones::RawScope raw;
+        c->PSSetShaderResources(mvrps::kTexBase + first, n, tex);
+    }
+    // A partial bind leaves the other slots as they were, unknown here unless noted: never equal to a real bind.
+    if (!g_lastTexOk && n != mvrps::kTextures) memset(g_lastTex, 0xFF, sizeof(g_lastTex));
+    memcpy(g_lastTex + first, tex, n * sizeof(*tex));
+    g_lastTexOk = true;
+    g_lastTexGen = clones::PsHighSlotsGen();
+    return false;
+}
+
+// The view of a screen texture on its focus clone, with the game view's description (null: no clone). `held`: the
+// game view is in g_srvClones (its address cannot be reused while there).
+ID3D11ShaderResourceView* CloneSrv(ID3D11ShaderResourceView* v, bool& held) {
+    held = true;
     for (const SrvClone& e : g_srvClones)
         if (e.game.Get() == v) return e.clone.Get();
     SrvClone e;
@@ -1540,8 +1679,10 @@ ID3D11ShaderResourceView* CloneSrv(ID3D11ShaderResourceView* v) {
         v->GetDesc(&d);
         if (FAILED(g_g.dev->CreateShaderResourceView(clone, &d, &e.clone))) e.clone.Reset();
     }
-    if (g_srvClones.size() < 64) g_srvClones.push_back(e);
-    return e.clone.Get();
+    held = g_srvClones.size() < kSrvClonesMax;
+    if (!held) return nullptr;  // e's views go with it: nothing to bind (a screen texture miss)
+    g_srvClones.push_back(e);
+    return g_srvClones.back().clone.Get();
 }
 
 // Before each draw of the forward pass: two views when the VS and the PS are right for view 1 (VS patched; PS
@@ -1555,35 +1696,42 @@ void ForwardDraw(ID3D11DeviceContext* c) {
         if (p.views != 1 && SetViews(c, 1)) p.views = 1;
         return;
     }
-    ID3D11PixelShader* ps = nullptr;
-    c->PSGetShader(&ps, nullptr, nullptr);
-    const mvrps::Info info = mvrps::InfoOf(ps);
-    if (ps) ps->Release();
+    mvrps::Info info;
+    {
+        ID3D11PixelShader* ps = DrawPs(c);
+        hookprof::SubScope prof(hookprof::SPsInfo);
+        info = mvrps::InfoOfRt(ps);
+    }
     const bool psOk = info.kind == mvrps::Kind::Patched || info.kind == mvrps::Kind::NotNeeded;
     if (info.kind == mvrps::Kind::Patched && p.vsPatched) {
         ++p.psPatchedDraws;
-        ID3D11Buffer* cur = nullptr;
-        c->PSGetConstantBuffers(mvrps::kCbSlot, 1, &cur);
         ID3D11Buffer* mine = g_g.psRowsCb.Get();
-        if (cur != mine) {
+        if (DrawCb3(c) != mine) {
             Internal in;
             c->PSSetConstantBuffers(mvrps::kCbSlot, 1, &mine);
             ++p.psCbRebinds;
+            hookprof::Count(hookprof::CPsSlot3Rebind);
         }
-        if (cur) cur->Release();
         ID3D11ShaderResourceView* tex[mvrps::kTextures] = {};
         for (unsigned k = 0; k < mvrps::kTextures; ++k) {
             if (info.slot[k] == mvrps::kNoSlot) continue;
-            ID3D11ShaderResourceView* g = nullptr;
-            c->PSGetShaderResources(info.slot[k], 1, &g);
+            ID3D11ShaderResourceView* g = DrawSrv(c, info.slot[k]);
             if (!g) continue;
-            tex[k] = k == mvrps::kLiveTrack ? LiveTrackSrv(c, g) : CloneSrv(g);
+            if (k == mvrps::kLiveTrack) {
+                tex[k] = LiveTrackSrv(c, g);
+            } else if (g == g_texIn[k]) {
+                tex[k] = g_texOut[k];
+            } else {
+                bool held = false;
+                tex[k] = CloneSrv(g, held);
+                if (held) {
+                    g_texIn[k] = g;
+                    g_texOut[k] = tex[k];
+                }
+            }
             if (!tex[k]) ++p.srvMisses;
-            g->Release();
         }
-        Internal in;
-        clones::RawScope raw;
-        c->PSSetShaderResources(mvrps::kTexBase, mvrps::kTextures, tex);
+        BindTex(c, 0, mvrps::kTextures, tex);
     }
     if (!p.vsPatched)
         ++p.vsPlainDraws;
@@ -1602,10 +1750,12 @@ void ForwardDraw(ID3D11DeviceContext* c) {
 void GbufDraw(ID3D11DeviceContext* c) {
     Pass& p = g_p;
     if (p.views != 2) return;
-    ID3D11PixelShader* ps = nullptr;
-    c->PSGetShader(&ps, nullptr, nullptr);
-    const mvrps::Info info = mvrps::InfoOf(ps);
-    if (ps) ps->Release();
+    mvrps::Info info;
+    {
+        ID3D11PixelShader* ps = DrawPs(c);
+        hookprof::SubScope prof(hookprof::SPsInfo);
+        info = mvrps::InfoOfRt(ps);
+    }
     if (info.kind != mvrps::Kind::Patched) return;
     if (!p.gbufPsBound) {
         c->PSGetConstantBuffers(mvrps::kCbSlot, 1, &p.psSlot3);
@@ -1614,14 +1764,12 @@ void GbufDraw(ID3D11DeviceContext* c) {
     bool screen = false;
     for (unsigned k = 0; k < mvrps::kLiveTrack; ++k) screen |= info.slot[k] != mvrps::kNoSlot;
     ID3D11Buffer* want = screen ? p.psSlot3 : g_g.psRowsCb.Get();
-    ID3D11Buffer* cur = nullptr;
-    c->PSGetConstantBuffers(mvrps::kCbSlot, 1, &cur);
-    if (cur != want) {
+    if (DrawCb3(c) != want) {
         Internal in;
         c->PSSetConstantBuffers(mvrps::kCbSlot, 1, &want);
         ++p.psCbRebinds;
+        hookprof::Count(hookprof::CPsSlot3Rebind);
     }
-    if (cur) cur->Release();
     if (screen) {
         ++p.gbufPsKept;
         return;
@@ -1629,17 +1777,12 @@ void GbufDraw(ID3D11DeviceContext* c) {
     ++p.gbufPsDraws;
     ID3D11ShaderResourceView* map = nullptr;
     if (info.slot[mvrps::kLiveTrack] != mvrps::kNoSlot) {
-        ID3D11ShaderResourceView* g = nullptr;
-        c->PSGetShaderResources(info.slot[mvrps::kLiveTrack], 1, &g);
-        if (g) {
+        if (ID3D11ShaderResourceView* g = DrawSrv(c, info.slot[mvrps::kLiveTrack])) {
             map = LiveTrackSrv(c, g);
             if (!map) ++p.srvMisses;
-            g->Release();
         }
     }
-    Internal in;
-    clones::RawScope raw;
-    c->PSSetShaderResources(mvrps::kTexBase + mvrps::kLiveTrack, 1, &map);
+    BindTex(c, mvrps::kLiveTrack, 1, &map);
 }
 
 // A constant buffer range the next draw reads (VS `slot` from its binding offset), read back at once (shot frame only:
@@ -2173,6 +2316,7 @@ void PassRefused(bool forward, bool live, int e, const char* why) {
 // live one, B9d) begins.
 void PassBegin(uint8_t* task, int e, bool forward, bool live = false) {
     Pass& p = g_p;
+    ResetLastTex();
     if (!forward) g_stash[e].valid = false;
     if (p.part != PartNone) {  // a pass whose task did not end (should not happen)
         ReleasePassRefs(p);
@@ -3258,6 +3402,8 @@ using DrawIndirectFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11Buff
 VSSetShaderFn o_vsSet = nullptr;
 VSSetCbFn o_vsCb = nullptr;
 VSSetCb1Fn o_vsCb1 = nullptr;
+VSSetCbFn o_psCb = nullptr;  // the same signatures for the PS
+VSSetCb1Fn o_psCb1 = nullptr;
 DrawIndexedInstancedFn o_dii = nullptr;
 DrawInstancedFn o_di = nullptr;
 DrawAutoFn o_da = nullptr;
@@ -3271,7 +3417,10 @@ void OnVs(ID3D11DeviceContext* c, ID3D11VertexShader* vs) {
         Pass& p = g_p;
         if (!vs) return;
         if (p.forward) {  // views per draw (ForwardDraw)
-            p.vsPatched = mvrvs::IsPatched(vs);
+            {
+                hookprof::SubScope prof(hookprof::SVsPatched);
+                p.vsPatched = mvrvs::IsPatchedRt(vs);
+            }
             if (p.vsPatched) {
                 ++p.patchedSets;
                 FillM(c);
@@ -3282,7 +3431,11 @@ void OnVs(ID3D11DeviceContext* c, ID3D11VertexShader* vs) {
         }
         const bool shot = g_shot.armed && p.eye == 0;
         char sum[40] = "";
-        const bool patched = mvrvs::IsPatched(vs, shot ? sum : nullptr);
+        bool patched;
+        {
+            hookprof::SubScope prof(hookprof::SVsPatched);
+            patched = shot ? mvrvs::IsPatched(vs, sum) : mvrvs::IsPatchedRt(vs);
+        }
         NvU32 want = 1;
         if (patched) {
             ++p.patchedSets;
@@ -3324,46 +3477,87 @@ void OnSlot3(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT first, UINT num) {
 
 void STDMETHODCALLTYPE D_VSSetShader(ID3D11DeviceContext* c, ID3D11VertexShader* vs, ID3D11ClassInstance* const* ci,
                                      UINT n) {
-    o_vsSet(c, vs, ci, n);
+    hookprof::Scope prof(hookprof::KVsShader);
+    {
+        hookprof::Orig o;
+        o_vsSet(c, vs, ci, n);
+    }
     if (InPass(c)) OnVs(c, vs);
 }
 void STDMETHODCALLTYPE D_VSSetCb(ID3D11DeviceContext* c, UINT start, UINT num, ID3D11Buffer* const* b) {
-    o_vsCb(c, start, num, b);
+    hookprof::Scope prof(hookprof::KVsCb);
+    {
+        hookprof::Orig o;
+        o_vsCb(c, start, num, b);
+    }
     if (InPass(c) && start <= mvrvs::kCbSlot && start + num > mvrvs::kCbSlot)
         OnSlot3(c, b ? b[mvrvs::kCbSlot - start] : nullptr, 0, 0);
 }
 void STDMETHODCALLTYPE D_VSSetCb1(ID3D11DeviceContext1* c, UINT start, UINT num, ID3D11Buffer* const* b,
                                   const UINT* first, const UINT* cnt) {
-    o_vsCb1(c, start, num, b, first, cnt);
+    hookprof::Scope prof(hookprof::KVsCb);
+    {
+        hookprof::Orig o;
+        o_vsCb1(c, start, num, b, first, cnt);
+    }
     if (InPass(c) && start <= mvrvs::kCbSlot && start + num > mvrvs::kCbSlot) {
         const UINT i = mvrvs::kCbSlot - start;
         OnSlot3(c, b ? b[i] : nullptr, first ? first[i] : 0, cnt ? cnt[i] : 0);
     }
 }
 
+// O1 step 3: PS slot 3 as bound (NotePsCb), for the MVR draws.
+void STDMETHODCALLTYPE D_PSSetCb(ID3D11DeviceContext* c, UINT start, UINT num, ID3D11Buffer* const* b) {
+    hookprof::Scope prof(hookprof::KPsCb);
+    {
+        hookprof::Orig o;
+        o_psCb(c, start, num, b);
+    }
+    NotePsCb(c, start, num, b);
+}
+void STDMETHODCALLTYPE D_PSSetCb1(ID3D11DeviceContext1* c, UINT start, UINT num, ID3D11Buffer* const* b,
+                                  const UINT* first, const UINT* cnt) {
+    hookprof::Scope prof(hookprof::KPsCb);
+    {
+        hookprof::Orig o;
+        o_psCb1(c, start, num, b, first, cnt);
+    }
+    NotePsCb(c, start, num, b);
+}
+
 void STDMETHODCALLTYPE D_DrawIndexedInstanced(ID3D11DeviceContext* c, UINT a, UINT b, UINT d, INT e, UINT f) {
+    hookprof::Scope prof(hookprof::KDraw);
     if (SkipDraw(c)) return;
     BeforeDraw(c);
+    hookprof::Orig orig;
     o_dii(c, a, b, d, e, f);
 }
 void STDMETHODCALLTYPE D_DrawInstanced(ID3D11DeviceContext* c, UINT a, UINT b, UINT d, UINT e) {
+    hookprof::Scope prof(hookprof::KDraw);
     if (SkipDraw(c)) return;
     BeforeDraw(c);
+    hookprof::Orig orig;
     o_di(c, a, b, d, e);
 }
 void STDMETHODCALLTYPE D_DrawAuto(ID3D11DeviceContext* c) {
+    hookprof::Scope prof(hookprof::KDraw);
     if (SkipDraw(c)) return;
     BeforeDraw(c);
+    hookprof::Orig orig;
     o_da(c);
 }
 void STDMETHODCALLTYPE D_DrawIndexedInstancedIndirect(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT o) {
+    hookprof::Scope prof(hookprof::KDraw);
     if (SkipDraw(c)) return;
     BeforeDraw(c);
+    hookprof::Orig orig;
     o_diii(c, b, o);
 }
 void STDMETHODCALLTYPE D_DrawInstancedIndirect(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT o) {
+    hookprof::Scope prof(hookprof::KDraw);
     if (SkipDraw(c)) return;
     BeforeDraw(c);
+    hookprof::Orig orig;
     o_dii2(c, b, o);
 }
 
@@ -3429,14 +3623,20 @@ void InstallD3DHooks(ID3D11DeviceContext* imm) {
     g_d3dHooked = true;
     Protect("InstallD3DHooks", [&] {
         void** vt = *(void***)imm;
-        // ID3D11DeviceContext vtable slots (d3d11.h order); VSSetConstantBuffers1 is ID3D11DeviceContext1's 119.
+        // ID3D11DeviceContext vtable slots (d3d11.h order); VSSetConstantBuffers1 is ID3D11DeviceContext1's 119,
+        // PSSetConstantBuffers1 its 123.
         const bool a = hooks::CreateAt(vt[11], (void*)D_VSSetShader, (void**)&o_vsSet, "VSSetShader");
         const bool b = hooks::CreateAt(vt[7], (void*)D_VSSetCb, (void**)&o_vsCb, "VSSetConstantBuffers");
-        bool b1 = false;
+        const bool p = hooks::CreateAt(vt[16], (void*)D_PSSetCb, (void**)&o_psCb, "PSSetConstantBuffers");
+        bool b1 = false, p1 = false;
         ComPtr<ID3D11DeviceContext1> c1;
-        if (SUCCEEDED(imm->QueryInterface(IID_PPV_ARGS(&c1))))
+        if (SUCCEEDED(imm->QueryInterface(IID_PPV_ARGS(&c1)))) {
             b1 = hooks::CreateAt((*(void***)c1.Get())[119], (void*)D_VSSetCb1, (void**)&o_vsCb1,
                                  "VSSetConstantBuffers1");
+            p1 = hooks::CreateAt((*(void***)c1.Get())[123], (void*)D_PSSetCb1, (void**)&o_psCb1,
+                                 "PSSetConstantBuffers1");
+        }
+        g_cbTracked = p && (!c1 || p1);  // else PS slot 3 is read back at each MVR draw
         const bool d = hooks::CreateAt(vt[20], (void*)D_DrawIndexedInstanced, (void**)&o_dii, "DrawIndexedInstanced");
         const bool e = hooks::CreateAt(vt[21], (void*)D_DrawInstanced, (void**)&o_di, "DrawInstanced");
         const bool f = hooks::CreateAt(vt[38], (void*)D_DrawAuto, (void**)&o_da, "DrawAuto");
@@ -3445,9 +3645,9 @@ void InstallD3DHooks(ID3D11DeviceContext* imm) {
         const bool h = hooks::CreateAt(vt[40], (void*)D_DrawInstancedIndirect, (void**)&o_dii2,
                                        "DrawInstancedIndirect");
         Log("MVR G-buffer: D3D11 hooks: VSSetShader %s, VSSetConstantBuffers %s, VSSetConstantBuffers1 %s, draws (shot "
-            "counts) %s",
+            "counts) %s, PSSetConstantBuffers %s, PSSetConstantBuffers1 %s",
             a ? "ok" : "FAILED", b ? "ok" : "FAILED", b1 ? "ok" : c1 ? "FAILED" : "(no ID3D11DeviceContext1)",
-            d && e && f && g && h ? "ok" : "FAILED");
+            d && e && f && g && h ? "ok" : "FAILED", p ? "ok" : "FAILED", p1 ? "ok" : c1 ? "FAILED" : "(none)");
         if (!a || !b || (c1 && !b1)) {
             g_on = false;
             Log("MVR G-buffer: off (a VS hook is missing: MVR could reach a VS without view 1, or slot 3 a game "
@@ -3946,7 +4146,7 @@ void LiveTrackDraw(ID3D11DeviceContext* c) {
     if (ps) ps->Release();  // only compared
     if (ps != g_ltLastPs) {
         g_ltLastPs = ps;
-        g_ltLastReads = ps && mvrps::InfoOf(ps).liveTrack;
+        g_ltLastReads = ps && mvrps::InfoOfRt(ps).liveTrack;
     }
     ++g_lts.checked;
     ++g_ltot.checked;
@@ -4344,13 +4544,17 @@ bool BeforeDraw(ID3D11DeviceContext* c) {
     }
     if (!t_pass || t_internal || c != Imm()) return false;
     if (g_p.forward) {
+        hookprof::SubScope prof(hookprof::SForwardDraw);
         Protect("Draw", [&] {
             FlushPending(c);
             ForwardDraw(c);
         });
         return false;
     }
-    if (g_gbufPsOn) Protect("Draw", [&] { GbufDraw(c); });
+    if (g_gbufPsOn) {
+        hookprof::SubScope prof(hookprof::SGbufDraw);
+        Protect("Draw", [&] { GbufDraw(c); });
+    }
     if (!g_shot.armed || g_p.eye != 0) return false;
     ++g_p.draws;
     if (g_p.views != 2) ++g_p.plainDraws;
@@ -4460,6 +4664,20 @@ void SetVelocityFill(VelocityFillFn fn) { g_velFill = fn; }
 void SetVelocitySkip(bool on) { g_velSkipOn = on; }
 bool GetVelocitySkip() { return g_velSkipOn; }
 void SetGbufferPs(bool on) { g_gbufPsOn = on; }
+void SetBindSkip(bool on) { g_texSkipOn = on; }
+bool GetBindSkip() { return g_texSkipOn; }
+void TestStateCheck(unsigned long long& checks, unsigned long long& mismatches) {
+    checks = g_trkTot.checks + g_trk.checks;
+    mismatches = g_trkTot.misPs + g_trkTot.misCb + g_trkTot.misSrv + g_trk.misPs + g_trk.misCb + g_trk.misSrv;
+}
+void SetStateTrack(int mode) {
+    if (mode == g_trackMode) return;
+    g_trackMode = mode;
+    NewStateEpoch();
+    Log("MVR: draws take the PS state %s (O1 step 3, mvr_state_track %d)",
+        mode == 0 ? "from PS*Get*" : mode == 1 ? "from the hooks" : "from the hooks, checked against PS*Get*", mode);
+}
+int GetStateTrack() { return g_trackMode; }
 bool GetGbufferPs() { return g_gbufPsOn; }
 void SetDirectExtract(bool on) { g_directOn = on; }
 bool GetDirectExtract() { return g_directOn; }
@@ -4599,9 +4817,26 @@ void LogStats(bool totals) {
             lr.empty() ? "" : "; drawn because: ", lr.c_str());
     }
     if (!totals) {
+        g_trkTot.checks += g_trk.checks;
+        g_trkTot.misPs += g_trk.misPs;
+        g_trkTot.misCb += g_trk.misCb;
+        g_trkTot.misSrv += g_trk.misSrv;
+        g_trkTot.cbReads += g_trk.cbReads;
+    }
+    const TrackStats& t = totals ? g_trkTot : g_trk;
+    if (g_trackMode || t.checks || t.cbReads) {
+        const bool bad = t.misPs || t.misCb || t.misSrv;
+        Log("MVR draw state%s (O1 step 3, mvr_state_track %d, slot 3 hooks %s): PS slot 3 read back %llu times; "
+            "checked against PS*Get* %llu draws, mismatches: PS %llu, slot 3 %llu, views %llu%s",
+            totals ? " (session)" : "", g_trackMode, g_cbTracked ? "on" : "MISSING", (unsigned long long)t.cbReads,
+            (unsigned long long)t.checks, (unsigned long long)t.misPs, (unsigned long long)t.misCb,
+            (unsigned long long)t.misSrv, bad ? " (MISMATCH: the hooks miss a state change)" : "");
+    }
+    if (!totals) {
         s = Stats{};
         g_fs = FwdStats{};
         g_lts = LtStats{};
+        g_trk = TrackStats{};
     }
 }
 
