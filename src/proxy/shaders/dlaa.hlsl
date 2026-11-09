@@ -19,9 +19,10 @@ void CSMask(uint3 id : SV_DispatchThreadID) {
     mask[id.xy] = (s & 2) ? biasValue : 0.0;
 }
 
-// Displays and mirrors from the game's TAA ([dlaa] cockpit_taa): after DLSS, the pixels whose stencil high byte has one of
-// `bits` take the game's TAA result, which handles changing digits without trails. Stencil values seen in the game:
-// 0x08 (bit 0x800) = displays and mirrors (DDU, timer, rear-view mirror), 0x02 (bit 0x200) = the rest of the player's car.
+// Displays and mirrors from the game's TAA ([dlaa] cockpit_taa): after DLSS, the pixels whose stencil high byte has all of
+// `bits` take the game's TAA result, which handles changing digits without trails. Stencil high bytes seen in the game:
+// 0x88 = displays and mirrors (DDU, timer, rear-view mirror), 0x86 = the rest of the player's car; trees 0x1A and sky
+// 0x28 share single bits with them and stay with DLSS.
 cbuffer CockpitParams : register(b1) {
     uint bits;
     uint3 pad2;
@@ -35,5 +36,5 @@ void CSCockpit(uint3 id : SV_DispatchThreadID) {
     outColor.GetDimensions(w, h);
     if (id.x >= w || id.y >= h) return;
     uint s = (uint)(normalStencil.Load(int3(id.xy, 0)).w * 65535.0) >> 8;
-    if (s & bits) outColor[id.xy] = taaColor.Load(int3(id.xy, 0)).rgb;
+    if ((s & bits) == bits) outColor[id.xy] = taaColor.Load(int3(id.xy, 0)).rgb;
 }

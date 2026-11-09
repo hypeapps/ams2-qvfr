@@ -877,7 +877,10 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             outUav = UavFor(out);
             if (!taaSrv || !outUav) return;  // the game's TAA result stays everywhere
             c->CopyResource(taaCopy, tex[3]);
-            const uint32_t bits = CockpitTaaNow() >= 2 ? 0x0A : 0x08;  // stencil high byte: 0x08 displays, 0x02 car
+            // Stencil high byte: 0x88 displays and mirrors, 0x86 the rest of the player's car (both 0x80). Testing any
+            // single bit took more: 0x08 is also in the trees (0x1A) and the sky (0x28), whose soft leaf edges then came
+            // from the game's TAA and thinned out while the head moved (docs/dlaa-trees.md).
+            const uint32_t bits = CockpitTaaNow() >= 2 ? 0x80 : 0x88;
             if (bits != g_cockpitCbBits) {
                 const uint32_t v[4] = {bits, 0, 0, 0};
                 c->UpdateSubresource(g_cockpitCb, 0, nullptr, v, 0, 0);

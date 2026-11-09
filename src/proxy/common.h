@@ -235,8 +235,8 @@ struct Config {
     int dlaaKey = 0;                  // testers: VK_F1 (F4 is focus culling in quad mode)
     int dlaaExpKeyMod = VK_RCONTROL;  // DLSS exposure steps (testers, dlaa.cpp kExpSteps)
     int dlaaExpKey = 0;               // testers: VK_F12
-    // From the game's TAA instead of DLSS: 0 nothing, 1 displays and mirrors (stencil bit 0x800), 2 also the rest of the
-    // player's car (bit 0x200). DLSS smears changing digits (dlaa-plan D4, tests 2-7).
+    // From the game's TAA instead of DLSS: 0 nothing, 1 displays and mirrors (stencil 0x88xx), 2 also the rest of the
+    // player's car (0x80xx). DLSS smears changing digits (dlaa-plan D4, tests 2-7).
     int dlaaCockpitTaa = 1;
     int dlaaPresetKeyMod = VK_RCONTROL;  // DLSS preset steps: ini, J, K, M, L (testers)
     int dlaaPresetKey = 0;               // testers: VK_HOME
