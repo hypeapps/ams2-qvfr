@@ -121,7 +121,7 @@
                     <div class="row">
                         <div class="label">
                             <div class="name">NVIDIA Multi-View Rendering <span class="tag" data-if="rs_mvr">Game restart needed</span></div>
-                            <div class="desc">The outer view of each eye draws the scene of its sharp area in the same pass, which saves CPU time every frame. NVIDIA GeForce GTX 16 and RTX graphics cards; on others the mod renders as with this off.</div>
+                            <div class="desc">The outer view of each eye draws the scene of its sharp area in the same pass, which saves CPU time every frame. NVIDIA graphics cards only.</div>
                         </div>
                         <div class="control">
                             <div class="switch"><input type="checkbox" data-checked="mvr"/><div class="knob"/></div>
