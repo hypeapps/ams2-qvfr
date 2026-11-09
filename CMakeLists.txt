@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(ams2_qvfr VERSION 0.4.0 LANGUAGES C CXX RC)
+project(ams2_qvfr VERSION 0.5.0 LANGUAGES C CXX RC)
 
 if(NOT MSVC OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "This project builds with MSVC x64 only (AMS2 is 64-bit).")
