@@ -686,26 +686,46 @@ void SwapResolveShader(ID3D11DeviceContext* c) {
     c->PSGetShader(&ps, nullptr, nullptr);
     if (!ps) return;
     ID3D11PixelShader* patched = nullptr;
+    std::vector<uint8_t> code;  // the engine shader's code when its copy is still to be made
     {
         std::lock_guard lock(g_resolveM);
         for (auto& r : g_resolveCode) {
             if (r.ps != ps) continue;
             if (!r.patched && !r.failed) {
-                r.failed = true;
-                const float zero[4] = {};
-                std::vector<uint8_t> out;
-                const int n = dxbc::ReplaceImmediate4(r.code.data(), r.code.size(), kTaaMotion, zero, out);
-                ID3D11Device* dev = nullptr;
-                c->GetDevice(&dev);
-                if (n == 1 && dev && SUCCEEDED(dev->CreatePixelShader(out.data(), out.size(), nullptr, &r.patched)))
-                    r.failed = false;
-                if (dev) dev->Release();
-                Log("TAA views: focus TAA resolve that keeps its history while the image moves: %s",
-                    !r.failed ? "made" : n == 1 ? "shader not made" : "motion constant not found once");
+                r.failed = true;  // one try
+                code = r.code;
             }
             patched = r.patched;
             break;
         }
+    }
+    if (!code.empty()) {
+        // Made without g_resolveM: CreatePixelShader goes through the hooks to OnPixelShaderMade, which takes it (a
+        // second lock on this thread throws).
+        const float zero[4] = {};
+        std::vector<uint8_t> out;
+        const int n = dxbc::ReplaceImmediate4(code.data(), code.size(), kTaaMotion, zero, out);
+        ID3D11Device* dev = nullptr;
+        c->GetDevice(&dev);
+        ID3D11PixelShader* made = nullptr;
+        if (n != 1 || !dev || FAILED(dev->CreatePixelShader(out.data(), out.size(), nullptr, &made))) made = nullptr;
+        if (dev) dev->Release();
+        {
+            std::lock_guard lock(g_resolveM);
+            for (auto& r : g_resolveCode) {
+                if (r.ps != ps) continue;
+                if (!r.patched) {
+                    r.patched = made;
+                    r.failed = !made;
+                    made = nullptr;
+                }
+                patched = r.patched;
+                break;
+            }
+        }
+        if (made) made->Release();  // the engine shader went meanwhile
+        Log("TAA views: focus TAA resolve that keeps its history while the image moves: %s",
+            patched ? "made" : n == 1 ? "shader not made" : "motion constant not found once");
     }
     if (!patched) {
         ps->Release();

@@ -323,11 +323,14 @@ int RunTaaFix() {
         if (v2Srv) v2Srv->Release();
         if (v2) v2->Release();
     }
+    // The copy is made through the CreatePixelShader hook (sun_fx -> OnPixelShaderMade): no fault there.
+    const unsigned long long sunFaults = qvfr::sunfx::TestGet().faults;
     const bool motionOk = std::fabs(motionOff - 1.65f) < 0.05f && std::fabs(motionOn - 0.95f) < 0.05f && motionPsBack &&
-                          motionFixed == 1;
+                          motionFixed == 1 && sunFaults == 0;
     printf("Focus TAA motion check %s: resolve output %.3f outside the focus groups (1.65), %.3f in focus L (0.95); the "
-           "engine's shader bound again %s; %llu draws with the copy\n",
-           motionOk ? "OK" : "FAILED", motionOff, motionOn, motionPsBack ? "yes" : "NO", (unsigned long long)motionFixed);
+           "engine's shader bound again %s; %llu draws with the copy; sun effects module faults %llu\n",
+           motionOk ? "OK" : "FAILED", motionOff, motionOn, motionPsBack ? "yes" : "NO", (unsigned long long)motionFixed,
+           sunFaults);
     UINT64 warnings = 0;
     if (info) {
         const UINT64 n = info->GetNumStoredMessages();
