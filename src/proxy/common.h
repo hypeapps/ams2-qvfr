@@ -235,6 +235,15 @@ struct Config {
     // mvr_livetrack_skip_key) toggles it.
     bool mvrLiveTrackSkip = true;
     int mvrLiveTrackSkipKey = 0;
+    // O2 step 2 (diagnosis, docs/mvr_optimizations.md): a focus group whose G-buffer and forward come from outer gets
+    // an empty draw queue before its CForwardBuildCommandThread (focus loses its transparent objects).
+    bool mvrEmptyQueue = false;
+    // O2 step 3 (diagnosis): once per stats window the draw queue of outer L's and focus L's forward pass by object
+    // class, layer and flags, in the log.
+    bool queueBreakdown = false;
+    // O2 step 3: focus's forward recording skips its velocity sub-passes' submits after the first draw when its
+    // velocity comes from outer (fwd_rec.h).
+    bool mvrVelocityRecordSkip = false;
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
     bool dlaa = false;                // mode=dlaa (a change needs a restart)

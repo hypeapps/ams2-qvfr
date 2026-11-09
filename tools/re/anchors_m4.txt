@@ -37,3 +37,5 @@ e4d010 SceneProcess scene processor (rcx = processor, rdx = renderables set, r8 
 16724b0 TaaCreateTarget CTAAControl target helper (rcx = TAA, edx/r8d = size, r9 = name, stack: kind, out render target, out texture; returns bool)
 16729a0 TaaReleaseTargets CTAAControl releases all its targets (vtable slot 32, called by the destructor; rcx = TAA)
 1672910 TaaReleaseArray CTAAControl releases one 3-slot array pair (rdx = render targets, r8 = textures; rcx unused)
+9cf790 ForwardDraw forward pass recording (CForwardBuildCommandThread job 0x9d2390; ecx = recording context index, rdx = render context; walks the draw queue once per sub-pass)
+15dbd50 DeviceSubmit engine device submit of one queue entry (vtable +0x660; rcx = device, rdx = pass state with the recording context at +0x48, r8d = layer, r9 = object)

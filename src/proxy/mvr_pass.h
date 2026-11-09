@@ -150,6 +150,9 @@ using VelocityFillFn = bool (*)(ID3D11DeviceContext* c, int eye, ID3D11Texture2D
                                 const char** why);
 void SetVelocityFill(VelocityFillFn fn);
 void SetVelocitySkip(bool on);
+// B11: focus eye `eye`'s velocity pass got outer's vectors (and dropped its draws) in this frame, or in the previous
+// one (`previous`, for a decision before this frame's pass ran).
+bool VelocityFilled(int eye, bool previous);
 bool GetVelocitySkip();
 // From every draw detour before the real draw: true = drop the draw (a velocity pass whose target got the vectors).
 bool SkipDraw(ID3D11DeviceContext* c);
@@ -195,6 +198,9 @@ void SetPhase3BuildVtable(uintptr_t vt);
 void SetLiveTrackVtables(uintptr_t render, uintptr_t build);
 void SetLiveTrackSkip(bool on);
 bool GetLiveTrackSkip();
+// Why focus eye `eye` (0 L, 1 R) draws its own G-buffer, SSAO, lights or forward in this frame; null when all of them
+// come from outer's passes (decided once the group's CPhase1Render ran or was skipped). Not in a shot or task map frame.
+const char* FromOuterWhy(int eye);
 void SetTaskMapFrame(bool on);  // quad: a task map frame (mvr_map_key) lists every task, the map's too
 void EyeGroupEnd();             // quad: an eye group's CEndEye, before the engine's
 // A focus group's CBeginEye, after its clones went in (the eye of the velocity pass's depth, above).

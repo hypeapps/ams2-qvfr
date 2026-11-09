@@ -89,6 +89,7 @@ int RunTaaFix();  // taa_fix_smoke.cpp
 int RunMvrMotion();  // mvr_motion_smoke.cpp
 #include "focus_cull.h"
 #include "focus_geometry.h"
+#include "fwd_rec.h"
 #include "hook_prof.h"
 #include "hooks.h"
 #include "shots.h"
@@ -1696,6 +1697,12 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--quad-compose")) composeTest = true;
         else if (!strcmp(argv[i], "--focus-geometry")) return RunGeometry();
         else if (!strcmp(argv[i], "--focus-cull")) return RunFocusCull();
+        else if (!strcmp(argv[i], "--fwd-rec")) {
+            char text[512];
+            const bool ok = qvfr::fwdrec::SelfTest(text, sizeof(text));
+            printf("%s\n", text);
+            return ok ? 0 : 1;
+        }
         else if (!strcmp(argv[i], "--clones")) clonesTest = true;
         else if (!strcmp(argv[i], "--sun-fx")) sunFxTest = true;
         else if (!strcmp(argv[i], "--taa-fix")) return RunTaaFix();

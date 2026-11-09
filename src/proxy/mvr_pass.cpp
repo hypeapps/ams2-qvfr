@@ -4095,6 +4095,12 @@ bool Phase3Task(uint8_t* task, int group, bool build) {
 const char* LiveTrackWhy(int eye) {
     if (!g_ltOn) return "";
     if (g_ltStopped) return "stopped: a draw in a focus group read the map it had skipped";
+    return FromOuterWhy(eye);
+}
+
+const char* FromOuterWhy(int eye) {
+    if (eye < 0 || eye > 1) return "not a focus group";
+    if (!On()) return "MVR off";
     if (!g_enabled) return "MVR G-buffer off (hotkey)";
     if (g_shot.armed || g_fshot.armed) return "shot frame";
     if (g_ltMapFrame) return "task map frame";
@@ -4663,6 +4669,13 @@ bool SkipDraw(ID3D11DeviceContext* c) {
 void SetVelocityFill(VelocityFillFn fn) { g_velFill = fn; }
 void SetVelocitySkip(bool on) { g_velSkipOn = on; }
 bool GetVelocitySkip() { return g_velSkipOn; }
+
+bool VelocityFilled(int eye, bool previous) {
+    if (eye < 0 || eye > 1 || !g_velSkipOn || !g_velFill) return false;
+    const VelSkip& v = g_velSkip[eye];
+    return v.state == VelFilled && v.frame == (previous ? g_frame - 1 : g_frame);
+}
+
 void SetGbufferPs(bool on) { g_gbufPsOn = on; }
 void SetBindSkip(bool on) { g_texSkipOn = on; }
 bool GetBindSkip() { return g_texSkipOn; }

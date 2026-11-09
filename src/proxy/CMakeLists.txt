@@ -93,6 +93,7 @@ add_library(qvfr_proxy SHARED
   experiment.cpp
   focus_geometry.cpp
   focus_cull.cpp
+  fwd_rec.cpp
   compose.cpp
   gpu.cpp
   callers.cpp
