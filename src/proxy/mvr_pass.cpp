@@ -3958,6 +3958,7 @@ void SetTaskMapFrame(bool on) {
 }
 
 bool TaskMapOn() { return g_map.on && g_s1Frame.load(std::memory_order_relaxed); }
+bool TaskMapFrame() { return g_s1Frame.load(std::memory_order_relaxed); }
 
 void TaskMapEvent(const char* text) {
     if (!g_s1Frame.load(std::memory_order_relaxed)) return;

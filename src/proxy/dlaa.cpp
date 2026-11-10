@@ -1492,7 +1492,7 @@ void __fastcall D_Resolve(void* taa, void* src, void* normal, uint32_t ctx, void
     g_lastCtx = ctx;
     if (Wanted()) EnsureD3DHooks();
     char ev[128] = "";
-    if (Cfg().quadMode == QuadMode::Quad) {  // S1 probe (task map frame)
+    if (mvrpass::TaskMapFrame()) {  // S1 probe: only in a task map frame (no cost otherwise)
         snprintf(ev, sizeof(ev), "TAA resolve recording begins (view slot %d, render context %u, from AMS2AVX.exe+0x%llX)",
                  view, ctx, (unsigned long long)((uintptr_t)_ReturnAddress() - hooks::ExeBase()));
         mvrpass::TaskMapEvent(ev);
@@ -1542,10 +1542,10 @@ void __fastcall D_Locks(void* taa, void* src, void* normal, uint32_t ctx, void* 
     if (Wanted() && Cfg().dlaaSkipLocks && !CockpitTaaNow() && g_evals.load() &&
         g_frame.load() <= g_lastOkFrame.load() + 1) {
         g_locksSkipped.fetch_add(1, std::memory_order_relaxed);
-        if (Cfg().quadMode == QuadMode::Quad) mvrpass::TaskMapEvent("TAA locks recording skipped (DLSS)");
+        mvrpass::TaskMapEvent("TAA locks recording skipped (DLSS)");  // S1 probe: one flag load outside a map frame
         return;
     }
-    const bool s1 = Cfg().quadMode == QuadMode::Quad;  // S1 probe (task map frame)
+    const bool s1 = mvrpass::TaskMapFrame();  // S1 probe
     if (s1) mvrpass::TaskMapEvent("TAA locks recording begins");
     o_locks(taa, src, normal, ctx, camera, a6, view);
     if (s1) mvrpass::TaskMapEvent("TAA locks recording ends");

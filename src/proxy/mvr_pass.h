@@ -216,7 +216,8 @@ void TaskMapEnd();
 // (its targets' ids and the engine's caller), draws into that draw's color source afterwards (the scene color the
 // windscreen, particles and sharpening draw into, with their depth target), the distinct viewports set and their
 // callers, and the engine's size constants (device+0x9b18 per context, postprocess+0x100) when they changed.
-bool TaskMapOn();  // render thread: a task is mapped now
+bool TaskMapOn();     // render thread: a task is mapped now
+bool TaskMapFrame();  // any thread: this frame is a task map frame (callers skip building event texts otherwise)
 // Any thread: an event of the mapped task when it comes on its thread, else (in a map frame) a log line of its own.
 void TaskMapEvent(const char* text);
 // A DrawIndexed(6) on the immediate context (before the draw, even when DLSS replaces it): the TAA resolve is noted.
