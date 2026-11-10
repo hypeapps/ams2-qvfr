@@ -464,8 +464,11 @@ Config ReadConfig(const fs::path& ini) {
             c.mvrDirectExtractKey, c.mvrNativeTargets, c.mvrNativeKey, c.mvrMsColorSkip, c.mvrMsColorSkipKey, c.mvrMsSlices,
             c.mvrLiveTrackSkip, c.mvrLiveTrackSkipKey, c.mvrEmptyQueue, c.queueBreakdown, c.mvrVelocityRecordSkip);
     const std::string dlaa = IniString(ini, L"dlaa", L"mode", L"off");
-    c.dlaa = dlaa == "dlaa";
-    if (dlaa != "off" && dlaa != "dlaa") Log("Settings: unknown [dlaa] mode=\"%s\", using off", dlaa.c_str());
+    c.dlaa = dlaa == "dlaa" || dlaa == "dlss";
+    c.dlaaSr = dlaa == "dlss";
+    if (dlaa != "off" && dlaa != "dlaa" && dlaa != "dlss")
+        Log("Settings: unknown [dlaa] mode=\"%s\", using off", dlaa.c_str());
+    c.dlaaRenderScale = std::clamp(IniFloat(ini, L"dlaa", L"render_scale", c.dlaaRenderScale), 0.33f, 1.0f);
     const std::string preset = IniString(ini, L"dlaa", L"preset", L"k");  // K: NVIDIA's DLAA default, set explicitly
     if (preset == "default") {
         c.dlaaPreset = 0;
@@ -491,10 +494,10 @@ Config ReadConfig(const fs::path& ini) {
     c.dlaaPresetKeyMod = IniInt(ini, L"dlaa", L"preset_modifier", c.dlaaPresetKeyMod);
     c.dlaaPresetKey = IniInt(ini, L"dlaa", L"preset_key", c.dlaaPresetKey);
     if (c.dlaa)
-        Log("Settings: [dlaa] mode=dlaa preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d auto_exposure=%d "
-            "exposure=%.4f exposure_scale=%.4f bias_mask=%.2f skip_locks=%d modifier=0x%X key=0x%X exposure_key=0x%X "
-            "preset_key=0x%X cockpit_taa=%d",
-            preset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY, c.dlaaMvJittered, c.dlaaAutoExposure,
+        Log("Settings: [dlaa] mode=%s render_scale=%.3f preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d "
+            "auto_exposure=%d exposure=%.4f exposure_scale=%.4f bias_mask=%.2f skip_locks=%d modifier=0x%X key=0x%X "
+            "exposure_key=0x%X preset_key=0x%X cockpit_taa=%d",
+            c.dlaaSr ? "dlss" : "dlaa", c.dlaaRenderScale, preset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY, c.dlaaMvJittered, c.dlaaAutoExposure,
             c.dlaaExposure, c.dlaaExposureScale, c.dlaaBiasMask, c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey,
             c.dlaaExpKey, c.dlaaPresetKey, c.dlaaCockpitTaa);
     c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
@@ -573,7 +576,8 @@ bool ReloadConfig() {
              n.fixedSectionX != c.fixedSectionX || n.fixedSectionY != c.fixedSectionY,
          "[quad] *_section");
     need(n.probeFrames != c.probeFrames || n.probeEngine != c.probeEngine || n.probeD3D != c.probeD3D, "[quad] probe_*");
-    need(n.dlaa != c.dlaa, "[dlaa] mode");
+    need(n.dlaa != c.dlaa || n.dlaaSr != c.dlaaSr, "[dlaa] mode");
+    need(n.dlaaRenderScale != c.dlaaRenderScale, "[dlaa] render_scale");
     need(n.mvr != c.mvr, "[mvr] mode");
     need(n.mvrVsPatch != c.mvrVsPatch, "[debug] mvr_vs_patch");
     need(n.mvrPsPatch != c.mvrPsPatch, "[debug] mvr_ps_patch");

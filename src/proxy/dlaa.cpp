@@ -12,12 +12,15 @@
 #include <mutex>
 #include <vector>
 
+#include "clones.h"
 #include "common.h"
 #include "diag.h"
 #include "gpu.h"
 #include "hook_prof.h"
 #include "hooks.h"
 #include "mvr_motion.h"
+#include "mvr_pass.h"
+#include "sr.h"
 #include "sun_fx.h"
 #include "sysinfo.h"
 
@@ -26,6 +29,9 @@
 
 #include "dlaa_cockpit_cs.h"  // kDlaaCockpitCS (fxc from shaders/dlaa.hlsl)
 #include "dlaa_mask_cs.h"     // kDlaaMaskCS
+#include "sr_color_ps.h"       // kSrColorPS (fxc from shaders/sr.hlsl)
+#include "sr_depth_ps.h"       // kSrDepthPS
+#include "sr_vs.h"             // kSrVS
 #endif
 
 namespace qvfr::dlaa {
@@ -65,7 +71,9 @@ bool g_viewLogged[kViews] = {};  // first DLSS evaluation of the view logged
 bool g_keyDown = false;
 bool g_expKeyDown = false;
 bool g_presetKeyDown = false;
-int CockpitTaaNow() { return Cfg().dlaaCockpitTaa; }  // displays/cockpit from the game's TAA (ini, read live)
+bool g_sr = false;  // DLSS SR (sr.h): [dlaa] mode=dlss in stereo
+// Displays/cockpit from the game's TAA (ini, read live); not with DLSS SR (the game's TAA would run at the render size).
+int CockpitTaaNow() { return g_sr ? 0 : Cfg().dlaaCockpitTaa; }
 const char* CockpitText(int mode) {
     return mode == 0 ? "nothing" : mode == 1 ? "displays and mirrors" : "displays, mirrors and the player's car";
 }
@@ -134,6 +142,8 @@ bool g_faultLogged = false;
 thread_local bool t_inside = false;  // inside our evaluation
 
 std::atomic<uint64_t> g_evals{0}, g_fallbacks{0}, g_locksSkipped{0}, g_resolves{0};
+std::atomic<uint64_t> g_srEvals{0};  // DLSS SR evaluations (render size -> eye size)
+uint64_t g_lastSrEvals = 0;
 uint64_t g_lastEvals = 0, g_lastFallbacks = 0, g_lastLocks = 0, g_lastResolves = 0;
 std::mutex g_sm;
 std::string g_state = "not started";
@@ -207,7 +217,8 @@ struct Feature {
     NVSDK_NGX_Handle* handle = nullptr;
     int view = 0;       // index in kViewName (quad eye group + 1)
     uintptr_t key = 0;  // the motion vector texture
-    UINT w = 0, h = 0;
+    UINT w = 0, h = 0;    // render size (DLSS input)
+    UINT ow = 0, oh = 0;  // output size (DLAA: the render size; DLSS SR: the eye size)
     int flags = 0;
     int preset = -1;
     uint64_t lastFrame = 0;
@@ -232,6 +243,7 @@ NVSDK_NGX_Parameter* g_params = nullptr;
 std::vector<Feature> g_feat;
 std::vector<Scratch> g_scratch;
 int g_evalFails = 0;
+int g_sizeLogs = 0;
 std::atomic<int> g_ngxLogLines{0};
 bool g_formatsLogged[kViews] = {};
 // Bias-current-color mask (shaders/dlaa.hlsl) and the fixed exposure texture ([dlaa] bias_mask, exposure).
@@ -253,6 +265,8 @@ void NVSDK_CONV NgxLog(const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_F
     while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
     Log("NGX: %s", s.c_str());
 }
+
+void DropCarry();  // DLSS SR (below)
 
 std::string ResultText(NVSDK_NGX_Result r) {
     char buf[64];
@@ -281,6 +295,7 @@ void DropNgxLocked() {
     g_maskFailed = false;
     SafeRelease(g_expTex);
     g_expValue = -1;
+    DropCarry();
     if (g_params) NVSDK_NGX_D3D11_DestroyParameters(g_params);
     g_params = nullptr;
     if (g_ngxInit && g_dev) NVSDK_NGX_D3D11_Shutdown1(g_dev);
@@ -674,9 +689,312 @@ void ReleasePending() {
     SafeRelease(g_pend.target);
 }
 
+// ---------------------------------------------------------------- DLSS SR: carry clones into the originals
+
+// A texture the passes after the TAA resolve need (clones::CarryList) is stretched from its clone at the render size
+// into the original at the eye size (shaders/sr.hlsl): colors linear, one-channel data and depth from the nearest texel,
+// depth through SV_Depth (no stencil: the scene's depth has none). Views per pair, made once per clone generation.
+struct CarryViews {
+    ID3D11Resource* src = nullptr;  // clone (only compared)
+    ID3D11Resource* dst = nullptr;  // original (only compared)
+    ID3D11ShaderResourceView* srv = nullptr;
+    ID3D11RenderTargetView* rtv = nullptr;
+    ID3D11DepthStencilView* dsv = nullptr;
+    bool linear = false;
+    bool skip = false;  // cannot be carried (logged once)
+    UINT w = 0, h = 0;
+};
+std::vector<CarryViews> g_carry;
+uint32_t g_carryGen = 0;
+ID3D11VertexShader* g_carryVs = nullptr;
+ID3D11PixelShader* g_carryColorPs = nullptr;
+ID3D11PixelShader* g_carryDepthPs = nullptr;
+ID3D11SamplerState* g_carryLinear = nullptr;
+ID3D11SamplerState* g_carryPoint = nullptr;
+ID3D11RasterizerState* g_carryRs = nullptr;
+ID3D11DepthStencilState* g_carryDepthWrite = nullptr;
+ID3D11DepthStencilState* g_carryNoDepth = nullptr;
+bool g_carryFailed = false;
+uint64_t g_carried = 0, g_carryFrames = 0, g_lastCarried = 0, g_lastCarryFrames = 0;
+bool g_carryListLogged = false;
+
+void DropCarryViews() {
+    for (CarryViews& v : g_carry) {
+        SafeRelease(v.srv);
+        SafeRelease(v.rtv);
+        SafeRelease(v.dsv);
+    }
+    g_carry.clear();
+}
+
+void DropCarry() {
+    DropCarryViews();
+    SafeRelease(g_carryVs);
+    SafeRelease(g_carryColorPs);
+    SafeRelease(g_carryDepthPs);
+    SafeRelease(g_carryLinear);
+    SafeRelease(g_carryPoint);
+    SafeRelease(g_carryRs);
+    SafeRelease(g_carryDepthWrite);
+    SafeRelease(g_carryNoDepth);
+    g_carryFailed = false;
+    g_carryListLogged = false;
+}
+
+bool EnsureCarry() {
+    if (g_carryVs) return true;
+    if (g_carryFailed) return false;
+    D3D11_SAMPLER_DESC sd{};
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+    sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    D3D11_SAMPLER_DESC sp = sd;
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sp.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    D3D11_RASTERIZER_DESC rd{};
+    rd.FillMode = D3D11_FILL_SOLID;
+    rd.CullMode = D3D11_CULL_NONE;
+    rd.DepthClipEnable = FALSE;
+    D3D11_DEPTH_STENCIL_DESC dw{};
+    dw.DepthEnable = TRUE;
+    dw.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ALL;
+    dw.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    D3D11_DEPTH_STENCIL_DESC dn{};
+    dn.DepthEnable = FALSE;
+    dn.DepthFunc = D3D11_COMPARISON_ALWAYS;
+    const bool ok = SUCCEEDED(g_dev->CreateVertexShader(kSrVS, sizeof(kSrVS), nullptr, &g_carryVs)) &&
+                    SUCCEEDED(g_dev->CreatePixelShader(kSrColorPS, sizeof(kSrColorPS), nullptr, &g_carryColorPs)) &&
+                    SUCCEEDED(g_dev->CreatePixelShader(kSrDepthPS, sizeof(kSrDepthPS), nullptr, &g_carryDepthPs)) &&
+                    SUCCEEDED(g_dev->CreateSamplerState(&sd, &g_carryLinear)) &&
+                    SUCCEEDED(g_dev->CreateSamplerState(&sp, &g_carryPoint)) &&
+                    SUCCEEDED(g_dev->CreateRasterizerState(&rd, &g_carryRs)) &&
+                    SUCCEEDED(g_dev->CreateDepthStencilState(&dw, &g_carryDepthWrite)) &&
+                    SUCCEEDED(g_dev->CreateDepthStencilState(&dn, &g_carryNoDepth));
+    if (!ok) {
+        Log("DLAA: DLSS SR: the carry shaders could not be made; the passes after TAA see stale targets");
+        DropCarry();
+        g_carryFailed = true;
+    }
+    return ok;
+}
+
+// The typed format to read a texture of format f through a shader view.
+DXGI_FORMAT ReadFormat(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R32_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT: return DXGI_FORMAT_R32_FLOAT;
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT: return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        case DXGI_FORMAT_R16_TYPELESS:
+        case DXGI_FORMAT_D16_UNORM: return DXGI_FORMAT_R16_UNORM;
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+        case DXGI_FORMAT_R32G32_TYPELESS: return DXGI_FORMAT_R32G32_FLOAT;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+        case DXGI_FORMAT_R8G8_TYPELESS: return DXGI_FORMAT_R8G8_UNORM;
+        case DXGI_FORMAT_R8_TYPELESS: return DXGI_FORMAT_R8_UNORM;
+        default: return f;
+    }
+}
+
+DXGI_FORMAT DepthFormat(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R32_TYPELESS: return DXGI_FORMAT_D32_FLOAT;
+        case DXGI_FORMAT_R24G8_TYPELESS: return DXGI_FORMAT_D24_UNORM_S8_UINT;
+        case DXGI_FORMAT_R16_TYPELESS: return DXGI_FORMAT_D16_UNORM;
+        case DXGI_FORMAT_R32G8X24_TYPELESS: return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        default: return f;
+    }
+}
+
+bool IsIntFormat(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R32G32B32A32_UINT:
+        case DXGI_FORMAT_R32G32B32A32_SINT:
+        case DXGI_FORMAT_R32G32B32_UINT:
+        case DXGI_FORMAT_R32G32B32_SINT:
+        case DXGI_FORMAT_R16G16B16A16_UINT:
+        case DXGI_FORMAT_R16G16B16A16_SINT:
+        case DXGI_FORMAT_R32G32_UINT:
+        case DXGI_FORMAT_R32G32_SINT:
+        case DXGI_FORMAT_R10G10B10A2_UINT:
+        case DXGI_FORMAT_R8G8B8A8_UINT:
+        case DXGI_FORMAT_R8G8B8A8_SINT:
+        case DXGI_FORMAT_R16G16_UINT:
+        case DXGI_FORMAT_R16G16_SINT:
+        case DXGI_FORMAT_R32_UINT:
+        case DXGI_FORMAT_R32_SINT:
+        case DXGI_FORMAT_R8G8_UINT:
+        case DXGI_FORMAT_R8G8_SINT:
+        case DXGI_FORMAT_R16_UINT:
+        case DXGI_FORMAT_R16_SINT:
+        case DXGI_FORMAT_R8_UINT:
+        case DXGI_FORMAT_R8_SINT: return true;
+        default: return false;
+    }
+}
+
+bool IsLinearColor(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R11G11B10_FLOAT:
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        case DXGI_FORMAT_R16G16B16A16_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        case DXGI_FORMAT_R10G10B10A2_UNORM: return true;
+        default: return false;
+    }
+}
+
+CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes) {
+    for (CarryViews& v : g_carry)
+        if (v.src == src && v.dst == dstRes) return &v;
+    if (g_carry.size() >= 64) return nullptr;
+    g_carry.push_back(CarryViews{});
+    CarryViews& v = g_carry.back();
+    v.src = src;
+    v.dst = dstRes;
+    ID3D11Texture2D* dst = nullptr;
+    D3D11_TEXTURE2D_DESC sd{}, dd{};
+    src->GetDesc(&sd);
+    const char* why = nullptr;
+    if (FAILED(dstRes->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&dst)) || !dst) {
+        why = "not a 2D texture";
+    } else {
+        dst->GetDesc(&dd);
+        const bool depth = (dd.BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0;
+        const DXGI_FORMAT rf = ReadFormat(sd.Format);
+        if (sd.SampleDesc.Count != 1 || dd.SampleDesc.Count != 1)
+            why = "multisampled";
+        else if (sd.ArraySize != 1 || dd.ArraySize != 1)
+            why = "a texture array";
+        else if (!(sd.BindFlags & D3D11_BIND_SHADER_RESOURCE))
+            why = "no shader view on the clone";
+        else if (IsIntFormat(rf))
+            why = "an integer format";
+        else if (!depth && !(dd.BindFlags & D3D11_BIND_RENDER_TARGET))
+            why = "neither a render target nor a depth target";
+        if (!why) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC s{};
+            s.Format = rf;
+            s.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            s.Texture2D.MipLevels = 1;
+            HRESULT hr = g_dev->CreateShaderResourceView(src, &s, &v.srv);
+            if (SUCCEEDED(hr) && depth) {
+                D3D11_DEPTH_STENCIL_VIEW_DESC d{};
+                d.Format = DepthFormat(dd.Format);
+                d.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+                hr = g_dev->CreateDepthStencilView(dst, &d, &v.dsv);
+            } else if (SUCCEEDED(hr)) {
+                D3D11_RENDER_TARGET_VIEW_DESC r{};
+                r.Format = ReadFormat(dd.Format);
+                r.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                hr = g_dev->CreateRenderTargetView(dst, &r, &v.rtv);
+            }
+            if (FAILED(hr)) why = "its views could not be made";
+            v.linear = !depth && IsLinearColor(rf);
+            v.w = dd.Width;
+            v.h = dd.Height;
+        }
+    }
+    if (why) {
+        v.skip = true;
+        SafeRelease(v.srv);
+        SafeRelease(v.rtv);
+        SafeRelease(v.dsv);
+    }
+    Log("DLAA: DLSS SR: carry %ux%u fmt %d -> %ux%u fmt %d (%s): %s", sd.Width, sd.Height, (int)sd.Format, dd.Width,
+        dd.Height, (int)dd.Format, v.dsv ? "depth" : v.linear ? "linear" : "nearest", why ? why : "ok");
+    if (!why && dd.MipLevels > 1) Log("DLAA: DLSS SR: only mip 0 of that texture is carried (%u mips)", dd.MipLevels);
+    SafeRelease(dst);
+    return &v;
+}
+
+// In DLSS's context state (the engine's state stays untouched).
+void Carry(ID3D11DeviceContext* c) {
+    ID3D11Texture2D* clone[24] = {};
+    ID3D11Resource* orig[24] = {};
+    const int n = clones::CarryList(clone, orig, 24);
+    if (!n || !g_ctx1 || !EnsureCarry()) return;
+    const uint32_t gen = clones::Generation() * 977u + gpu::Generation();
+    if (gen != g_carryGen) {
+        DropCarryViews();
+        g_carryGen = gen;
+    }
+    ++g_carryFrames;
+    ID3DDeviceContextState* prev = nullptr;
+    g_ctx1->SwapDeviceContextState(g_ctxState, &prev);
+    t_inside = true;
+    Protect("carry", [&] {
+        c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        c->IASetInputLayout(nullptr);
+        c->VSSetShader(g_carryVs, nullptr, 0);
+        c->RSSetState(g_carryRs);
+        c->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+        for (int i = 0; i < n; ++i) {
+            CarryViews* v = CarryViewsFor(clone[i], orig[i]);
+            if (!v || v->skip) continue;
+            D3D11_VIEWPORT vp{0, 0, (float)v->w, (float)v->h, 0, 1};
+            c->RSSetViewports(1, &vp);
+            if (v->dsv) {
+                c->OMSetRenderTargets(0, nullptr, v->dsv);
+                c->OMSetDepthStencilState(g_carryDepthWrite, 0);
+                c->PSSetShader(g_carryDepthPs, nullptr, 0);
+                c->PSSetSamplers(0, 1, &g_carryPoint);
+            } else {
+                c->OMSetRenderTargets(1, &v->rtv, nullptr);
+                c->OMSetDepthStencilState(g_carryNoDepth, 0);
+                c->PSSetShader(g_carryColorPs, nullptr, 0);
+                c->PSSetSamplers(0, 1, v->linear ? &g_carryLinear : &g_carryPoint);
+            }
+            c->PSSetShaderResources(0, 1, &v->srv);
+            c->Draw(3, 0);
+            ID3D11ShaderResourceView* none = nullptr;
+            c->PSSetShaderResources(0, 1, &none);
+            c->OMSetRenderTargets(0, nullptr, nullptr);
+            ++g_carried;
+        }
+    });
+    t_inside = false;
+    g_ctx1->SwapDeviceContextState(prev, nullptr);
+    SafeRelease(prev);
+    if (!g_carryListLogged) {
+        g_carryListLogged = true;
+        Log("DLAA: DLSS SR: %d textures carried from the clones into the originals at each TAA resolve", n);
+    }
+}
+
 // One DLSS feature per view, motion vector texture (the engine keeps one per view slot; taa_views adds the focus ones)
 // and size. The view keeps the focus histories apart even when the focus groups share a texture (taa_views off).
-Feature* FeatureFor(ID3D11DeviceContext* c, int view, uintptr_t key, UINT w, UINT h) {
+// DLSS SR (sr.h): the quality mode whose scale is nearest to render / output (DLSS takes render sizes around it).
+NVSDK_NGX_PerfQuality_Value QualityFor(UINT w, UINT ow) {
+    const double r = ow ? (double)w / ow : 1.0;
+    if (r >= 0.99) return NVSDK_NGX_PerfQuality_Value_DLAA;
+    if (r >= 0.625) return NVSDK_NGX_PerfQuality_Value_MaxQuality;  // 0.667
+    if (r >= 0.54) return NVSDK_NGX_PerfQuality_Value_Balanced;     // 0.58
+    if (r >= 0.42) return NVSDK_NGX_PerfQuality_Value_MaxPerf;      // 0.5
+    return NVSDK_NGX_PerfQuality_Value_UltraPerformance;           // 0.333
+}
+
+const char* QualityName(NVSDK_NGX_PerfQuality_Value q) {
+    switch (q) {
+        case NVSDK_NGX_PerfQuality_Value_DLAA: return "DLAA";
+        case NVSDK_NGX_PerfQuality_Value_MaxQuality: return "Quality";
+        case NVSDK_NGX_PerfQuality_Value_Balanced: return "Balanced";
+        case NVSDK_NGX_PerfQuality_Value_MaxPerf: return "Performance";
+        case NVSDK_NGX_PerfQuality_Value_UltraPerformance: return "Ultra Performance";
+        default: return "?";
+    }
+}
+
+Feature* FeatureFor(ID3D11DeviceContext* c, int view, uintptr_t key, UINT w, UINT h, UINT ow, UINT oh) {
     const Config& cfg = Cfg();
     int flags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
     if (cfg.dlaaMvJittered) flags |= NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
@@ -684,7 +1002,7 @@ Feature* FeatureFor(ID3D11DeviceContext* c, int view, uintptr_t key, UINT w, UIN
     const int preset = PresetNow();
     Feature* f = nullptr;
     for (Feature& x : g_feat)
-        if (x.view == view && x.key == key && x.w == w && x.h == h) f = &x;
+        if (x.view == view && x.key == key && x.w == w && x.h == h && x.ow == ow && x.oh == oh) f = &x;
     if (f && f->handle && f->flags == flags && f->preset == preset) return f;
     if (!f) {
         if (g_feat.size() >= 8) {
@@ -697,29 +1015,36 @@ Feature* FeatureFor(ID3D11DeviceContext* c, int view, uintptr_t key, UINT w, UIN
         f->key = key;
         f->w = w;
         f->h = h;
+        f->ow = ow;
+        f->oh = oh;
     }
     if (f->handle) NVSDK_NGX_D3D11_ReleaseFeature(f->handle);
     f->handle = nullptr;
-    NVSDK_NGX_Parameter_SetUI(g_params, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, (unsigned)preset);
+    for (const char* hint : {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
+                             NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced,
+                             NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
+                             NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance})
+        NVSDK_NGX_Parameter_SetUI(g_params, hint, (unsigned)preset);
+    const NVSDK_NGX_PerfQuality_Value quality = QualityFor(w, ow);
     NVSDK_NGX_DLSS_Create_Params cp{};
     cp.Feature.InWidth = w;
     cp.Feature.InHeight = h;
-    cp.Feature.InTargetWidth = w;
-    cp.Feature.InTargetHeight = h;
-    cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+    cp.Feature.InTargetWidth = ow;
+    cp.Feature.InTargetHeight = oh;
+    cp.Feature.InPerfQualityValue = quality;
     cp.InFeatureCreateFlags = flags;
     NVSDK_NGX_Result r = NGX_D3D11_CREATE_DLSS_EXT(c, &f->handle, g_params, &cp);
     if (NVSDK_NGX_FAILED(r) || !f->handle) {
-        Log("DLAA: DLSS feature for %s, motion vectors %p (%ux%u, flags 0x%X, preset %d) failed: %s", kViewName[view],
-            (void*)key, w, h, flags, preset, ResultText(r).c_str());
+        Log("DLAA: DLSS feature for %s, motion vectors %p (%ux%u -> %ux%u, %s, flags 0x%X, preset %d) failed: %s",
+            kViewName[view], (void*)key, w, h, ow, oh, QualityName(quality), flags, preset, ResultText(r).c_str());
         f->handle = nullptr;
         return nullptr;
     }
     f->flags = flags;
     f->preset = preset;
     f->fresh = true;
-    Log("DLAA: DLSS feature for %s, motion vectors %p created (%ux%u, DLAA, flags 0x%X, preset %d)", kViewName[view],
-        (void*)key, w, h, flags, preset);
+    Log("DLAA: DLSS feature for %s, motion vectors %p created (%ux%u -> %ux%u, %s, flags 0x%X, preset %d)",
+        kViewName[view], (void*)key, w, h, ow, oh, QualityName(quality), flags, preset);
     return f;
 }
 
@@ -815,7 +1140,8 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
         D3D11_TEXTURE2D_DESC d[4];
         for (int i = 0; i < 4; ++i) tex[i]->GetDesc(&d[i]);
         const DXGI_FORMAT vf[3] = {ViewFormat(srv[0]), ViewFormat(srv[1]), ViewFormat(srv[3])};
-        const UINT w = d[3].Width, h = d[3].Height;
+        const UINT w = d[3].Width, h = d[3].Height;  // the TAA target: DLSS's output size
+        const UINT iw = d[0].Width, ih = d[0].Height;  // its inputs (DLSS SR: the clones at the render size)
         if (!g_formatsLogged[view]) {
             g_formatsLogged[view] = true;
             Log("DLAA: TAA resolve found (%s): depth %ux%u fmt %d (view %d), color %ux%u fmt %d (view %d), motion %ux%u fmt "
@@ -823,11 +1149,17 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
                 kViewName[view], d[0].Width, d[0].Height, (int)d[0].Format, (int)vf[0], d[1].Width, d[1].Height, (int)d[1].Format,
                 (int)vf[1], d[2].Width, d[2].Height, (int)d[2].Format, (int)vf[2], w, h, (int)d[3].Format);
         }
-        for (int i = 0; i < 4; ++i)
-            if (d[i].Width != w || d[i].Height != h || d[i].SampleDesc.Count != 1) {
-                Log("DLAA: TAA inputs differ in size or are multisampled; the game's TAA for this draw");
-                return;
+        bool sizesOk = d[3].SampleDesc.Count == 1 && (g_sr ? iw <= w && ih <= h : iw == w && ih == h);
+        for (int i = 0; i < 3; ++i) sizesOk &= d[i].Width == iw && d[i].Height == ih && d[i].SampleDesc.Count == 1;
+        if (!sizesOk) {
+            if (g_sizeLogs < 8) {
+                ++g_sizeLogs;
+                Log("DLAA: TAA inputs differ in size or are multisampled (depth %ux%u, color %ux%u, motion %ux%u, target "
+                    "%ux%u); the game's TAA for this draw",
+                    d[0].Width, d[0].Height, d[1].Width, d[1].Height, d[2].Width, d[2].Height, w, h);
             }
+            return;
+        }
         // DLSS reads typed 2D resources: a typeless engine texture (or a two-slice array, MVR B17) is copied into a typed
         // single one first.
         ID3D11Resource* in[3] = {};
@@ -919,7 +1251,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
         NVSDK_NGX_Result r = NVSDK_NGX_Result_Fail;
         Feature* f = nullptr;
         Protect("evaluate", [&] {
-            f = FeatureFor(c, view, (uintptr_t)tex[2], w, h);
+            f = FeatureFor(c, view, (uintptr_t)tex[2], iw, ih, w, h);
             if (!f) return;
             // MVR (mvr_motion.h): outer's motion vectors kept per eye, the focus views' made from them.
             ID3D11Resource* mv = in[2];
@@ -953,12 +1285,12 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             e.pInMotionVectors = mv;
             e.InJitterOffsetX = j[0] * Cfg().dlaaJitterScaleX;
             e.InJitterOffsetY = j[1] * Cfg().dlaaJitterScaleY;
-            e.InRenderSubrectDimensions.Width = w;
-            e.InRenderSubrectDimensions.Height = h;
+            e.InRenderSubrectDimensions.Width = iw;
+            e.InRenderSubrectDimensions.Height = ih;
             e.InReset = (f->fresh || frame > f->lastFrame + 2) ? 1 : 0;
             // The engine stores uv now - uv before; DLSS wants the offset to the previous position in pixels.
-            e.InMVScaleX = -(float)w;
-            e.InMVScaleY = -(float)h;
+            e.InMVScaleX = -(float)iw;
+            e.InMVScaleY = -(float)ih;
             e.InPreExposure = 1.0f;
             e.InExposureScale = ExposureScaleNow();
             e.pInBiasCurrentColorMask = mask;
@@ -994,7 +1326,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
         }
         if (g_evalFails || !g_viewLogged[view]) {
             g_viewLogged[view] = true;
-            Log("DLAA: DLSS replaces the game's TAA resolve (%s, %ux%u)", kViewName[view], w, h);
+            Log("DLAA: DLSS replaces the game's TAA resolve (%s, %ux%u -> %ux%u)", kViewName[view], iw, ih, w, h);
             SetState(view ? "on in quad views (DLSS replaces the game's TAA)" : "on (DLSS replaces the game's TAA)");
         }
         g_viewEvals[view].fetch_add(1, std::memory_order_relaxed);
@@ -1015,6 +1347,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             SafeRelease(sOut);
         }
         c->CopyResource(tex[3], out);
+        if (g_sr) sr::ShotDlss(c, tex[1], tex[3]);  // shot frame only
         result = kDone;
     }();
     for (auto*& t : tex) SafeRelease(t);
@@ -1028,6 +1361,19 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
 
 bool Wanted() { return g_on.load() && g_active.load() && !g_failed; }
 
+#ifdef QVFR_HAVE_DLSS
+bool BoundIsTaa(ID3D11DeviceContext* c) {
+    ID3D11ShaderResourceView* srv[6] = {};
+    c->PSGetShaderResources(0, 6, srv);
+    ID3D11RenderTargetView* rtv = nullptr;
+    c->OMGetRenderTargets(1, &rtv, nullptr);
+    const bool taa = IsTaaResolve(rtv, srv);
+    for (auto*& v : srv) SafeRelease(v);
+    SafeRelease(rtv);
+    return taa;
+}
+#endif
+
 // A DrawIndexed on some context: true = DLSS replaced the game's TAA resolve (the draw is not forwarded).
 bool Replace(ID3D11DeviceContext* c, UINT n) {
     if (t_inside || c != gpu::Context()) return false;
@@ -1039,6 +1385,31 @@ bool Replace(ID3D11DeviceContext* c, UINT n) {
     if (n != 6 || !Wanted()) return false;
     int r = kNotTaa;
 #ifdef QVFR_HAVE_DLSS
+    // DLSS SR (sr.h): with the clones in, DLSS scales the scene to the eye size, the textures the passes after TAA need
+    // are carried into the originals and the scene phase ends; the game's draw is skipped. Without them (learning, off)
+    // the draw ends the learning groups' scene phase and DLSS runs as DLAA at the eye size.
+    if (g_sr) {
+        bool taa = false;
+        Protect("draw", [&] { taa = BoundIsTaa(c); });
+        if (!taa) return false;
+        if (clones::SwappedIn(clones::Outer)) {
+            {
+                clones::RawScope raw;  // our calls pass the clones' hooks as they are
+                Protect("draw", [&] { r = Evaluate(c, false); });
+                if (r == kDone) Protect("carry", [&] { Carry(c); });
+            }
+            clones::SceneEnd(c);
+            if (r == kDone) {
+                g_evals.fetch_add(1, std::memory_order_relaxed);
+                g_srEvals.fetch_add(1, std::memory_order_relaxed);
+                g_lastOkFrame = g_frame.load();
+                return true;
+            }
+            g_fallbacks.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        clones::MarkTaa(c);
+    }
     if (CockpitTaaNow()) {
         // The game's TAA draw goes on; DLSS and the cockpit composition run in After.
         Protect("draw", [&] {
@@ -1120,7 +1491,14 @@ void __fastcall D_Resolve(void* taa, void* src, void* normal, uint32_t ctx, void
     g_resolves.fetch_add(1, std::memory_order_relaxed);
     g_lastCtx = ctx;
     if (Wanted()) EnsureD3DHooks();
+    char ev[128] = "";
+    if (Cfg().quadMode == QuadMode::Quad) {  // S1 probe (task map frame)
+        snprintf(ev, sizeof(ev), "TAA resolve recording begins (view slot %d, render context %u, from AMS2AVX.exe+0x%llX)",
+                 view, ctx, (unsigned long long)((uintptr_t)_ReturnAddress() - hooks::ExeBase()));
+        mvrpass::TaskMapEvent(ev);
+    }
     o_resolve(taa, src, normal, ctx, camera, a6, view);
+    if (ev[0]) mvrpass::TaskMapEvent("TAA resolve recording ends");
 }
 
 // The locks pass only feeds the game's TAA: not recorded while DLSS replaced the last frames' resolves.
@@ -1164,9 +1542,13 @@ void __fastcall D_Locks(void* taa, void* src, void* normal, uint32_t ctx, void* 
     if (Wanted() && Cfg().dlaaSkipLocks && !CockpitTaaNow() && g_evals.load() &&
         g_frame.load() <= g_lastOkFrame.load() + 1) {
         g_locksSkipped.fetch_add(1, std::memory_order_relaxed);
+        if (Cfg().quadMode == QuadMode::Quad) mvrpass::TaskMapEvent("TAA locks recording skipped (DLSS)");
         return;
     }
+    const bool s1 = Cfg().quadMode == QuadMode::Quad;  // S1 probe (task map frame)
+    if (s1) mvrpass::TaskMapEvent("TAA locks recording begins");
     o_locks(taa, src, normal, ctx, camera, a6, view);
+    if (s1) mvrpass::TaskMapEvent("TAA locks recording ends");
 }
 
 }  // namespace
@@ -1193,6 +1575,9 @@ void Install() {
         SetState("off with [quad] mode=probe");
         return;
     }
+    g_sr = Cfg().dlaaSr && Cfg().quadMode == QuadMode::Off;
+    if (Cfg().dlaaSr && !g_sr)
+        Log("DLAA: [dlaa] mode=dlss is for stereo only so far ([quad] mode=off); DLAA at the render size instead");
     if (Cfg().quadMode == QuadMode::Quad && !Cfg().taaViews)
         Log("DLAA: [debug] taa_views=0: the focus views share outer R's TAA targets and get motion vectors without the "
             "focus window's motion (smearing in the focus area)");
@@ -1258,8 +1643,22 @@ void OnFrameStart() {
     });
 }
 
+bool SrWanted() { return g_sr && Wanted(); }
+
 void LogStats(bool totals) {
     if (!g_installed) return;
+#ifdef QVFR_HAVE_DLSS
+    if (g_sr) {
+        const uint64_t se = g_srEvals.load();
+        Log("DLAA%s: DLSS SR: %llu evaluations at the render size, %llu textures carried in %llu resolves",
+            totals ? " (session total)" : "", (unsigned long long)(totals ? se : se - g_lastSrEvals),
+            (unsigned long long)(totals ? g_carried : g_carried - g_lastCarried),
+            (unsigned long long)(totals ? g_carryFrames : g_carryFrames - g_lastCarryFrames));
+        g_lastSrEvals = se;
+        g_lastCarried = g_carried;
+        g_lastCarryFrames = g_carryFrames;
+    }
+#endif
     const uint64_t e = g_evals.load(), f = g_fallbacks.load(), l = g_locksSkipped.load(), r = g_resolves.load();
     const uint64_t sc = g_setCalls, sn = g_setNonzero;
     Log("DLAA%s: %llu DLSS evaluations, %llu TAA draws left to the game, %llu locks passes skipped, %llu resolves "

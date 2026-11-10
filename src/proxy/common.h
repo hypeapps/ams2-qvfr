@@ -249,7 +249,11 @@ struct Config {
     bool mvrVelocityRecordSkip = true;
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
-    bool dlaa = false;                // mode=dlaa (a change needs a restart)
+    bool dlaa = false;                // mode=dlaa or dlss (a change needs a restart)
+    // mode=dlss (dlaa-plan S1, stereo only): the scene renders at render_scale of the eye size into the clones
+    // (sr.h) and DLSS Super Resolution scales it to the eye size at the TAA resolve. Restart for both.
+    bool dlaaSr = false;
+    float dlaaRenderScale = 0.67f;
     int dlaaPreset = 0;               // DLSS render preset hint for DLAA: 0 = DLSS default, 10 = J, 11 = K, ...
     float dlaaJitterScaleX = 0.5f;    // DLSS jitter in pixels = the engine's projection offset * scale
     float dlaaJitterScaleY = -0.5f;

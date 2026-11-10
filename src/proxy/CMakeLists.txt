@@ -36,6 +36,19 @@ add_custom_command(
   DEPENDS ${QVFR_DLAA_HLSL}
   COMMENT "fxc dlaa.hlsl"
   VERBATIM)
+set(QVFR_SR_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sr.hlsl)
+add_custom_command(
+  OUTPUT ${QVFR_SHADER_OUT}/sr_vs.h ${QVFR_SHADER_OUT}/sr_color_ps.h ${QVFR_SHADER_OUT}/sr_depth_ps.h
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${QVFR_SHADER_OUT}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T vs_5_0 /E VSFull /Vn kSrVS
+          /Fh ${QVFR_SHADER_OUT}/sr_vs.h ${QVFR_SR_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T ps_5_0 /E PSColor /Vn kSrColorPS
+          /Fh ${QVFR_SHADER_OUT}/sr_color_ps.h ${QVFR_SR_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T ps_5_0 /E PSDepth /Vn kSrDepthPS
+          /Fh ${QVFR_SHADER_OUT}/sr_depth_ps.h ${QVFR_SR_HLSL}
+  DEPENDS ${QVFR_SR_HLSL}
+  COMMENT "fxc sr.hlsl"
+  VERBATIM)
 set(QVFR_MVRPASS_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/shaders/mvr_pass.hlsl)
 add_custom_command(
   OUTPUT ${QVFR_SHADER_OUT}/mvr_pass_vs.h ${QVFR_SHADER_OUT}/mvr_pass_depth_ps.h ${QVFR_SHADER_OUT}/mvr_pass_mask_ps.h
@@ -80,7 +93,8 @@ add_library(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT}/compose_vs.h ${QVFR_SHADER
             ${QVFR_SHADER_OUT}/mvr_pass_mask_ps.h ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ps.h
             ${QVFR_SHADER_OUT}/mvr_pass_blit_ps.h ${QVFR_SHADER_OUT}/mvr_pass_color_in_ms_ps.h
             ${QVFR_SHADER_OUT}/mvr_pass_color_out_ms_ps.h ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ms_ps.h
-            ${QVFR_SHADER_OUT}/mvr_pass_depth_ms_ps.h ${QVFR_SHADER_OUT}/mvr_motion_cs.h)
+            ${QVFR_SHADER_OUT}/mvr_pass_depth_ms_ps.h ${QVFR_SHADER_OUT}/mvr_motion_cs.h
+            ${QVFR_SHADER_OUT}/sr_vs.h ${QVFR_SHADER_OUT}/sr_color_ps.h ${QVFR_SHADER_OUT}/sr_depth_ps.h)
 target_include_directories(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT})
 
 enable_language(ASM_MASM)  # export thunks (generated/thunks.asm)
@@ -107,6 +121,7 @@ add_library(qvfr_proxy SHARED
   runtime.cpp
   diag.cpp
   dlaa.cpp
+  sr.cpp
   xr_layer.cpp
   sysinfo.cpp
   sun_fx.cpp

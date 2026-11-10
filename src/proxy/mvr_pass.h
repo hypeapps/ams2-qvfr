@@ -210,6 +210,18 @@ void FocusGroupIn(int eye);
 // the distinct PS shader resources and constant buffers of its draws (resource ids, clones marked).
 void TaskMapBegin(const char* group, const char* name, bool detail);
 void TaskMapEnd();
+// S1 probe (docs/dlaa-plan.md S1: when the scene phase ends and the phase after TAA starts). In a task map frame each
+// mapped task also gets a line "MVR task map S1" when it saw any of: the TAA resolve and locks recordings (begin and
+// end, with the task's draw count at that moment, so draws inside the recording show), the TAA resolve's D3D11 draw
+// (its targets' ids and the engine's caller), draws into that draw's color source afterwards (the scene color the
+// windscreen, particles and sharpening draw into, with their depth target), the distinct viewports set and their
+// callers, and the engine's size constants (device+0x9b18 per context, postprocess+0x100) when they changed.
+bool TaskMapOn();  // render thread: a task is mapped now
+// Any thread: an event of the mapped task when it comes on its thread, else (in a map frame) a log line of its own.
+void TaskMapEvent(const char* text);
+// A DrawIndexed(6) on the immediate context (before the draw, even when DLSS replaces it): the TAA resolve is noted.
+void TaskMapDraw6(ID3D11DeviceContext* c, void* caller);
+void TaskMapViewports(ID3D11DeviceContext* c, UINT n, const D3D11_VIEWPORT* vps, void* caller);
 
 // D3D11 detours of the immediate context, before the real call (after the clones' mapping): the targets to bind or
 // clear instead during the MVR part. MapTargets: false = bind as they are; rtvOut has room for n entries.

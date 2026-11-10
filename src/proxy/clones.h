@@ -42,6 +42,17 @@ void SetSizes(uint32_t gameW, uint32_t gameH, uint32_t outerW, uint32_t outerH, 
 void OnFrameStart(ID3D11DeviceContext* imm, bool enabled);
 void BeginGroup(ID3D11DeviceContext* imm, Set set);  // eye group CBeginEye, before the engine's Execute
 void EndGroup(ID3D11DeviceContext* imm);             // eye group CEndEye, after the engine's Execute (no-op without Begin)
+// S1 (docs/dlaa-plan.md, sr.h): stereo with the outer set at the render size. Only the scene phase of an eye group
+// (until the TAA resolve's draw) renders into the clones. In the learning groups MarkTaa at the TAA draw ends the scene
+// phase: a texture gets a clone when it is written before it and is not the TAA draw's target; one used after it too is
+// carried (its clone's contents go into the original at the TAA draw).
+void SetStereoSr(bool on);                    // before the first frame
+void MarkTaa(ID3D11DeviceContext* imm);       // learning: the TAA draw comes now (its target bound)
+// While the outer clones are in: the carried textures' clones and originals (not referenced; valid until frame start).
+int CarryList(ID3D11Texture2D** clone, ID3D11Resource** orig, int max);
+// At the TAA draw while the clones are in: they go out as at CEndEye (fields, size constants, viewport, the bound
+// state); until the group ends the bind fix sends views of clones to their originals. False: no clones were in.
+bool SceneEnd(ID3D11DeviceContext* imm);
 // From quad's OMSetRenderTargets hook, before the real call: the targets to bind instead of the engine's (bind fix;
 // `rtvOut` holds 8 entries). False: bind the engine's as they are.
 bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv, ID3D11DepthStencilView* dsv,
@@ -91,6 +102,10 @@ bool IsArray(ID3D11Resource* res);
 int FocusSlice(ID3D11Resource* original, int eye, uint32_t* w = nullptr, uint32_t* h = nullptr);
 // Any thread: changes whenever the clones are dropped (views kept on old clones would keep them alive).
 uint32_t Generation();
+// The engine device's size constants (device from the factory hook): the render target size of command contexts
+// 0..3 (+0x9b18, stride 0xe60) and the postprocess object's scene size (+0x100). False: no device yet or not
+// readable. S1 probe (mvr_pass task map).
+bool EngineSizes(float rt[4][2], int post[2]);
 // Render thread: while one lives, this thread's D3D11 calls pass the clones' hooks as they are (no bind fix, not
 // observed). The MVR forward test (gate B9c) copies focus's clones inside outer's group, where the bind fix would put
 // the originals in their place.

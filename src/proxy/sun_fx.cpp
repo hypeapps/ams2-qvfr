@@ -601,6 +601,7 @@ void STDMETHODCALLTYPE D_DrawIndexed(ID3D11DeviceContext* c, UINT count, UINT st
         o_drawIndexed(c, count, start, base);
         return;
     }
+    if (count == 6 && mvrpass::TaskMapOn()) mvrpass::TaskMapDraw6(c, _ReturnAddress());  // S1 probe
     if (mvrpass::SkipDraw(c)) return;  // B11: a focus velocity pass whose target got outer's vectors
     if (const DrawReplaceFn replace = g_drawReplace.load(std::memory_order_relaxed)) {
         hookprof::SubScope sp(hookprof::SDlss);

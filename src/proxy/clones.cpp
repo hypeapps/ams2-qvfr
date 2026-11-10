@@ -92,6 +92,9 @@ struct Tex {
     // views see slice `slice`, the twin's slice + 1, in focus's size sw x sh. 0: a texture of its own.
     int slice = 0;
     uint32_t sw = 0, sh = 0;
+    // S1 (SetStereoSr): in the learning groups, written before the TAA resolve's draw (scene), used after it (post), the
+    // target of that draw (taaOut: the TAA history, written in the output size).
+    bool scene = false, post = false, taaOut = false;
 };
 struct Rt {
     uint8_t* obj = nullptr;
@@ -162,6 +165,17 @@ int g_twinLogs = 0;
 int g_resetLogs = 0;
 uint64_t g_frame = 0;
 bool g_texSizeLogged = false, g_devLogged = false;
+// S1 (SetStereoSr): stereo with the outer set at the render size; g_post = the TAA resolve's draw came in this group.
+bool g_stereo = false;
+bool g_post = false;
+uint64_t g_sceneEnds = 0, g_sceneEndsTot = 0;
+// S1: from SceneEnd to the group's end. The passes after TAA were recorded (worker threads) while the clones' sizes
+// were in, so a viewport they replay has the render size's fraction; on a target of the eye size it becomes that
+// fraction of the eye size (suspected cause of the double image in the first S1 test: the sharpening, windscreen and
+// particles drawing into the top left 67% only).
+std::atomic<bool> g_postVp{false};
+uint64_t g_postVpFixed = 0, g_postVpFixedTot = 0;
+std::vector<void*> g_postVpCallers;
 
 std::unordered_map<uint8_t*, bool> g_pending;  // created since the last frame start (true: render target)
 std::unordered_map<uint8_t*, Tex> g_tex;
@@ -567,8 +581,10 @@ bool AnyWanted() { return g_set[Outer].wanted || g_set[Focus].wanted; }
 // A changed list: no clones until the groups were watched again.
 void ResetLocked(const char* why) {
     DropClonesLocked();
-    for (auto& [obj, t] : g_tex)
+    for (auto& [obj, t] : g_tex) {
         for (int s = 0; s < 2; ++s) t.read[s] = t.written[s] = false;
+        t.scene = t.post = t.taaOut = false;
+    }
     for (SetState& s : g_set) {
         s.failed = false;
         s.learned = 0;
@@ -777,7 +793,12 @@ uint64_t PackSize(uint32_t w, uint32_t h) { return (uint64_t)(w & 0xffff) | ((ui
 // Outer keeps a texture focus reads but does not write: focus needs outer's data in it.
 bool KeptForFocus(const Tex& t) { return t.read[Focus] && !t.written[Focus]; }
 
-bool CloneWanted(const Tex& t, Set s) { return t.written[s] && !(s == Outer && KeptForFocus(t)); }
+bool CloneWanted(const Tex& t, Set s) {
+    if (g_stereo && s == Outer) return t.scene && !t.taaOut;  // S1: only the scene phase renders at the render size
+    return t.written[s] && !(s == Outer && KeptForFocus(t));
+}
+// S1: a clone whose contents the passes after the TAA resolve need in the original.
+bool Carried(const Tex& t) { return g_stereo && t.scene && t.post && !t.taaOut && t.clone[Outer]; }
 
 // Clones for the textures set s writes, entries for their fields and the render targets' view arrays and sizes.
 // A new texture's memory may hold anything (NaN included). Passes that accumulate over frames (history) read their
@@ -814,6 +835,8 @@ ID3D11Texture2D* SliceArrayLocked(const Tex& t, const D3D11_TEXTURE2D_DESC& d) {
     return nullptr;
 }
 
+bool DepthTypeless(DXGI_FORMAT f);  // below
+
 double CloneMb(const Tex& t, ID3D11Texture2D* c) {
     return !c || (t.slice && (ID3D11Resource*)c == t.res) ? 0.0 : Megabytes(DescOf(c));
 }
@@ -831,6 +854,11 @@ bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
         d.MipLevels = std::min(std::max(1u, d.MipLevels), MaxMips(d.Width, d.Height));
         d.MiscFlags &= ~(UINT)(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
                                D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_GDI_COMPATIBLE);
+        // S1: a carried depth target the game only binds as depth (no shader view) gets one on its clone, so its contents
+        // can be carried into the original (test 2: the right eye's windscreen was depth tested against stale depth).
+        if (g_stereo && si == Outer && t.scene && t.post && !t.taaOut && (d.BindFlags & D3D11_BIND_DEPTH_STENCIL) &&
+            DepthTypeless(d.Format))
+            d.BindFlags |= D3D11_BIND_SHADER_RESOURCE;
         ID3D11Texture2D* c = nullptr;
         HRESULT hr = S_OK;
         if (ID3D11Texture2D* arr = si == Focus ? SliceArrayLocked(t, d) : nullptr) {
@@ -955,12 +983,16 @@ void LogListLocked() {
                 const D3D11_TEXTURE2D_DESC d = DescOf(t->clone[s]);
                 n += snprintf(clones + n, sizeof(clones) - n, " -> %s %u x %u", kSetNames[s], d.Width, d.Height);
             }
-        const bool kept = g_set[Outer].wanted && t->written[Outer] && KeptForFocus(*t);
-        char line[360];
-        snprintf(line, sizeof(line), "  %-40s %5u x %-5u (1/%d) fmt %3d x%u mips %u arr %u  O %s F %s%s%s", TexName(*t),
+        const bool kept = !g_stereo && g_set[Outer].wanted && t->written[Outer] && KeptForFocus(*t);
+        char sr[64] = "";
+        if (g_stereo)
+            snprintf(sr, sizeof(sr), "  S1:%s%s%s%s", t->scene ? " scene" : "", t->post ? " post" : "",
+                     t->taaOut ? " TAA target" : "", Carried(*t) ? " CARRIED" : "");
+        char line[400];
+        snprintf(line, sizeof(line), "  %-40s %5u x %-5u (1/%d) fmt %3d x%u mips %u arr %u  O %s F %s%s%s%s", TexName(*t),
                  t->desc.Width, t->desc.Height, t->fr.d, (int)t->desc.Format, t->desc.SampleDesc.Count,
                  t->desc.MipLevels, t->desc.ArraySize, role(t->read[Outer], t->written[Outer]),
-                 role(t->read[Focus], t->written[Focus]), clones, kept ? "  (kept for outer: focus reads it)" : "");
+                 role(t->read[Focus], t->written[Focus]), clones, kept ? "  (kept for outer: focus reads it)" : "", sr);
         LogRaw(line);
     }
     if (!g_otherLines.empty()) {
@@ -1905,6 +1937,10 @@ void NoteLocked(ID3D11Resource* r, Use use, const char* method, void* caller) {
         if (auto it = g_byRes.find(r); it != g_byRes.end()) {
             Tex& t = g_tex[it->second];
             (use == Write ? t.written : t.read)[g_cur] = true;
+            if (g_stereo && g_post)
+                t.post = true;
+            else if (g_stereo && use == Write)
+                t.scene = true;
         } else if (use == Write && g_otherCount[g_cur] < kMaxOtherLogs && g_otherWritten.insert(r).second) {
             ++g_otherCount[g_cur];
             char line[280];
@@ -2280,9 +2316,73 @@ void STDMETHODCALLTYPE D_Mips(ID3D11DeviceContext* c, ID3D11ShaderResourceView* 
     hookprof::Orig o;
     o_mips(c, v);
 }
+// S1: the viewports `in` for the bound target after the scene phase; true when one of them was changed (into `out`).
+bool PostFixLocked(ID3D11DeviceContext* c, UINT n, const D3D11_VIEWPORT* in, D3D11_VIEWPORT* out, void* caller) {
+    n = std::min(n, kMaxViewports);
+    if (!n || !in) return false;
+    const uint32_t rw = g_set[Outer].w, rh = g_set[Outer].h;
+    if (!rw || !rh || !g_gameW || !g_gameH) return false;
+    ID3D11RenderTargetView* rtv = nullptr;
+    ID3D11DepthStencilView* dsv = nullptr;
+    c->OMGetRenderTargets(1, &rtv, &dsv);
+    void* v = rtv ? (void*)rtv : (void*)dsv;
+    uint32_t tw = 0, th = 0;
+    char what[160];
+    const bool sized = v && TargetSize(v, tw, th, what, sizeof(what));
+    if (rtv) rtv->Release();
+    if (dsv) dsv->Release();
+    if (!sized) return false;
+    bool fixed = false;
+    for (UINT i = 0; i < n; ++i) {
+        out[i] = in[i];
+        float ow = 0, oh = 0;
+        const D3D11_VIEWPORT& p = in[i];
+        if (p.TopLeftX != 0 || p.TopLeftY != 0 || !MapSize(rw, rh, g_gameW, g_gameH, p.Width, p.Height, ow, oh)) continue;
+        if (fabsf(ow - (float)tw) > 1.5f || fabsf(oh - (float)th) > 1.5f || (p.Width == ow && p.Height == oh)) continue;
+        out[i].Width = ow;
+        out[i].Height = oh;
+        fixed = true;
+    }
+    if (!fixed) return false;
+    ++g_postVpFixed;
+    if (g_postVpCallers.size() < (size_t)kMaxCallerLogs &&
+        std::find(g_postVpCallers.begin(), g_postVpCallers.end(), caller) == g_postVpCallers.end()) {
+        g_postVpCallers.push_back(caller);
+        Log("Clones: S1: viewport %.0f x %.0f after the TAA resolve on %s, from %s; set to %.0f x %.0f", in[0].Width,
+            in[0].Height, what, caller ? Where(caller).c_str() : "the state bound at the scene's end", out[0].Width,
+            out[0].Height);
+    }
+    return true;
+}
+
+// S1: the viewports bound now, checked again (after a target bind or the scene's end).
+void PostRefixLocked(ID3D11DeviceContext* c, void* caller) {
+    if (!o_rsVp) return;
+    D3D11_VIEWPORT cur[kMaxViewports], eff[kMaxViewports];
+    UINT n = kMaxViewports;
+    c->RSGetViewports(&n, cur);
+    if (!PostFixLocked(c, n, cur, eff, caller)) return;
+    t_internal = true;
+    o_rsVp(c, n, eff);
+    t_internal = false;
+}
+
 // Fast path: one atomic load unless clones are in.
 void STDMETHODCALLTYPE D_RSSetViewports(ID3D11DeviceContext* c, UINT n, const D3D11_VIEWPORT* vps) {
     hookprof::Scope prof(hookprof::KViewports);
+    if (mvrpass::TaskMapOn() && !t_internal && c == g_imm) mvrpass::TaskMapViewports(c, n, vps, _ReturnAddress());
+    if (g_postVp.load(std::memory_order_relaxed) && !t_internal && c == g_imm) {
+        D3D11_VIEWPORT eff[kMaxViewports];
+        bool fixed = false;
+        void* caller = _ReturnAddress();
+        Protect("RSSetViewports (S1)", [&] {
+            std::lock_guard lock(g_cm);
+            fixed = PostFixLocked(c, n, vps, eff, caller);
+        });
+        hookprof::Orig o;
+        o_rsVp(c, fixed ? std::min(n, kMaxViewports) : n, fixed ? eff : vps);
+        return;
+    }
     if (!g_vpActive.load(std::memory_order_relaxed) || t_internal || c != g_imm) {
         hookprof::Orig o;
         o_rsVp(c, n, vps);
@@ -2505,6 +2605,7 @@ void OnFrameStart(ID3D11DeviceContext* imm, bool enabled) {
         std::lock_guard lock(g_cm);
         ++g_frame;
         g_watch = false;
+        g_postVp = false;
         SetLive(LiveOff);
         g_inGroup = false;
         if (g_swapped) {
@@ -2542,8 +2643,9 @@ void OnFrameStart(ID3D11DeviceContext* imm, bool enabled) {
             g_phase = Learning;
             Log("Clones: B17: clones made again on the two-slice arrays' views");
         }
-        if (g_phase == Learning && g_set[Outer].learned >= kLearnGroups && g_set[Focus].learned >= kLearnGroups &&
-            g_enabled && imm)
+        // S1 (stereo): no focus groups; the focus set is not wanted there.
+        const bool focusDone = g_set[Focus].learned >= kLearnGroups || (g_stereo && !g_set[Focus].wanted);
+        if (g_phase == Learning && g_set[Outer].learned >= kLearnGroups && focusDone && g_enabled && imm)
             BuildLocked(imm);
         if (g_phase == Ready && !g_dirty && g_twinPending && imm) BuildTwinsLocked(imm);
     });
@@ -2554,6 +2656,8 @@ void BeginGroup(ID3D11DeviceContext* imm, Set set) {
         std::lock_guard lock(g_cm);
         if (g_failed || g_swapped) return;
         g_inGroup = true;
+        g_post = false;
+        g_postVp = false;
         g_cur = set;
         MapsChanged();
         SetState& s = g_set[set];
@@ -2610,6 +2714,8 @@ void EndGroup(ID3D11DeviceContext* imm) {
         std::lock_guard lock(g_cm);
         g_watch = false;
         SetLive(LiveOff);
+        g_post = false;
+        g_postVp = false;
         if (!g_inGroup) return;
         g_inGroup = false;
         SetState& s = g_set[g_cur];
@@ -2621,6 +2727,66 @@ void EndGroup(ID3D11DeviceContext* imm) {
             if (--s.proofLeft == 0) LogProofLocked(g_cur);
         }
     });
+}
+
+void SetStereoSr(bool on) {
+    std::lock_guard lock(g_cm);
+    g_stereo = on;
+}
+
+void MarkTaa(ID3D11DeviceContext* imm) {
+    Protect("MarkTaa", [&] {
+        std::lock_guard lock(g_cm);
+        if (!g_stereo || !g_inGroup || g_swapped || g_phase != Learning) return;
+        g_post = true;
+        ID3D11RenderTargetView* rtv = nullptr;
+        imm->OMGetRenderTargets(1, &rtv, nullptr);
+        if (!rtv) return;
+        ID3D11Resource* r = nullptr;
+        rtv->GetResource(&r);
+        rtv->Release();
+        if (!r) return;
+        if (auto it = g_byRes.find(r); it != g_byRes.end()) g_tex[it->second].taaOut = true;
+        r->Release();
+    });
+}
+
+int CarryList(ID3D11Texture2D** clone, ID3D11Resource** orig, int max) {
+    int n = 0;
+    Protect("CarryList", [&] {
+        std::lock_guard lock(g_cm);
+        if (!g_swapped || g_cur != Outer) return;
+        for (auto& [obj, t] : g_tex)
+            if (n < max && Carried(t)) {
+                clone[n] = t.clone[Outer];
+                orig[n] = t.res;
+                ++n;
+            }
+    });
+    return n;
+}
+
+bool SceneEnd(ID3D11DeviceContext* imm) {
+    bool ended = false;
+    Protect("SceneEnd", [&] {
+        std::lock_guard lock(g_cm);
+        if (!g_stereo || !g_inGroup || !g_swapped) return;
+        SetState& s = g_set[g_cur];
+        RestoreLocked(imm);
+        g_watch = false;  // the passes after TAA use the originals: no leaks to count
+        g_post = true;
+        if (s.proofLeft > 0) {
+            ++s.proofGroup;
+            if (--s.proofLeft == 0) LogProofLocked(g_cur);
+        }
+        // Views of clones the recorded passes still hold go to their originals until the group ends.
+        if (Cfg().clonesBindFix && !g_byClone.empty()) SetLive(LiveBack);
+        g_postVp = true;
+        if (imm) PostRefixLocked(imm, nullptr);
+        ++g_sceneEnds;
+        ended = true;
+    });
+    return ended;
 }
 
 bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv, ID3D11DepthStencilView* dsv,
@@ -2642,6 +2808,11 @@ void OnOMSetRenderTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView
         CheckTargets(c, n, rtv, dsv, "OMSetRenderTargets", caller);
     }
     TrackBind(c, n, rtv, dsv, caller);
+    if (g_postVp.load(std::memory_order_relaxed) && !t_internal && c == g_imm)
+        Protect("bind (S1)", [&] {
+            std::lock_guard lock(g_cm);
+            PostRefixLocked(c, caller);
+        });
 }
 
 void* Original(void* res) {
@@ -2730,6 +2901,19 @@ int FocusSlice(ID3D11Resource* original, int eye, uint32_t* w, uint32_t* h) {
 bool IsArray(ID3D11Resource* res) { return res && g_arrOn.load(std::memory_order_acquire) && IsArrayFast(res); }
 
 uint32_t Generation() { return g_cloneGen.load(std::memory_order_relaxed); }
+
+bool EngineSizes(float rt[4][2], int post[2]) {
+    uint8_t* dev = g_dev;
+    if (!dev || !hooks::TryRead(dev + kDevRtSize, rt[0], 8) ||
+        !hooks::TryRead(dev + kDevRtSize + kDevStride, rt[1], 8) ||
+        !hooks::TryRead(dev + kDevRtSize + 2 * kDevStride, rt[2], 8) ||
+        !hooks::TryRead(dev + kDevRtSize + 3 * kDevStride, rt[3], 8))
+        return false;
+    uint8_t* p = nullptr;
+    post[0] = post[1] = 0;
+    if (hooks::TryRead(dev + kDevPost, &p, 8) && p) hooks::TryRead(p + kPostSize, post, 8);
+    return true;
+}
 
 bool IsReady() {
     bool out = false;
@@ -2824,6 +3008,17 @@ std::string Describe() {
 void LogStats(bool totals) {
     Protect("LogStats", [&] {
         std::lock_guard lock(g_cm);
+        if (g_stereo) {
+            g_sceneEndsTot += g_sceneEnds;
+            g_postVpFixedTot += g_postVpFixed;
+            Log("Clones%s: S1: scene phases ended at the TAA resolve %llu (outer swaps %llu), viewports after it set to "
+                "the eye size %llu",
+                totals ? " (session total)" : "", (unsigned long long)(totals ? g_sceneEndsTot : g_sceneEnds),
+                (unsigned long long)(totals ? g_ctot.swaps[Outer] + g_c.swaps[Outer] : g_c.swaps[Outer]),
+                (unsigned long long)(totals ? g_postVpFixedTot : g_postVpFixed));
+            g_sceneEnds = 0;
+            g_postVpFixed = 0;
+        }
         for (int s = 0; s < 2; ++s) g_ctot.swaps[s] += g_c.swaps[s];
         g_ctot.translated += g_c.translated;
         g_ctot.lateRestores += g_c.lateRestores;

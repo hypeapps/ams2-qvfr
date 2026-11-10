@@ -20,6 +20,7 @@
 #include "common.h"
 #include "diag.h"
 #include "dlaa.h"
+#include "sr.h"
 #include "experiment.h"
 #include "frame.h"
 #include "gpu.h"
@@ -233,6 +234,7 @@ IVRSystem* VR_CALLTYPE VR_Init(EVRInitError* peError, EVRApplicationType eApplic
     probe::Install();  // [quad] mode=probe; guards itself
     quad::Install();   // [quad] mode=quad; guards itself
     dlaa::Install();   // [dlaa] mode=dlaa; guards itself
+    sr::Install();     // [dlaa] mode=dlss in stereo; guards itself
     return Wrap() ? wrap::System(real) : real;
 }
 
@@ -243,6 +245,7 @@ void VR_CALLTYPE VR_Shutdown() {
     Guarded("LogCallStats", [] { LogCallStats(true); });
     probe::Shutdown();
     quad::Shutdown();
+    sr::Shutdown();    // clones back before DLSS goes
     dlaa::Shutdown();  // before the device reference goes
     gpu::Release();  // after everything that drew with the device
     modern::Shutdown();
