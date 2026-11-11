@@ -274,6 +274,37 @@ struct Config {
     int dlaaCockpitTaa = 1;
     int dlaaPresetKeyMod = VK_RCONTROL;  // DLSS preset steps: ini, J, K, M, L (testers)
     int dlaaPresetKey = 0;               // testers: VK_HOME
+    // [nr] (prototype NR-P1, dlaa-plan D7; not in the default ini): 0 off, 1 focus = after DLAA the focus views go
+    // through the NR bridge (nr.h; step 1: passthrough without a model); 2 final = the finished focus images at the
+    // composition (motion vectors and depth from DLAA). Live, like its hotkey.
+    int nrMode = 0;
+    int nrKeyMod = VK_RCONTROL;  // NR on/off (A/B)
+    int nrKey = 0;
+    int nrTestKey = 0;           // with nrKeyMod: the next step of the built-in NR test sequence (nr.cpp kSteps)
+    bool nrModel = true;        // false: the bridge only copies (passthrough test)
+    // Model tuning (nr-bridge's names): a change recreates the model instances.
+    float nrIntensity = 1.0f;
+    int nrStyle = 0;
+    int nrPreset = 0;
+    bool nrAutoMask = true;      // DLSSNR.UseAutoMask
+    bool nrUiCorrection = true;  // DLSSNR.UICorrection
+    // 0 off, 1 the focus views show the model's edit instead of the image: grey = unchanged, lighter or darker =
+    // what the model changed (x20, in the model's units).
+    int nrDebug = 0;
+    float nrStrength = 1.0f;     // the model's edit x this (DXL's "Self Layers"; 1 = as the model made it)
+    // Into the model: DLAA's HDR color * input_scale (0.002 = DLAA's exposure), tonemap 0 none, 1 Reinhard,
+    // 2 Reinhard and 2.2 gamma (a display-like image); undone after the model.
+    float nrInputScale = 0.002f;
+    int nrTonemap = 2;
+    int nrTransfer = 1;          // back from the model: 1 ratio (output / input on the HDR image), 0 inverse
+    bool nrMotion = true;        // the game's motion vectors (0: zero vectors)
+    // Depth into the model: 0 constant 0.5 (as nr-bridge), 1 the game's linear TAA depth, 2 reversed device-like
+    // depth depth_k / linear. A change recreates the model instances.
+    int nrDepth = 0;
+    float nrDepthK = 2e-5f;
+    // Fixed for the session: 0 auto (the driver's NGX core, then the model directly), 1 core, 2 model directly.
+    int nrNgx = 0;
+    unsigned long long nrAppId = 0x24480451ull;  // NGX application id (nr-bridge's default)
     // [test] (not in the default ini; used by qvfr_proxy_smoke --fault)
     int testFaultFrames = 0;          // > 0: deliberate access violation in the diagnostics at this proxy frame
 };

@@ -20,6 +20,7 @@
 #include "hooks.h"
 #include "mvr_motion.h"
 #include "mvr_pass.h"
+#include "nr.h"
 #include "sr.h"
 #include "sun_fx.h"
 #include "sysinfo.h"
@@ -1310,6 +1311,10 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
                 c->CSSetShader(nullptr, nullptr, 0);
                 ++g_cockpitEvals;
             }
+            // NR prototype (nr.h, [nr] mode=focus): the focus views' DLAA result through the D3D12 bridge, still in
+            // DLAA's own context state.
+            if (NVSDK_NGX_SUCCEED(r) && nr::Wanted(view))
+                nr::Process(c, view, SrvFor(out), UavFor(out), mv, in[0], w, h, e.InReset != 0);
         });
         t_inside = false;
         g_ctx1->SwapDeviceContextState(prev, nullptr);
@@ -1641,6 +1646,7 @@ void OnFrameStart() {
             Log("DLAA: preset hotkey: %s%s", ExposureText().c_str(), g_presetStep.load() == 0 ? " (the ini preset)" : "");
         }
     });
+    nr::OnFrameStart();
 }
 
 bool SrWanted() { return g_sr && Wanted(); }
@@ -1680,6 +1686,7 @@ void LogStats(bool totals) {
             "TAA %llu (session)",
             (unsigned long long)g_maskEvals, (unsigned long long)g_expEvals, (unsigned long long)g_cockpitEvals);
 #endif
+    nr::LogStats(totals);
     if (Cfg().quadMode != QuadMode::Quad) return;
     mvrmotion::LogStats(totals);
     std::string views;
@@ -1730,6 +1737,7 @@ void Shutdown() {
 #ifdef QVFR_HAVE_DLSS
     Protect("Shutdown", [&] {
         ReleasePending();
+        nr::Shutdown();  // the bridge's D3D12 work on the device ends first
         DropNgxLocked();
     });
     g_ngxLogLines = 0;

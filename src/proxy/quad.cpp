@@ -30,6 +30,7 @@
 #include "mvr_pass.h"
 #include "mvr_ps.h"
 #include "mvr_vs.h"
+#include "nr.h"
 #include "shots.h"
 #include "sun_fx.h"
 #include "taa_views.h"
@@ -2107,6 +2108,9 @@ ID3D11Texture2D* ComposeLocked(int e, const vr::Texture_t* tex, const vr::VRText
         l.gazeX = (g_gaze[e][0] + 1) * 0.5f * g.gridW;
         l.gazeY = (1 - g_gaze[e][1]) * 0.5f * g.gridH;
     }
+    // [nr] mode=final: the finished focus image through NVIDIA's NR model; compose reads NR's copy (same size and
+    // format family), the game's texture stays as it is.
+    if (nr::WantedFinal()) focusTex = nr::ProcessFinal(imm, e, focusTex);
     const gpu::Phase phase = e ? gpu::ComposeR : gpu::ComposeL;
     gpu::Begin(phase);
     ID3D11Texture2D* out = compose::Draw(imm, e, outerTex, focusTex, l);
@@ -3238,6 +3242,7 @@ const Switch kSwitches[] = {
          g_vrOn = v != 0;
          if (g_vrOn) g_vrStopped = false;
      }},
+    {"nr", false, 0, 1, [] { return (int)nr::Active(); }, [](int v) { nr::SetActive(v != 0); }},
     {"queue_breakdown", false, 0, 1, [] { return (int)g_qbOn; }, [](int v) {
          g_qbOn = v != 0;
          g_qbWant = g_qbOn ? (1u << OuterL) | (1u << FocusL) : 0;

@@ -500,6 +500,44 @@ Config ReadConfig(const fs::path& ini) {
             c.dlaaSr ? "dlss" : "dlaa", c.dlaaRenderScale, preset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY, c.dlaaMvJittered, c.dlaaAutoExposure,
             c.dlaaExposure, c.dlaaExposureScale, c.dlaaBiasMask, c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey,
             c.dlaaExpKey, c.dlaaPresetKey, c.dlaaCockpitTaa);
+    const std::string nr = IniString(ini, L"nr", L"mode", L"off");
+    c.nrMode = nr == "focus" ? 1 : nr == "final" ? 2 : 0;
+    if (nr != "off" && nr != "focus" && nr != "final") Log("Settings: unknown [nr] mode=\"%s\", using off", nr.c_str());
+    c.nrKeyMod = IniInt(ini, L"nr", L"modifier", c.nrKeyMod);
+    c.nrKey = IniInt(ini, L"nr", L"key", c.nrKey);
+    c.nrTestKey = IniInt(ini, L"nr", L"test_key", c.nrTestKey);
+    c.nrModel = IniInt(ini, L"nr", L"model", 1) != 0;
+    c.nrIntensity = std::clamp(IniFloat(ini, L"nr", L"intensity", c.nrIntensity), 0.0f, 2.0f);
+    c.nrStyle = std::clamp(IniInt(ini, L"nr", L"style", c.nrStyle), 0, 16);
+    c.nrPreset = std::clamp(IniInt(ini, L"nr", L"preset", c.nrPreset), 0, 16);
+    c.nrAutoMask = IniInt(ini, L"nr", L"auto_mask", 1) != 0;
+    c.nrUiCorrection = IniInt(ini, L"nr", L"ui_correction", 1) != 0;
+    c.nrDebug = std::clamp(IniInt(ini, L"nr", L"debug", 0), 0, 1);
+    c.nrStrength = std::clamp(IniFloat(ini, L"nr", L"strength", 1.0f), 0.0f, 5.0f);
+    c.nrInputScale = IniFloat(ini, L"nr", L"input_scale", c.nrInputScale);
+    if (c.nrInputScale <= 0) c.nrInputScale = 1.0f;
+    c.nrTonemap = std::clamp(IniInt(ini, L"nr", L"tonemap", c.nrTonemap), 0, 2);
+    c.nrMotion = IniInt(ini, L"nr", L"motion_vectors", 1) != 0;
+    c.nrDepth = std::clamp(IniInt(ini, L"nr", L"depth", c.nrDepth), 0, 2);
+    c.nrDepthK = std::clamp(IniFloat(ini, L"nr", L"depth_k", c.nrDepthK), 1e-7f, 1.0f);
+    const std::string transfer = IniString(ini, L"nr", L"transfer", L"ratio");
+    c.nrTransfer = transfer == "inverse" ? 0 : 1;
+    if (transfer != "ratio" && transfer != "inverse")
+        Log("Settings: unknown [nr] transfer=\"%s\", using ratio", transfer.c_str());
+    const std::string ngx = IniString(ini, L"nr", L"ngx", L"auto");
+    c.nrNgx = ngx == "core" ? 1 : ngx == "direct" ? 2 : 0;
+    if (ngx != "auto" && ngx != "core" && ngx != "direct") Log("Settings: unknown [nr] ngx=\"%s\", using auto", ngx.c_str());
+    const std::string app = IniString(ini, L"nr", L"app_id", L"");
+    if (!app.empty()) c.nrAppId = strtoull(app.c_str(), nullptr, 0);
+    if (c.nrMode)
+        Log("Settings: [nr] mode=%s model=%d intensity=%.2f style=%d preset=%d auto_mask=%d ui_correction=%d "
+            "debug=%d strength=%.2f input_scale=%g tonemap=%d "
+            "transfer=%s motion_vectors=%d depth=%d depth_k=%g ngx=%s app_id=0x%llX modifier=0x%X key=0x%X "
+            "test_key=0x%X (prototype NR-P1)",
+            c.nrMode == 2 ? "final" : "focus", c.nrModel, c.nrIntensity, c.nrStyle, c.nrPreset, c.nrAutoMask,
+            c.nrUiCorrection, c.nrDebug, c.nrStrength, c.nrInputScale, c.nrTonemap,
+            c.nrTransfer ? "ratio" : "inverse", c.nrMotion, c.nrDepth, c.nrDepthK, ngx.c_str(),
+            c.nrAppId, c.nrKeyMod, c.nrKey, c.nrTestKey);
     c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
     if (c.testFaultFrames > 0) Log("Settings: [test] fault_frames=%d (deliberate fault for testing)", c.testFaultFrames);
     return c;
@@ -598,6 +636,25 @@ bool ReloadConfig() {
     c.dlaaCockpitTaa = n.dlaaCockpitTaa;
     c.dlaaPresetKeyMod = n.dlaaPresetKeyMod;
     c.dlaaPresetKey = n.dlaaPresetKey;
+    c.nrMode = n.nrMode;
+    c.nrKeyMod = n.nrKeyMod;
+    c.nrKey = n.nrKey;
+    c.nrTestKey = n.nrTestKey;
+    c.nrModel = n.nrModel;
+    c.nrIntensity = n.nrIntensity;
+    c.nrStyle = n.nrStyle;
+    c.nrPreset = n.nrPreset;
+    c.nrAutoMask = n.nrAutoMask;
+    c.nrUiCorrection = n.nrUiCorrection;
+    c.nrDebug = n.nrDebug;
+    c.nrStrength = n.nrStrength;
+    c.nrInputScale = n.nrInputScale;
+    c.nrTonemap = n.nrTonemap;
+    c.nrTransfer = n.nrTransfer;
+    c.nrMotion = n.nrMotion;
+    c.nrDepth = n.nrDepth;
+    c.nrDepthK = n.nrDepthK;
+    need(n.nrNgx != c.nrNgx || n.nrAppId != c.nrAppId, "[nr] ngx, app_id");
     c.statsIntervalS = n.statsIntervalS;
     c.warningBox = n.warningBox;
     c.benchKeyMod = n.benchKeyMod;

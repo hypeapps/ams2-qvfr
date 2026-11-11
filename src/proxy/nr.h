@@ -1,0 +1,41 @@
+// NVIDIA Neural Rendering prototype NR-P1 (dlaa-plan D7, [nr] mode=focus): after DLAA in the focus views of quad
+// views, the DLAA result goes through the NR bridge (nr_bridge.h) to a private D3D12 device, where the user's
+// nvngx_dlssnr.dll (x64\qvfr\, never shipped) runs on it with the game's motion vectors, and back. [nr] model=0 is the
+// bridge alone (passthrough: the image must stay the same). Not in the default ini; a prototype for local tests only
+// (no release without NVIDIA's official SDK).
+// [nr] mode=final: the model runs on the finished focus images (after the game's post-processing, display-encoded, as
+// nr-bridge and DXL's compatibility mode do) at the composition; DLAA's evaluation only hands over the motion vectors and
+// depth (Process), ProcessFinal the color.
+#pragma once
+
+#include <d3d11.h>
+
+#include <string>
+
+namespace qvfr::nr {
+
+// Render thread, in DLAA's evaluation (dlaa.cpp, after DLSS wrote `out`): true when this view goes through the bridge.
+// view: dlaa's view index (3 focus L, 4 focus R).
+bool Wanted(int view);
+// The DLAA result (w x h, an SRV and a UAV of the same texture) through the bridge. motion: the motion vectors DLAA
+// used (R16G16_FLOAT, uv now - uv before), depth: its linear depth (R32_FLOAT); either may be null. reset: DLAA reset
+// its history in this evaluation. Guards itself (SEH); a failure turns NR off for the session and leaves the DLAA
+// result.
+void Process(ID3D11DeviceContext* c, int view, ID3D11ShaderResourceView* srv, ID3D11UnorderedAccessView* uav,
+             ID3D11Resource* motion, ID3D11Resource* depth, UINT w, UINT h, bool reset);
+// Render thread, at the composition (quad.cpp, before compose::Draw): true when the eyes' focus images go through the
+// model (mode=final).
+bool WantedFinal();
+// Eye e's finished focus image through the model: returns the texture to compose from (the module's copy with the
+// model's result, valid until the next call or Shutdown) or `focus` itself when nothing ran. The compute shader state
+// of `c` is restored. Guards itself (SEH).
+ID3D11Texture2D* ProcessFinal(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* focus);
+// Live on/off ([nr] key, benchmark switch `nr`).
+bool Active();
+void SetActive(bool on);
+void OnFrameStart();  // hotkey (render thread)
+void LogStats(bool totals);
+std::string Describe();
+void Shutdown();  // before DLAA releases the device
+
+}  // namespace qvfr::nr
