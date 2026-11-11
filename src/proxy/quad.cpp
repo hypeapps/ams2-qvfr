@@ -2108,9 +2108,20 @@ ID3D11Texture2D* ComposeLocked(int e, const vr::Texture_t* tex, const vr::VRText
         l.gazeX = (g_gaze[e][0] + 1) * 0.5f * g.gridW;
         l.gazeY = (1 - g_gaze[e][1]) * 0.5f * g.gridH;
     }
-    // [nr] mode=final: the finished focus image through NVIDIA's NR model; compose reads NR's copy (same size and
-    // format family), the game's texture stays as it is.
-    if (nr::WantedFinal()) focusTex = nr::ProcessFinal(imm, e, focusTex);
+    // [nr] mode=final: the finished focus image (and with [nr] outer the outer image) through NVIDIA's NR model;
+    // compose reads NR's copies (same size and format), the game's textures stay as they are.
+    if (nr::WantedFinal()) {
+        // The right eye's finished images for the left eye's call (one evaluation for the frame with [nr] batch=1):
+        // focus R is what its CEndEye wrote, outer R this frame's copy.
+        ID3D11Texture2D* rightFocus = nullptr;
+        ID3D11Texture2D* rightOuter = nullptr;
+        if (e == 0 && g_run[FocusR].out)
+            static_cast<IUnknown*>(g_run[FocusR].out)->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&rightFocus);
+        if (e == 0 && g_copy[CopyOuterR].frame) rightOuter = g_copy[CopyOuterR].tex;
+        nr::ProcessFinal(imm, e, focusTex, outerTex, rightFocus, rightOuter);
+        if (rightFocus) rightFocus->Release();
+        l.smoothen = nr::Smoothen(l.smoothen);
+    }
     const gpu::Phase phase = e ? gpu::ComposeR : gpu::ComposeL;
     gpu::Begin(phase);
     ID3D11Texture2D* out = compose::Draw(imm, e, outerTex, focusTex, l);

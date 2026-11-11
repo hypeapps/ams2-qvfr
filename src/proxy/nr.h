@@ -15,7 +15,7 @@
 namespace qvfr::nr {
 
 // Render thread, in DLAA's evaluation (dlaa.cpp, after DLSS wrote `out`): true when this view goes through the bridge.
-// view: dlaa's view index (3 focus L, 4 focus R).
+// view: dlaa's view index (1 outer L, 2 outer R, 3 focus L, 4 focus R; outer only in mode=final with outer on).
 bool Wanted(int view);
 // The DLAA result (w x h, an SRV and a UAV of the same texture) through the bridge. motion: the motion vectors DLAA
 // used (R16G16_FLOAT, uv now - uv before), depth: its linear depth (R32_FLOAT); either may be null. reset: DLAA reset
@@ -23,13 +23,18 @@ bool Wanted(int view);
 // result.
 void Process(ID3D11DeviceContext* c, int view, ID3D11ShaderResourceView* srv, ID3D11UnorderedAccessView* uav,
              ID3D11Resource* motion, ID3D11Resource* depth, UINT w, UINT h, bool reset);
-// Render thread, at the composition (quad.cpp, before compose::Draw): true when the eyes' focus images go through the
-// model (mode=final).
+// Render thread, at the composition (quad.cpp, before compose::Draw): true when the eyes' final images go through the
+// model (mode=final; the outer ones too with [nr] outer).
 bool WantedFinal();
-// Eye e's finished focus image through the model: returns the texture to compose from (the module's copy with the
-// model's result, valid until the next call or Shutdown) or `focus` itself when nothing ran. The compute shader state
-// of `c` is restored. Guards itself (SEH).
-ID3D11Texture2D* ProcessFinal(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* focus);
+// [quad] smoothen_focus_view_edges at the composition: `ini`, or the NR test step's.
+float Smoothen(float ini);
+// Eye e's finished focus and outer images through the model: `focus` and `outer` become the textures to compose from
+// (the module's copies with the model's result, valid until the next frame or Shutdown) or stay. With [nr] batch=1 the
+// left eye's call runs all images of the frame in one evaluation (rightFocus, rightOuter: the right eye's finished
+// images; null skips the frame) and the right eye's call only takes its copies. The compute shader state of `c` is
+// restored. Guards itself (SEH).
+void ProcessFinal(ID3D11DeviceContext* c, int eye, ID3D11Texture2D*& focus, ID3D11Texture2D*& outer,
+                  ID3D11Texture2D* rightFocus, ID3D11Texture2D* rightOuter);
 // Live on/off ([nr] key, benchmark switch `nr`).
 bool Active();
 void SetActive(bool on);

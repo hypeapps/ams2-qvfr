@@ -292,6 +292,8 @@ struct Config {
     // what the model changed (x20, in the model's units).
     int nrDebug = 0;
     float nrStrength = 1.0f;     // the model's edit x this (DXL's "Self Layers"; 1 = as the model made it)
+    bool nrOuter = false;        // mode=final: the outer images through the model too (no tone step at the focus edge)
+    bool nrBatch = true;         // mode=final: all images of a frame in one atlas, one evaluation of the model
     // Into the model: DLAA's HDR color * input_scale (0.002 = DLAA's exposure), tonemap 0 none, 1 Reinhard,
     // 2 Reinhard and 2.2 gamma (a display-like image); undone after the model.
     float nrInputScale = 0.002f;

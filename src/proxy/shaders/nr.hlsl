@@ -14,6 +14,12 @@ cbuffer Params : register(b0) {
     float depthK;      // near / far of the reversed depth (2)
     uint debug;        // CSUnpack: 1 the model's edit instead of the image (needs t1)
     float pad;         // CSUnpack: strength, the model's edit x this (1 = as the model made it)
+    // CSMotion, CSDepth: the region of the output they write (the whole output, or one image in the atlas of all images
+    // that go through the model in one evaluation); the source is the region's size.
+    uint offsetX;
+    uint offsetY;
+    uint regionW;
+    uint regionH;
 };
 
 // transfer 1: the model's input (t1) and the original HDR image (t2). The ratio is taken in linear display values
@@ -105,23 +111,26 @@ RWTexture2D<float> depthOut : register(u0);
 
 [numthreads(8, 8, 1)]
 void CSDepth(uint3 id : SV_DispatchThreadID) {
-    uint w, h;
-    depthOut.GetDimensions(w, h);
-    if (id.x >= w || id.y >= h) return;
+    if (id.x >= regionW || id.y >= regionH) return;
     const float z = src.Load(int3(id.xy, 0)).r;
-    depthOut[id.xy] = depthMode == 2 ? saturate(depthK / max(z, 1e-7)) : saturate(z);
+    depthOut[id.xy + uint2(offsetX, offsetY)] = depthMode == 2 ? saturate(depthK / max(z, 1e-7)) : saturate(z);
 }
 
 // The game stores uv now - uv before (as DLAA reads it); the model, like DLSS, wants the offset from the current pixel
-// to its previous position in pixels.
+// to its previous position in pixels. In the atlas the previous position is held inside the pixel's own image, so the
+// model's history never reaches into the neighbouring one.
 RWTexture2D<float2> motion : register(u0);
 
 [numthreads(8, 8, 1)]
 void CSMotion(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= regionW || id.y >= regionH) return;
     uint w, h;
     motion.GetDimensions(w, h);
-    if (id.x >= w || id.y >= h) return;
+    const float2 size = float2(regionW, regionH);
     float2 m = 0;
-    if (mvScale != 0) m = src.Load(int3(id.xy, 0)).xy * -mvScale * float2(w, h);
-    motion[id.xy] = m;
+    if (mvScale != 0) {
+        m = src.Load(int3(id.xy, 0)).xy * -mvScale * size;
+        if (regionW != w || regionH != h) m = clamp(float2(id.xy) + m, 0.0, size - 1.0) - float2(id.xy);
+    }
+    motion[id.xy + uint2(offsetX, offsetY)] = m;
 }

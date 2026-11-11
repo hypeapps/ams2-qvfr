@@ -18,6 +18,7 @@ namespace {
 
 constexpr UINT kW = 2117, kH = 1775;  // the focus size in the user's quad views
 constexpr int kRounds = 100;          // per slot
+constexpr int kAtlasRounds = 20;      // slot 4: two regions' guides, then one evaluation
 
 // Random R11G11B10_FLOAT: each channel's exponent below 31 (31 is Inf/NaN), mantissa anything.
 uint32_t RandomPacked(std::mt19937& rng) {
@@ -188,6 +189,22 @@ int RunNrBridge() {
                 printf("NR bridge: guidesReady without guides of the size did not refuse\n");
                 ++fails;
             }
+            // The atlas (slot 4): the guides of two images go into the halves of slot 0's image, then the whole image
+            // goes through once (it must stay bit for bit too). A region outside the atlas is refused.
+            for (int r = 0; r < kAtlasRounds; ++r) {
+                bridge.Configure(fin);
+                const UINT half = kW / 2;
+                if (!bridge.Guides(ctx, 4, nullptr, nullptr, half, kH, 0, 0, kW, kH) ||
+                    !bridge.Guides(ctx, 4, nullptr, nullptr, kW - half, kH, half, 0, kW, kH) ||
+                    !bridge.Process(ctx, 4, fs[0], fu[0], nullptr, nullptr, kW, kH, r == 0, true)) {
+                    printf("NR bridge: atlas failed in round %d: %s\n", r, bridge.why().c_str());
+                    return 1;
+                }
+            }
+            if (bridge.Guides(ctx, 4, nullptr, nullptr, kW, kH, 1, 0, kW, kH) || bridge.failed()) {
+                printf("NR bridge: a region outside the atlas was not refused\n");
+                ++fails;
+            }
             D3D11_TEXTURE2D_DESC fsd = fd;
             fsd.Usage = D3D11_USAGE_STAGING;
             fsd.BindFlags = 0;
@@ -212,7 +229,7 @@ int RunNrBridge() {
                 st->Release();
                 printf("NR bridge: slot %d (final image RGBA8%s, guides first) after %d round trips: %zu of %u pixels "
                        "differ\n",
-                       2 + i, i ? ", strength 3" : "", kRounds, diff, kW * kH);
+                       2 + i, i ? ", strength 3" : ", then the atlas of two regions in slot 4", kRounds, diff, kW * kH);
                 if (diff) ++fails;
             }
             for (int i = 0; i < 2; ++i) {
@@ -226,7 +243,7 @@ int RunNrBridge() {
         printf("NR bridge: %llu calls, CPU %.3f ms per call (with the Flush), D3D12 GPU %.3f ms per call (%llu samples)\n",
                (unsigned long long)s.calls, s.calls ? s.cpuMs / (double)s.calls : 0.0,
                s.gpuSamples ? s.gpuMs / (double)s.gpuSamples : 0.0, (unsigned long long)s.gpuSamples);
-        if (s.calls != 4u * kRounds) ++fails;
+        if (s.calls != 4u * kRounds + kAtlasRounds) ++fails;
     }  // the bridge is released here, while the device lives
 
     if (info) {

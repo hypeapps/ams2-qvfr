@@ -239,6 +239,7 @@ struct Consts {
     float depthK;
     uint32_t debug;
     float pad;
+    uint32_t offsetX, offsetY, regionW, regionH;  // CSMotion, CSDepth: the region they write
 };
 
 #ifdef QVFR_HAVE_NGX_HEADERS
@@ -315,7 +316,7 @@ struct Bridge::Impl {
     ID3D11ComputeShader* motionCs = nullptr;
     ID3D11ComputeShader* depthCs = nullptr;
     ID3D11Buffer* cb = nullptr;
-    Consts cbValue{-1, 0, 0, 0, 0, 0, 0, 0};
+    Consts cbValue{-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     HMODULE d3d12 = nullptr;
     ID3D12Device* dev12 = nullptr;
     ID3D12CommandQueue* queue = nullptr;
@@ -332,6 +333,7 @@ struct Bridge::Impl {
     ID3D12Resource* tsRead = nullptr;
     UINT64 tsFreq = 0;
     bool tsPending[kRing] = {};
+    int tsSlot[kRing] = {};  // the slot whose submission wrote the timestamps
     UINT ring = 0;
     struct Slot {
         UINT w = 0, h = 0;
@@ -726,14 +728,19 @@ bool Bridge::EnsureSlot(int slot, UINT w, UINT h) {
 }
 
 bool Bridge::Guides(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* motion,
-                    ID3D11ShaderResourceView* depth, UINT w, UINT h) {
-    if (!ready_ || failed_ || !c || slot < 0 || slot >= kSlots || !w || !h) return false;
+                    ID3D11ShaderResourceView* depth, UINT w, UINT h, UINT x0, UINT y0, UINT fullW, UINT fullH) {
+    if (!fullW || !fullH) {
+        fullW = w;
+        fullH = h;
+    }
+    if (!ready_ || failed_ || !c || slot < 0 || slot >= kSlots || !w || !h || x0 + w > fullW || y0 + h > fullH)
+        return false;
     Impl& m = *impl_;
-    if (!EnsureContext(c) || !EnsureSlot(slot, w, h)) return false;
+    if (!EnsureContext(c) || !EnsureSlot(slot, fullW, fullH)) return false;
     Impl::Slot& s = m.slots[slot];
     const bool gameDepth = set_.depthMode > 0 && depth;
     const Consts k{1.0f, 0u, (set_.motion && motion) ? 1.0f : 0.0f, 0u, gameDepth ? (uint32_t)set_.depthMode : 0u,
-                   set_.depthK, 0u, 1.0f};
+                   set_.depthK, 0u, 1.0f, x0, y0, w, h};
     if (memcmp(&k, &m.cbValue, sizeof(k)) != 0) {
         c->UpdateSubresource(m.cb, 0, nullptr, &k, 0, 0);
         m.cbValue = k;
@@ -759,8 +766,8 @@ bool Bridge::Guides(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* 
     c->CSSetShaderResources(0, 1, &noSrv);
     c->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
     c->CSSetShader(nullptr, nullptr, 0);
-    s.guideW = w;
-    s.guideH = h;
+    s.guideW = fullW;
+    s.guideH = fullH;
     s.guideDepth = gameDepth;
     return true;
 }
@@ -794,8 +801,11 @@ bool Bridge::Process(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView*
         if (SUCCEEDED(m.tsRead->Map(0, &range, (void**)&p))) {
             const UINT64* q = p + r * 2;
             if (q[1] >= q[0]) {
-                stats_.gpuMs += (double)(q[1] - q[0]) * 1000.0 / (double)m.tsFreq;
+                const double ms = (double)(q[1] - q[0]) * 1000.0 / (double)m.tsFreq;
+                stats_.gpuMs += ms;
                 ++stats_.gpuSamples;
+                stats_.slotGpuMs[m.tsSlot[r]] += ms;
+                ++stats_.slotGpuSamples[m.tsSlot[r]];
             }
             const D3D12_RANGE none{0, 0};
             m.tsRead->Unmap(0, &none);
@@ -941,7 +951,7 @@ bool Bridge::Process(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView*
                       ud.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
     const Consts k{shaped ? set_.inputScale : 1.0f, shaped ? (uint32_t)set_.tonemap : 0u, set_.motion ? 1.0f : 0.0f,
                    ratio ? 1u : 0u, gameDepth ? (uint32_t)set_.depthMode : 0u, set_.depthK, debugView ? 1u : 0u,
-                   strength};
+                   strength, 0u, 0u, w, h};
     if (ratio || diagNow || four) {  // the image as it came, for CSUnpack and the measurement
         ID3D11Resource* img = nullptr;
         srv->GetResource(&img);
@@ -1030,6 +1040,7 @@ bool Bridge::Process(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView*
     m.queue->Signal(m.ba12, ++m.vBA);
     m.allocValue[r] = m.vBA;
     m.tsPending[r] = ts;
+    m.tsSlot[r] = slot;
     ++m.ring;
     if (FAILED(hr = m.dev12->GetDeviceRemovedReason())) {
         // No D3D11 wait on a signal that may never come; the image keeps its D3D11 content.

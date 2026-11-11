@@ -15,9 +15,21 @@ namespace qvfr::nr {
 
 namespace {
 
-constexpr int kFocusL = 3;  // dlaa's view index of focus L (focus R = 4)
-constexpr const char* kName[2] = {"focus L", "focus R"};
-constexpr int kMotionCache = 8;
+// The images, one bridge slot each: 0/1 focus L/R, 2/3 outer L/R (outer only in mode=final).
+constexpr int kImages = 4;
+constexpr const char* kName[kImages] = {"focus L", "focus R", "outer L", "outer R"};
+constexpr int kMotionCache = 16;  // motion vectors and depth of up to four views, twice
+
+// dlaa's view index (1 outer L, 2 outer R, 3 focus L, 4 focus R) to the image, -1 for the others.
+int ImageOf(int view) {
+    switch (view) {
+        case 3: return 0;
+        case 4: return 1;
+        case 1: return 2;
+        case 2: return 3;
+        default: return -1;
+    }
+}
 
 nrbridge::Bridge* g_bridge = nullptr;
 nrbridge::Settings g_set;  // what the bridge was configured with
@@ -25,11 +37,11 @@ uint32_t g_gen = 0;
 bool g_failed = false;  // the rest of the session: DLAA only
 std::string g_why;
 std::atomic<bool> g_active{true};
-std::atomic<bool> g_resetPending[2] = {false, false};  // NR turned on again: the model's history starts over
+std::atomic<bool> g_resetPending[kImages] = {};  // NR turned on again: the model's history starts over
 bool g_keyDown = false;
 bool g_faultLogged = false;
-uint64_t g_calls[2] = {}, g_lastCalls[2] = {};
-bool g_firstLogged[2] = {};
+uint64_t g_calls[kImages] = {}, g_lastCalls[kImages] = {};
+bool g_firstLogged[kImages] = {};
 nrbridge::Stats g_last{};
 
 // SRVs of the motion vector and depth textures DLAA hands over (kept with a reference on the texture).
@@ -42,29 +54,27 @@ InputSrv g_motion[kMotionCache];
 int g_motionNext = 0;
 bool g_motionLogged[2] = {};
 
-// The built-in test sequence (dlaa-plan D7, test 6): [nr] modifier + test_key goes to the next step, on top of the ini.
-// Step 0 is the ini as it is. `mode` 0 keeps the ini's mode, 1 after DLAA (focus), 2 the final image. Test 5's sequence
-// (input_scale, transfer after DLAA) is in dlaa-plan D7.
+// The built-in test sequence (dlaa-plan D7, test 8): [nr] modifier + test_key goes to the next step, on top of the ini.
+// Step 0 is the ini as it is. `mode` 0 keeps the ini's mode, 1 after DLAA (focus), 2 the final image; `outer` and
+// `batch` -1 keep the ini's [nr] outer / batch, 0 off, 1 on; `smoothen` >= 0 replaces [quad] smoothen_focus_view_edges
+// at the composition. Earlier sequences (tests 5 to 7) are in dlaa-plan D7.
 struct TestStep {
     const char* name;
     int mode;
+    int outer;
+    int batch;
+    float smoothen;
     void (*apply)(nrbridge::Settings&);
 };
 const TestStep kSteps[] = {
-    {"the ini as it is", 0, [](nrbridge::Settings&) {}},
-    {"edit map (debug=1)", 0, [](nrbridge::Settings& s) { s.debug = 1; }},
-    {"intensity=0 (the output should equal the input)", 0, [](nrbridge::Settings& s) { s.intensity = 0.0f; }},
-    {"strength=2 (the model's edit x2)", 0, [](nrbridge::Settings& s) { s.strength = 2.0f; }},
-    {"strength=3 (the model's edit x3)", 0, [](nrbridge::Settings& s) { s.strength = 3.0f; }},
-    {"style=1", 0, [](nrbridge::Settings& s) { s.style = 1; }},
-    {"style=2 (Cinematic)", 0, [](nrbridge::Settings& s) { s.style = 2; }},
-    {"style=3", 0, [](nrbridge::Settings& s) { s.style = 3; }},
-    {"auto_mask=0", 0, [](nrbridge::Settings& s) { s.autoMask = false; }},
-    {"ui_correction=0", 0, [](nrbridge::Settings& s) { s.uiCorrection = false; }},
-    {"motion_vectors=0", 0, [](nrbridge::Settings& s) { s.motion = false; }},
-    {"after DLAA (mode=focus), input_scale=0.0005", 1, [](nrbridge::Settings& s) { s.inputScale = 0.0005f; }},
-    {"after DLAA (mode=focus), input_scale=0.0005, strength=3", 1,
-     [](nrbridge::Settings& s) { s.inputScale = 0.0005f; s.strength = 3.0f; }},
+    {"the ini as it is", 0, -1, -1, -1.0f, [](nrbridge::Settings&) {}},
+    {"batch=0 (one evaluation per image, as test 7)", 0, -1, 0, -1.0f, [](nrbridge::Settings&) {}},
+    {"batch=1, focus only (outer=0)", 0, 0, 1, -1.0f, [](nrbridge::Settings&) {}},
+    {"batch=0, focus only (outer=0, as test 6)", 0, 0, 0, -1.0f, [](nrbridge::Settings&) {}},
+    {"batch=1, outer=1, a wider focus edge blend (smoothen 0.4)", 0, 1, 1, 0.4f, [](nrbridge::Settings&) {}},
+    {"batch=1, outer=1, style=2 (Cinematic)", 0, 1, 1, -1.0f, [](nrbridge::Settings& s) { s.style = 2; }},
+    {"batch=1, outer=1, strength=1.5", 0, 1, 1, -1.0f, [](nrbridge::Settings& s) { s.strength = 1.5f; }},
+    {"batch=1, outer=1, edit map (debug=1)", 0, 1, 1, -1.0f, [](nrbridge::Settings& s) { s.debug = 1; }},
 };
 constexpr int kStepCount = (int)(sizeof(kSteps) / sizeof(kSteps[0]));
 std::atomic<int> g_step{0};
@@ -77,25 +87,90 @@ int ModeNow() {
     return ini && step ? step : ini;
 }
 
-// mode=final: per eye, a copy of the finished focus image the model writes into (compose reads it instead).
+// mode=final: the outer images through the model too (the ini's [nr] outer, or the test step's).
+bool OuterNow() {
+    const int step = kSteps[g_step.load()].outer;
+    return ModeNow() == 2 && (step >= 0 ? step != 0 : Cfg().nrOuter);
+}
+
+// mode=final: all images of a frame in one atlas and one evaluation of the model (the ini's [nr] batch, or the test
+// step's). The model has a fixed cost per evaluation of about 1 ms besides its cost per pixel (test 7).
+bool BatchNow() {
+    const int step = kSteps[g_step.load()].batch;
+    return ModeNow() == 2 && (step >= 0 ? step != 0 : Cfg().nrBatch);
+}
+
+// The atlas (batch=1): focus L and R in the top row, outer L and R (with outer on) below, kAtlasGap pixels apart. Its
+// motion vectors and depth go into the bridge's slot kAtlasSlot region by region at DLAA time; at the left eye's
+// composition all images are copied in, go through the model once and are copied back out.
+constexpr int kAtlasSlot = 4;
+constexpr UINT kAtlasGap = 16;
+struct Region {
+    UINT w = 0, h = 0;  // the image's size (DLAA's)
+    UINT x = 0, y = 0;  // its place in the atlas
+};
+Region g_region[kImages];
+UINT g_atlasW = 0, g_atlasH = 0;  // 0: not all sizes known yet
+bool g_layoutOuter = false;
+uint32_t g_layoutGen = 1;
+uint32_t g_guided[kImages] = {};  // the layout generation of the region's guides written since the last atlas run
+uint32_t g_atlasRunGen = 0;       // the layout of the last atlas run (another one: the history starts over)
+bool g_atlasReset = false;        // DLAA reset a history since the last atlas run
+bool g_atlasOut = false;          // this frame's atlas ran: the eyes compose from g_final
+bool g_atlasLogged = false, g_atlasSkipLogged = false;
+
+void Relayout() {
+    ++g_layoutGen;
+    g_atlasW = g_atlasH = 0;
+    const int n = g_layoutOuter ? 4 : 2;
+    for (int i = 0; i < n; ++i)
+        if (!g_region[i].w) return;
+    Region* r = g_region;
+    r[0].x = 0;
+    r[0].y = 0;
+    r[1].x = r[0].w + kAtlasGap;
+    r[1].y = 0;
+    UINT w = r[1].x + r[1].w, h = r[0].h > r[1].h ? r[0].h : r[1].h;
+    if (g_layoutOuter) {
+        const UINT y = h + kAtlasGap;
+        r[2].x = 0;
+        r[2].y = y;
+        r[3].x = r[2].w + kAtlasGap;
+        r[3].y = y;
+        if (r[3].x + r[3].w > w) w = r[3].x + r[3].w;
+        h = y + (r[2].h > r[3].h ? r[2].h : r[3].h);
+    }
+    g_atlasW = w;
+    g_atlasH = h;
+    Log("NR: atlas %ux%u (%.1f MP) for one evaluation: focus %ux%u + %ux%u%s", w, h, (double)w * h / 1e6, r[0].w,
+        r[0].h, r[1].w, r[1].h, g_layoutOuter ? ", outer below" : "");
+}
+
+// mode=final: per image, a copy of the finished image the model writes into (compose reads it instead).
 struct FinalImage {
     ID3D11Texture2D* tex = nullptr;
     ID3D11ShaderResourceView* srv = nullptr;
     ID3D11UnorderedAccessView* uav = nullptr;
     D3D11_TEXTURE2D_DESC desc{};  // of the game's image it copies
 };
-FinalImage g_final[2];
-bool g_finalReset[2] = {};       // DLAA reset its history since the last final image
-bool g_finalLogged[2] = {};
-bool g_finalSkipLogged[2] = {};
+FinalImage g_final[kImages];
+FinalImage g_atlas;  // batch=1: all images side by side, the model writes into it
+bool g_finalReset[kImages] = {};  // DLAA reset its history since the last final image
+bool g_finalLogged[kImages] = {};
+bool g_finalSkipLogged[kImages] = {};
+
+void DropImage(FinalImage& f) {
+    if (f.uav) f.uav->Release();
+    if (f.srv) f.srv->Release();
+    if (f.tex) f.tex->Release();
+    f = {};
+}
 
 void DropFinal() {
-    for (FinalImage& f : g_final) {
-        if (f.uav) f.uav->Release();
-        if (f.srv) f.srv->Release();
-        if (f.tex) f.tex->Release();
-        f = {};
-    }
+    for (FinalImage& f : g_final) DropImage(f);
+    DropImage(g_atlas);
+    for (auto& g : g_guided) g = 0;
+    g_atlasOut = false;
 }
 
 // The copy's texture format (the image's own: compose wants outer and focus in one format) and the view format the
@@ -272,9 +347,10 @@ void ProcessImpl(ID3D11DeviceContext* c, int view, ID3D11ShaderResourceView* srv
         if (!Same(s, g_set)) {
             g_bridge->Configure(s);
             g_set = s;
-            Log("NR: settings: mode=%s model=%d intensity=%.2f style=%u preset=%u auto_mask=%d ui_correction=%d "
-                "debug=%d strength=%.2f input_scale=%g tonemap=%d transfer=%s motion_vectors=%d depth=%d depth_k=%g",
-                ModeNow() == 2 ? "final" : "focus", s.model, s.intensity, s.style, s.preset, s.autoMask,
+            Log("NR: settings: mode=%s outer=%d model=%d intensity=%.2f style=%u preset=%u auto_mask=%d "
+                "ui_correction=%d debug=%d strength=%.2f input_scale=%g tonemap=%d transfer=%s motion_vectors=%d "
+                "depth=%d depth_k=%g",
+                ModeNow() == 2 ? "final" : "focus", OuterNow(), s.model, s.intensity, s.style, s.preset, s.autoMask,
                 s.uiCorrection, s.debug, s.strength, s.inputScale, s.tonemap, s.transfer ? "ratio" : "inverse",
                 s.motion, s.depthMode, s.depthK);
         }
@@ -282,12 +358,31 @@ void ProcessImpl(ID3D11DeviceContext* c, int view, ID3D11ShaderResourceView* srv
     ID3D11ShaderResourceView* mv = InputFor(dev, motion, DXGI_FORMAT_R16G16_FLOAT);
     ID3D11ShaderResourceView* dp = g_set.depthMode ? InputFor(dev, depth, DXGI_FORMAT_R32_FLOAT) : nullptr;
     dev->Release();
-    const int i = view - kFocusL;
+    const int i = ImageOf(view);
+    if (i < 0) return;
     // A change between after-DLAA and final images: the model's history is of the other kind of image.
-    static int lastMode[2] = {};
+    static int lastMode[kImages] = {};
     const int mode = ModeNow();
     if (lastMode[i] && lastMode[i] != mode) g_resetPending[i] = true;
     lastMode[i] = mode;
+    if (mode == 2 && BatchNow()) {  // the image's motion vectors and depth into its region of the atlas
+        const bool outer = OuterNow();
+        if (g_region[i].w != w || g_region[i].h != h || g_layoutOuter != outer) {
+            g_region[i].w = w;
+            g_region[i].h = h;
+            g_layoutOuter = outer;
+            Relayout();
+        }
+        if (!g_atlasW) return;  // not all images' sizes known yet
+        const Region& r = g_region[i];
+        if (g_bridge->Guides(c, kAtlasSlot, mv, dp, w, h, r.x, r.y, g_atlasW, g_atlasH)) {
+            g_guided[i] = g_layoutGen;
+            if (reset) g_atlasReset = true;
+        } else if (g_bridge->failed()) {
+            TurnOff("bridge: " + g_bridge->why());
+        }
+        return;
+    }
     if (mode == 2) {  // the final image: only the motion vectors and depth now, the color at the composition
         if (g_bridge->Guides(c, i, mv, dp, w, h)) {
             if (reset) g_finalReset[i] = true;
@@ -338,102 +433,208 @@ struct CsState {
     }
 };
 
-ID3D11Texture2D* ProcessFinalImpl(ID3D11DeviceContext* c, int e, ID3D11Texture2D* focus) {
-    if (!g_bridge || !g_bridge->ready()) return focus;  // the bridge starts at the first focus DLAA
+// `f` as a d.Width x d.Height texture in d.Format's family with an SRV and a UAV in the stored (UNORM) format; made or
+// remade when needed. False (logged, NR off for the session): it cannot be made.
+bool EnsureImage(ID3D11DeviceContext* c, FinalImage& f, const D3D11_TEXTURE2D_DESC& d, const char* name) {
+    if (f.tex && f.desc.Width == d.Width && f.desc.Height == d.Height && f.desc.Format == d.Format) return true;
+    DropImage(f);
+    DXGI_FORMAT texFmt = DXGI_FORMAT_UNKNOWN, viewFmt = DXGI_FORMAT_UNKNOWN;
+    if (!FinalFormats(d.Format, texFmt, viewFmt)) return false;
+    ID3D11Device* dev = nullptr;
+    c->GetDevice(&dev);
+    if (!dev) return false;
+    D3D11_TEXTURE2D_DESC n = d;
+    n.Format = texFmt;
+    n.MipLevels = 1;
+    n.ArraySize = 1;
+    n.SampleDesc = {1, 0};
+    n.Usage = D3D11_USAGE_DEFAULT;
+    n.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    n.CPUAccessFlags = 0;
+    n.MiscFlags = 0;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Format = viewFmt;
+    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sd.Texture2D.MipLevels = 1;
+    D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
+    ud.Format = viewFmt;
+    ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
+    const HRESULT hr = dev->CreateTexture2D(&n, nullptr, &f.tex);
+    if (SUCCEEDED(hr)) dev->CreateShaderResourceView(f.tex, &sd, &f.srv);
+    if (f.srv) dev->CreateUnorderedAccessView(f.tex, &ud, &f.uav);
+    dev->Release();
+    if (!f.uav) {
+        Log("NR: cannot make the copy of the final %s image (%ux%u fmt %d, 0x%08lX); it stays", name, d.Width, d.Height,
+            (int)d.Format, (unsigned long)hr);
+        DropImage(f);
+        g_failed = true;
+        g_why = "no copy of the final image";
+        return false;
+    }
+    f.desc = d;
+    return true;
+}
+
+ID3D11Texture2D* ProcessFinalImpl(ID3D11DeviceContext* c, int i, ID3D11Texture2D* img) {
+    if (!g_bridge || !g_bridge->ready()) return img;  // the bridge starts at the first DLAA it is wanted in
     D3D11_TEXTURE2D_DESC d{};
-    focus->GetDesc(&d);
+    img->GetDesc(&d);
     DXGI_FORMAT texFmt = DXGI_FORMAT_UNKNOWN, viewFmt = DXGI_FORMAT_UNKNOWN;
     if (!FinalFormats(d.Format, texFmt, viewFmt) || d.ArraySize != 1 || d.SampleDesc.Count != 1) {
-        if (!g_finalSkipLogged[e]) {
-            g_finalSkipLogged[e] = true;
+        if (!g_finalSkipLogged[i]) {
+            g_finalSkipLogged[i] = true;
             Log("NR: the final %s image (%ux%u fmt %d, %u slices, %u samples) cannot go through the model; it stays",
-                kName[e], d.Width, d.Height, (int)d.Format, d.ArraySize, d.SampleDesc.Count);
+                kName[i], d.Width, d.Height, (int)d.Format, d.ArraySize, d.SampleDesc.Count);
         }
-        return focus;
+        return img;
     }
-    FinalImage& f = g_final[e];
-    if (f.tex && (f.desc.Width != d.Width || f.desc.Height != d.Height || f.desc.Format != d.Format)) {
-        f.uav->Release();
-        f.srv->Release();
-        f.tex->Release();
-        f = {};
-    }
-    if (!f.tex) {
-        ID3D11Device* dev = nullptr;
-        c->GetDevice(&dev);
-        if (!dev) return focus;
-        D3D11_TEXTURE2D_DESC n = d;
-        n.Format = texFmt;
-        n.MipLevels = 1;
-        n.Usage = D3D11_USAGE_DEFAULT;
-        n.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-        n.CPUAccessFlags = 0;
-        n.MiscFlags = 0;
-        D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-        sd.Format = viewFmt;
-        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        sd.Texture2D.MipLevels = 1;
-        D3D11_UNORDERED_ACCESS_VIEW_DESC ud{};
-        ud.Format = viewFmt;
-        ud.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-        const HRESULT hr = dev->CreateTexture2D(&n, nullptr, &f.tex);
-        if (SUCCEEDED(hr)) dev->CreateShaderResourceView(f.tex, &sd, &f.srv);
-        if (f.srv) dev->CreateUnorderedAccessView(f.tex, &ud, &f.uav);
-        dev->Release();
-        if (!f.uav) {
-            Log("NR: cannot make the copy of the final %s image (%ux%u fmt %d, 0x%08lX); it stays", kName[e], d.Width,
-                d.Height, (int)d.Format, (unsigned long)hr);
-            if (f.srv) f.srv->Release();
-            if (f.tex) f.tex->Release();
-            f = {};
-            g_failed = true;
-            g_why = "no copy of the final image";
-            return focus;
-        }
-        f.desc = d;
-    }
-    c->CopySubresourceRegion(f.tex, 0, 0, 0, 0, focus, 0, nullptr);
-    const bool reset = g_finalReset[e] || g_resetPending[e].exchange(false);
-    g_finalReset[e] = false;
+    FinalImage& f = g_final[i];
+    if (!EnsureImage(c, f, d, kName[i])) return img;
+    c->CopySubresourceRegion(f.tex, 0, 0, 0, 0, img, 0, nullptr);
+    const bool reset = g_finalReset[i] || g_resetPending[i].exchange(false);
+    g_finalReset[i] = false;
     CsState st;
     st.Save(c);
-    const bool ok = g_bridge->Process(c, e, f.srv, f.uav, nullptr, nullptr, d.Width, d.Height, reset, true);
+    const bool ok = g_bridge->Process(c, i, f.srv, f.uav, nullptr, nullptr, d.Width, d.Height, reset, true);
     st.Restore(c);
     if (!ok) {
         if (g_bridge->failed()) {
             TurnOff("bridge: " + g_bridge->why());
-        } else if (!g_finalSkipLogged[e]) {
-            g_finalSkipLogged[e] = true;
+        } else if (!g_finalSkipLogged[i]) {
+            g_finalSkipLogged[i] = true;
             Log("NR: the final %s image (%ux%u) has no motion vectors and depth of its size from DLAA; it stays",
-                kName[e], d.Width, d.Height);
+                kName[i], d.Width, d.Height);
         }
-        return focus;
+        return img;
     }
-    ++g_calls[e];
-    if (!g_finalLogged[e]) {
-        g_finalLogged[e] = true;
+    ++g_calls[i];
+    if (!g_finalLogged[i]) {
+        g_finalLogged[i] = true;
         Log("NR: first final %s image (%ux%u fmt %d, the game's bind flags 0x%X) through %s; the composition reads the "
             "copy",
-            kName[e], d.Width, d.Height, (int)d.Format, d.BindFlags, g_bridge->modelPath());
+            kName[i], d.Width, d.Height, (int)d.Format, d.BindFlags, g_bridge->modelPath());
     }
     return f.tex;
+}
+
+// batch=1, at the left eye's composition: img = focus L, focus R, outer L, outer R (the outer ones only with the
+// layout's outer). True: g_final holds every image through the model.
+bool RunAtlas(ID3D11DeviceContext* c, ID3D11Texture2D* const img[kImages]) {
+    if (!g_bridge || !g_bridge->ready()) return false;
+    const int n = g_layoutOuter ? 4 : 2;
+    const char* why = nullptr;
+    D3D11_TEXTURE2D_DESC d[kImages] = {};
+    DXGI_FORMAT texFmt = DXGI_FORMAT_UNKNOWN, viewFmt = DXGI_FORMAT_UNKNOWN;
+    if (!g_atlasW) why = "not all images' sizes are known yet";
+    for (int i = 0; i < n && !why; ++i) {
+        if (!img[i]) {
+            why = "an image of this frame is missing";
+            break;
+        }
+        img[i]->GetDesc(&d[i]);
+        if (g_guided[i] != g_layoutGen)
+            why = "the motion vectors and depth of an image are not from this frame's layout";
+        else if (d[i].Width != g_region[i].w || d[i].Height != g_region[i].h)
+            why = "an image's size is not DLAA's";
+        else if (d[i].Format != d[0].Format || !FinalFormats(d[i].Format, texFmt, viewFmt) || d[i].ArraySize != 1 ||
+                 d[i].SampleDesc.Count != 1)
+            why = "an image's format cannot go through the model";
+    }
+    if (why) {
+        if (!g_atlasSkipLogged) {
+            g_atlasSkipLogged = true;
+            Log("NR: atlas skipped (%s; logged once); the images stay", why);
+        }
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC a = d[0];
+    a.Width = g_atlasW;
+    a.Height = g_atlasH;
+    const bool fresh = !g_atlas.tex || g_atlas.desc.Width != a.Width || g_atlas.desc.Height != a.Height ||
+                       g_atlas.desc.Format != a.Format;
+    if (!EnsureImage(c, g_atlas, a, "atlas")) return false;
+    if (fresh) {  // the gaps between the images stay black
+        const float black[4] = {0, 0, 0, 1};
+        c->ClearUnorderedAccessViewFloat(g_atlas.uav, black);
+    }
+    for (int i = 0; i < n; ++i) {
+        if (!EnsureImage(c, g_final[i], d[i], kName[i])) return false;
+        c->CopySubresourceRegion(g_atlas.tex, 0, g_region[i].x, g_region[i].y, 0, img[i], 0, nullptr);
+    }
+    bool reset = g_atlasReset || g_atlasRunGen != g_layoutGen;
+    for (int i = 0; i < n; ++i) reset |= g_resetPending[i].exchange(false);
+    g_atlasReset = false;
+    g_atlasRunGen = g_layoutGen;
+    CsState st;
+    st.Save(c);
+    const bool ok = g_bridge->Process(c, kAtlasSlot, g_atlas.srv, g_atlas.uav, nullptr, nullptr, a.Width, a.Height,
+                                      reset, true);
+    st.Restore(c);
+    for (auto& g : g_guided) g = 0;  // the next run needs the next frame's guides
+    if (!ok) {
+        if (g_bridge->failed()) {
+            TurnOff("bridge: " + g_bridge->why());
+        } else if (!g_atlasSkipLogged) {
+            g_atlasSkipLogged = true;
+            Log("NR: atlas skipped (no motion vectors and depth of the atlas size; logged once); the images stay");
+        }
+        return false;
+    }
+    for (int i = 0; i < n; ++i) {
+        const D3D11_BOX b{g_region[i].x, g_region[i].y, 0, g_region[i].x + d[i].Width, g_region[i].y + d[i].Height, 1};
+        c->CopySubresourceRegion(g_final[i].tex, 0, 0, 0, 0, g_atlas.tex, 0, &b);
+        ++g_calls[i];
+    }
+    if (!g_atlasLogged) {
+        g_atlasLogged = true;
+        Log("NR: first atlas (%ux%u fmt %d, %d images) through %s in one evaluation; the composition reads the copies",
+            a.Width, a.Height, (int)a.Format, n, g_bridge->modelPath());
+    }
+    return true;
+}
+
+void FinalEyeImpl(ID3D11DeviceContext* c, int eye, ID3D11Texture2D*& focus, ID3D11Texture2D*& outer,
+                  ID3D11Texture2D* rightFocus, ID3D11Texture2D* rightOuter) {
+    if (!BatchNow()) {
+        g_atlasOut = false;
+        focus = ProcessFinalImpl(c, eye, focus);
+        if (OuterNow()) outer = ProcessFinalImpl(c, eye + 2, outer);
+        return;
+    }
+    if (eye == 0) {
+        ID3D11Texture2D* const img[kImages] = {focus, rightFocus, outer, rightOuter};
+        g_atlasOut = RunAtlas(c, img);
+    }
+    if (g_atlasOut) {
+        focus = g_final[eye].tex;
+        if (g_layoutOuter) outer = g_final[eye + 2].tex;
+    }
+    if (eye == 1) g_atlasOut = false;  // the next frame's atlas first
 }
 
 }  // namespace
 
 bool Wanted(int view) {
-    return ModeNow() != 0 && (view == kFocusL || view == kFocusL + 1) && !g_failed &&
+    const int i = ImageOf(view);
+    return ModeNow() != 0 && (i == 0 || i == 1 || (i >= 2 && OuterNow())) && !g_failed &&
            g_active.load(std::memory_order_relaxed);
 }
 
 bool WantedFinal() { return ModeNow() == 2 && !g_failed && g_active.load(std::memory_order_relaxed); }
 
-ID3D11Texture2D* ProcessFinal(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* focus) {
-    if (!c || !focus || eye < 0 || eye > 1) return focus;
+float Smoothen(float ini) {
+    const float step = kSteps[g_step.load()].smoothen;
+    return step >= 0 ? step : ini;
+}
+
+void ProcessFinal(ID3D11DeviceContext* c, int eye, ID3D11Texture2D*& focus, ID3D11Texture2D*& outer,
+                  ID3D11Texture2D* rightFocus, ID3D11Texture2D* rightOuter) {
+    if (!c || !focus || !outer || eye < 0 || eye > 1) return;
+    ID3D11Texture2D* f = focus;
+    ID3D11Texture2D* o = outer;
     unsigned long code = 0;
-    ID3D11Texture2D* out = focus;
     __try {
-        out = ProcessFinalImpl(c, eye, focus);
+        FinalEyeImpl(c, eye, f, o, rightFocus, rightOuter);
     } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
         if (!g_faultLogged) {
             g_faultLogged = true;
@@ -441,9 +642,11 @@ ID3D11Texture2D* ProcessFinal(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* 
         }
         g_failed = true;
         g_why = "exception";
-        out = focus;
+        f = focus;
+        o = outer;
     }
-    return out;
+    focus = f;
+    outer = o;
 }
 
 void Process(ID3D11DeviceContext* c, int view, ID3D11ShaderResourceView* srv, ID3D11UnorderedAccessView* uav,
@@ -465,7 +668,8 @@ void Process(ID3D11DeviceContext* c, int view, ID3D11ShaderResourceView* srv, ID
 bool Active() { return g_active.load(); }
 
 void SetActive(bool on) {
-    if (on && !g_active.load()) g_resetPending[0] = g_resetPending[1] = true;
+    if (on && !g_active.load())
+        for (auto& r : g_resetPending) r = true;
     g_active = on;
 }
 
@@ -478,6 +682,11 @@ void OnFrameStart() {
         StepBeeps(step);
         Log("NR: test step %d of %d: %s", step, kStepCount - 1, kSteps[step].name);
     }
+    // The outer images on again: their model history is from before the pause.
+    static bool outerWas = false;
+    const bool outer = OuterNow();
+    if (outer && !outerWas) g_resetPending[2] = g_resetPending[3] = true;
+    outerWas = outer;
     if (!c.nrKey) return;
     if (Pressed(c.nrKeyMod, c.nrKey, g_keyDown)) {
         const bool on = !g_active.load();
@@ -497,24 +706,49 @@ void LogStats(bool totals) {
         d.cpuMs -= g_last.cpuMs;
         d.gpuMs -= g_last.gpuMs;
         d.gpuSamples -= g_last.gpuSamples;
+        for (int i = 0; i < nrbridge::kSlots; ++i) {
+            d.slotGpuMs[i] -= g_last.slotGpuMs[i];
+            d.slotGpuSamples[i] -= g_last.slotGpuSamples[i];
+        }
     }
-    Log("NR%s: %s %llu, %s %llu images; model %llu (failed %llu); CPU %.3f ms per image (with the Flush), D3D12 GPU "
-        "%.3f ms per image; %s",
-        totals ? " (session total)" : "", kName[0], (unsigned long long)(totals ? g_calls[0] : g_calls[0] - g_lastCalls[0]),
-        kName[1], (unsigned long long)(totals ? g_calls[1] : g_calls[1] - g_lastCalls[1]),
-        (unsigned long long)d.modelCalls, (unsigned long long)d.modelFails, d.calls ? d.cpuMs / (double)d.calls : 0.0,
-        d.gpuSamples ? d.gpuMs / (double)d.gpuSamples : 0.0, Describe().c_str());
+    // Per image how many went through, per evaluation (one image, or the atlas of all) the model's D3D12 GPU time.
+    static const char* const kSlotName[nrbridge::kSlots] = {"focus L", "focus R", "outer L", "outer R", "atlas"};
+    std::string images, gpu;
+    for (int i = 0; i < kImages; ++i) {
+        const uint64_t n = totals ? g_calls[i] : g_calls[i] - g_lastCalls[i];
+        if (!n && i >= 2) continue;
+        char b[64];
+        snprintf(b, sizeof(b), "%s%s %llu", images.empty() ? "" : ", ", kName[i], (unsigned long long)n);
+        images += b;
+    }
+    for (int i = 0; i < nrbridge::kSlots; ++i) {
+        if (!d.slotGpuSamples[i]) continue;
+        char b[64];
+        snprintf(b, sizeof(b), "%s%s %.3f", gpu.empty() ? "" : ", ", kSlotName[i],
+                 d.slotGpuMs[i] / (double)d.slotGpuSamples[i]);
+        gpu += b;
+    }
+    // The D3D12 GPU time per frame: all evaluations of a frame (focus L counts the frames).
+    const uint64_t frames = totals ? g_calls[0] : g_calls[0] - g_lastCalls[0];
+    Log("NR%s: %s images; %llu evaluations (failed %llu), D3D12 GPU ms per evaluation: %s; %.2f ms per frame; CPU "
+        "%.3f ms per evaluation (with the Flush); %s",
+        totals ? " (session total)" : "", images.c_str(), (unsigned long long)d.modelCalls,
+        (unsigned long long)d.modelFails, gpu.empty() ? "none" : gpu.c_str(),
+        frames && d.gpuSamples ? d.gpuMs / (double)d.gpuSamples * (double)d.calls / (double)frames : 0.0,
+        d.calls ? d.cpuMs / (double)d.calls : 0.0, Describe().c_str());
     g_last = s;
-    g_lastCalls[0] = g_calls[0];
-    g_lastCalls[1] = g_calls[1];
+    for (int i = 0; i < kImages; ++i) g_lastCalls[i] = g_calls[i];
 }
 
 std::string Describe() {
     if (Cfg().nrMode == 0) return "NR: off";
     if (g_failed) return "NR: off (" + g_why + ")";
     if (!g_bridge) return "NR: waiting for the first focus DLAA";
-    std::string s = std::string(ModeNow() == 2 ? "NR: final focus images through " : "NR: focus views through ") +
+    std::string s = std::string(ModeNow() != 2  ? "NR: focus views through "
+                                : OuterNow()    ? "NR: final focus and outer images through "
+                                                : "NR: final focus images through ") +
                     g_bridge->modelPath() + " on " + g_bridge->adapter();
+    if (BatchNow()) s += ", one evaluation per frame (atlas)";
     if (!g_active.load()) s += ", hotkey: off";
     if (g_step.load()) s += std::string(", test step ") + std::to_string(g_step.load()) + ": " + kSteps[g_step.load()].name;
     return s;
@@ -523,8 +757,8 @@ std::string Describe() {
 void Shutdown() {
     Drop();
     g_set = {};
-    g_firstLogged[0] = g_firstLogged[1] = false;
-    g_finalLogged[0] = g_finalLogged[1] = false;
+    for (int i = 0; i < kImages; ++i) g_firstLogged[i] = g_finalLogged[i] = false;
+    g_atlasLogged = g_atlasSkipLogged = false;
 }
 
 }  // namespace qvfr::nr

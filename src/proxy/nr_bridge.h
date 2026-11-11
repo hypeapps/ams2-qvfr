@@ -23,7 +23,8 @@
 
 namespace qvfr::nrbridge {
 
-constexpr int kSlots = 4;  // independent images (one per view); each has its own shared textures and model instance
+// Independent images (one per view, or an atlas of several); each has its own shared textures and model instance.
+constexpr int kSlots = 5;
 
 struct Settings {
     bool model = false;  // false: passthrough (the D3D12 side only copies)
@@ -65,6 +66,8 @@ struct Stats {
     double cpuMs = 0;          // sum of the CPU time of Process (includes the Flush)
     double gpuMs = 0;          // sum of the D3D12 queue time between the timestamps
     uint64_t gpuSamples = 0;
+    double slotGpuMs[kSlots] = {};  // the same per slot
+    uint64_t slotGpuSamples[kSlots] = {};
 };
 
 class Bridge {
@@ -90,9 +93,11 @@ public:
                  ID3D11ShaderResourceView* motion, ID3D11ShaderResourceView* depth, UINT w, UINT h, bool reset,
                  bool guidesReady = false);
     // Only the motion vectors and depth of a slot (w x h), for a later Process with guidesReady (NR on the final image:
-    // the guides at DLAA time, the color at the composition). False: nothing written.
+    // the guides at DLAA time, the color at the composition). With fullW x fullH (the slot's size) they go into the
+    // region at (x0, y0) of an atlas of several images that go through the model in one evaluation; the previous
+    // positions are held inside the region. False: nothing written.
     bool Guides(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* motion, ID3D11ShaderResourceView* depth,
-                UINT w, UINT h);
+                UINT w, UINT h, UINT x0 = 0, UINT y0 = 0, UINT fullW = 0, UINT fullH = 0);
     void Release();  // waits for the D3D12 queue, then releases everything
 
     bool ready() const { return ready_; }
