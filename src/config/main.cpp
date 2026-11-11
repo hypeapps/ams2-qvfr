@@ -252,7 +252,7 @@ void LoadLog() {
 }
 
 void CheckNow() {
-    g.files = CheckFiles(g.home, g.s.openxr, g.s.dlaa);
+    g.files = CheckFiles(g.home, g.s.openxr, g.s.dlaa, g.s.nr);
     g.fileRows.clear();
     for (const Check& c : g.files.checks) {
         const char* cls = c.status == Status::Ok ? "ok" : c.status == Status::Info ? "info" : c.status == Status::Warning ? "warn" : "err";
@@ -440,7 +440,8 @@ void BindModel(Rml::Context* ctx) {
                g.ini.Set("dlaa", "key", on ? "0x70" : "0");
                g.ini.Set("dlaa", "exposure_key", on ? "0x7B" : "0");
                g.ini.Set("dlaa", "preset_key", on ? "0x24" : "0");
-               g.ini.Set("debug", "taa_views_key", on ? "0x71" : "0");
+               // Right Ctrl + F2 is the DLSS 5 tuning panel ([panel] key, always on): focus TAA history only in the ini.
+               g.ini.Set("debug", "taa_views_key", "0");
                g.ini.Set("debug", "sun_effects_key", on ? "0x72" : "0");
                g.ini.Set("debug", "cull_key", on ? "0x73" : "0");
                g.ini.Set("debug", "clones_key", on ? "0x74" : "0");
@@ -465,42 +466,70 @@ void BindModel(Rml::Context* ctx) {
     toggle("mvr", [] { return g.s.mvr; }, [](bool on) { Set("mvr", "mode", on ? "mvr" : "off"); });
     rs("rs_mvr", [](const Settings& a, const Settings& b) { return a.mvr != b.mvr; });
     // --- Rendering: NVIDIA DLAA ([dlaa], docs/dlaa.md). The DLL row on the Files page depends on the mode.
+    // DLSS 5 runs on DLAA's result, so with DLSS 5 on the DLAA switch stays on and is greyed out.
     toggle("dlaa", [] { return g.s.dlaa; }, [](bool on) {
+        if (!on && g.s.nr) return;
         Set("dlaa", "mode", on ? "dlaa" : "off");
         CheckNow();
     });
+    c.BindFunc("dlaa_locked", [](Rml::Variant& v) { v = g.s.nr && g.s.dlaa; });
     rs("rs_dlaa", [](const Settings& a, const Settings& b) { return a.dlaa != b.dlaa; });
+    // DLSS 5 itself is live, but the DLAA it turned on starts with the game.
+    rs("rs_nr", [](const Settings& a, const Settings& b) { return b.nr && a.dlaa != b.dlaa; });
+    // --- Rendering: DLSS 5 ([nr], dlaa-plan D7): the options of the tuning panel in the headset (proxy panel.cpp),
+    // with its ranges and value formats. All live.
+    toggle("nr", [] { return g.s.nr; }, [](bool on) {
+        WriteNr(g.ini, on);
+        Changed();
+        CheckNow();
+    });
+    c.BindFunc("nr_files", [](Rml::Variant& v) { v = g.files.nrModel && g.files.nrForwarder; });
+    c.BindFunc("nr_model", [](Rml::Variant& v) { v = g.files.nrModel; });
+    c.BindFunc("nr_missing", [](Rml::Variant& v) {
+        v = Rml::String(!g.files.nrModel && !g.files.nrForwarder ? "nvngx_dlssnr.dll and nvngx.dll_qvfr_nr.dll are"
+                        : !g.files.nrModel                       ? "nvngx_dlssnr.dll is"
+                                                                 : "nvngx.dll_qvfr_nr.dll is");
+    });
+    // A slider over a fraction in hundredths (lo..hi), its text from the fraction. The value shown is clamped to the
+    // slider's range, and only a value other than the one shown is written (the slider reports it when bound).
+    auto hundredths = [&](const char* name, float Settings::* field, int lo, int hi, const char* key, const char* fmt,
+                          float textScale = 1) {
+        auto shown = [field, lo, hi] { return std::clamp((int)std::lround(g.s.*field * 100), lo, hi); };
+        c.BindFunc(name, [shown](Rml::Variant& v) { v = shown(); }, [shown, key](const Rml::Variant& v) {
+            const int p = (int)std::lround(VarFloat(v));
+            if (p != shown()) Set("nr", key, Num(p / 100.0f));
+        });
+        c.BindFunc(std::string(name) + "_text", [field, fmt, textScale](Rml::Variant& v) { v = Fmt(fmt, g.s.*field * textScale); });
+    };
+    hundredths("nr_intensity", &Settings::nrIntensity, 0, 100, "intensity", "%.2f");
+    hundredths("nr_strength", &Settings::nrStrength, 0, 300, "strength", "%.1fx");
+    hundredths("nr_local_tone", &Settings::nrLocalTone, 0, 200, "local_tone", "%.2f");
+    hundredths("nr_local_structure", &Settings::nrLocalStructure, 0, 200, "local_structure", "%.2f");
+    hundredths("nr_outer_area", &Settings::nrOuterArea, 50, 100, "outer_area", "%.0f", 100);
+    auto choice = [&](const char* name, int Settings::* field, const char* key) {
+        c.BindFunc(name, [field](Rml::Variant& v) { v = g.s.*field; }, [field, key](const Rml::Variant& v) {
+            const int i = v.Get<int>();
+            if (i != g.s.*field) Set("nr", key, std::to_string(i));
+        });
+    };
+    choice("nr_style", &Settings::nrStyle, "style");
+    choice("nr_preset", &Settings::nrPreset, "preset");
+    toggle("nr_auto_mask", [] { return g.s.nrAutoMask; }, [](bool on) { Set("nr", "auto_mask", on ? "1" : "0"); });
+    toggle("nr_outer", [] { return g.s.nrOuter; }, [](bool on) { Set("nr", "outer", on ? "1" : "0"); });
+    // outer_resolution as 1 / step, written like the panel does (1, 0.5, 0.333).
+    c.BindFunc("nr_outer_step", [](Rml::Variant& v) { v = g.s.nrOuterStep; }, [](const Rml::Variant& v) {
+        const int i = std::clamp(v.Get<int>(), 1, 3);
+        if (i != g.s.nrOuterStep) Set("nr", "outer_resolution", Fmt("%.3g", 1.0 / i));
+    });
+    c.BindFunc("nr_outer_separate", [](Rml::Variant& v) { v = g.s.nrOuterSeparate; }, [](const Rml::Variant& v) {
+        if (v.Get<bool>() != g.s.nrOuterSeparate) Set("nr", "outer_atlas", v.Get<bool>() ? "separate" : "shared");
+    });
     c.BindFunc("dlaa_preset", [](Rml::Variant& v) { v = Rml::String(g.s.dlaaPreset); },
                [](const Rml::Variant& v) {
                    const Rml::String p = v.Get<Rml::String>();
                    if (p != g.s.dlaaPreset) Set("dlaa", "preset", p);
                });
-    c.BindFunc("dlaa_auto_exp", [](Rml::Variant& v) { v = g.s.dlaaAutoExposure; },
-               [](const Rml::Variant& v) {
-                   if (v.Get<bool>() != g.s.dlaaAutoExposure) Set("dlaa", "auto_exposure", v.Get<bool>() ? "1" : "0");
-               });
-    // The fixed exposure on a log scale: slider steps over kExposures (0.002 = the scale the game's TAA applies).
-    static constexpr float kExposures[] = {0.0005f, 0.00075f, 0.001f, 0.0015f, 0.002f, 0.003f, 0.004f,
-                                           0.005f,  0.0075f,  0.01f,  0.015f,  0.02f};
-    static constexpr int kExposureSteps = (int)std::size(kExposures);
-    auto expStep = [] {
-        int best = 0;
-        for (int i = 1; i < kExposureSteps; ++i)
-            if (std::fabs(std::log(kExposures[i] / g.s.dlaaExposure)) < std::fabs(std::log(kExposures[best] / g.s.dlaaExposure)))
-                best = i;
-        return best;
-    };
-    c.BindFunc("dlaa_exp_step", [expStep](Rml::Variant& v) { v = g.s.dlaaExposure > 0 ? expStep() : 4; },
-               [expStep](const Rml::Variant& v) {
-                   // Only a step other than the one shown (the slider reports its value when the page binds it).
-                   const int i = std::clamp((int)std::lround(VarFloat(v)), 0, kExposureSteps - 1);
-                   const int shown = g.s.dlaaExposure > 0 ? expStep() : 4;
-                   if (i != shown) Set("dlaa", "exposure", Fmt("%g", kExposures[i]));
-               });
-    c.BindFunc("dlaa_exp_max", [](Rml::Variant& v) { v = kExposureSteps - 1; });
-    c.BindFunc("dlaa_exp_text", [](Rml::Variant& v) {
-        v = g.s.dlaaExposure > 0 ? Fmt("%g", g.s.dlaaExposure) : Rml::String("1 (DLSS default)");
-    });
+    // The DLSS exposure ([dlaa] auto_exposure, exposure) is not in the GUI (decision 2026-11-11): only the ini.
     c.BindFunc("dlss_dll", [](Rml::Variant& v) { v = g.files.dlss; });
     // From the newest log's Detected block: the game's anti-aliasing options and the DLAA state at that start.
     auto detected = [](const char* key) -> std::string {
@@ -542,7 +571,9 @@ void BindModel(Rml::Context* ctx) {
         const Rml::String which = args[0].Get<Rml::String>();
         const wchar_t* url = which == "github"    ? L"https://github.com/hypeapps/ams2-qvfr"
                              : which == "youtube" ? L"https://www.youtube.com/@hypevrtv"
-                                                  : nullptr;
+                             // NVIDIA's DLSS 5 model (not part of the mod), for the DLSS 5 warning.
+                             : which == "dlssnr" ? L"https://github.com/RankFTW/rhi-repo/releases/tag/dlssnr-310.9.16"
+                                                 : nullptr;
         if (url) ShellExecuteW(nullptr, L"open", url, nullptr, nullptr, SW_SHOWNORMAL);
     });
 

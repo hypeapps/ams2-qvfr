@@ -85,7 +85,7 @@ bool GameRunning() {
     return found;
 }
 
-FileState CheckFiles(const fs::path& modDir, bool openxrPath, bool dlaa) {
+FileState CheckFiles(const fs::path& modDir, bool openxrPath, bool dlaa, bool nr) {
     FileState st;
     st.x64 = modDir.parent_path();
     std::error_code ec;
@@ -136,6 +136,14 @@ FileState CheckFiles(const fs::path& modDir, bool openxrPath, bool dlaa) {
     add(st.dlss ? Status::Ok : dlaa ? Status::Error : Status::Info, "x64\\qvfr\\nvngx_dlss.dll",
         st.dlss ? "NVIDIA DLSS (NVIDIA DLAA)" : dlaa ? "missing: NVIDIA DLAA cannot start, the game's TAA stays"
                                                     : "missing (needed only for NVIDIA DLAA)");
+    st.nrModel = fs::exists(modDir / L"nvngx_dlssnr.dll", ec);
+    st.nrForwarder = fs::exists(modDir / L"nvngx.dll_qvfr_nr.dll", ec);
+    if (nr) {
+        add(st.nrModel ? Status::Ok : Status::Error, "x64\\qvfr\\nvngx_dlssnr.dll",
+            st.nrModel ? "NVIDIA DLSS 5 model" : "missing: DLSS 5 cannot start (the mod does not include it)");
+        add(st.nrForwarder ? Status::Ok : Status::Error, "x64\\qvfr\\nvngx.dll_qvfr_nr.dll",
+            st.nrForwarder ? "DLSS 5 loader of the mod" : "missing: DLSS 5 cannot start");
+    }
     return st;
 }
 

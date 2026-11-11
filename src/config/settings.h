@@ -34,6 +34,16 @@ struct Settings {
     std::string dlaaPreset = "k";    // j, k, l, m ("default" reads as k, NVIDIA's DLAA default)
     bool dlaaAutoExposure = false;
     float dlaaExposure = 0.002f;     // fixed DLSS exposure with auto off
+    // [nr] (dlaa-plan D7): DLSS 5 neural rendering on the finished image; runs on DLAA's motion vectors and depth, so
+    // it needs [dlaa] mode=dlaa. All live. The same options as the tuning panel in the headset (proxy panel.cpp).
+    bool nr = false;                 // mode=final (or the older focus)
+    float nrIntensity = 1.0f, nrStrength = 1.0f, nrLocalTone = 1.0f, nrLocalStructure = 1.0f;
+    int nrStyle = 0, nrPreset = 0;   // 0..3
+    bool nrAutoMask = true;
+    bool nrOuter = true;             // the outer views through the model too
+    int nrOuterStep = 2;             // outer_resolution 1/step: 1 full, 2 half, 3 a third
+    float nrOuterArea = 1.0f;        // 0.5..1
+    bool nrOuterSeparate = false;    // outer_atlas=separate
     // Testers
     bool csvAlways = false;
     int benchKey = 0;
@@ -49,6 +59,8 @@ Settings Read(const IniFile& ini);
 std::string Num(float v);
 void WritePreset(IniFile& ini, int preset);        // preset=<name> and the five preset keys emptied
 void ClearPresetOverrides(IniFile& ini);
+// DLSS 5 on ([nr] mode=final, and [dlaa] mode=dlaa, which it runs on) or off ([nr] mode=off; DLAA stays as it is).
+void WriteNr(IniFile& ini, bool on);
 
 // Keys that only take effect at the next game start (the rest work while the game runs, about 1 s after saving).
 struct KeyRef {
