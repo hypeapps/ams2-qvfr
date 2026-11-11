@@ -104,8 +104,8 @@ NVIDIA's DLSS 5 neural rendering model reworks the light and materials of the fi
 the periphery. It works on the DLAA image (its motion vectors and depth), so turning it on also turns DLAA on.
 
 - **Requirements:** everything DLAA needs, and NVIDIA's model `nvngx_dlssnr.dll` in `x64\qvfr\`. The mod does not include
-  the model: when it is missing, the settings app shows a **Download** button under the DLSS 5 switch. The mod's own
-  loader for it (`x64\qvfr\nvngx.dll_qvfr_nr.dll`) comes with the mod.
+  the model: when it is missing, the settings app shows a **Download** button under the DLSS 5 switch.
+  You can download it here: https://github.com/RankFTW/rhi-repo/releases/tag/dlssnr-310.9.16
 - **Turn it on:** `qvfr_config.exe` → **Settings** → **Rendering** → **NVIDIA DLSS 5**. Off by default. The **DLSS 5**
   card has its options: intensity, style, preset, strength, local tone and structure, auto mask, and how the periphery
   goes through the model (on or off, resolution, area, together with the sharp area or separately).
