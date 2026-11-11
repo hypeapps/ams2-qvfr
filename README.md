@@ -89,13 +89,37 @@ mod in `x64\qvfr\`.
 - **Turn it on:** `qvfr_config.exe` → **Settings** → **Rendering** → **NVIDIA DLAA**, then restart the game. Off by
   default.
 - **DLSS preset:** the DLSS model (J, K, L, M).
-- **DLSS exposure:** fixed (default 0.002) keeps the brightness of lights and reflections; auto lets DLSS measure it,
-  which dims them, most at night. Lower fixed values keep brighter highlights.
+- **DLSS exposure** (`[dlaa] auto_exposure` and `exposure` in `qvfr.ini`): fixed (default 0.002) keeps the brightness of
+  lights and reflections; auto lets DLSS measure it, which dims them, most at night. Lower fixed values keep brighter
+  highlights.
 - Dashboard displays and mirrors keep the game's TAA, because DLSS leaves trails behind changing digits
   (`[dlaa] cockpit_taa` in `qvfr.ini`: 0 = DLSS everywhere, 2 = also the rest of your car).
 - With **Debug hotkeys** on: right Ctrl + F1 switches between DLAA and the game's TAA, F12 steps through exposures and
   Home through the presets while you drive.
 - The **Status** page shows whether DLAA ran at the last game start, and if not, why.
+
+## NVIDIA DLSS 5 (alpha)
+
+NVIDIA's DLSS 5 neural rendering model reworks the light and materials of the finished image, in the sharp area and in
+the periphery. It works on the DLAA image (its motion vectors and depth), so turning it on also turns DLAA on.
+
+- **Requirements:** everything DLAA needs, and NVIDIA's model `nvngx_dlssnr.dll` in `x64\qvfr\`. The mod does not include
+  the model: when it is missing, the settings app shows a **Download** button under the DLSS 5 switch. The mod's own
+  loader for it (`x64\qvfr\nvngx.dll_qvfr_nr.dll`) comes with the mod.
+- **Turn it on:** `qvfr_config.exe` → **Settings** → **Rendering** → **NVIDIA DLSS 5**. Off by default. The **DLSS 5**
+  card has its options: intensity, style, preset, strength, local tone and structure, auto mask, and how the periphery
+  goes through the model (on or off, resolution, area, together with the sharp area or separately).
+- **Tuning panel in the headset:** right Ctrl + F2 while you drive (always on, also without Debug hotkeys). Arrows choose
+  and change an option, Enter switches, Esc closes; the game does not get these keys while the panel is open. Changes
+  show at once, **Save to qvfr.ini** keeps them. The panel also shows the frame rate, the CPU and GPU frame time and
+  the cost of DLSS 5.
+- **Cost:** about 4 ms of GPU time per frame on an RTX 5090 with the periphery at half resolution (the default).
+
+## NVIDIA DLSS Super Resolution in stereo (prototype)
+
+With quad views off, the game renders at a lower resolution and DLSS upscales it to the full SteamVR resolution. Only in
+`qvfr.ini` for now: `[quad] mode=off`, `[dlaa] mode=dlss` and `render_scale=0.67` (0.67 = DLSS Quality, 0.5 =
+Performance), then restart the game. The same requirements as DLAA. With quad views on, the mod keeps DLAA.
 
 ## Requirements
 
@@ -104,6 +128,7 @@ mod in `x64\qvfr\`.
 - Eye tracking is optional. Without it you get fixed foveated rendering (the focus stays in the middle).
 - MSAA or TAA in the game (MSAA is the most tested). With TAA the focus views keep their own TAA history.
 - For NVIDIA DLAA: an NVIDIA RTX graphics card and TAA on in the game.
+- For NVIDIA DLSS 5: the same, and NVIDIA's model `nvngx_dlssnr.dll` (not included).
 
 ## Compatibility notes
 
@@ -130,7 +155,7 @@ Turn these on in the GUI (**Settings → Debug**):
 - **Frame timing CSV for the whole session:** the same timings for the whole drive in `x64\qvfr\bench\`.
 - **Show the gaze in the game** (Eye tracking): a white ring where you look, the focus edges in red (blend starts) and
   green (fully sharp).
-- **Debug hotkeys:** right Ctrl + F2 the focus views' own TAA history, F3 sun effects from outer (crepuscular rays and lens flares), F4 focus culling, F5 clones, F7 freeze the gaze, F8 overlay, F10 screenshot of the views, F11 outer only, F1 NVIDIA DLAA or the game's TAA, F12 DLSS exposure steps, Home DLSS preset steps.
+- **Debug hotkeys:** right Ctrl + F3 sun effects from outer (crepuscular rays and lens flares), F4 focus culling, F5 clones, F7 freeze the gaze, F8 overlay, F10 screenshot of the views, F11 outer only, F1 NVIDIA DLAA or the game's TAA, F12 DLSS exposure steps, Home DLSS preset steps.
 
 ### Issue reporting
 
@@ -146,7 +171,8 @@ AMS2 QVFR is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE.m
 any noncommercial purpose. Third-party software and its licenses: [THIRD_PARTY.md](THIRD_PARTY.md). OpenComposite is
 included unmodified under the GPLv3; its source code is linked there and in `x64\qvfr\opencomposite\SOURCE.txt`.
 NVIDIA DLSS is included unmodified under the NVIDIA RTX SDKs License (`x64\qvfr\licenses\nvidia-rtx-sdks-LICENSE.txt`).
-NVIDIA and DLSS are trademarks of NVIDIA Corporation; this mod is not sponsored or endorsed by NVIDIA.
+NVIDIA's DLSS 5 model (`nvngx_dlssnr.dll`) is not included. NVIDIA and DLSS are trademarks of NVIDIA Corporation; this mod
+is not sponsored or endorsed by NVIDIA.
 
 Thanks to Matthieu Bucchianeri for Quad-Views-Foveated, whose settings and focus edge the mod follows, and to the
 OpenComposite project.
