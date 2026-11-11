@@ -3254,6 +3254,20 @@ const Switch kSwitches[] = {
          if (g_vrOn) g_vrStopped = false;
      }},
     {"nr", false, 0, 1, [] { return (int)nr::Active(); }, [](int v) { nr::SetActive(v != 0); }},
+    {"nr_outer", false, 0, 1, [] { return nr::GetKnob(nr::Knob::Outer); },
+     [](int v) { nr::SetKnob(nr::Knob::Outer, v); }},
+    {"nr_batch", false, 0, 1, [] { return nr::GetKnob(nr::Knob::Batch); },
+     [](int v) { nr::SetKnob(nr::Knob::Batch, v); }},
+    {"nr_outer_res", false, 1, 4, [] { return nr::GetKnob(nr::Knob::OuterRes); },
+     [](int v) { nr::SetKnob(nr::Knob::OuterRes, v); }},
+    {"nr_outer_area", false, 50, 100, [] { return nr::GetKnob(nr::Knob::OuterArea); },
+     [](int v) { nr::SetKnob(nr::Knob::OuterArea, v); }},
+    {"nr_preset", false, 0, 3, [] { return nr::GetKnob(nr::Knob::Preset); },
+     [](int v) { nr::SetKnob(nr::Knob::Preset, v); }},
+    {"nr_style", false, 0, 3, [] { return nr::GetKnob(nr::Knob::Style); },
+     [](int v) { nr::SetKnob(nr::Knob::Style, v); }},
+    {"nr_strength", false, 0, 300, [] { return nr::GetKnob(nr::Knob::Strength); },
+     [](int v) { nr::SetKnob(nr::Knob::Strength, v); }},
     {"queue_breakdown", false, 0, 1, [] { return (int)g_qbOn; }, [](int v) {
          g_qbOn = v != 0;
          g_qbWant = g_qbOn ? (1u << OuterL) | (1u << FocusL) : 0;

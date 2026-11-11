@@ -294,6 +294,12 @@ struct Config {
     float nrStrength = 1.0f;     // the model's edit x this (DXL's "Self Layers"; 1 = as the model made it)
     bool nrOuter = false;        // mode=final: the outer images through the model too (no tone step at the focus edge)
     bool nrBatch = true;         // mode=final: all images of a frame in one atlas, one evaluation of the model
+    // batch=1: the outer images go into the atlas at 1/nrOuterStep of their size per axis ([nr] outer_resolution, 1 =
+    // full, 0.5 = half); the model's edit is enlarged back onto them.
+    int nrOuterStep = 2;
+    // The outer images' centre part that goes through the model, percent per axis ([nr] outer_area 0.5..1); outside it
+    // the model's edit fades out (the far periphery keeps the game's image).
+    int nrOuterAreaPct = 100;
     // Into the model: DLAA's HDR color * input_scale (0.002 = DLAA's exposure), tonemap 0 none, 1 Reinhard,
     // 2 Reinhard and 2.2 gamma (a display-like image); undone after the model.
     float nrInputScale = 0.002f;

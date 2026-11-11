@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -43,6 +44,7 @@ bool g_faultLogged = false;
 uint64_t g_calls[kImages] = {}, g_lastCalls[kImages] = {};
 bool g_firstLogged[kImages] = {};
 nrbridge::Stats g_last{};
+Window g_window;  // the last statistics window (LastWindow)
 
 // SRVs of the motion vector and depth textures DLAA hands over (kept with a reference on the texture).
 struct InputSrv {
@@ -54,27 +56,23 @@ InputSrv g_motion[kMotionCache];
 int g_motionNext = 0;
 bool g_motionLogged[2] = {};
 
-// The built-in test sequence (dlaa-plan D7, test 8): [nr] modifier + test_key goes to the next step, on top of the ini.
-// Step 0 is the ini as it is. `mode` 0 keeps the ini's mode, 1 after DLAA (focus), 2 the final image; `outer` and
-// `batch` -1 keep the ini's [nr] outer / batch, 0 off, 1 on; `smoothen` >= 0 replaces [quad] smoothen_focus_view_edges
-// at the composition. Earlier sequences (tests 5 to 7) are in dlaa-plan D7.
+// The built-in test sequence (dlaa-plan D7, test 10: an A/B of the outer resolution): [nr] modifier + test_key goes to
+// the next step, on top of the ini. Step 0 is the ini as it is. `mode` 0 keeps the ini's mode, 1 after DLAA (focus), 2 the final image; `outer` and
+// `batch` -1 keep the ini's [nr] outer / batch, 0 off, 1 on; `outerStep` -1 keeps the ini's [nr] outer_resolution,
+// else the outer images go into the atlas at 1/outerStep of their size per axis; `smoothen` >= 0 replaces [quad]
+// smoothen_focus_view_edges at the composition. Earlier sequences (tests 5 to 9) are in dlaa-plan D7.
 struct TestStep {
     const char* name;
     int mode;
     int outer;
     int batch;
+    int outerStep;
     float smoothen;
     void (*apply)(nrbridge::Settings&);
 };
 const TestStep kSteps[] = {
-    {"the ini as it is", 0, -1, -1, -1.0f, [](nrbridge::Settings&) {}},
-    {"batch=0 (one evaluation per image, as test 7)", 0, -1, 0, -1.0f, [](nrbridge::Settings&) {}},
-    {"batch=1, focus only (outer=0)", 0, 0, 1, -1.0f, [](nrbridge::Settings&) {}},
-    {"batch=0, focus only (outer=0, as test 6)", 0, 0, 0, -1.0f, [](nrbridge::Settings&) {}},
-    {"batch=1, outer=1, a wider focus edge blend (smoothen 0.4)", 0, 1, 1, 0.4f, [](nrbridge::Settings&) {}},
-    {"batch=1, outer=1, style=2 (Cinematic)", 0, 1, 1, -1.0f, [](nrbridge::Settings& s) { s.style = 2; }},
-    {"batch=1, outer=1, strength=1.5", 0, 1, 1, -1.0f, [](nrbridge::Settings& s) { s.strength = 1.5f; }},
-    {"batch=1, outer=1, edit map (debug=1)", 0, 1, 1, -1.0f, [](nrbridge::Settings& s) { s.debug = 1; }},
+    {"the ini as it is", 0, -1, -1, -1, -1.0f, [](nrbridge::Settings&) {}},
+    {"outer at full resolution (outer_resolution=1)", 0, 1, 1, 1, -1.0f, [](nrbridge::Settings&) {}},
 };
 constexpr int kStepCount = (int)(sizeof(kSteps) / sizeof(kSteps[0]));
 std::atomic<int> g_step{0};
@@ -87,37 +85,68 @@ int ModeNow() {
     return ini && step ? step : ini;
 }
 
-// mode=final: the outer images through the model too (the ini's [nr] outer, or the test step's).
+// Benchmark sequence switches (quad.cpp, Knob): -1 keeps the ini's value; a test step still wins over them.
+std::atomic<int> g_knob[(int)Knob::Count] = {-1, -1, -1, -1, -1, -1, -1};
+
+int KnobOr(Knob k, int ini) {
+    const int v = g_knob[(int)k].load();
+    return v >= 0 ? v : ini;
+}
+
+// mode=final: the outer images through the model too (the ini's [nr] outer, a benchmark switch or the test step's).
 bool OuterNow() {
     const int step = kSteps[g_step.load()].outer;
-    return ModeNow() == 2 && (step >= 0 ? step != 0 : Cfg().nrOuter);
+    return ModeNow() == 2 && (step >= 0 ? step != 0 : KnobOr(Knob::Outer, Cfg().nrOuter) != 0);
 }
 
-// mode=final: all images of a frame in one atlas and one evaluation of the model (the ini's [nr] batch, or the test
-// step's). The model has a fixed cost per evaluation of about 1 ms besides its cost per pixel (test 7).
+// mode=final: all images of a frame in one atlas and one evaluation of the model (the ini's [nr] batch, a benchmark
+// switch or the test step's). The model has a fixed cost per evaluation of about 1 ms besides its cost per pixel (test
+// 7).
 bool BatchNow() {
     const int step = kSteps[g_step.load()].batch;
-    return ModeNow() == 2 && (step >= 0 ? step != 0 : Cfg().nrBatch);
+    return ModeNow() == 2 && (step >= 0 ? step != 0 : KnobOr(Knob::Batch, Cfg().nrBatch) != 0);
 }
 
-// The atlas (batch=1): focus L and R in the top row, outer L and R (with outer on) below, kAtlasGap pixels apart. Its
-// motion vectors and depth go into the bridge's slot kAtlasSlot region by region at DLAA time; at the left eye's
-// composition all images are copied in, go through the model once and are copied back out.
+// The atlas's source pixels per outer pixel in each axis (1 full, 2 half, ...; [nr] outer_resolution, a benchmark
+// switch or the test step's). The model's cost follows its pixels (about 0.5 ms per MP, test 9); in the periphery its
+// tone and color matter, not its finest detail.
+UINT OuterStepNow() {
+    const int step = kSteps[g_step.load()].outerStep;
+    return step > 0 ? (UINT)step : (UINT)KnobOr(Knob::OuterRes, Cfg().nrOuterStep);
+}
+
+// The centre part of the outer images that goes through the model, percent of each axis ([nr] outer_area or a
+// benchmark switch); outside it the model's edit fades out (the far periphery keeps the game's image).
+UINT OuterAreaNow() { return (UINT)KnobOr(Knob::OuterArea, Cfg().nrOuterAreaPct); }
+
+// The atlas (batch=1): focus L and R in the top row, outer L and R (with outer on: their centre part at 1/step of its
+// size) below or right of them, kAtlasGap pixels apart. Its motion vectors and depth go into the bridge's slot
+// kAtlasSlot region by region at DLAA time; at the left eye's composition all images are copied (or downsampled) in, go
+// through the model once and are copied back out (or get the model's edit enlarged onto them).
 constexpr int kAtlasSlot = 4;
 constexpr UINT kAtlasGap = 16;
 struct Region {
-    UINT w = 0, h = 0;  // the image's size (DLAA's)
-    UINT x = 0, y = 0;  // its place in the atlas
+    UINT w = 0, h = 0;    // the image's size (DLAA's)
+    UINT step = 1;        // source pixels per atlas pixel in each axis
+    UINT cx = 0, cy = 0;  // the part of the image in the atlas: origin and size in source pixels
+    UINT cw = 0, ch = 0;
+    UINT fade = 0;        // with a centre part: the edit's fade-out band inside its edge, source pixels
+    bool edit = false;    // downsampled or a centre part: in through Downsample, back through UpsampleEdit
+    UINT aw = 0, ah = 0;  // its size in the atlas
+    UINT x = 0, y = 0;    // its place in the atlas
 };
 Region g_region[kImages];
 UINT g_atlasW = 0, g_atlasH = 0;  // 0: not all sizes known yet
 bool g_layoutOuter = false;
+UINT g_layoutStep = 1;            // the outer images' step in the layout
+UINT g_layoutArea = 100;          // and their centre part, percent
 uint32_t g_layoutGen = 1;
 uint32_t g_guided[kImages] = {};  // the layout generation of the region's guides written since the last atlas run
 uint32_t g_atlasRunGen = 0;       // the layout of the last atlas run (another one: the history starts over)
 bool g_atlasReset = false;        // DLAA reset a history since the last atlas run
 bool g_atlasOut = false;          // this frame's atlas ran: the eyes compose from g_final
 bool g_atlasLogged = false, g_atlasSkipLogged = false;
+double g_atlasMp = 0;             // the atlas's size, for the benchmark summary
 
 void Relayout() {
     ++g_layoutGen;
@@ -126,24 +155,56 @@ void Relayout() {
     for (int i = 0; i < n; ++i)
         if (!g_region[i].w) return;
     Region* r = g_region;
+    for (int i = 0; i < n; ++i) {
+        const bool outer = i >= 2;
+        r[i].step = outer ? g_layoutStep : 1;
+        const UINT area = outer ? g_layoutArea : 100;
+        r[i].cw = (r[i].w * area + 50) / 100;
+        r[i].ch = (r[i].h * area + 50) / 100;
+        r[i].cx = (r[i].w - r[i].cw) / 2;
+        r[i].cy = (r[i].h - r[i].ch) / 2;
+        r[i].fade = area < 100 ? (std::max)(16u, (std::min)(r[i].cw, r[i].ch) / 10) : 0;
+        r[i].edit = r[i].step > 1 || area < 100;
+        r[i].aw = (r[i].cw + r[i].step - 1) / r[i].step;
+        r[i].ah = (r[i].ch + r[i].step - 1) / r[i].step;
+    }
     r[0].x = 0;
     r[0].y = 0;
-    r[1].x = r[0].w + kAtlasGap;
+    r[1].x = r[0].aw + kAtlasGap;
     r[1].y = 0;
-    UINT w = r[1].x + r[1].w, h = r[0].h > r[1].h ? r[0].h : r[1].h;
+    UINT w = r[1].x + r[1].aw, h = r[0].ah > r[1].ah ? r[0].ah : r[1].ah;
+    bool column = false;
     if (g_layoutOuter) {
-        const UINT y = h + kAtlasGap;
-        r[2].x = 0;
-        r[2].y = y;
-        r[3].x = r[2].w + kAtlasGap;
-        r[3].y = y;
-        if (r[3].x + r[3].w > w) w = r[3].x + r[3].w;
-        h = y + (r[2].h > r[3].h ? r[2].h : r[3].h);
+        // The outer images in a row below the focus images, or (smaller ones) one above the other right of them:
+        // whichever atlas is smaller, since the model pays for the empty pixels too.
+        const UINT rowW = (std::max)(w, r[2].aw + kAtlasGap + r[3].aw);
+        const UINT rowH = h + kAtlasGap + (std::max)(r[2].ah, r[3].ah);
+        const UINT colW = w + kAtlasGap + (std::max)(r[2].aw, r[3].aw);
+        const UINT colH = (std::max)(h, r[2].ah + kAtlasGap + r[3].ah);
+        column = (uint64_t)colW * colH < (uint64_t)rowW * rowH;
+        if (column) {
+            r[2].x = r[3].x = w + kAtlasGap;
+            r[2].y = 0;
+            r[3].y = r[2].ah + kAtlasGap;
+            w = colW;
+            h = colH;
+        } else {
+            r[2].x = 0;
+            r[2].y = r[3].y = h + kAtlasGap;
+            r[3].x = r[2].aw + kAtlasGap;
+            w = rowW;
+            h = rowH;
+        }
     }
     g_atlasW = w;
     g_atlasH = h;
-    Log("NR: atlas %ux%u (%.1f MP) for one evaluation: focus %ux%u + %ux%u%s", w, h, (double)w * h / 1e6, r[0].w,
-        r[0].h, r[1].w, r[1].h, g_layoutOuter ? ", outer below" : "");
+    g_atlasMp = (double)w * h / 1e6;
+    Log("NR: atlas %ux%u (%.1f MP) for one evaluation: focus %ux%u + %ux%u%s", w, h, g_atlasMp, r[0].aw, r[0].ah,
+        r[1].aw, r[1].ah, !g_layoutOuter ? "" : column ? ", outer right of them" : ", outer below");
+    if (g_layoutOuter)
+        Log("NR: atlas: outer %ux%u + %ux%u: the centre %u%% (%ux%u) of %ux%u at 1/%u, the edit fading out over %u px",
+            r[2].aw, r[2].ah, r[3].aw, r[3].ah, g_layoutArea, r[2].cw, r[2].ch, r[2].w, r[2].h, g_layoutStep,
+            r[2].fade);
 }
 
 // mode=final: per image, a copy of the finished image the model writes into (compose reads it instead).
@@ -155,6 +216,9 @@ struct FinalImage {
 };
 FinalImage g_final[kImages];
 FinalImage g_atlas;  // batch=1: all images side by side, the model writes into it
+// An image at a lower resolution in the atlas: the image as it came (Downsample and UpsampleEdit read it) and its
+// region as it went into the model.
+FinalImage g_orig[kImages], g_small[kImages];
 bool g_finalReset[kImages] = {};  // DLAA reset its history since the last final image
 bool g_finalLogged[kImages] = {};
 bool g_finalSkipLogged[kImages] = {};
@@ -168,6 +232,8 @@ void DropImage(FinalImage& f) {
 
 void DropFinal() {
     for (FinalImage& f : g_final) DropImage(f);
+    for (FinalImage& f : g_orig) DropImage(f);
+    for (FinalImage& f : g_small) DropImage(f);
     DropImage(g_atlas);
     for (auto& g : g_guided) g = 0;
     g_atlasOut = false;
@@ -289,8 +355,8 @@ nrbridge::Settings SettingsNow() {
     }
     s.model = c.nrModel;
     s.intensity = c.nrIntensity;
-    s.style = (unsigned)c.nrStyle;
-    s.preset = (unsigned)c.nrPreset;
+    s.style = (unsigned)KnobOr(Knob::Style, c.nrStyle);
+    s.preset = (unsigned)KnobOr(Knob::Preset, c.nrPreset);
     s.autoMask = c.nrAutoMask;
     s.uiCorrection = c.nrUiCorrection;
     s.debug = c.nrDebug;
@@ -300,7 +366,7 @@ nrbridge::Settings SettingsNow() {
     s.motion = c.nrMotion;
     s.depthMode = c.nrDepth;
     s.depthK = c.nrDepthK;
-    s.strength = c.nrStrength;
+    s.strength = (float)KnobOr(Knob::Strength, (int)(c.nrStrength * 100.0f + 0.5f)) / 100.0f;
     kSteps[g_step.load()].apply(s);
     if (ModeNow() == 2) {  // the final image is display-encoded already: into the model and back as it is
         s.inputScale = 1.0f;
@@ -367,15 +433,20 @@ void ProcessImpl(ID3D11DeviceContext* c, int view, ID3D11ShaderResourceView* srv
     lastMode[i] = mode;
     if (mode == 2 && BatchNow()) {  // the image's motion vectors and depth into its region of the atlas
         const bool outer = OuterNow();
-        if (g_region[i].w != w || g_region[i].h != h || g_layoutOuter != outer) {
+        const UINT step = OuterStepNow(), area = OuterAreaNow();
+        if (g_region[i].w != w || g_region[i].h != h || g_layoutOuter != outer ||
+            (outer && (g_layoutStep != step || g_layoutArea != area))) {
             g_region[i].w = w;
             g_region[i].h = h;
             g_layoutOuter = outer;
+            g_layoutStep = step;
+            g_layoutArea = area;
             Relayout();
         }
         if (!g_atlasW) return;  // not all images' sizes known yet
         const Region& r = g_region[i];
-        if (g_bridge->Guides(c, kAtlasSlot, mv, dp, w, h, r.x, r.y, g_atlasW, g_atlasH)) {
+        if (g_bridge->Guides(c, kAtlasSlot, mv, dp, r.aw, r.ah, r.x, r.y, g_atlasW, g_atlasH, r.step, r.cx,
+                             r.cy)) {
             g_guided[i] = g_layoutGen;
             if (reset) g_atlasReset = true;
         } else if (g_bridge->failed()) {
@@ -553,24 +624,51 @@ bool RunAtlas(ID3D11DeviceContext* c, ID3D11Texture2D* const img[kImages]) {
     const bool fresh = !g_atlas.tex || g_atlas.desc.Width != a.Width || g_atlas.desc.Height != a.Height ||
                        g_atlas.desc.Format != a.Format;
     if (!EnsureImage(c, g_atlas, a, "atlas")) return false;
+    for (int i = 0; i < n; ++i) {
+        if (!EnsureImage(c, g_final[i], d[i], kName[i])) return false;
+        if (g_region[i].edit) {  // the image as it came (read by Downsample and UpsampleEdit) and its region before
+            D3D11_TEXTURE2D_DESC s = d[i];
+            s.Width = g_region[i].aw;
+            s.Height = g_region[i].ah;
+            if (!EnsureImage(c, g_orig[i], d[i], kName[i]) || !EnsureImage(c, g_small[i], s, kName[i])) return false;
+        }
+    }
+    CsState st;
+    st.Save(c);
     if (fresh) {  // the gaps between the images stay black
         const float black[4] = {0, 0, 0, 1};
         c->ClearUnorderedAccessViewFloat(g_atlas.uav, black);
     }
-    for (int i = 0; i < n; ++i) {
-        if (!EnsureImage(c, g_final[i], d[i], kName[i])) return false;
-        c->CopySubresourceRegion(g_atlas.tex, 0, g_region[i].x, g_region[i].y, 0, img[i], 0, nullptr);
+    bool ok = true;
+    for (int i = 0; i < n && ok; ++i) {
+        const Region& r = g_region[i];
+        if (!r.edit) {
+            c->CopySubresourceRegion(g_atlas.tex, 0, r.x, r.y, 0, img[i], 0, nullptr);
+            continue;
+        }
+        c->CopySubresourceRegion(g_orig[i].tex, 0, 0, 0, 0, img[i], 0, nullptr);
+        ok = g_bridge->Downsample(c, g_orig[i].srv, g_atlas.uav, r.x, r.y, r.aw, r.ah, r.step, r.cx, r.cy);
+        const D3D11_BOX b{r.x, r.y, 0, r.x + r.aw, r.y + r.ah, 1};
+        c->CopySubresourceRegion(g_small[i].tex, 0, 0, 0, 0, g_atlas.tex, 0, &b);
     }
     bool reset = g_atlasReset || g_atlasRunGen != g_layoutGen;
     for (int i = 0; i < n; ++i) reset |= g_resetPending[i].exchange(false);
     g_atlasReset = false;
     g_atlasRunGen = g_layoutGen;
-    CsState st;
-    st.Save(c);
-    const bool ok = g_bridge->Process(c, kAtlasSlot, g_atlas.srv, g_atlas.uav, nullptr, nullptr, a.Width, a.Height,
-                                      reset, true);
-    st.Restore(c);
+    ok = ok && g_bridge->Process(c, kAtlasSlot, g_atlas.srv, g_atlas.uav, nullptr, nullptr, a.Width, a.Height, reset,
+                                 true);
     for (auto& g : g_guided) g = 0;  // the next run needs the next frame's guides
+    for (int i = 0; i < n && ok; ++i) {
+        const Region& r = g_region[i];
+        if (!r.edit) {
+            const D3D11_BOX b{r.x, r.y, 0, r.x + r.w, r.y + r.h, 1};
+            c->CopySubresourceRegion(g_final[i].tex, 0, 0, 0, 0, g_atlas.tex, 0, &b);
+        } else {
+            ok = g_bridge->UpsampleEdit(c, g_orig[i].srv, g_small[i].srv, g_atlas.srv, r.x, r.y, r.aw, r.ah, r.step,
+                                        g_final[i].uav, r.w, r.h, r.cx, r.cy, r.fade);
+        }
+    }
+    st.Restore(c);
     if (!ok) {
         if (g_bridge->failed()) {
             TurnOff("bridge: " + g_bridge->why());
@@ -580,15 +678,12 @@ bool RunAtlas(ID3D11DeviceContext* c, ID3D11Texture2D* const img[kImages]) {
         }
         return false;
     }
-    for (int i = 0; i < n; ++i) {
-        const D3D11_BOX b{g_region[i].x, g_region[i].y, 0, g_region[i].x + d[i].Width, g_region[i].y + d[i].Height, 1};
-        c->CopySubresourceRegion(g_final[i].tex, 0, 0, 0, 0, g_atlas.tex, 0, &b);
-        ++g_calls[i];
-    }
+    for (int i = 0; i < n; ++i) ++g_calls[i];
     if (!g_atlasLogged) {
         g_atlasLogged = true;
-        Log("NR: first atlas (%ux%u fmt %d, %d images) through %s in one evaluation; the composition reads the copies",
-            a.Width, a.Height, (int)a.Format, n, g_bridge->modelPath());
+        Log("NR: first atlas (%ux%u fmt %d, %d images, outer at 1/%u, its centre %u%%) through %s in one evaluation; "
+            "the composition reads the copies",
+            a.Width, a.Height, (int)a.Format, n, g_region[2].step, g_layoutArea, g_bridge->modelPath());
     }
     return true;
 }
@@ -667,6 +762,26 @@ void Process(ID3D11DeviceContext* c, int view, ID3D11ShaderResourceView* srv, ID
 
 bool Active() { return g_active.load(); }
 
+int GetKnob(Knob k) {
+    const Config& c = Cfg();
+    switch (k) {
+        case Knob::Outer: return KnobOr(k, c.nrOuter);
+        case Knob::Batch: return KnobOr(k, c.nrBatch);
+        case Knob::OuterRes: return KnobOr(k, c.nrOuterStep);
+        case Knob::OuterArea: return KnobOr(k, c.nrOuterAreaPct);
+        case Knob::Preset: return KnobOr(k, c.nrPreset);
+        case Knob::Style: return KnobOr(k, c.nrStyle);
+        case Knob::Strength: return KnobOr(k, (int)(c.nrStrength * 100.0f + 0.5f));
+        default: return 0;
+    }
+}
+
+void SetKnob(Knob k, int value) {
+    if (k < Knob::Count) g_knob[(int)k] = value;
+}
+
+Window LastWindow() { return g_window; }
+
 void SetActive(bool on) {
     if (on && !g_active.load())
         for (auto& r : g_resetPending) r = true;
@@ -730,12 +845,18 @@ void LogStats(bool totals) {
     }
     // The D3D12 GPU time per frame: all evaluations of a frame (focus L counts the frames).
     const uint64_t frames = totals ? g_calls[0] : g_calls[0] - g_lastCalls[0];
+    const double perFrame =
+        frames && d.gpuSamples ? d.gpuMs / (double)d.gpuSamples * (double)d.calls / (double)frames : 0.0;
     Log("NR%s: %s images; %llu evaluations (failed %llu), D3D12 GPU ms per evaluation: %s; %.2f ms per frame; CPU "
         "%.3f ms per evaluation (with the Flush); %s",
         totals ? " (session total)" : "", images.c_str(), (unsigned long long)d.modelCalls,
-        (unsigned long long)d.modelFails, gpu.empty() ? "none" : gpu.c_str(),
-        frames && d.gpuSamples ? d.gpuMs / (double)d.gpuSamples * (double)d.calls / (double)frames : 0.0,
+        (unsigned long long)d.modelFails, gpu.empty() ? "none" : gpu.c_str(), perFrame,
         d.calls ? d.cpuMs / (double)d.calls : 0.0, Describe().c_str());
+    if (!totals) {
+        g_window.any = frames > 0;
+        g_window.gpuMsPerFrame = perFrame;
+        g_window.atlasMp = BatchNow() ? g_atlasMp : 0.0;
+    }
     g_last = s;
     for (int i = 0; i < kImages; ++i) g_lastCalls[i] = g_calls[i];
 }
@@ -748,7 +869,10 @@ std::string Describe() {
                                 : OuterNow()    ? "NR: final focus and outer images through "
                                                 : "NR: final focus images through ") +
                     g_bridge->modelPath() + " on " + g_bridge->adapter();
-    if (BatchNow()) s += ", one evaluation per frame (atlas)";
+    if (BatchNow())
+        s += OuterNow() ? ", one evaluation per frame (atlas, outer at 1/" + std::to_string(OuterStepNow()) +
+                              ", its centre " + std::to_string(OuterAreaNow()) + "%)"
+                        : ", one evaluation per frame (atlas)";
     if (!g_active.load()) s += ", hotkey: off";
     if (g_step.load()) s += std::string(", test step ") + std::to_string(g_step.load()) + ": " + kSteps[g_step.load()].name;
     return s;

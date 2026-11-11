@@ -22,6 +22,7 @@
 #include "gpu.h"
 #include "hook_prof.h"
 #include "modern_vr.h"
+#include "nr.h"
 #include "quad.h"
 #include "sysinfo.h"
 #include "xr_layer.h"
@@ -428,6 +429,8 @@ struct SeqResult {
     uint64_t frames = 0;
     double cpu = 0, cpuP50 = 0, gpu = 0, gpuPhase[4] = {}, groupCpu[4] = {}, hooks[6] = {};
     bool hooksOn = false;
+    nr::Window nr;  // the NR model's D3D12 GPU time in the run (prototype NR-P1)
+    double fps = 0;
 };
 bool g_seqOn = false;
 size_t g_seqStep = 0;
@@ -657,6 +660,8 @@ void EndSequence(bool aborted) {
              "its hooks ([debug] hook_profile)", aborted ? "ABORTED" : "finished", g_seqRes.size(), g_seq.size());
     lines.push_back(buf);
     const SeqResult* first = g_seqRes.empty() ? nullptr : &g_seqRes[0];
+    bool anyNr = false;  // NR ran in some step: every line gets its frame rate and NR cost
+    for (const SeqResult& r : g_seqRes) anyNr |= r.nr.any;
     for (size_t i = 0; i < g_seqRes.size(); ++i) {
         const SeqResult& r = g_seqRes[i];
         int n = snprintf(buf, sizeof(buf),
@@ -668,6 +673,15 @@ void EndSequence(bool aborted) {
         if (r.hooksOn)
             n += snprintf(buf + n, sizeof(buf) - n, " | hooks oL %.3f oR %.3f fL %.3f fR %.3f outside %.3f", r.hooks[0],
                           r.hooks[1], r.hooks[2], r.hooks[3], r.hooks[4]);
+        if (anyNr) {
+            if (r.nr.any)
+                n += snprintf(buf + n, sizeof(buf) - n, " | fps %.1f | NR GPU %.2f%s", r.fps, r.nr.gpuMsPerFrame,
+                              r.nr.atlasMp > 0 ? "" : " (no atlas)");
+            else
+                n += snprintf(buf + n, sizeof(buf) - n, " | fps %.1f | NR off", r.fps);
+            if (r.nr.any && r.nr.atlasMp > 0)
+                n += snprintf(buf + n, sizeof(buf) - n, " atlas %.1f MP", r.nr.atlasMp);
+        }
         snprintf(buf + n, sizeof(buf) - n, " | %s", r.dir.c_str());
         lines.push_back(buf);
     }
@@ -709,6 +723,8 @@ void SeqAfterRun(bool aborted, const vr::TrackedDevicePose_t& pose) {
     for (int k = 0; k < 4; ++k) res.gpuPhase[k] = Avg(r.gpuPhase[k].v);
     quad::LastWindowCpu(res.groupCpu);
     res.hooksOn = hookprof::LastTotals(res.hooks);
+    res.nr = nr::LastWindow();  // the forced stats window at the end of the run covers exactly the recording
+    res.fps = Cfg().benchDurationS > 0 ? (double)res.frames / Cfg().benchDurationS : 0.0;
     g_seqRes.push_back(res);
     if (aborted) {
         EndSequence(true);

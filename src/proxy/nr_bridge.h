@@ -95,9 +95,24 @@ public:
     // Only the motion vectors and depth of a slot (w x h), for a later Process with guidesReady (NR on the final image:
     // the guides at DLAA time, the color at the composition). With fullW x fullH (the slot's size) they go into the
     // region at (x0, y0) of an atlas of several images that go through the model in one evaluation; the previous
-    // positions are held inside the region. False: nothing written.
+    // positions are held inside the region. step > 1: the region is the image at 1/step of its size in each axis (the
+    // guides are point-sampled); (srcX, srcY): the region holds only the part of the image from there. False: nothing
+    // written.
     bool Guides(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* motion, ID3D11ShaderResourceView* depth,
-                UINT w, UINT h, UINT x0 = 0, UINT y0 = 0, UINT fullW = 0, UINT fullH = 0);
+                UINT w, UINT h, UINT x0 = 0, UINT y0 = 0, UINT fullW = 0, UINT fullH = 0, UINT step = 1, UINT srcX = 0,
+                UINT srcY = 0);
+    // An image at a lower resolution, or only its centre part, in the atlas (D3D11 only, `c` as above). Downsample:
+    // `src` (display-encoded, an UNORM view) from (srcX, srcY) averaged over step x step pixels into the w x h region at
+    // (x0, y0) of `dst`. UpsampleEdit: into `out` (fullW x fullH) the image `full` plus the model's edit of its region,
+    // bilinearly enlarged: the region at (x0, y0) of `after` (the atlas after the model) minus `before` (w x h, the
+    // region as it went in); with fade > 0 the edit fades out over `fade` pixels inside the part's edge (zero outside).
+    // Without an edit `out` gets `full` bit for bit.
+    bool Downsample(ID3D11DeviceContext* c, ID3D11ShaderResourceView* src, ID3D11UnorderedAccessView* dst, UINT x0,
+                    UINT y0, UINT w, UINT h, UINT step, UINT srcX = 0, UINT srcY = 0);
+    bool UpsampleEdit(ID3D11DeviceContext* c, ID3D11ShaderResourceView* full, ID3D11ShaderResourceView* before,
+                      ID3D11ShaderResourceView* after, UINT x0, UINT y0, UINT w, UINT h, UINT step,
+                      ID3D11UnorderedAccessView* out, UINT fullW, UINT fullH, UINT srcX = 0, UINT srcY = 0,
+                      UINT fade = 0);
     void Release();  // waits for the D3D12 queue, then releases everything
 
     bool ready() const { return ready_; }

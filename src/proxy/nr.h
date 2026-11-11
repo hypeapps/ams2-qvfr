@@ -38,6 +38,19 @@ void ProcessFinal(ID3D11DeviceContext* c, int eye, ID3D11Texture2D*& focus, ID3D
 // Live on/off ([nr] key, benchmark switch `nr`).
 bool Active();
 void SetActive(bool on);
+// Benchmark sequence switches (quad.cpp): nr_outer 0/1, nr_batch 0/1, nr_outer_res (source pixels per outer pixel in
+// the atlas, 1..4), nr_outer_area (the outer images' centre part through the model, percent 50..100), nr_preset 0..3,
+// nr_style 0..3, nr_strength (percent 0..300). GetKnob: the value now (the ini's until set).
+enum class Knob { Outer, Batch, OuterRes, OuterArea, Preset, Style, Strength, Count };
+int GetKnob(Knob k);
+void SetKnob(Knob k, int value);
+// The last statistics window's (a benchmark run's) D3D12 GPU time of the model per frame and the atlas's size.
+struct Window {
+    bool any = false;  // images went through the model in it
+    double gpuMsPerFrame = 0;
+    double atlasMp = 0;  // 0 without the atlas
+};
+Window LastWindow();
 void OnFrameStart();  // hotkey (render thread)
 void LogStats(bool totals);
 std::string Describe();

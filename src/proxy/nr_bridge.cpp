@@ -25,10 +25,12 @@
 
 #include "common.h"
 #include "nr_depth_cs.h"   // kNrDepthCS (fxc from shaders/nr.hlsl)
+#include "nr_down_cs.h"    // kNrDownCS
 #include "nr_motion_cs.h"  // kNrMotionCS
 #include "nr_pack_cs.h"    // kNrPackCS
 #include "nr_unpack4_cs.h"  // kNrUnpack4CS
 #include "nr_unpack_cs.h"   // kNrUnpackCS
+#include "nr_upedit_cs.h"   // kNrUpEditCS
 
 namespace qvfr::nrbridge {
 
@@ -239,7 +241,8 @@ struct Consts {
     float depthK;
     uint32_t debug;
     float pad;
-    uint32_t offsetX, offsetY, regionW, regionH;  // CSMotion, CSDepth: the region they write
+    uint32_t offsetX, offsetY, regionW, regionH;  // CSMotion, CSDepth, CSDown, CSUpEdit: the region they use
+    uint32_t srcStep, srcX, srcY, fade;  // source pixels per region pixel, the part's origin, CSUpEdit's fade (px)
 };
 
 #ifdef QVFR_HAVE_NGX_HEADERS
@@ -313,10 +316,12 @@ struct Bridge::Impl {
     ID3D11ComputeShader* pack = nullptr;
     ID3D11ComputeShader* unpack = nullptr;
     ID3D11ComputeShader* unpack4 = nullptr;  // into an image with alpha
+    ID3D11ComputeShader* down = nullptr;     // an image into its atlas region at a lower resolution
+    ID3D11ComputeShader* upEdit = nullptr;   // the model's edit of such a region onto the full image
     ID3D11ComputeShader* motionCs = nullptr;
     ID3D11ComputeShader* depthCs = nullptr;
     ID3D11Buffer* cb = nullptr;
-    Consts cbValue{-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    Consts cbValue{-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     HMODULE d3d12 = nullptr;
     ID3D12Device* dev12 = nullptr;
     ID3D12CommandQueue* queue = nullptr;
@@ -508,7 +513,9 @@ bool Bridge::Init(ID3D11Device* dev) {
         FAILED(hr = dev->CreateComputeShader(kNrUnpackCS, sizeof(kNrUnpackCS), nullptr, &m.unpack)) ||
         FAILED(hr = dev->CreateComputeShader(kNrUnpack4CS, sizeof(kNrUnpack4CS), nullptr, &m.unpack4)) ||
         FAILED(hr = dev->CreateComputeShader(kNrMotionCS, sizeof(kNrMotionCS), nullptr, &m.motionCs)) ||
-        FAILED(hr = dev->CreateComputeShader(kNrDepthCS, sizeof(kNrDepthCS), nullptr, &m.depthCs)))
+        FAILED(hr = dev->CreateComputeShader(kNrDepthCS, sizeof(kNrDepthCS), nullptr, &m.depthCs)) ||
+        FAILED(hr = dev->CreateComputeShader(kNrDownCS, sizeof(kNrDownCS), nullptr, &m.down)) ||
+        FAILED(hr = dev->CreateComputeShader(kNrUpEditCS, sizeof(kNrUpEditCS), nullptr, &m.upEdit)))
         return Fail("CreateComputeShader", hr);
     D3D11_BUFFER_DESC bdesc{};
     bdesc.ByteWidth = sizeof(Consts);
@@ -728,19 +735,21 @@ bool Bridge::EnsureSlot(int slot, UINT w, UINT h) {
 }
 
 bool Bridge::Guides(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* motion,
-                    ID3D11ShaderResourceView* depth, UINT w, UINT h, UINT x0, UINT y0, UINT fullW, UINT fullH) {
+                    ID3D11ShaderResourceView* depth, UINT w, UINT h, UINT x0, UINT y0, UINT fullW, UINT fullH,
+                    UINT step, UINT srcX, UINT srcY) {
     if (!fullW || !fullH) {
         fullW = w;
         fullH = h;
     }
-    if (!ready_ || failed_ || !c || slot < 0 || slot >= kSlots || !w || !h || x0 + w > fullW || y0 + h > fullH)
+    if (!ready_ || failed_ || !c || slot < 0 || slot >= kSlots || !w || !h || x0 + w > fullW || y0 + h > fullH ||
+        step < 1 || step > 4)
         return false;
     Impl& m = *impl_;
     if (!EnsureContext(c) || !EnsureSlot(slot, fullW, fullH)) return false;
     Impl::Slot& s = m.slots[slot];
     const bool gameDepth = set_.depthMode > 0 && depth;
     const Consts k{1.0f, 0u, (set_.motion && motion) ? 1.0f : 0.0f, 0u, gameDepth ? (uint32_t)set_.depthMode : 0u,
-                   set_.depthK, 0u, 1.0f, x0, y0, w, h};
+                   set_.depthK, 0u, 1.0f, x0, y0, w, h, step, srcX, srcY, 0u};
     if (memcmp(&k, &m.cbValue, sizeof(k)) != 0) {
         c->UpdateSubresource(m.cb, 0, nullptr, &k, 0, 0);
         m.cbValue = k;
@@ -769,6 +778,53 @@ bool Bridge::Guides(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* 
     s.guideW = fullW;
     s.guideH = fullH;
     s.guideDepth = gameDepth;
+    return true;
+}
+
+bool Bridge::Downsample(ID3D11DeviceContext* c, ID3D11ShaderResourceView* src, ID3D11UnorderedAccessView* dst, UINT x0,
+                        UINT y0, UINT w, UINT h, UINT step, UINT srcX, UINT srcY) {
+    if (!ready_ || failed_ || !c || !src || !dst || !w || !h || step < 1 || step > 4) return false;
+    Impl& m = *impl_;
+    const Consts k{1.0f, 0u, 0.0f, 0u, 0u, 0.0f, 0u, 1.0f, x0, y0, w, h, step, srcX, srcY, 0u};
+    if (memcmp(&k, &m.cbValue, sizeof(k)) != 0) {
+        c->UpdateSubresource(m.cb, 0, nullptr, &k, 0, 0);
+        m.cbValue = k;
+    }
+    ID3D11ShaderResourceView* noSrv = nullptr;
+    ID3D11UnorderedAccessView* noUav = nullptr;
+    c->CSSetConstantBuffers(0, 1, &m.cb);
+    c->CSSetShader(m.down, nullptr, 0);
+    c->CSSetShaderResources(0, 1, &src);
+    c->CSSetUnorderedAccessViews(0, 1, &dst, nullptr);
+    c->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    c->CSSetShaderResources(0, 1, &noSrv);
+    c->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
+    c->CSSetShader(nullptr, nullptr, 0);
+    return true;
+}
+
+bool Bridge::UpsampleEdit(ID3D11DeviceContext* c, ID3D11ShaderResourceView* full, ID3D11ShaderResourceView* before,
+                          ID3D11ShaderResourceView* after, UINT x0, UINT y0, UINT w, UINT h, UINT step,
+                          ID3D11UnorderedAccessView* out, UINT fullW, UINT fullH, UINT srcX, UINT srcY,
+                          UINT fade) {
+    if (!ready_ || failed_ || !c || !full || !before || !after || !out || !w || !h || step < 1 || step > 4) return false;
+    Impl& m = *impl_;
+    const Consts k{1.0f, 0u, 0.0f, 0u, 0u, 0.0f, 0u, 1.0f, x0, y0, w, h, step, srcX, srcY, fade};
+    if (memcmp(&k, &m.cbValue, sizeof(k)) != 0) {
+        c->UpdateSubresource(m.cb, 0, nullptr, &k, 0, 0);
+        m.cbValue = k;
+    }
+    ID3D11ShaderResourceView* in[3] = {full, before, after};
+    ID3D11ShaderResourceView* noIn[3] = {};
+    ID3D11UnorderedAccessView* noUav = nullptr;
+    c->CSSetConstantBuffers(0, 1, &m.cb);
+    c->CSSetShader(m.upEdit, nullptr, 0);
+    c->CSSetShaderResources(0, 3, in);
+    c->CSSetUnorderedAccessViews(0, 1, &out, nullptr);
+    c->Dispatch((fullW + 7) / 8, (fullH + 7) / 8, 1);
+    c->CSSetShaderResources(0, 3, noIn);
+    c->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
+    c->CSSetShader(nullptr, nullptr, 0);
     return true;
 }
 
@@ -951,7 +1007,7 @@ bool Bridge::Process(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView*
                       ud.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
     const Consts k{shaped ? set_.inputScale : 1.0f, shaped ? (uint32_t)set_.tonemap : 0u, set_.motion ? 1.0f : 0.0f,
                    ratio ? 1u : 0u, gameDepth ? (uint32_t)set_.depthMode : 0u, set_.depthK, debugView ? 1u : 0u,
-                   strength, 0u, 0u, w, h};
+                   strength, 0u, 0u, w, h, 1u, 0u, 0u, 0u};
     if (ratio || diagNow || four) {  // the image as it came, for CSUnpack and the measurement
         ID3D11Resource* img = nullptr;
         srv->GetResource(&img);
@@ -1148,6 +1204,8 @@ void Bridge::Release() {
         Rel(m.pack);
         Rel(m.unpack);
         Rel(m.unpack4);
+        Rel(m.down);
+        Rel(m.upEdit);
         Rel(m.motionCs);
         Rel(m.depthCs);
         Rel(m.cb);

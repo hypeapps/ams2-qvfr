@@ -516,6 +516,9 @@ Config ReadConfig(const fs::path& ini) {
     c.nrStrength = std::clamp(IniFloat(ini, L"nr", L"strength", 1.0f), 0.0f, 5.0f);
     c.nrOuter = IniInt(ini, L"nr", L"outer", 0) != 0;
     c.nrBatch = IniInt(ini, L"nr", L"batch", 1) != 0;
+    const float outerRes = std::clamp(IniFloat(ini, L"nr", L"outer_resolution", 0.5f), 0.25f, 1.0f);
+    c.nrOuterStep = std::clamp((int)(1.0f / outerRes + 0.5f), 1, 4);
+    c.nrOuterAreaPct = std::clamp((int)(IniFloat(ini, L"nr", L"outer_area", 1.0f) * 100.0f + 0.5f), 50, 100);
     c.nrInputScale = IniFloat(ini, L"nr", L"input_scale", c.nrInputScale);
     if (c.nrInputScale <= 0) c.nrInputScale = 1.0f;
     c.nrTonemap = std::clamp(IniInt(ini, L"nr", L"tonemap", c.nrTonemap), 0, 2);
@@ -533,11 +536,12 @@ Config ReadConfig(const fs::path& ini) {
     if (!app.empty()) c.nrAppId = strtoull(app.c_str(), nullptr, 0);
     if (c.nrMode)
         Log("Settings: [nr] mode=%s model=%d intensity=%.2f style=%d preset=%d auto_mask=%d ui_correction=%d "
-            "debug=%d strength=%.2f outer=%d batch=%d input_scale=%g tonemap=%d "
-            "transfer=%s motion_vectors=%d depth=%d depth_k=%g ngx=%s app_id=0x%llX modifier=0x%X key=0x%X "
+            "debug=%d strength=%.2f outer=%d batch=%d outer_resolution=1/%d outer_area=%d%% input_scale=%g "
+            "tonemap=%d transfer=%s motion_vectors=%d depth=%d depth_k=%g ngx=%s app_id=0x%llX modifier=0x%X key=0x%X "
             "test_key=0x%X (prototype NR-P1)",
             c.nrMode == 2 ? "final" : "focus", c.nrModel, c.nrIntensity, c.nrStyle, c.nrPreset, c.nrAutoMask,
-            c.nrUiCorrection, c.nrDebug, c.nrStrength, c.nrOuter, c.nrBatch, c.nrInputScale, c.nrTonemap,
+            c.nrUiCorrection, c.nrDebug, c.nrStrength, c.nrOuter, c.nrBatch, c.nrOuterStep, c.nrOuterAreaPct,
+            c.nrInputScale, c.nrTonemap,
             c.nrTransfer ? "ratio" : "inverse", c.nrMotion, c.nrDepth, c.nrDepthK, ngx.c_str(),
             c.nrAppId, c.nrKeyMod, c.nrKey, c.nrTestKey);
     c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
@@ -652,6 +656,8 @@ bool ReloadConfig() {
     c.nrStrength = n.nrStrength;
     c.nrOuter = n.nrOuter;
     c.nrBatch = n.nrBatch;
+    c.nrOuterStep = n.nrOuterStep;
+    c.nrOuterAreaPct = n.nrOuterAreaPct;
     c.nrInputScale = n.nrInputScale;
     c.nrTonemap = n.nrTonemap;
     c.nrTransfer = n.nrTransfer;

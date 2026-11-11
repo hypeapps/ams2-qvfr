@@ -15,11 +15,17 @@ cbuffer Params : register(b0) {
     uint debug;        // CSUnpack: 1 the model's edit instead of the image (needs t1)
     float pad;         // CSUnpack: strength, the model's edit x this (1 = as the model made it)
     // CSMotion, CSDepth: the region of the output they write (the whole output, or one image in the atlas of all images
-    // that go through the model in one evaluation); the source is the region's size.
+    // that go through the model in one evaluation).
     uint offsetX;
     uint offsetY;
     uint regionW;
     uint regionH;
+    // CSMotion, CSDepth, CSDown, CSUpEdit: source pixels per region pixel in each axis (an image at a lower resolution
+    // in the atlas: 2 = half) and where the region starts in the source (only a centre part of it in the atlas)
+    uint srcStep;
+    uint srcX;
+    uint srcY;
+    uint fade;  // CSUpEdit: with a centre part, the model's edit fades out over this many source pixels to its edge
 };
 
 // transfer 1: the model's input (t1) and the original HDR image (t2). The ratio is taken in linear display values
@@ -112,25 +118,77 @@ RWTexture2D<float> depthOut : register(u0);
 [numthreads(8, 8, 1)]
 void CSDepth(uint3 id : SV_DispatchThreadID) {
     if (id.x >= regionW || id.y >= regionH) return;
-    const float z = src.Load(int3(id.xy, 0)).r;
+    const float z = src.Load(int3(uint2(srcX, srcY) + id.xy * srcStep, 0)).r;
     depthOut[id.xy + uint2(offsetX, offsetY)] = depthMode == 2 ? saturate(depthK / max(z, 1e-7)) : saturate(z);
 }
 
 // The game stores uv now - uv before (as DLAA reads it); the model, like DLSS, wants the offset from the current pixel
-// to its previous position in pixels. In the atlas the previous position is held inside the pixel's own image, so the
-// model's history never reaches into the neighbouring one.
+// to its previous position in pixels (of the region: the source's size / srcStep). In the atlas the previous position
+// is held inside the pixel's own region, so the model's history never reaches into the neighbouring one.
 RWTexture2D<float2> motion : register(u0);
 
 [numthreads(8, 8, 1)]
 void CSMotion(uint3 id : SV_DispatchThreadID) {
     if (id.x >= regionW || id.y >= regionH) return;
-    uint w, h;
+    uint w, h, sw, sh;
     motion.GetDimensions(w, h);
-    const float2 size = float2(regionW, regionH);
+    src.GetDimensions(sw, sh);
     float2 m = 0;
     if (mvScale != 0) {
-        m = src.Load(int3(id.xy, 0)).xy * -mvScale * size;
-        if (regionW != w || regionH != h) m = clamp(float2(id.xy) + m, 0.0, size - 1.0) - float2(id.xy);
+        m = src.Load(int3(uint2(srcX, srcY) + id.xy * srcStep, 0)).xy * -mvScale * float2(sw, sh) / (float)srcStep;
+        if (regionW != w || regionH != h)
+            m = clamp(float2(id.xy) + m, 0.0, float2(regionW, regionH) - 1.0) - float2(id.xy);
     }
     motion[id.xy + uint2(offsetX, offsetY)] = m;
+}
+
+// An image at a lower resolution or only its centre part in the atlas (the outer images: the periphery needs the
+// model's tone and color, not its finest detail, and its far edge none of it). CSDown: the image (t0, display-encoded)
+// from (srcX, srcY) averaged over srcStep x srcStep pixels into its region of the atlas (u0 at offsetX/offsetY,
+// regionW x regionH).
+[numthreads(8, 8, 1)]
+void CSDown(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= regionW || id.y >= regionH) return;
+    uint w, h;
+    src.GetDimensions(w, h);
+    const uint2 base = uint2(srcX, srcY) + id.xy * srcStep;
+    float4 sum = 0;
+    for (uint y = 0; y < srcStep; ++y)
+        for (uint x = 0; x < srcStep; ++x) sum += src.Load(int3(min(base + uint2(x, y), uint2(w - 1, h - 1)), 0));
+    color4[id.xy + uint2(offsetX, offsetY)] = sum / (float)(srcStep * srcStep);
+}
+
+// CSUpEdit: the full image (t0) plus the model's edit of its region, bilinearly enlarged: the region after the model
+// (t2, the atlas at offsetX/offsetY) minus before it (t1, regionW x regionH). With a centre part (fade > 0) the edit
+// fades out smoothly over `fade` source pixels inside the part's edge and is zero outside it. Without an edit the image
+// stays bit for bit; alpha stays.
+float3 RegionEdit(int2 p) {
+    return original.Load(int3(p + int2(offsetX, offsetY), 0)).rgb - modelIn.Load(int3(p, 0)).rgb;
+}
+
+[numthreads(8, 8, 1)]
+void CSUpEdit(uint3 id : SV_DispatchThreadID) {
+    uint w, h;
+    color4.GetDimensions(w, h);
+    if (id.x >= w || id.y >= h) return;
+    const float4 o = src.Load(int3(id.xy, 0));
+    const float2 local = float2(id.xy) + 0.5 - float2(srcX, srcY);  // pixel centre in the part, source pixels
+    float weight = 1;
+    if (fade > 0) {
+        const float2 size = float2(regionW, regionH) * (float)srcStep;
+        const float2 inside = min(local, size - local);
+        weight = smoothstep(0.0, 1.0, saturate(min(inside.x, inside.y) / (float)fade));
+    }
+    if (weight <= 0) {
+        color4[id.xy] = o;
+        return;
+    }
+    const float2 last = float2(regionW - 1, regionH - 1);
+    const float2 q = clamp(local / (float)srcStep - 0.5, 0.0, last);
+    const int2 a = int2(q);
+    const int2 b = int2(min(float2(a + 1), last));
+    const float2 f = q - float2(a);
+    const float3 e = lerp(lerp(RegionEdit(a), RegionEdit(int2(b.x, a.y)), f.x),
+                          lerp(RegionEdit(int2(a.x, b.y)), RegionEdit(b), f.x), f.y);
+    color4[id.xy] = float4(saturate(o.rgb + e * weight), o.a);
 }
