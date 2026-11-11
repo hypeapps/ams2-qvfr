@@ -4,6 +4,7 @@
 
 #include <openvr.h>  // 0.9.12
 
+#include <cstdint>
 #include <string>
 
 namespace qvfr::frame {
@@ -23,5 +24,18 @@ void OnSubmit(vr::EVREye eye, const vr::Texture_t* tex, const vr::VRTextureBound
 void NoteRecommendedSize(uint32_t realW, uint32_t realH, uint32_t returnedW, uint32_t returnedH);
 std::string TextureInfo(void* handle, int type);  // D3D11 texture description for the log (size, format, samples)
 void OnShutdown();
+
+// Running totals for the tuning panel (render thread; never reset): frames with a GPU frame span (gpu.h) and its sum,
+// the proxy's frame intervals (WaitGetPoses entry to the next) and their sum, and the game's render thread CPU time
+// per frame (WaitGetPoses exit to the last Submit) and its sum.
+struct Totals {
+    uint64_t gpuFrames = 0;
+    double gpuMs = 0;
+    uint64_t intervals = 0;
+    double intervalMs = 0;
+    uint64_t cpuFrames = 0;
+    double cpuMs = 0;
+};
+Totals LiveTotals();
 
 }  // namespace qvfr::frame

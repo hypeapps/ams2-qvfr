@@ -127,6 +127,14 @@ target_include_directories(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT})
 
 enable_language(ASM_MASM)  # export thunks (generated/thunks.asm)
 
+# The tuning panel (panel_ui.cpp): RmlUi's D3D11 renderer from its backends; its own Windows header defines
+# WIN32_LEAN_AND_MEAN again (C4005). The fonts in panel.rc.
+set(QVFR_RML_BACKENDS ${PROJECT_SOURCE_DIR}/third_party/rmlui-6.3/Backends)
+set_source_files_properties(${QVFR_RML_BACKENDS}/RmlUi_Renderer_DX11.cpp PROPERTIES COMPILE_OPTIONS "/wd4005")
+file(GLOB QVFR_PANEL_FONTS "${PROJECT_SOURCE_DIR}/third_party/fonts/inter/*.ttf"
+     "${PROJECT_SOURCE_DIR}/third_party/fonts/barlowcondensed/*.ttf")
+set_source_files_properties(panel.rc PROPERTIES OBJECT_DEPENDS "${QVFR_PANEL_FONTS}")
+
 add_library(qvfr_proxy SHARED
   exports.cpp
   generated/thunks.asm
@@ -161,8 +169,19 @@ add_library(qvfr_proxy SHARED
   mvr_motion.cpp
   taa_views.cpp
   common.cpp
+  panel.cpp
+  panel_ui.cpp
+  panel_input.cpp
+  ${PROJECT_SOURCE_DIR}/src/config/ini_file.cpp
+  ${QVFR_RML_BACKENDS}/RmlUi_Renderer_DX11.cpp
+  panel.rc
 )
-target_link_libraries(qvfr_proxy PRIVATE qvfr_shaders qvfr_dxbc nvapi openvr_0912 openxr_headers minhook bcrypt version psapi shell32 ole32 windowscodecs)
+target_link_libraries(qvfr_proxy PRIVATE qvfr_shaders qvfr_dxbc nvapi openvr_0912 openxr_headers minhook bcrypt version psapi shell32 ole32 windowscodecs
+                      RmlUi::Core d3dcompiler delayimp dxguid)
+# The tuning panel's renderer compiles its shaders at run time; the system compiler loads only when the panel opens.
+target_link_options(qvfr_proxy PRIVATE /DELAYLOAD:d3dcompiler_47.dll)
+# The tuning panel saves qvfr.ini with the settings GUI's ini writer (comments and order kept).
+target_include_directories(qvfr_proxy PRIVATE ${QVFR_RML_BACKENDS} ${PROJECT_SOURCE_DIR}/src/config)
 target_compile_definitions(qvfr_proxy PRIVATE VR_API_EXPORT)
 # /EHa instead of the default /EHsc: an SEH fault caught by Guarded/Safe then unwinds C++ objects (lock_guard),
 # so no mutex stays locked after a fault in our code. Directory scope: only this target is built here.

@@ -1,0 +1,6 @@
+// Resources of the tuning panel (panel_ui.cpp): the fonts of the settings GUI (third_party/fonts), Inter and Barlow
+// Condensed (SIL Open Font License 1.1). Linked into the proxy and into qvfr_proxy_smoke.
+PANEL_FONT_BODY_400 RCDATA "../../third_party/fonts/inter/Inter-Regular.ttf"
+PANEL_FONT_BODY_600 RCDATA "../../third_party/fonts/inter/Inter-SemiBold.ttf"
+PANEL_FONT_HEAD_600 RCDATA "../../third_party/fonts/barlowcondensed/BarlowCondensed-SemiBold.ttf"
+PANEL_FONT_HEAD_700 RCDATA "../../third_party/fonts/barlowcondensed/BarlowCondensed-Bold.ttf"

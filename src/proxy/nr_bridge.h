@@ -37,6 +37,10 @@ struct Settings {
     int ngx = 0;                 // 0 the driver's core first, then the model directly; 1 core only; 2 model only
     // Model tuning (read at creation; a change recreates the instances). Names and defaults as in nr-bridge.
     float intensity = 1.0f, localStructure = 1.0f, localTone = 1.0f, skinStructure = -1.0f;
+    // true: a change of intensity, local structure and tone or skin structure only goes into the next evaluations
+    // (the bridge sets them before each one) instead of making the instances again; whether the model reads them
+    // there is what [nr] live_tuning tests.
+    bool liveTuning = false;
     unsigned style = 0, preset = 0;
     bool autoMask = true;
     bool uiCorrection = true;

@@ -24,6 +24,7 @@
 #include "experiment.h"
 #include "frame.h"
 #include "gpu.h"
+#include "panel.h"
 #include "modern_vr.h"
 #include "probe.h"
 #include "quad.h"
@@ -247,6 +248,7 @@ void VR_CALLTYPE VR_Shutdown() {
     quad::Shutdown();
     sr::Shutdown();    // clones back before DLSS goes
     dlaa::Shutdown();  // before the device reference goes
+    panel::Shutdown();
     gpu::Release();  // after everything that drew with the device
     modern::Shutdown();
     if (g_fn.shutdown) g_fn.shutdown();
@@ -309,6 +311,9 @@ IVROverlay* VR_CALLTYPE VROverlay() {
 }
 
 }  // namespace vr
+
+// The backend's own IVROverlay_007 (SteamVR's, or OpenComposite's), for the proxy's tuning panel.
+vr::IVROverlay* qvfr::wrap::RealOverlay() { return Ready() && g_fn.overlay ? g_fn.overlay() : nullptr; }
 
 // ---------------------------------------------------------------- export thunks
 

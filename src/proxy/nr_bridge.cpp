@@ -571,13 +571,15 @@ void Bridge::ReleaseFeatures() {
 }
 
 void Bridge::Configure(const Settings& s) {
-    const bool tuning = s.intensity != set_.intensity || s.localStructure != set_.localStructure ||
-                        s.localTone != set_.localTone || s.skinStructure != set_.skinStructure || s.style != set_.style ||
-                        s.preset != set_.preset || s.autoMask != set_.autoMask || s.uiCorrection != set_.uiCorrection ||
-                        s.model != set_.model ||
+    const bool floats = s.intensity != set_.intensity || s.localStructure != set_.localStructure ||
+                        s.localTone != set_.localTone || s.skinStructure != set_.skinStructure;
+    const bool tuning = (floats && !s.liveTuning) || s.style != set_.style || s.preset != set_.preset ||
+                        s.autoMask != set_.autoMask || s.uiCorrection != set_.uiCorrection || s.model != set_.model ||
+                        s.liveTuning != set_.liveTuning ||
                         s.depthMode != set_.depthMode;  // depth: a new instance, its history and one more measurement
     // The rest changes only what goes in and comes back: the instances stay and measure again.
-    const bool remeasure = s.inputScale != set_.inputScale || s.tonemap != set_.tonemap || s.transfer != set_.transfer ||
+    const bool remeasure = (floats && s.liveTuning) || s.inputScale != set_.inputScale || s.tonemap != set_.tonemap ||
+                           s.transfer != set_.transfer ||
                            s.motion != set_.motion || s.debug != set_.debug || s.strength != set_.strength ||
                            s.depth != set_.depth ||
                            s.depthK != set_.depthK;

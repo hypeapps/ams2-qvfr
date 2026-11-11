@@ -288,11 +288,16 @@ struct Config {
     int nrPreset = 0;
     bool nrAutoMask = true;      // DLSSNR.UseAutoMask
     bool nrUiCorrection = true;  // DLSSNR.UICorrection
+    // DLSSNR.LocalToneStrength, LocalStructureStrength (0..2) and SkinStructureStrength (0..1, -1 = the model's own).
+    float nrLocalTone = 1.0f, nrLocalStructure = 1.0f, nrSkinStructure = -1.0f;
+    // 1: a change of intensity, local tone, local structure or skin structure goes into the next evaluations without
+    // new model instances (smooth sliders, if the model reads them there); 0: new instances.
+    bool nrLiveTuning = true;
     // 0 off, 1 the focus views show the model's edit instead of the image: grey = unchanged, lighter or darker =
     // what the model changed (x20, in the model's units).
     int nrDebug = 0;
     float nrStrength = 1.0f;     // the model's edit x this (DXL's "Self Layers"; 1 = as the model made it)
-    bool nrOuter = false;        // mode=final: the outer images through the model too (no tone step at the focus edge)
+    bool nrOuter = true;         // mode=final: the outer images through the model too (no tone step at the focus edge)
     bool nrBatch = true;         // mode=final: all images of a frame in one atlas, one evaluation of the model
     // batch=1: the outer images go into the atlas at 1/nrOuterStep of their size per axis ([nr] outer_resolution, 1 =
     // full, 0.5 = half); the model's edit is enlarged back onto them.
@@ -317,6 +322,14 @@ struct Config {
     // Fixed for the session: 0 auto (the driver's NGX core, then the model directly), 1 core, 2 model directly.
     int nrNgx = 0;
     unsigned long long nrAppId = 0x24480451ull;  // NGX application id (nr-bridge's default)
+    // [panel] the tuning panel in the headset (dlaa-plan D7.P): hotkey (modifier + key, VK codes) and its place in the
+    // seated space: width, distance ahead of and drop below the seated origin, tilt towards the eyes (degrees).
+    int panelKeyMod = VK_RCONTROL;
+    int panelKey = VK_F2;
+    float panelWidthM = 0.50f;  // the rows and the measured values right of them
+    float panelDistanceM = 0.55f;
+    float panelDownM = 0.12f;
+    float panelTiltDeg = 15.0f;
     // [test] (not in the default ini; used by qvfr_proxy_smoke --fault)
     int testFaultFrames = 0;          // > 0: deliberate access violation in the diagnostics at this proxy frame
 };
@@ -324,8 +337,9 @@ struct Config {
 const Config& Cfg();
 void LoadConfig();                    // creates a default qvfr.ini if it does not exist
 // Render thread, every frame: at most once a second checks the ini date; a changed file updates the live settings
-// (listed at the end of the default ini) and logs the ones that need a restart. True when it reloaded.
-bool ReloadConfig();
+// (listed at the end of the default ini) and logs the ones that need a restart. True when it reloaded. now: check at
+// once (the tuning panel after it saved).
+bool ReloadConfig(bool now = false);
 
 fs::path ModuleDir();                 // folder of the proxy DLL (the game's x64\)
 fs::path BaseDir();                   // %QVFR_HOME% (tests) or x64\qvfr; %TEMP%\ams2-qvfr when x64\qvfr is not writable

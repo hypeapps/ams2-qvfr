@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <thread>
@@ -90,13 +92,20 @@ int ModeNow() {
     return ini && step ? step : ini;
 }
 
-// Benchmark sequence switches (quad.cpp, Knob): -1 keeps the ini's value; a test step still wins over them.
-std::atomic<int> g_knob[(int)Knob::Count] = {-1, -1, -1, -1, -1, -1, -1, -1};
+// Live settings (benchmark switches, the panel; Knob): kUnset keeps the ini's value; a test step still wins over them.
+constexpr int kUnset = INT_MIN;
+std::atomic<int> g_knob[(int)Knob::Count];
+const bool g_knobInit = [] {
+    for (auto& k : g_knob) k = kUnset;
+    return true;
+}();
 
 int KnobOr(Knob k, int ini) {
     const int v = g_knob[(int)k].load();
-    return v >= 0 ? v : ini;
+    return v != kUnset ? v : ini;
 }
+
+int Pct(float v) { return (int)std::lround(v * 100.0f); }
 
 // mode=final: the outer images through the model too (the ini's [nr] outer, a benchmark switch or the test step's).
 bool OuterNow() {
@@ -396,12 +405,17 @@ nrbridge::Settings SettingsNow() {
         s.ngx = c.nrNgx;
     }
     s.model = c.nrModel;
-    s.intensity = c.nrIntensity;
+    s.intensity = (float)KnobOr(Knob::Intensity, Pct(c.nrIntensity)) / 100.0f;
+    s.localTone = (float)KnobOr(Knob::LocalTone, Pct(c.nrLocalTone)) / 100.0f;
+    s.localStructure = (float)KnobOr(Knob::LocalStructure, Pct(c.nrLocalStructure)) / 100.0f;
+    const int skin = KnobOr(Knob::SkinStructure, c.nrSkinStructure < 0 ? -1 : Pct(c.nrSkinStructure));
+    s.skinStructure = skin < 0 ? -1.0f : (float)skin / 100.0f;
+    s.liveTuning = c.nrLiveTuning;
     s.style = (unsigned)KnobOr(Knob::Style, c.nrStyle);
     s.preset = (unsigned)KnobOr(Knob::Preset, c.nrPreset);
-    s.autoMask = c.nrAutoMask;
-    s.uiCorrection = c.nrUiCorrection;
-    s.debug = c.nrDebug;
+    s.autoMask = KnobOr(Knob::AutoMask, c.nrAutoMask) != 0;
+    s.uiCorrection = KnobOr(Knob::UiCorrection, c.nrUiCorrection) != 0;
+    s.debug = KnobOr(Knob::Debug, c.nrDebug);
     s.inputScale = c.nrInputScale;
     s.tonemap = c.nrTonemap;
     s.transfer = c.nrTransfer;
@@ -419,7 +433,9 @@ nrbridge::Settings SettingsNow() {
 }
 
 bool Same(const nrbridge::Settings& a, const nrbridge::Settings& b) {
-    return a.model == b.model && a.intensity == b.intensity && a.style == b.style && a.preset == b.preset &&
+    return a.model == b.model && a.intensity == b.intensity && a.localTone == b.localTone &&
+           a.localStructure == b.localStructure && a.skinStructure == b.skinStructure &&
+           a.liveTuning == b.liveTuning && a.style == b.style && a.preset == b.preset &&
            a.autoMask == b.autoMask && a.uiCorrection == b.uiCorrection && a.debug == b.debug &&
            a.strength == b.strength &&
            a.inputScale == b.inputScale && a.tonemap == b.tonemap && a.transfer == b.transfer && a.motion == b.motion &&
@@ -808,7 +824,8 @@ bool WantedFinal() { return ModeNow() == 2 && !g_failed && g_active.load(std::me
 
 float Smoothen(float ini) {
     const float step = kSteps[g_step.load()].smoothen;
-    return step >= 0 ? step : ini;
+    if (step >= 0) return step;
+    return KnobSet(Knob::Smoothen) ? (float)GetKnob(Knob::Smoothen) / 100.0f : ini;
 }
 
 void ProcessFinal(ID3D11DeviceContext* c, int eye, ID3D11Texture2D*& focus, ID3D11Texture2D*& outer,
@@ -862,6 +879,14 @@ int GetKnob(Knob k) {
         case Knob::Style: return KnobOr(k, c.nrStyle);
         case Knob::Strength: return KnobOr(k, (int)(c.nrStrength * 100.0f + 0.5f));
         case Knob::OuterSeparate: return KnobOr(k, c.nrOuterSeparate);
+        case Knob::Intensity: return KnobOr(k, Pct(c.nrIntensity));
+        case Knob::LocalTone: return KnobOr(k, Pct(c.nrLocalTone));
+        case Knob::LocalStructure: return KnobOr(k, Pct(c.nrLocalStructure));
+        case Knob::SkinStructure: return KnobOr(k, c.nrSkinStructure < 0 ? -1 : Pct(c.nrSkinStructure));
+        case Knob::AutoMask: return KnobOr(k, c.nrAutoMask);
+        case Knob::UiCorrection: return KnobOr(k, c.nrUiCorrection);
+        case Knob::Debug: return KnobOr(k, c.nrDebug);
+        case Knob::Smoothen: return KnobOr(k, Pct(c.smoothen));
         default: return 0;
     }
 }
@@ -869,6 +894,16 @@ int GetKnob(Knob k) {
 void SetKnob(Knob k, int value) {
     if (k < Knob::Count) g_knob[(int)k] = value;
 }
+
+void ClearKnobs() {
+    for (auto& k : g_knob) k = kUnset;
+}
+
+void ClearKnob(Knob k) {
+    if (k < Knob::Count) g_knob[(int)k] = kUnset;
+}
+
+bool KnobSet(Knob k) { return k < Knob::Count && g_knob[(int)k].load() != kUnset; }
 
 Window LastWindow() { return g_window; }
 
@@ -970,6 +1005,24 @@ void LogStats(bool totals) {
     }
     g_last = s;
     for (int i = 0; i < kImages; ++i) g_lastCalls[i] = g_calls[i];
+}
+
+Totals LiveTotals() {
+    Totals t;
+    t.frames = g_calls[0];
+    if (g_bridge) {
+        const nrbridge::Stats s = g_bridge->stats();
+        t.calls = s.calls;
+        t.gpuSamples = s.gpuSamples;
+        t.gpuMs = s.gpuMs;
+        t.d11Frames = s.d11Frames;
+        t.d11Guides = s.d11GuidesMs;
+        t.d11Pack = s.d11PackMs;
+        t.d11Handoff = s.d11HandoffMs;
+        t.d11Unpack = s.d11UnpackMs;
+    }
+    t.atlasMp = BatchNow() ? g_atlasMp : 0.0;
+    return t;
 }
 
 std::string Describe() {

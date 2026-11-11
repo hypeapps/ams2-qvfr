@@ -26,7 +26,7 @@ void Process(ID3D11DeviceContext* c, int view, ID3D11ShaderResourceView* srv, ID
 // Render thread, at the composition (quad.cpp, before compose::Draw): true when the eyes' final images go through the
 // model (mode=final; the outer ones too with [nr] outer).
 bool WantedFinal();
-// [quad] smoothen_focus_view_edges at the composition: `ini`, or the NR test step's.
+// [quad] smoothen_focus_view_edges at the composition: `ini`, or the panel's, or the NR test step's.
 float Smoothen(float ini);
 // Eye e's finished focus and outer images through the model: `focus` and `outer` become the textures to compose from
 // (the module's copies with the model's result, valid until the next frame or Shutdown) or stay. With [nr] batch=1 the
@@ -38,13 +38,23 @@ void ProcessFinal(ID3D11DeviceContext* c, int eye, ID3D11Texture2D*& focus, ID3D
 // Live on/off ([nr] key, benchmark switch `nr`).
 bool Active();
 void SetActive(bool on);
-// Benchmark sequence switches (quad.cpp): nr_outer 0/1, nr_batch 0/1, nr_outer_res (source pixels per outer pixel in
-// the atlas, 1..4), nr_outer_area (the outer images' centre part through the model, percent 50..100), nr_preset 0..3,
-// nr_style 0..3, nr_strength (percent 0..300), nr_outer_separate 0/1 (the outer images in their own evaluation).
-// GetKnob: the value now (the ini's until set).
-enum class Knob { Outer, Batch, OuterRes, OuterArea, Preset, Style, Strength, OuterSeparate, Count };
+// Live settings over the ini: the benchmark sequence switches (quad.cpp) and the tuning panel (panel.cpp).
+// nr_outer 0/1, nr_batch 0/1, nr_outer_res (source pixels per outer pixel in the atlas, 1..4), nr_outer_area (the outer images'
+// centre part through the model, percent 50..100), nr_preset 0..3, nr_style 0..3, nr_strength (percent 0..300),
+// nr_outer_separate 0/1 (the outer images in their own evaluation). The panel's too: intensity (percent 0..100),
+// local tone and structure (percent 0..200), skin structure (percent 0..100, -1 = the model's own), auto mask, UI
+// correction and the edit map 0/1, the focus edge's smoothen (percent 0..100, [quad] smoothen_focus_view_edges).
+// GetKnob: the value now (the ini's until set); ClearKnobs: all back to the ini; KnobSet: set over the ini.
+enum class Knob {
+    Outer, Batch, OuterRes, OuterArea, Preset, Style, Strength, OuterSeparate,
+    Intensity, LocalTone, LocalStructure, SkinStructure, AutoMask, UiCorrection, Debug, Smoothen,
+    Count
+};
 int GetKnob(Knob k);
 void SetKnob(Knob k, int value);
+void ClearKnobs();
+void ClearKnob(Knob k);  // this one back to the ini
+bool KnobSet(Knob k);
 // The last statistics window's (a benchmark run's) D3D12 GPU time of the model per frame and the atlas's size.
 struct Window {
     bool any = false;  // images went through the model in it
@@ -56,6 +66,14 @@ struct Window {
     bool d11 = false;
 };
 Window LastWindow();
+// Running totals for the tuning panel (render thread; never reset): frames (focus L images through NR), the model's
+// D3D12 GPU time over its timed evaluations and all evaluations, the D3D11 parts over the atlas frames, the atlas size.
+struct Totals {
+    uint64_t frames = 0, calls = 0, gpuSamples = 0, d11Frames = 0;
+    double gpuMs = 0, d11Guides = 0, d11Pack = 0, d11Handoff = 0, d11Unpack = 0;
+    double atlasMp = 0;  // 0 without the atlas
+};
+Totals LiveTotals();
 void OnFrameStart();  // hotkey (render thread)
 void LogStats(bool totals);
 std::string Describe();

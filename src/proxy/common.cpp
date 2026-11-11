@@ -512,9 +512,14 @@ Config ReadConfig(const fs::path& ini) {
     c.nrPreset = std::clamp(IniInt(ini, L"nr", L"preset", c.nrPreset), 0, 16);
     c.nrAutoMask = IniInt(ini, L"nr", L"auto_mask", 1) != 0;
     c.nrUiCorrection = IniInt(ini, L"nr", L"ui_correction", 1) != 0;
+    c.nrLocalTone = std::clamp(IniFloat(ini, L"nr", L"local_tone", c.nrLocalTone), 0.0f, 2.0f);
+    c.nrLocalStructure = std::clamp(IniFloat(ini, L"nr", L"local_structure", c.nrLocalStructure), 0.0f, 2.0f);
+    c.nrSkinStructure = IniFloat(ini, L"nr", L"skin_structure", c.nrSkinStructure);
+    c.nrSkinStructure = c.nrSkinStructure < 0 ? -1.0f : (std::min)(c.nrSkinStructure, 1.0f);
+    c.nrLiveTuning = IniInt(ini, L"nr", L"live_tuning", 1) != 0;
     c.nrDebug = std::clamp(IniInt(ini, L"nr", L"debug", 0), 0, 1);
     c.nrStrength = std::clamp(IniFloat(ini, L"nr", L"strength", 1.0f), 0.0f, 5.0f);
-    c.nrOuter = IniInt(ini, L"nr", L"outer", 0) != 0;
+    c.nrOuter = IniInt(ini, L"nr", L"outer", 1) != 0;
     c.nrBatch = IniInt(ini, L"nr", L"batch", 1) != 0;
     const float outerRes = std::clamp(IniFloat(ini, L"nr", L"outer_resolution", 0.5f), 0.25f, 1.0f);
     c.nrOuterStep = std::clamp((int)(1.0f / outerRes + 0.5f), 1, 4);
@@ -548,6 +553,18 @@ Config ReadConfig(const fs::path& ini) {
             c.nrOuterSeparate ? "separate" : "shared", c.nrInputScale, c.nrTonemap,
             c.nrTransfer ? "ratio" : "inverse", c.nrMotion, c.nrDepth, c.nrDepthK, ngx.c_str(),
             c.nrAppId, c.nrKeyMod, c.nrKey, c.nrTestKey);
+    if (c.nrMode)
+        Log("Settings: [nr] local_tone=%.2f local_structure=%.2f skin_structure=%.2f live_tuning=%d",
+            c.nrLocalTone, c.nrLocalStructure, c.nrSkinStructure, c.nrLiveTuning);
+    c.panelKeyMod = IniInt(ini, L"panel", L"modifier", c.panelKeyMod);
+    c.panelKey = IniInt(ini, L"panel", L"key", c.panelKey);
+    c.panelWidthM = std::clamp(IniFloat(ini, L"panel", L"width_m", c.panelWidthM), 0.1f, 2.0f);
+    c.panelDistanceM = std::clamp(IniFloat(ini, L"panel", L"distance_m", c.panelDistanceM), 0.2f, 3.0f);
+    c.panelDownM = std::clamp(IniFloat(ini, L"panel", L"down_m", c.panelDownM), -1.0f, 1.0f);
+    c.panelTiltDeg = std::clamp(IniFloat(ini, L"panel", L"tilt_deg", c.panelTiltDeg), -60.0f, 60.0f);
+    if (c.nrMode)
+        Log("Settings: [panel] modifier=0x%X key=0x%X width_m=%.2f distance_m=%.2f down_m=%.2f tilt_deg=%.0f",
+            c.panelKeyMod, c.panelKey, c.panelWidthM, c.panelDistanceM, c.panelDownM, c.panelTiltDeg);
     c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
     if (c.testFaultFrames > 0) Log("Settings: [test] fault_frames=%d (deliberate fault for testing)", c.testFaultFrames);
     return c;
@@ -590,9 +607,9 @@ void LoadConfig() {
         c.benchSequence.c_str(), c.gazeRead, ExpModeName(c.expMode), c.expFocusSize, c.expCenterX, c.expCenterY, c.expPad);
 }
 
-bool ReloadConfig() {
+bool ReloadConfig(bool force) {
     const double now = NowMs();
-    if (now - g_iniCheckMs < 1000) return false;
+    if (!force && now - g_iniCheckMs < 1000) return false;
     g_iniCheckMs = now;
     WIN32_FILE_ATTRIBUTE_DATA a{};
     if (!GetFileAttributesExW(IniFile().c_str(), GetFileExInfoStandard, &a)) return false;
@@ -656,6 +673,16 @@ bool ReloadConfig() {
     c.nrPreset = n.nrPreset;
     c.nrAutoMask = n.nrAutoMask;
     c.nrUiCorrection = n.nrUiCorrection;
+    c.nrLocalTone = n.nrLocalTone;
+    c.nrLocalStructure = n.nrLocalStructure;
+    c.nrSkinStructure = n.nrSkinStructure;
+    c.nrLiveTuning = n.nrLiveTuning;
+    c.panelKeyMod = n.panelKeyMod;
+    c.panelKey = n.panelKey;
+    c.panelWidthM = n.panelWidthM;
+    c.panelDistanceM = n.panelDistanceM;
+    c.panelDownM = n.panelDownM;
+    c.panelTiltDeg = n.panelTiltDeg;
     c.nrDebug = n.nrDebug;
     c.nrStrength = n.nrStrength;
     c.nrOuter = n.nrOuter;

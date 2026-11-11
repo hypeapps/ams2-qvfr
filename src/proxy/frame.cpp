@@ -197,6 +197,7 @@ struct GpuSums {
     uint64_t frames = 0, n[gpu::kPhases] = {}, spanN[gpu::kSpans] = {};
     double frame = 0, phase[gpu::kPhases] = {}, span[gpu::kSpans] = {};
 } g_gpuSums;
+Totals g_live;  // LiveTotals
 
 bool g_frozen = false;
 vr::TrackedDevicePose_t g_frozenPose{};
@@ -348,6 +349,8 @@ void ProcessFrames(uint64_t current) {
             if (g.frameMs >= 0) {
                 ++g_gpuSums.frames;
                 g_gpuSums.frame += g.frameMs;
+                ++g_live.gpuFrames;
+                g_live.gpuMs += g.frameMs;
             }
             for (int k = 0; k < gpu::kPhases; ++k) {
                 if (g.phaseMs[k] < 0) continue;
@@ -1004,6 +1007,10 @@ void OnWaitGetPosesBegin() {
         std::lock_guard lock(g_mutex);
         double now = NowMs();
         if (g_cur.wgpExit > 0) {
+            if (g_cur.submits && g_cur.lastSubmit >= g_cur.wgpExit) {
+                ++g_live.cpuFrames;
+                g_live.cpuMs += g_cur.lastSubmit - g_cur.wgpExit;
+            }
             if (g_cur.submits != 2 && g_badSubmitLogs < 5) {
                 ++g_badSubmitLogs;
                 Log("Frame %llu: %d Submit calls between WaitGetPoses (expected 2)",
@@ -1015,7 +1022,11 @@ void OnWaitGetPosesBegin() {
         }
         g_cur = ProxyFrame{};
         g_cur.wgpEnter = now;
-        if (g_prevWgpEnter > 0) g_cur.intervalMs = (float)(now - g_prevWgpEnter);
+        if (g_prevWgpEnter > 0) {
+            g_cur.intervalMs = (float)(now - g_prevWgpEnter);
+            ++g_live.intervals;
+            g_live.intervalMs += g_cur.intervalMs;
+        }
         g_prevWgpEnter = now;
         g_frameHandle[0] = g_frameHandle[1] = nullptr;
     });
@@ -1273,5 +1284,7 @@ void OnShutdown() {
     });
     experiment::Shutdown();  // guards itself; runs even after a diagnostics fault
 }
+
+Totals LiveTotals() { return g_live; }
 
 }  // namespace qvfr::frame

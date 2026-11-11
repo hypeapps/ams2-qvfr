@@ -15,6 +15,7 @@
 #include "experiment.h"
 #include "frame.h"
 #include "gpu.h"
+#include "panel.h"
 #include "generated/wrappers_0912.h"
 #include "probe.h"
 #include "quad.h"
@@ -263,6 +264,7 @@ public:
         vr::Texture_t composed{};
         out = quad::PrepareSubmit(eye, out, bounds, composed);
         if (eye == vr::Eye_Right) gpu::FrameEnd();
+        panel::OnSubmit(eye);  // the tuning panel's keys, picture and overlay (right eye)
         double t0 = NowMs();
         vr::EVRCompositorError err = CompositorWrapBase::Submit(eye, out, bounds, flags);
         probe::OnSubmitEnd(eye);

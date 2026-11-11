@@ -51,6 +51,8 @@
 //                                     (B10) against a clip-space reference on a D3D11 device (mvr_motion_smoke.cpp)
 //   --nr-bridge                       without SteamVR and without the proxy DLL: the NR bridge (D3D11 -> D3D12 -> D3D11
 //                                     passthrough) on two focus-sized images, bit for bit (nr_bridge_smoke.cpp)
+//   --panel                           without SteamVR and without the proxy DLL: the tuning panel's picture (RmlUi on
+//                                     D3D11), its redraws and the game's state around it (panel_smoke.cpp)
 //   --xr-layer                        without SteamVR: the proxy DLL as an OpenXR API layer between a fake loader and a
 //                                     fake runtime (extension, gaze set in attach and sync, own sync, gaze, 2 sessions)
 //   --openxr-path                     [runtime] path=openxr with the Valve DLL as the backend: loader environment,
@@ -90,6 +92,7 @@ int RunMvrForward();  // mvr_forward_smoke.cpp
 int RunTaaFix();  // taa_fix_smoke.cpp
 int RunMvrMotion();  // mvr_motion_smoke.cpp
 int RunNrBridge();   // nr_bridge_smoke.cpp
+int RunPanel();      // panel_smoke.cpp
 #include "focus_cull.h"
 #include "focus_geometry.h"
 #include "fwd_rec.h"
@@ -1711,6 +1714,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--taa-fix")) return RunTaaFix();
         else if (!strcmp(argv[i], "--mvr-motion")) return RunMvrMotion();
         else if (!strcmp(argv[i], "--nr-bridge")) return RunNrBridge();
+        else if (!strcmp(argv[i], "--panel")) return RunPanel();
         else if (!strcmp(argv[i], "--mvr-vs")) mvrVsTest = true;
         else if (!strcmp(argv[i], "--mvr-ps")) mvrPsTest = true;
         else if (!strcmp(argv[i], "--mvr-pass")) mvrPassTest = true;

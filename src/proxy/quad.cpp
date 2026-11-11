@@ -2098,7 +2098,7 @@ ID3D11Texture2D* ComposeLocked(int e, const vr::Texture_t* tex, const vr::VRText
     l.y0 = foc.y0;
     const Config& c = Cfg();
     l.marginPx = (float)c.quadMarginPx;
-    l.smoothen = c.smoothen;
+    l.smoothen = nr::Smoothen(c.smoothen);  // the ini's, the tuning panel's or the NR test step's
     l.legacyEdge = c.legacyEdge;
     l.featherPx = (float)c.quadFeatherPx;
     l.overlay = g_overlay;
@@ -2120,7 +2120,6 @@ ID3D11Texture2D* ComposeLocked(int e, const vr::Texture_t* tex, const vr::VRText
         if (e == 0 && g_copy[CopyOuterR].frame) rightOuter = g_copy[CopyOuterR].tex;
         nr::ProcessFinal(imm, e, focusTex, outerTex, rightFocus, rightOuter);
         if (rightFocus) rightFocus->Release();
-        l.smoothen = nr::Smoothen(l.smoothen);
     }
     const gpu::Phase phase = e ? gpu::ComposeR : gpu::ComposeL;
     gpu::Begin(phase);
