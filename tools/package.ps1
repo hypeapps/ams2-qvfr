@@ -51,6 +51,8 @@ $oc = Need (Join-Path $build "qvfr\opencomposite\openvr_api.dll")
 $manifest = Need (Join-Path $build "qvfr\XR_APILAYER_AMS2QVFR_eye_gaze.json")
 $gui = Need (Join-Path $build "qvfr\qvfr_config.exe")
 $spare = Need (Join-Path $build "qvfr\proxy\openvr_api.dll")
+# DLSS 5: the mod's loader for NVIDIA's model (nvngx_dlssnr.dll, which the player downloads; not in the package).
+$nrLoader = Need (Join-Path $build "qvfr\nvngx.dll_qvfr_nr.dll")
 $dlss = Join-Path $build "qvfr\nvngx_dlss.dll"
 if (-not (Test-Path $dlss)) {
     throw "$dlss not found: the build has no DLSS SDK, so the proxy has no DLAA. Run .\tools\fetch_dlss_sdk.ps1, then .\build.ps1."
@@ -76,6 +78,7 @@ $files = [ordered]@{
     "x64/qvfr/qvfr_config.exe"                     = $gui
     "x64/qvfr/proxy/openvr_api.dll"                = $spare
     "x64/qvfr/nvngx_dlss.dll"                      = $dlss
+    "x64/qvfr/nvngx.dll_qvfr_nr.dll"               = $nrLoader
     "x64/qvfr/README.md"                           = Need (Join-Path $root "README.md")
     "x64/qvfr/licenses/LICENSE.md"                 = Need (Join-Path $root "LICENSE.md")
     "x64/qvfr/licenses/THIRD_PARTY.md"             = Need (Join-Path $root "THIRD_PARTY.md")
@@ -88,6 +91,7 @@ $files = [ordered]@{
     "x64/qvfr/licenses/barlowcondensed-OFL.txt"    = Need (Join-Path $root "third_party\fonts\barlowcondensed\OFL.txt")
     "x64/qvfr/licenses/tabler-icons-LICENSE.txt"   = Need (Join-Path $root "third_party\fonts\tabler-icons\LICENSE")
     "x64/qvfr/licenses/nvidia-rtx-sdks-LICENSE.txt" = Need (Join-Path $DlssSdk "LICENSE.txt")
+    "x64/qvfr/licenses/nvapi-LICENSE.txt"          = Need (Join-Path $root "third_party\nvapi-r615\License.txt")
 }
 foreach ($f in Get-ChildItem $OpenCompositeDir -File) { $files["x64/qvfr/opencomposite/$($f.Name)"] = $f.FullName }
 

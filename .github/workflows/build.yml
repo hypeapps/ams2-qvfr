@@ -1,5 +1,6 @@
 # Builds the mod on every push and pull request, runs the tests that need no GPU or headset, and keeps the release zip
-# as an artifact. A tag v<version> (the version in CMakeLists.txt) also publishes a GitHub release with the zip.
+# as an artifact. A tag v<version> (the version in CMakeLists.txt) also publishes a GitHub release with the zip, and a tag
+# v<version>-<label> (e.g. v0.6.0-alpha) a pre-release named and zipped with the label.
 name: Build
 
 on:
@@ -67,11 +68,22 @@ jobs:
           VERSION: ${{ steps.package.outputs.version }}
           ZIP: ${{ steps.package.outputs.zip }}
         run: |
-          if ($env:TAG -ne "v$env:VERSION") { throw "Tag $env:TAG does not match the project version $env:VERSION (CMakeLists.txt)." }
+          # v<version> is a release; v<version>-<label> (e.g. v0.6.0-alpha) a pre-release with the label in its name and zip.
+          if ($env:TAG -notmatch "^v$([regex]::Escape($env:VERSION))(-[0-9A-Za-z.]+)?$") {
+            throw "Tag $env:TAG does not match the project version $env:VERSION (CMakeLists.txt)."
+          }
+          $name = $env:TAG.Substring(1)
+          $pre = @()
+          $zip = $env:ZIP
+          if ($name -ne $env:VERSION) {
+            $pre = @('--prerelease')
+            $zip = Join-Path (Split-Path $env:ZIP) "ams2-qvfr-$name.zip"
+            Move-Item $env:ZIP $zip
+          }
           $notes = @"
-          AMS2 QVFR $($env:VERSION): quad views foveated rendering for Automobilista 2 in VR.
+          AMS2 QVFR $($name): quad views foveated rendering for Automobilista 2 in VR.
 
-          **Install:** download ``ams2-qvfr-$env:VERSION.zip``, back up ``x64\openvr_api.dll`` of the game and extract the zip into
+          **Install:** download ``ams2-qvfr-$name.zip``, back up ``x64\openvr_api.dll`` of the game and extract the zip into
           the folder with ``AMS2.exe``. Settings: ``x64\qvfr\qvfr_config.exe``. Details, requirements and compatibility notes are
           in the [README](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:TAG/README.md).
 
@@ -80,4 +92,4 @@ jobs:
           see [THIRD_PARTY.md](https://github.com/$env:GITHUB_REPOSITORY/blob/$env:TAG/THIRD_PARTY.md) for their licenses and
           OpenComposite's source.
           "@
-          gh release create $env:TAG $env:ZIP --title "AMS2 QVFR $env:VERSION" --notes $notes
+          gh release create $env:TAG $zip --title "AMS2 QVFR $name" --notes $notes @pre
