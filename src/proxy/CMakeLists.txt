@@ -52,8 +52,8 @@ add_custom_command(
 set(QVFR_NR_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr.hlsl)
 add_custom_command(
   OUTPUT ${QVFR_SHADER_OUT}/nr_pack_cs.h ${QVFR_SHADER_OUT}/nr_unpack_cs.h ${QVFR_SHADER_OUT}/nr_motion_cs.h
-         ${QVFR_SHADER_OUT}/nr_depth_cs.h ${QVFR_SHADER_OUT}/nr_unpack4_cs.h ${QVFR_SHADER_OUT}/nr_down_cs.h
-         ${QVFR_SHADER_OUT}/nr_upedit_cs.h
+         ${QVFR_SHADER_OUT}/nr_depth_cs.h ${QVFR_SHADER_OUT}/nr_unpack4_cs.h ${QVFR_SHADER_OUT}/nr_pack_region_cs.h
+         ${QVFR_SHADER_OUT}/nr_unpack_region_cs.h ${QVFR_SHADER_OUT}/nr_upedit_cs.h
   COMMAND ${CMAKE_COMMAND} -E make_directory ${QVFR_SHADER_OUT}
   COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSPack /Vn kNrPackCS
           /Fh ${QVFR_SHADER_OUT}/nr_pack_cs.h ${QVFR_NR_HLSL}
@@ -65,8 +65,10 @@ add_custom_command(
           /Fh ${QVFR_SHADER_OUT}/nr_motion_cs.h ${QVFR_NR_HLSL}
   COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSDepth /Vn kNrDepthCS
           /Fh ${QVFR_SHADER_OUT}/nr_depth_cs.h ${QVFR_NR_HLSL}
-  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSDown /Vn kNrDownCS
-          /Fh ${QVFR_SHADER_OUT}/nr_down_cs.h ${QVFR_NR_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSPackRegion /Vn kNrPackRegionCS
+          /Fh ${QVFR_SHADER_OUT}/nr_pack_region_cs.h ${QVFR_NR_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSUnpackRegion /Vn kNrUnpackRegionCS
+          /Fh ${QVFR_SHADER_OUT}/nr_unpack_region_cs.h ${QVFR_NR_HLSL}
   COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSUpEdit /Vn kNrUpEditCS
           /Fh ${QVFR_SHADER_OUT}/nr_upedit_cs.h ${QVFR_NR_HLSL}
   DEPENDS ${QVFR_NR_HLSL}
@@ -119,8 +121,8 @@ add_library(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT}/compose_vs.h ${QVFR_SHADER
             ${QVFR_SHADER_OUT}/mvr_pass_depth_ms_ps.h ${QVFR_SHADER_OUT}/mvr_motion_cs.h
             ${QVFR_SHADER_OUT}/sr_vs.h ${QVFR_SHADER_OUT}/sr_color_ps.h ${QVFR_SHADER_OUT}/sr_depth_ps.h
             ${QVFR_SHADER_OUT}/nr_pack_cs.h ${QVFR_SHADER_OUT}/nr_unpack_cs.h ${QVFR_SHADER_OUT}/nr_motion_cs.h
-            ${QVFR_SHADER_OUT}/nr_depth_cs.h ${QVFR_SHADER_OUT}/nr_unpack4_cs.h ${QVFR_SHADER_OUT}/nr_down_cs.h
-            ${QVFR_SHADER_OUT}/nr_upedit_cs.h)
+            ${QVFR_SHADER_OUT}/nr_depth_cs.h ${QVFR_SHADER_OUT}/nr_unpack4_cs.h ${QVFR_SHADER_OUT}/nr_pack_region_cs.h
+            ${QVFR_SHADER_OUT}/nr_unpack_region_cs.h ${QVFR_SHADER_OUT}/nr_upedit_cs.h)
 target_include_directories(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT})
 
 enable_language(ASM_MASM)  # export thunks (generated/thunks.asm)

@@ -136,8 +136,9 @@ bool SeparateNow() {
 // The atlases (batch=1). Shared: focus L and R in the top row, outer L and R (with outer on: their centre part at
 // 1/step of its size) below or right of them. Separate: the focus images in atlas 0, the outer images side by side in
 // atlas 1. Images kAtlasGap pixels apart. The motion vectors and depth go into the bridge's slot kAtlasSlot + atlas
-// region by region at DLAA time; at the left eye's composition all images are copied (or downsampled) in, each atlas
-// goes through the model once and the images are copied back out (or get the model's edit enlarged onto them).
+// region by region at DLAA time; at the left eye's composition each image goes straight into its region (downsampled
+// with a step), each atlas through the model once, and each image straight back into its copy (or the model's edit
+// enlarged onto it). The atlases are the bridge's shared textures: no copy of them in D3D11.
 constexpr int kAtlases = 2;
 constexpr int kAtlasSlot = 4;
 constexpr UINT kAtlasGap = 16;
@@ -147,7 +148,6 @@ struct Region {
     UINT cx = 0, cy = 0;  // the part of the image in the atlas: origin and size in source pixels
     UINT cw = 0, ch = 0;
     UINT fade = 0;        // with a centre part: the edit's fade-out band inside its edge, source pixels
-    bool edit = false;    // downsampled or a centre part: in through Downsample, back through UpsampleEdit
     int atlas = 0;        // which atlas it is in
     UINT aw = 0, ah = 0;  // its size in the atlas
     UINT x = 0, y = 0;    // its place in the atlas
@@ -185,7 +185,6 @@ void Relayout() {
         r[i].cx = (r[i].w - r[i].cw) / 2;
         r[i].cy = (r[i].h - r[i].ch) / 2;
         r[i].fade = area < 100 ? (std::max)(16u, (std::min)(r[i].cw, r[i].ch) / 10) : 0;
-        r[i].edit = r[i].step > 1 || area < 100;
         r[i].atlas = outer && separate ? 1 : 0;
         r[i].aw = (r[i].cw + r[i].step - 1) / r[i].step;
         r[i].ah = (r[i].ch + r[i].step - 1) / r[i].step;
@@ -249,10 +248,15 @@ struct FinalImage {
     D3D11_TEXTURE2D_DESC desc{};  // of the game's image it copies
 };
 FinalImage g_final[kImages];
-FinalImage g_atlas[kAtlases];  // batch=1: the images side by side, the model writes into them
-// An image at a lower resolution in the atlas: the image as it came (Downsample and UpsampleEdit read it) and its
-// region as it went into the model.
-FinalImage g_orig[kImages], g_small[kImages];
+// batch=1: the copy of an image the bridge cannot read in place (no SRV binding).
+FinalImage g_orig[kImages];
+// batch=1: the bridge's view of an image, while it is the same image.
+struct View {
+    ID3D11Texture2D* tex = nullptr;  // not a reference of its own (the view holds one)
+    ID3D11ShaderResourceView* srv = nullptr;
+};
+View g_view[kImages];
+bool g_viewLogged = false;
 bool g_finalReset[kImages] = {};  // DLAA reset its history since the last final image
 bool g_finalLogged[kImages] = {};
 bool g_finalSkipLogged[kImages] = {};
@@ -264,11 +268,15 @@ void DropImage(FinalImage& f) {
     f = {};
 }
 
+void DropView(View& v) {
+    if (v.srv) v.srv->Release();
+    v = {};
+}
+
 void DropFinal() {
     for (FinalImage& f : g_final) DropImage(f);
     for (FinalImage& f : g_orig) DropImage(f);
-    for (FinalImage& f : g_small) DropImage(f);
-    for (FinalImage& f : g_atlas) DropImage(f);
+    for (View& v : g_view) DropView(v);
     for (auto& g : g_guided) g = 0;
     g_atlasOut = false;
 }
@@ -623,9 +631,65 @@ ID3D11Texture2D* ProcessFinalImpl(ID3D11DeviceContext* c, int i, ID3D11Texture2D
     return f.tex;
 }
 
+// The output merger's targets, saved and unbound while the bridge reads the images (the game's Submit texture may still
+// be bound as a render target, and an SRV of it would be unbound), restored after.
+struct OmState {
+    ID3D11RenderTargetView* rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* dsv = nullptr;
+    void Save(ID3D11DeviceContext* c) {
+        c->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, &dsv);
+        c->OMSetRenderTargets(0, nullptr, nullptr);
+    }
+    void Restore(ID3D11DeviceContext* c) {
+        c->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rtv, dsv);
+        for (auto* v : rtv)
+            if (v) v->Release();
+        if (dsv) dsv->Release();
+    }
+};
+
+// batch=1: an UNORM view of the image for the bridge (cached while the image stays); an image without an SRV binding
+// goes through its copy in g_orig. Null: neither can be made (logged once).
+ID3D11ShaderResourceView* ImageView(ID3D11DeviceContext* c, int i, ID3D11Texture2D* img,
+                                    const D3D11_TEXTURE2D_DESC& d) {
+    if (!(d.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+        if (!EnsureImage(c, g_orig[i], d, kName[i])) return nullptr;
+        c->CopySubresourceRegion(g_orig[i].tex, 0, 0, 0, 0, img, 0, nullptr);
+        return g_orig[i].srv;
+    }
+    View& v = g_view[i];
+    if (v.tex == img) return v.srv;
+    DropView(v);
+    DXGI_FORMAT texFmt = DXGI_FORMAT_UNKNOWN, viewFmt = DXGI_FORMAT_UNKNOWN;
+    FinalFormats(d.Format, texFmt, viewFmt);
+    ID3D11Device* dev = nullptr;
+    c->GetDevice(&dev);
+    if (!dev) return nullptr;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Format = viewFmt;
+    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sd.Texture2D.MipLevels = 1;
+    const HRESULT hr = dev->CreateShaderResourceView(img, &sd, &v.srv);
+    dev->Release();
+    if (FAILED(hr) || !v.srv) {
+        v = {};
+        if (!g_viewLogged) {
+            g_viewLogged = true;
+            Log("NR: no view of the final %s image (fmt %d, 0x%08lX); it goes through a copy", kName[i], (int)d.Format,
+                (unsigned long)hr);
+        }
+        if (!EnsureImage(c, g_orig[i], d, kName[i])) return nullptr;
+        c->CopySubresourceRegion(g_orig[i].tex, 0, 0, 0, 0, img, 0, nullptr);
+        return g_orig[i].srv;
+    }
+    v.tex = img;  // the view holds a reference, so the address stays this image's
+    return v.srv;
+}
+
 // batch=1, at the left eye's composition: img = focus L, focus R, outer L, outer R (the outer ones only with the
-// layout's outer). Each atlas of the layout goes through the model once. True: g_final holds every image through the
-// model.
+// layout's outer). Each image goes straight into its region of its atlas (the bridge's shared model input), each atlas
+// through the model once, and each image straight back out into its copy in g_final. True: g_final holds every image
+// through the model.
 bool RunAtlas(ID3D11DeviceContext* c, ID3D11Texture2D* const img[kImages]) {
     if (!g_bridge || !g_bridge->ready()) return false;
     const int n = g_layoutOuter ? 4 : 2;
@@ -654,72 +718,45 @@ bool RunAtlas(ID3D11DeviceContext* c, ID3D11Texture2D* const img[kImages]) {
         }
         return false;
     }
-    bool fresh[kAtlases] = {};
-    for (int a = 0; a < g_atlasCount; ++a) {
-        D3D11_TEXTURE2D_DESC ad = d[0];
-        ad.Width = g_atlasW[a];
-        ad.Height = g_atlasH[a];
-        const FinalImage& f = g_atlas[a];
-        fresh[a] = !f.tex || f.desc.Width != ad.Width || f.desc.Height != ad.Height || f.desc.Format != ad.Format;
-        if (!EnsureImage(c, g_atlas[a], ad, a ? "outer atlas" : "atlas")) return false;
-    }
-    for (int i = 0; i < n; ++i) {
+    for (int i = 0; i < n; ++i)
         if (!EnsureImage(c, g_final[i], d[i], kName[i])) return false;
-        if (g_region[i].edit) {  // the image as it came (read by Downsample and UpsampleEdit) and its region before
-            D3D11_TEXTURE2D_DESC s = d[i];
-            s.Width = g_region[i].aw;
-            s.Height = g_region[i].ah;
-            if (!EnsureImage(c, g_orig[i], d[i], kName[i]) || !EnsureImage(c, g_small[i], s, kName[i])) return false;
-        }
-    }
     CsState st;
     st.Save(c);
-    for (int a = 0; a < g_atlasCount; ++a)
-        if (fresh[a]) {  // the gaps between the images stay black
-            const float black[4] = {0, 0, 0, 1};
-            c->ClearUnorderedAccessViewFloat(g_atlas[a].uav, black);
-        }
+    OmState om;
+    om.Save(c);
+    ID3D11ShaderResourceView* view[kImages] = {};
     bool ok = true;
+    for (int i = 0; i < n && ok; ++i) ok = (view[i] = ImageView(c, i, img[i], d[i])) != nullptr;
+    bool reset[kAtlases] = {};
+    for (int a = 0; a < g_atlasCount; ++a) {
+        reset[a] = g_atlasReset[a] || g_atlasRunGen[a] != g_layoutGen;
+        if (g_atlasRunGen[a] != g_layoutGen) g_bridge->ClearInput(kAtlasSlot + a);  // the new layout's gaps black
+    }
+    for (int i = 0; i < n; ++i) reset[g_region[i].atlas] |= g_resetPending[i].exchange(false);
     for (int i = 0; i < n && ok; ++i) {
         const Region& r = g_region[i];
-        FinalImage& at = g_atlas[r.atlas];
-        if (!r.edit) {
-            c->CopySubresourceRegion(at.tex, 0, r.x, r.y, 0, img[i], 0, nullptr);
-            continue;
-        }
-        c->CopySubresourceRegion(g_orig[i].tex, 0, 0, 0, 0, img[i], 0, nullptr);
-        ok = g_bridge->Downsample(c, g_orig[i].srv, at.uav, r.x, r.y, r.aw, r.ah, r.step, r.cx, r.cy);
-        const D3D11_BOX b{r.x, r.y, 0, r.x + r.aw, r.y + r.ah, 1};
-        c->CopySubresourceRegion(g_small[i].tex, 0, 0, 0, 0, at.tex, 0, &b);
+        ok = g_bridge->PackRegion(c, kAtlasSlot + r.atlas, view[i], r.x, r.y, r.aw, r.ah, r.step, r.cx, r.cy);
     }
-    bool reset[kAtlases] = {};
-    for (int a = 0; a < g_atlasCount; ++a) reset[a] = g_atlasReset[a] || g_atlasRunGen[a] != g_layoutGen;
-    for (int i = 0; i < n; ++i) reset[g_region[i].atlas] |= g_resetPending[i].exchange(false);
     for (int a = 0; a < g_atlasCount && ok; ++a) {
         g_atlasReset[a] = false;
         g_atlasRunGen[a] = g_layoutGen;
-        ok = g_bridge->Process(c, kAtlasSlot + a, g_atlas[a].srv, g_atlas[a].uav, nullptr, nullptr, g_atlasW[a],
-                               g_atlasH[a], reset[a], true);
+        ok = g_bridge->Evaluate(c, kAtlasSlot + a, reset[a]);
     }
     for (auto& g : g_guided) g = 0;  // the next run needs the next frame's guides
     for (int i = 0; i < n && ok; ++i) {
         const Region& r = g_region[i];
-        const FinalImage& at = g_atlas[r.atlas];
-        if (!r.edit) {
-            const D3D11_BOX b{r.x, r.y, 0, r.x + r.w, r.y + r.h, 1};
-            c->CopySubresourceRegion(g_final[i].tex, 0, 0, 0, 0, at.tex, 0, &b);
-        } else {
-            ok = g_bridge->UpsampleEdit(c, g_orig[i].srv, g_small[i].srv, at.srv, r.x, r.y, r.aw, r.ah, r.step,
-                                        g_final[i].uav, r.w, r.h, r.cx, r.cy, r.fade);
-        }
+        ok = g_bridge->UnpackRegion(c, kAtlasSlot + r.atlas, view[i], g_final[i].uav, r.x, r.y, r.aw, r.ah, r.step,
+                                    r.w, r.h, r.cx, r.cy, r.fade);
     }
+    om.Restore(c);
     st.Restore(c);
     if (!ok) {
         if (g_bridge->failed()) {
             TurnOff("bridge: " + g_bridge->why());
         } else if (!g_atlasSkipLogged) {
             g_atlasSkipLogged = true;
-            Log("NR: atlas skipped (no motion vectors and depth of the atlas size; logged once); the images stay");
+            Log("NR: atlas skipped (no view of an image, or no motion vectors and depth of the atlas size; logged "
+                "once); the images stay");
         }
         return false;
     }
@@ -727,9 +764,10 @@ bool RunAtlas(ID3D11DeviceContext* c, ID3D11Texture2D* const img[kImages]) {
     if (!g_atlasLogged) {
         g_atlasLogged = true;
         Log("NR: first atlas run (%ux%u%s fmt %d, %d images, outer at 1/%u, its centre %u%%) through %s in %d "
-            "evaluation(s); the composition reads the copies",
+            "evaluation(s), the images read in place%s; the composition reads the copies",
             g_atlasW[0], g_atlasH[0], g_atlasCount > 1 ? " and the outer atlas" : "", (int)d[0].Format, n,
-            g_region[2].step, g_layoutArea, g_bridge->modelPath(), g_atlasCount);
+            g_region[2].step, g_layoutArea, g_bridge->modelPath(), g_atlasCount,
+            (d[0].BindFlags & D3D11_BIND_SHADER_RESOURCE) ? "" : " (through a copy: no SRV binding)");
     }
     return true;
 }

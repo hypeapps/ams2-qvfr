@@ -18,7 +18,7 @@ namespace {
 
 constexpr UINT kW = 2117, kH = 1775;  // the focus size in the user's quad views
 constexpr int kRounds = 100;          // per slot
-constexpr int kAtlasRounds = 20;      // slot 4: two regions' guides, then one evaluation
+constexpr int kAtlasRounds = 20;      // slot 4: two images into their regions, one evaluation, both back out
 
 // Random R11G11B10_FLOAT: each channel's exponent below 31 (31 is Inf/NaN), mantissa anything.
 uint32_t RandomPacked(std::mt19937& rng) {
@@ -189,22 +189,6 @@ int RunNrBridge() {
                 printf("NR bridge: guidesReady without guides of the size did not refuse\n");
                 ++fails;
             }
-            // The atlas (slot 4): the guides of two images go into the halves of slot 0's image, then the whole image
-            // goes through once (it must stay bit for bit too). A region outside the atlas is refused.
-            for (int r = 0; r < kAtlasRounds; ++r) {
-                bridge.Configure(fin);
-                const UINT half = kW / 2;
-                if (!bridge.Guides(ctx, 4, nullptr, nullptr, half, kH, 0, 0, kW, kH) ||
-                    !bridge.Guides(ctx, 4, nullptr, nullptr, kW - half, kH, half, 0, kW, kH) ||
-                    !bridge.Process(ctx, 4, fs[0], fu[0], nullptr, nullptr, kW, kH, r == 0, true)) {
-                    printf("NR bridge: atlas failed in round %d: %s\n", r, bridge.why().c_str());
-                    return 1;
-                }
-            }
-            if (bridge.Guides(ctx, 4, nullptr, nullptr, kW, kH, 1, 0, kW, kH) || bridge.failed()) {
-                printf("NR bridge: a region outside the atlas was not refused\n");
-                ++fails;
-            }
             D3D11_TEXTURE2D_DESC fsd = fd;
             fsd.Usage = D3D11_USAGE_STAGING;
             fsd.BindFlags = 0;
@@ -229,7 +213,7 @@ int RunNrBridge() {
                 st->Release();
                 printf("NR bridge: slot %d (final image RGBA8%s, guides first) after %d round trips: %zu of %u pixels "
                        "differ\n",
-                       2 + i, i ? ", strength 3" : ", then the atlas of two regions in slot 4", kRounds, diff, kW * kH);
+                       2 + i, i ? ", strength 3" : "", kRounds, diff, kW * kH);
                 if (diff) ++fails;
             }
             for (int i = 0; i < 2; ++i) {
@@ -238,13 +222,9 @@ int RunNrBridge() {
                 ft[i]->Release();
             }
         }
-        // An image at half resolution in the atlas: Downsample averages 2x2 pixels into its region (odd sizes clamp at
-        // the edge); UpsampleEdit with the region unchanged since (no edit) must give the image back bit for bit.
+        // The atlas path (slots 4 and 5): images straight into their regions of the slot's input (PackRegion), the
+        // slot through once (Evaluate), each image straight back out into its own texture (UnpackRegion).
         {
-            constexpr UINT kStep = 2, kX = 24, kY = 8;
-            const UINT sw = (kW + kStep - 1) / kStep, sh = (kH + kStep - 1) / kStep;
-            std::vector<uint32_t> img((size_t)kW * kH);
-            for (uint32_t& p : img) p = rng();
             D3D11_TEXTURE2D_DESC td{};
             td.MipLevels = 1;
             td.ArraySize = 1;
@@ -259,32 +239,24 @@ int RunNrBridge() {
             D3D11_UNORDERED_ACCESS_VIEW_DESC uv{};
             uv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
             uv.ViewDimension = D3D11_UAV_DIMENSION_TEXTURE2D;
-            // 0 the image, 1 the atlas, 2 the region as it went in, 3 the result
-            const UINT ws[4] = {kW, sw + kX + 8, sw, kW}, hs[4] = {kH, sh + kY + 8, sh, kH};
-            ID3D11Texture2D* tx[4] = {};
-            ID3D11ShaderResourceView* sr[4] = {};
-            ID3D11UnorderedAccessView* ua[4] = {};
-            for (int i = 0; i < 4; ++i) {
-                td.Width = ws[i];
-                td.Height = hs[i];
-                D3D11_SUBRESOURCE_DATA init{img.data(), kW * 4, 0};
-                if (FAILED(dev->CreateTexture2D(&td, i == 0 ? &init : nullptr, &tx[i])) ||
-                    FAILED(dev->CreateShaderResourceView(tx[i], &sv, &sr[i])) ||
-                    FAILED(dev->CreateUnorderedAccessView(tx[i], &uv, &ua[i]))) {
-                    printf("NR bridge: downsample test textures failed\n");
-                    return 1;
-                }
-            }
-            const D3D11_BOX box{kX, kY, 0, kX + sw, kY + sh, 1};
-            if (!bridge.Downsample(ctx, sr[0], ua[1], kX, kY, sw, sh, kStep)) {
-                printf("NR bridge: Downsample failed\n");
-                return 1;
-            }
-            ctx->CopySubresourceRegion(tx[2], 0, 0, 0, 0, tx[1], 0, &box);
-            if (!bridge.UpsampleEdit(ctx, sr[0], sr[2], sr[1], kX, kY, sw, sh, kStep, ua[3], kW, kH)) {
-                printf("NR bridge: UpsampleEdit failed\n");
-                return 1;
-            }
+            struct Img {
+                ID3D11Texture2D* tex = nullptr;
+                ID3D11ShaderResourceView* srv = nullptr;
+                ID3D11UnorderedAccessView* uav = nullptr;
+            };
+            std::vector<Img> made;
+            auto make = [&](UINT w, UINT h, const std::vector<uint32_t>* px) {
+                Img m;
+                td.Width = w;
+                td.Height = h;
+                D3D11_SUBRESOURCE_DATA init{px ? px->data() : nullptr, w * 4, 0};
+                if (FAILED(dev->CreateTexture2D(&td, px ? &init : nullptr, &m.tex)) ||
+                    FAILED(dev->CreateShaderResourceView(m.tex, &sv, &m.srv)) ||
+                    FAILED(dev->CreateUnorderedAccessView(m.tex, &uv, &m.uav)))
+                    m = {};
+                made.push_back(m);
+                return m;
+            };
             auto read = [&](ID3D11Texture2D* tex, UINT w, UINT h, std::vector<uint32_t>& out) {
                 D3D11_TEXTURE2D_DESC sd = td;
                 sd.Width = w;
@@ -304,50 +276,122 @@ int RunNrBridge() {
                 st->Release();
                 return true;
             };
-            std::vector<uint32_t> regionPx, result;
-            if (!read(tx[2], sw, sh, regionPx) || !read(tx[3], kW, kH, result)) return 1;
+            qvfr::nrbridge::Settings fin;
+            fin.testShaders = true;
+            fin.transfer = 0;  // as [nr] mode=final
+            bridge.Configure(fin);
+
+            // Two full-size images side by side in slot 4 (16 px apart): both back bit for bit, alpha included.
+            constexpr UINT kGap = 16;
+            const UINT aw = 2 * kW + kGap;
+            std::vector<uint32_t> pa((size_t)kW * kH), pb((size_t)kW * kH), got;
+            for (uint32_t& p : pa) p = rng();
+            for (uint32_t& p : pb) p = rng();
+            const Img ia = make(kW, kH, &pa), ib = make(kW, kH, &pb), oa = make(kW, kH, nullptr),
+                      ob = make(kW, kH, nullptr);
+            if (!ia.uav || !ib.uav || !oa.uav || !ob.uav) {
+                printf("NR bridge: atlas test textures failed\n");
+                return 1;
+            }
+            for (int r = 0; r < kAtlasRounds; ++r) {
+                if (!bridge.Guides(ctx, 4, nullptr, nullptr, kW, kH, 0, 0, aw, kH) ||
+                    !bridge.Guides(ctx, 4, nullptr, nullptr, kW, kH, kW + kGap, 0, aw, kH) ||
+                    !bridge.PackRegion(ctx, 4, ia.srv, 0, 0, kW, kH) ||
+                    !bridge.PackRegion(ctx, 4, ib.srv, kW + kGap, 0, kW, kH) || !bridge.Evaluate(ctx, 4, r == 0) ||
+                    !bridge.UnpackRegion(ctx, 4, ia.srv, oa.uav, 0, 0, kW, kH, 1, kW, kH) ||
+                    !bridge.UnpackRegion(ctx, 4, ib.srv, ob.uav, kW + kGap, 0, kW, kH, 1, kW, kH)) {
+                    printf("NR bridge: atlas failed in round %d: %s\n", r, bridge.why().c_str());
+                    return 1;
+                }
+            }
+            size_t diffA = 0, diffB = 0;
+            if (!read(oa.tex, kW, kH, got)) return 1;
+            for (size_t i = 0; i < got.size(); ++i) diffA += got[i] != pa[i];
+            if (!read(ob.tex, kW, kH, got)) return 1;
+            for (size_t i = 0; i < got.size(); ++i) diffB += got[i] != pb[i];
+            printf("NR bridge: atlas of two images in slot 4 after %d round trips: %zu and %zu of %u pixels differ\n",
+                   kAtlasRounds, diffA, diffB, kW * kH);
+            if (diffA || diffB) ++fails;
+            // Refused, not failures: a region outside the atlas (guides and color).
+            if (bridge.Guides(ctx, 4, nullptr, nullptr, kW, kH, 1, 0, kW, kH) ||
+                bridge.PackRegion(ctx, 4, ia.srv, kW + kGap + 1, 0, kW, kH) || bridge.failed()) {
+                printf("NR bridge: a region outside the atlas was not refused\n");
+                ++fails;
+            }
+
+            // An image at half resolution in slot 5: its region holds the 2x2 averages (odd sizes clamp at the edge;
+            // read back through a step-1 unpack of the region alone); unpacked at its step without an edit it comes
+            // back bit for bit.
+            constexpr UINT kStep = 2, kX = 24, kY = 8;
+            const UINT sw = (kW + kStep - 1) / kStep, sh = (kH + kStep - 1) / kStep;
+            const UINT sAw = sw + kX + 8, sAh = sh + kY + 8;
+            std::vector<uint32_t> img((size_t)kW * kH), regionPx;
+            for (uint32_t& p : img) p = rng();
+            const Img src = make(kW, kH, &img), part = make(sw, sh, nullptr), res = make(kW, kH, nullptr);
+            if (!src.uav || !part.uav || !res.uav) {
+                printf("NR bridge: half-resolution test textures failed\n");
+                return 1;
+            }
+            if (!bridge.Guides(ctx, 5, nullptr, nullptr, sw, sh, kX, kY, sAw, sAh, kStep) ||
+                !bridge.PackRegion(ctx, 5, src.srv, kX, kY, sw, sh, kStep) || !bridge.Evaluate(ctx, 5, true) ||
+                !bridge.UnpackRegion(ctx, 5, src.srv, part.uav, kX, kY, sw, sh, 1, sw, sh) ||
+                !bridge.UnpackRegion(ctx, 5, src.srv, res.uav, kX, kY, sw, sh, kStep, kW, kH)) {
+                printf("NR bridge: half-resolution region failed: %s\n", bridge.why().c_str());
+                return 1;
+            }
+            if (!read(part.tex, sw, sh, regionPx) || !read(res.tex, kW, kH, got)) return 1;
             size_t badAvg = 0, diff = 0;
             for (UINT y = 0; y < sh; ++y)
                 for (UINT x = 0; x < sw; ++x)
-                    for (int ch = 0; ch < 4; ++ch) {
+                    for (int ch = 0; ch < 3; ++ch) {  // the region's alpha is not the image's
                         int sum = 0;
                         for (UINT j = 0; j < kStep; ++j)
                             for (UINT i = 0; i < kStep; ++i) {
-                                const UINT px = (std::min)(x * kStep + i, kW - 1), py = (std::min)(y * kStep + j, kH - 1);
+                                const UINT px = (std::min)(x * kStep + i, kW - 1);
+                                const UINT py = (std::min)(y * kStep + j, kH - 1);
                                 sum += (int)((img[(size_t)py * kW + px] >> (8 * ch)) & 0xFF);
                             }
                         const int want = sum / (int)(kStep * kStep);
-                        const int got = (int)((regionPx[(size_t)y * sw + x] >> (8 * ch)) & 0xFF);
-                        if (got < want - 1 || got > want + 1) ++badAvg;
+                        const int v = (int)((regionPx[(size_t)y * sw + x] >> (8 * ch)) & 0xFF);
+                        if (v < want - 1 || v > want + 1) ++badAvg;
                     }
-            for (size_t i = 0; i < result.size(); ++i)
-                if (result[i] != img[i]) ++diff;
+            for (size_t i = 0; i < got.size(); ++i) diff += got[i] != img[i];
             printf("NR bridge: half-resolution region %ux%u of %ux%u: %zu channels off the 2x2 average, the image back "
                    "without an edit: %zu of %u pixels differ\n",
                    sw, sh, kW, kH, badAvg, diff, kW * kH);
             if (badAvg || diff) ++fails;
-            // A uniform edit of +10/255 (the region before: black, after: 10/255) lifts every channel by 10.
-            const float zero[4] = {0, 0, 0, 0}, lift[4] = {10 / 255.0f, 10 / 255.0f, 10 / 255.0f, 10 / 255.0f};
-            ctx->ClearUnorderedAccessViewFloat(ua[2], zero);
-            ctx->ClearUnorderedAccessViewFloat(ua[1], lift);
-            if (!bridge.UpsampleEdit(ctx, sr[0], sr[2], sr[1], kX, kY, sw, sh, kStep, ua[3], kW, kH) ||
-                !read(tx[3], kW, kH, result))
+
+            // A uniform edit: with debug=1 the model's output reads as 0.5 (no change: mid grey), so an image of 60/255
+            // gets the edit 0.5 - 60/255 and comes back at 127 or 128 (alpha stays). Then only on a centre part (half
+            // of each axis from (kW/4, kH/4), fading out over kFade pixels): outside the part the image stays bit for
+            // bit, past the band the edit is whole, in the band in between.
+            qvfr::nrbridge::Settings dbg = fin;
+            dbg.debug = 1;
+            bridge.Configure(dbg);
+            std::vector<uint32_t> flat((size_t)kW * kH);
+            for (uint32_t& p : flat) p = (rng() & 0xFF000000u) | 0x003C3C3Cu;
+            const Img flatImg = make(kW, kH, &flat);
+            if (!flatImg.uav) return 1;
+            auto lifted = [](int v) { return v == 127 || v == 128; };
+            if (!bridge.PackRegion(ctx, 5, flatImg.srv, kX, kY, sw, sh, kStep) || !bridge.Evaluate(ctx, 5, false) ||
+                !bridge.UnpackRegion(ctx, 5, flatImg.srv, res.uav, kX, kY, sw, sh, kStep, kW, kH) ||
+                !read(res.tex, kW, kH, got))
                 return 1;
             size_t badLift = 0;
-            for (size_t i = 0; i < result.size(); ++i)
-                for (int ch = 0; ch < 3; ++ch) {  // alpha stays
-                    const int o = (int)((img[i] >> (8 * ch)) & 0xFF), got = (int)((result[i] >> (8 * ch)) & 0xFF);
-                    if (got != (std::min)(o + 10, 255)) ++badLift;
-                }
-            printf("NR bridge: a uniform edit of +10/255 enlarged onto the image: %zu channels off\n", badLift);
+            for (size_t i = 0; i < got.size(); ++i) {
+                for (int ch = 0; ch < 3; ++ch) badLift += !lifted((int)((got[i] >> (8 * ch)) & 0xFF));
+                badLift += (got[i] >> 24) != (flat[i] >> 24);
+            }
+            printf("NR bridge: a uniform edit enlarged onto the image: %zu channels off\n", badLift);
             if (badLift) ++fails;
-            // The same edit on a centre part (half of each axis from (kW/4, kH/4), fading out over kFade pixels):
-            // outside the part the image stays bit for bit, past the band the edit is whole, in the band in between.
             constexpr UINT kFade = 32;
             const UINT px0 = kW / 4, py0 = kH / 4, pw = kW / 2, ph = kH / 2;
-            if (!bridge.UpsampleEdit(ctx, sr[0], sr[2], sr[1], kX, kY, pw / kStep, ph / kStep, kStep, ua[3], kW, kH,
-                                     px0, py0, kFade) ||
-                !read(tx[3], kW, kH, result))
+            const UINT rw = (pw + kStep - 1) / kStep, rh = (ph + kStep - 1) / kStep;
+            if (!bridge.Guides(ctx, 5, nullptr, nullptr, rw, rh, kX, kY, sAw, sAh, kStep, px0, py0) ||
+                !bridge.PackRegion(ctx, 5, flatImg.srv, kX, kY, rw, rh, kStep, px0, py0) ||
+                !bridge.Evaluate(ctx, 5, false) ||
+                !bridge.UnpackRegion(ctx, 5, flatImg.srv, res.uav, kX, kY, rw, rh, kStep, kW, kH, px0, py0, kFade) ||
+                !read(res.tex, kW, kH, got))
                 return 1;
             size_t outsideOff = 0, insideOff = 0, bandOff = 0;
             for (UINT y = 0; y < kH; ++y)
@@ -355,24 +399,26 @@ int RunNrBridge() {
                     const size_t i = (size_t)y * kW + x;
                     const int lx = (int)x - (int)px0, ly = (int)y - (int)py0;
                     const int inside = (std::min)((std::min)(lx, (int)pw - 1 - lx), (std::min)(ly, (int)ph - 1 - ly));
+                    if (inside < 0) {
+                        outsideOff += got[i] != flat[i];
+                        continue;
+                    }
                     for (int ch = 0; ch < 3; ++ch) {
-                        const int o = (int)((img[i] >> (8 * ch)) & 0xFF), got = (int)((result[i] >> (8 * ch)) & 0xFF);
-                        if (inside < 0) {
-                            outsideOff += got != o;
-                        } else if (inside >= (int)kFade) {
-                            insideOff += got != (std::min)(o + 10, 255);
-                        } else {
-                            bandOff += got < o || got > (std::min)(o + 10, 255);
-                        }
+                        const int v = (int)((got[i] >> (8 * ch)) & 0xFF);
+                        if (inside >= (int)kFade)
+                            insideOff += !lifted(v);
+                        else
+                            bandOff += v < 60 || v > 128;
                     }
                 }
-            printf("NR bridge: the edit on a centre part: outside %zu, inside %zu, in the fade band %zu channels off\n",
+            printf("NR bridge: the edit on a centre part: outside %zu pixels, inside %zu, in the fade band %zu "
+                   "channels off\n",
                    outsideOff, insideOff, bandOff);
             if (outsideOff || insideOff || bandOff) ++fails;
-            for (int i = 0; i < 4; ++i) {
-                ua[i]->Release();
-                sr[i]->Release();
-                tx[i]->Release();
+            for (Img& m : made) {
+                if (m.uav) m.uav->Release();
+                if (m.srv) m.srv->Release();
+                if (m.tex) m.tex->Release();
             }
         }
 
@@ -380,7 +426,7 @@ int RunNrBridge() {
         printf("NR bridge: %llu calls, CPU %.3f ms per call (with the Flush), D3D12 GPU %.3f ms per call (%llu samples)\n",
                (unsigned long long)s.calls, s.calls ? s.cpuMs / (double)s.calls : 0.0,
                s.gpuSamples ? s.gpuMs / (double)s.gpuSamples : 0.0, (unsigned long long)s.gpuSamples);
-        if (s.calls != 4u * kRounds + kAtlasRounds) ++fails;
+        if (s.calls != 4u * kRounds + kAtlasRounds + 3u) ++fails;
     }  // the bridge is released here, while the device lives
 
     if (info) {

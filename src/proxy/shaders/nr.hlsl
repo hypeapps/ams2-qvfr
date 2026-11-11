@@ -14,14 +14,15 @@ cbuffer Params : register(b0) {
     float depthK;      // near / far of the reversed depth (2)
     uint debug;        // CSUnpack: 1 the model's edit instead of the image (needs t1)
     float pad;         // CSUnpack: strength, the model's edit x this (1 = as the model made it)
-    // CSMotion, CSDepth: the region of the output they write (the whole output, or one image in the atlas of all images
-    // that go through the model in one evaluation).
+    // CSMotion, CSDepth, the region shaders: the region of the slot they use (the whole slot, or one image in the
+    // atlas of all images that go through the model in one evaluation).
     uint offsetX;
     uint offsetY;
     uint regionW;
     uint regionH;
-    // CSMotion, CSDepth, CSDown, CSUpEdit: source pixels per region pixel in each axis (an image at a lower resolution
-    // in the atlas: 2 = half) and where the region starts in the source (only a centre part of it in the atlas)
+    // CSMotion, CSDepth, CSPackRegion, CSUpEdit: source pixels per region pixel in each axis (an image at a lower
+    // resolution in the atlas: 2 = half) and where the region starts in the source (only a centre part of it in the
+    // atlas)
     uint srcStep;
     uint srcX;
     uint srcY;
@@ -59,10 +60,12 @@ float3 FromModel(float3 v) {
     return v;
 }
 
-float3 Unpacked(uint2 id) {
-    float3 c = max(src.Load(int3(id, 0)).rgb, 0.0);
-    const float3 i0 = max(modelIn.Load(int3(id, 0)).rgb, 0.0);  // read only where bound (debug, strength, ratio)
+// The model's output at `m` of `outT` (its input at the same place in t1); `o`: the pixel's place in `original` (t2).
+float3 Unpacked(Texture2D<float4> outT, uint2 m, uint2 o) {
+    float3 c = max(outT.Load(int3(m, 0)).rgb, 0.0);
     const float strength = pad;
+    float3 i0 = 0;
+    [branch] if (debug == 1 || strength != 1.0 || transfer == 1) i0 = max(modelIn.Load(int3(m, 0)).rgb, 0.0);
     float3 result;
     if (debug == 1) {
         // The edit as a grey-centred picture in the model's units, made into the image's units (so the game's tonemapper
@@ -75,14 +78,14 @@ float3 Unpacked(uint2 id) {
         }
         if (transfer == 1) {
             if (all(c == i0)) {
-                result = original.Load(int3(id, 0)).rgb;  // untouched by the model: DLAA's pixel bit for bit
+                result = original.Load(int3(o, 0)).rgb;  // untouched by the model: DLAA's pixel bit for bit
             } else {
                 float3 cl = c, il = i0;
                 if (tonemap >= 2) {
                     cl = pow(cl, 2.2);
                     il = pow(il, 2.2);
                 }
-                result = original.Load(int3(id, 0)).rgb * clamp((cl + 1e-4) / (il + 1e-4), 0.125, 8.0);
+                result = original.Load(int3(o, 0)).rgb * clamp((cl + 1e-4) / (il + 1e-4), 0.125, 8.0);
             }
         } else {
             result = FromModel(c);
@@ -98,7 +101,7 @@ void CSUnpack(uint3 id : SV_DispatchThreadID) {
     uint w, h;
     color.GetDimensions(w, h);
     if (id.x >= w || id.y >= h) return;
-    color[id.xy] = Unpacked(id.xy);
+    color[id.xy] = Unpacked(src, id.xy, id.xy);
 }
 
 // The same into an image with alpha (the final focus image, R8G8B8A8): its alpha comes from the copy of the image (t2).
@@ -109,7 +112,7 @@ void CSUnpack4(uint3 id : SV_DispatchThreadID) {
     uint w, h;
     color4.GetDimensions(w, h);
     if (id.x >= w || id.y >= h) return;
-    color4[id.xy] = float4(Unpacked(id.xy), original.Load(int3(id.xy, 0)).a);
+    color4[id.xy] = float4(Unpacked(src, id.xy, id.xy), original.Load(int3(id.xy, 0)).a);
 }
 
 // The game's TAA depth is linear, 0 at the camera to 1 at the far plane (the sky is >= 0.99999, docs/ams2-renderer.md).
@@ -142,28 +145,47 @@ void CSMotion(uint3 id : SV_DispatchThreadID) {
     motion[id.xy + uint2(offsetX, offsetY)] = m;
 }
 
-// An image at a lower resolution or only its centre part in the atlas (the outer images: the periphery needs the
-// model's tone and color, not its finest detail, and its far edge none of it). CSDown: the image (t0, display-encoded)
-// from (srcX, srcY) averaged over srcStep x srcStep pixels into its region of the atlas (u0 at offsetX/offsetY,
-// regionW x regionH).
+// The atlas of final images (display-encoded, UNORM views): each image goes straight into its region of the model's
+// input and comes straight back out of the model's output, without a copy of the atlas. An outer image may go in at a
+// lower resolution or only its centre part (the periphery needs the model's tone and color, not its finest detail, and
+// its far edge none of it).
+// CSPackRegion: the image (t0) from (srcX, srcY), averaged over srcStep x srcStep pixels, into the regionW x regionH
+// region at (offsetX, offsetY) of the model's input (u0), through input_scale and tonemap like CSPack.
 [numthreads(8, 8, 1)]
-void CSDown(uint3 id : SV_DispatchThreadID) {
+void CSPackRegion(uint3 id : SV_DispatchThreadID) {
     if (id.x >= regionW || id.y >= regionH) return;
     uint w, h;
     src.GetDimensions(w, h);
     const uint2 base = uint2(srcX, srcY) + id.xy * srcStep;
-    float4 sum = 0;
+    float3 c = 0;
     for (uint y = 0; y < srcStep; ++y)
-        for (uint x = 0; x < srcStep; ++x) sum += src.Load(int3(min(base + uint2(x, y), uint2(w - 1, h - 1)), 0));
-    color4[id.xy + uint2(offsetX, offsetY)] = sum / (float)(srcStep * srcStep);
+        for (uint x = 0; x < srcStep; ++x) c += src.Load(int3(min(base + uint2(x, y), uint2(w - 1, h - 1)), 0)).rgb;
+    c /= (float)(srcStep * srcStep);
+    if (inputScale != 1.0) c *= inputScale;
+    if (tonemap) c /= 1.0 + max(c.r, max(c.g, c.b));
+    if (tonemap >= 2) c = pow(max(c, 0.0), 1.0 / 2.2);
+    shared4[id.xy + uint2(offsetX, offsetY)] = float4(c, 1.0);
 }
 
-// CSUpEdit: the full image (t0) plus the model's edit of its region, bilinearly enlarged: the region after the model
-// (t2, the atlas at offsetX/offsetY) minus before it (t1, regionW x regionH). With a centre part (fade > 0) the edit
-// fades out smoothly over `fade` source pixels inside the part's edge and is zero outside it. Without an edit the image
-// stays bit for bit; alpha stays.
+// The model's output (its region at offsetX/offsetY) for the region shaders.
+Texture2D<float4> modelOut : register(t3);
+
+// CSUnpackRegion (an image at full resolution, whole): the region of the model's output (t3) back into the image's
+// units, into the image's copy (u0, regionW x regionH) with the image's (t2) alpha.
+[numthreads(8, 8, 1)]
+void CSUnpackRegion(uint3 id : SV_DispatchThreadID) {
+    if (id.x >= regionW || id.y >= regionH) return;
+    color4[id.xy] = float4(Unpacked(modelOut, id.xy + uint2(offsetX, offsetY), id.xy), original.Load(int3(id.xy, 0)).a);
+}
+
+// CSUpEdit (an image at a lower resolution or only its centre part): the image (t0) plus the model's edit of its
+// region, bilinearly enlarged: the region of the model's output (t3) minus its input (t1), both back in the image's
+// units (transfer 0 only: there is no original pixel for a region pixel). With a centre part (fade > 0) the edit fades
+// out smoothly over `fade` source pixels inside the part's edge and is zero outside it. Without an edit the image stays
+// bit for bit; alpha stays.
 float3 RegionEdit(int2 p) {
-    return original.Load(int3(p + int2(offsetX, offsetY), 0)).rgb - modelIn.Load(int3(p, 0)).rgb;
+    const uint2 m = uint2(p) + uint2(offsetX, offsetY);
+    return Unpacked(modelOut, m, m) - FromModel(max(modelIn.Load(int3(m, 0)).rgb, 0.0));
 }
 
 [numthreads(8, 8, 1)]

@@ -25,11 +25,12 @@
 
 #include "common.h"
 #include "nr_depth_cs.h"   // kNrDepthCS (fxc from shaders/nr.hlsl)
-#include "nr_down_cs.h"    // kNrDownCS
 #include "nr_motion_cs.h"  // kNrMotionCS
 #include "nr_pack_cs.h"    // kNrPackCS
+#include "nr_pack_region_cs.h"  // kNrPackRegionCS
 #include "nr_unpack4_cs.h"  // kNrUnpack4CS
 #include "nr_unpack_cs.h"   // kNrUnpackCS
+#include "nr_unpack_region_cs.h"  // kNrUnpackRegionCS
 #include "nr_upedit_cs.h"   // kNrUpEditCS
 
 namespace qvfr::nrbridge {
@@ -241,7 +242,7 @@ struct Consts {
     float depthK;
     uint32_t debug;
     float pad;
-    uint32_t offsetX, offsetY, regionW, regionH;  // CSMotion, CSDepth, CSDown, CSUpEdit: the region they use
+    uint32_t offsetX, offsetY, regionW, regionH;  // CSMotion, CSDepth, the region shaders: the region
     uint32_t srcStep, srcX, srcY, fade;  // source pixels per region pixel, the part's origin, CSUpEdit's fade (px)
 };
 
@@ -316,8 +317,9 @@ struct Bridge::Impl {
     ID3D11ComputeShader* pack = nullptr;
     ID3D11ComputeShader* unpack = nullptr;
     ID3D11ComputeShader* unpack4 = nullptr;  // into an image with alpha
-    ID3D11ComputeShader* down = nullptr;     // an image into its atlas region at a lower resolution
-    ID3D11ComputeShader* upEdit = nullptr;   // the model's edit of such a region onto the full image
+    ID3D11ComputeShader* packRegion = nullptr;    // an image into its atlas region (also at a lower resolution)
+    ID3D11ComputeShader* unpackRegion = nullptr;  // a whole image at full resolution out of its region
+    ID3D11ComputeShader* upEdit = nullptr;        // the model's edit of a smaller region onto the full image
     ID3D11ComputeShader* motionCs = nullptr;
     ID3D11ComputeShader* depthCs = nullptr;
     ID3D11Buffer* cb = nullptr;
@@ -364,6 +366,7 @@ struct Bridge::Impl {
         bool fresh = true;
         int fails = 0;
         int diagLeft = -1;  // images until the model's input and output are measured once (-1: not planned)
+        bool inputClear = false;  // the model's input was cleared (an atlas: its gaps black) since it was made
     } slots[kSlots];
     // NGX
     bool ngxTried = false, ngxOk = false;
@@ -406,6 +409,7 @@ struct Bridge::Impl {
         Rel(s.depth12);
         s.w = s.h = 0;
         s.depthValue = -1;
+        s.inputClear = false;
     }
 };
 
@@ -514,7 +518,8 @@ bool Bridge::Init(ID3D11Device* dev) {
         FAILED(hr = dev->CreateComputeShader(kNrUnpack4CS, sizeof(kNrUnpack4CS), nullptr, &m.unpack4)) ||
         FAILED(hr = dev->CreateComputeShader(kNrMotionCS, sizeof(kNrMotionCS), nullptr, &m.motionCs)) ||
         FAILED(hr = dev->CreateComputeShader(kNrDepthCS, sizeof(kNrDepthCS), nullptr, &m.depthCs)) ||
-        FAILED(hr = dev->CreateComputeShader(kNrDownCS, sizeof(kNrDownCS), nullptr, &m.down)) ||
+        FAILED(hr = dev->CreateComputeShader(kNrPackRegionCS, sizeof(kNrPackRegionCS), nullptr, &m.packRegion)) ||
+        FAILED(hr = dev->CreateComputeShader(kNrUnpackRegionCS, sizeof(kNrUnpackRegionCS), nullptr, &m.unpackRegion)) ||
         FAILED(hr = dev->CreateComputeShader(kNrUpEditCS, sizeof(kNrUpEditCS), nullptr, &m.upEdit)))
         return Fail("CreateComputeShader", hr);
     D3D11_BUFFER_DESC bdesc{};
@@ -781,11 +786,21 @@ bool Bridge::Guides(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* 
     return true;
 }
 
-bool Bridge::Downsample(ID3D11DeviceContext* c, ID3D11ShaderResourceView* src, ID3D11UnorderedAccessView* dst, UINT x0,
-                        UINT y0, UINT w, UINT h, UINT step, UINT srcX, UINT srcY) {
-    if (!ready_ || failed_ || !c || !src || !dst || !w || !h || step < 1 || step > 4) return false;
+bool Bridge::PackRegion(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* src, UINT x0, UINT y0, UINT w,
+                        UINT h, UINT step, UINT srcX, UINT srcY) {
+    if (!ready_ || failed_ || !c || !src || slot < 0 || slot >= kSlots || !w || !h || step < 1 || step > 4)
+        return false;
     Impl& m = *impl_;
-    const Consts k{1.0f, 0u, 0.0f, 0u, 0u, 0.0f, 0u, 1.0f, x0, y0, w, h, step, srcX, srcY, 0u};
+    Impl::Slot& s = m.slots[slot];
+    if (!s.w || x0 + w > s.w || y0 + h > s.h || !EnsureContext(c)) return false;  // the slot's size: its Guides
+    if (!s.inputClear) {  // the gaps between the regions stay black
+        const float black[4] = {0, 0, 0, 1};
+        c->ClearUnorderedAccessViewFloat(s.colorUav, black);
+        s.inputClear = true;
+    }
+    const bool shaped = set_.model || set_.testShaders;
+    const Consts k{shaped ? set_.inputScale : 1.0f, shaped ? (uint32_t)set_.tonemap : 0u, 0.0f, 0u, 0u, 0.0f, 0u, 1.0f,
+                   x0, y0, w, h, step, srcX, srcY, 0u};
     if (memcmp(&k, &m.cbValue, sizeof(k)) != 0) {
         c->UpdateSubresource(m.cb, 0, nullptr, &k, 0, 0);
         m.cbValue = k;
@@ -793,9 +808,9 @@ bool Bridge::Downsample(ID3D11DeviceContext* c, ID3D11ShaderResourceView* src, I
     ID3D11ShaderResourceView* noSrv = nullptr;
     ID3D11UnorderedAccessView* noUav = nullptr;
     c->CSSetConstantBuffers(0, 1, &m.cb);
-    c->CSSetShader(m.down, nullptr, 0);
+    c->CSSetShader(m.packRegion, nullptr, 0);
     c->CSSetShaderResources(0, 1, &src);
-    c->CSSetUnorderedAccessViews(0, 1, &dst, nullptr);
+    c->CSSetUnorderedAccessViews(0, 1, &s.colorUav, nullptr);
     c->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
     c->CSSetShaderResources(0, 1, &noSrv);
     c->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
@@ -803,48 +818,75 @@ bool Bridge::Downsample(ID3D11DeviceContext* c, ID3D11ShaderResourceView* src, I
     return true;
 }
 
-bool Bridge::UpsampleEdit(ID3D11DeviceContext* c, ID3D11ShaderResourceView* full, ID3D11ShaderResourceView* before,
-                          ID3D11ShaderResourceView* after, UINT x0, UINT y0, UINT w, UINT h, UINT step,
-                          ID3D11UnorderedAccessView* out, UINT fullW, UINT fullH, UINT srcX, UINT srcY,
-                          UINT fade) {
-    if (!ready_ || failed_ || !c || !full || !before || !after || !out || !w || !h || step < 1 || step > 4) return false;
+void Bridge::ClearInput(int slot) {
+    if (impl_ && slot >= 0 && slot < kSlots) impl_->slots[slot].inputClear = false;
+}
+
+bool Bridge::Evaluate(ID3D11DeviceContext* c, int slot, bool reset) {
+    if (!ready_ || failed_ || !c || slot < 0 || slot >= kSlots) return false;
     Impl& m = *impl_;
-    const Consts k{1.0f, 0u, 0.0f, 0u, 0u, 0.0f, 0u, 1.0f, x0, y0, w, h, step, srcX, srcY, fade};
+    Impl::Slot& s = m.slots[slot];
+    if (!s.w || s.guideW != s.w || s.guideH != s.h || !s.inputClear) return false;  // no guides or no image yet
+    LARGE_INTEGER t0, t1, qpf;
+    QueryPerformanceCounter(&t0);
+    if (!EnsureContext(c)) return false;
+    if (set_.model && !EnsureNgx()) return false;
+    const bool gameDepth = set_.model && set_.depthMode > 0 && s.guideDepth;
+    bool modelRan = false;
+    if (!Record(slot, s.w, s.h, reset, gameDepth, modelRan) || !Submit(c, slot)) return false;
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&qpf);
+    stats_.cpuMs += (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)qpf.QuadPart;
+    ++stats_.calls;
+    if (modelRan) ++stats_.modelCalls;
+    // After each new instance and each [nr] change: what the model got and gave back (in its units).
+    if ((modelRan || set_.testShaders) && s.diagLeft > 0 && --s.diagLeft == 0)
+        LogEdit(c, slot, nullptr, s.w, s.h, set_.debug == 1, gameDepth);
+    return true;
+}
+
+bool Bridge::UnpackRegion(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* src,
+                          ID3D11UnorderedAccessView* out, UINT x0, UINT y0, UINT w, UINT h, UINT step, UINT fullW,
+                          UINT fullH, UINT srcX, UINT srcY, UINT fade) {
+    if (!ready_ || failed_ || !c || !src || !out || slot < 0 || slot >= kSlots || !w || !h || step < 1 || step > 4 ||
+        !fullW || !fullH)
+        return false;
+    Impl& m = *impl_;
+    Impl::Slot& s = m.slots[slot];
+    if (!s.w || x0 + w > s.w || y0 + h > s.h || !EnsureContext(c)) return false;
+    const bool whole = step == 1 && srcX == 0 && srcY == 0 && w == fullW && h == fullH;
+    const bool shaped = set_.model || set_.testShaders;
+    // transfer 1 only for a whole image: a pixel of a smaller region has no original pixel.
+    const Consts k{shaped ? set_.inputScale : 1.0f, shaped ? (uint32_t)set_.tonemap : 0u, 0.0f,
+                   (whole && shaped && set_.transfer == 1) ? 1u : 0u, 0u, 0.0f, (shaped && set_.debug == 1) ? 1u : 0u,
+                   shaped ? set_.strength : 1.0f, x0, y0, w, h, step, srcX, srcY, fade};
     if (memcmp(&k, &m.cbValue, sizeof(k)) != 0) {
         c->UpdateSubresource(m.cb, 0, nullptr, &k, 0, 0);
         m.cbValue = k;
     }
-    ID3D11ShaderResourceView* in[3] = {full, before, after};
-    ID3D11ShaderResourceView* noIn[3] = {};
+    // t0 the image (CSUpEdit), t1 the model's input, t2 the image (CSUnpackRegion: alpha, transfer 1), t3 its output
+    ID3D11ShaderResourceView* in[4] = {src, s.colorSrv, src, s.outSrv};
+    ID3D11ShaderResourceView* noIn[4] = {};
     ID3D11UnorderedAccessView* noUav = nullptr;
     c->CSSetConstantBuffers(0, 1, &m.cb);
-    c->CSSetShader(m.upEdit, nullptr, 0);
-    c->CSSetShaderResources(0, 3, in);
+    c->CSSetShader(whole ? m.unpackRegion : m.upEdit, nullptr, 0);
+    c->CSSetShaderResources(0, 4, in);
     c->CSSetUnorderedAccessViews(0, 1, &out, nullptr);
-    c->Dispatch((fullW + 7) / 8, (fullH + 7) / 8, 1);
-    c->CSSetShaderResources(0, 3, noIn);
+    if (whole)
+        c->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+    else
+        c->Dispatch((fullW + 7) / 8, (fullH + 7) / 8, 1);
+    c->CSSetShaderResources(0, 4, noIn);
     c->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
     c->CSSetShader(nullptr, nullptr, 0);
     return true;
 }
 
-bool Bridge::Process(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* srv, ID3D11UnorderedAccessView* uav,
-                     ID3D11ShaderResourceView* motion, ID3D11ShaderResourceView* depth, UINT w, UINT h, bool reset,
-                     bool guidesReady) {
-    if (!ready_ || failed_ || !c || !srv || !uav || slot < 0 || slot >= kSlots || !w || !h) return false;
+// The slot's D3D12 commands: the model (or a copy: passthrough) from its input to its output, between two timestamps.
+bool Bridge::Record(int slot, UINT w, UINT h, bool reset, bool gameDepth, bool& modelRan) {
     Impl& m = *impl_;
-    LARGE_INTEGER t0, t1, qpf;
-    QueryPerformanceCounter(&t0);
-    HRESULT hr = S_OK;
-
-    if (!EnsureContext(c)) return false;
-    if (set_.model && !EnsureNgx()) return false;
     Impl::Slot& s = m.slots[slot];
-    if (guidesReady && (s.guideW != w || s.guideH != h)) return false;  // no guides of this size: the image stays
-    if (!EnsureSlot(slot, w, h)) return false;
-    // The game's depth: from this call, or what the slot's Guides wrote.
-    const bool gameDepth = set_.model && set_.depthMode > 0 && (guidesReady ? s.guideDepth : depth != nullptr);
-
+    HRESULT hr = S_OK;
     // A free allocator: the submission that used it last has finished (its timestamps can be read then).
     const UINT r = m.ring % kRing;
     if (m.allocValue[r] && m.ba12->GetCompletedValue() < m.allocValue[r]) {
@@ -875,7 +917,7 @@ bool Bridge::Process(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView*
     if (FAILED(hr = a->Reset()) || FAILED(hr = cl->Reset(a, nullptr))) return Fail("command list Reset", hr);
     const bool ts = m.tsHeap != nullptr;
     if (ts) cl->EndQuery(m.tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, r * 2);
-    bool modelRan = false;
+    modelRan = false;
 #ifdef QVFR_HAVE_NGX_HEADERS
     if (set_.model) {
         auto* caps = (NVSDK_NGX_Parameter*)m.caps;
@@ -992,6 +1034,120 @@ bool Bridge::Process(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView*
         cl->ResolveQueryData(m.tsHeap, D3D12_QUERY_TYPE_TIMESTAMP, r * 2, 2, m.tsRead, r * 2 * sizeof(UINT64));
     }
     if (FAILED(hr = cl->Close())) return Fail("command list Close", hr);
+    return true;
+}
+
+// D3D11's work so far (the inputs) to D3D12, the recorded commands, then D3D11 waits on the GPU for the output.
+bool Bridge::Submit(ID3D11DeviceContext* c, int slot) {
+    Impl& m = *impl_;
+    HRESULT hr = S_OK;
+    const UINT r = m.ring % kRing;
+    const bool ts = m.tsHeap != nullptr;
+    ID3D12GraphicsCommandList* cl = m.list;
+    m.ctx4->Signal(m.ab11, ++m.vAB);
+    c->Flush();
+
+    // D3D12: wait for the inputs, run, signal the output.
+    m.queue->Wait(m.ab12, m.vAB);
+    ID3D12CommandList* lists[] = {cl};
+    m.queue->ExecuteCommandLists(1, lists);
+    m.queue->Signal(m.ba12, ++m.vBA);
+    m.allocValue[r] = m.vBA;
+    m.tsPending[r] = ts;
+    m.tsSlot[r] = slot;
+    ++m.ring;
+    if (FAILED(hr = m.dev12->GetDeviceRemovedReason())) {
+        // No D3D11 wait on a signal that may never come; the image keeps its D3D11 content.
+        c->CSSetShader(nullptr, nullptr, 0);
+        return Fail("D3D12 device removed", hr);
+    }
+
+    // D3D11: wait on the GPU for the output.
+    m.ctx4->Wait(m.ba11, m.vBA);
+    return true;
+}
+
+// The model's input and output of a slot (in its units, after input_scale and tonemap), and with `srv` (the image the
+// slot's output went back into) what reached the HDR image.
+void Bridge::LogEdit(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* srv, UINT w, UINT h, bool debugView,
+                     bool gameDepth) {
+    Impl& m = *impl_;
+    Impl::Slot& s = m.slots[slot];
+    ID3D11Resource* img = nullptr;
+    if (srv) srv->GetResource(&img);
+    ID3D11Texture2D* imgTex = nullptr;
+    if (img) img->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&imgTex);
+    Rel(img);
+    auto staging = [&](ID3D11Texture2D* from) {
+        ID3D11Texture2D* t = nullptr;
+        if (!from) return t;
+        D3D11_TEXTURE2D_DESC d{};
+        from->GetDesc(&d);
+        d.MipLevels = 1;
+        d.ArraySize = 1;
+        d.Usage = D3D11_USAGE_STAGING;
+        d.BindFlags = 0;
+        d.MiscFlags = 0;
+        d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(m.dev11->CreateTexture2D(&d, nullptr, &t))) return (ID3D11Texture2D*)nullptr;
+        c->CopySubresourceRegion(t, 0, 0, 0, 0, from, 0, nullptr);
+        return t;
+    };
+    // With debug=1 the image holds the edit picture, not the result: no HDR measurement.
+    const bool hdr = !debugView && srv;
+    ID3D11Texture2D *in = staging(s.color11), *out = staging(s.out11), *before = hdr ? staging(s.orig11) : nullptr,
+                    *after = hdr ? staging(imgTex) : nullptr;
+    if (in && out) {
+        const Mean mi = Measure(c, in, w, h), mo = Measure(c, out, w, h);
+        Log("NR bridge: slot %d after %d model images (intensity %.2f, style %u, preset %u, auto_mask %d, "
+            "ui_correction %d, depth %d, tonemap %d, input_scale %g, transfer %s): model "
+            "input mean RGB (%.4f, %.4f, %.4f) luminance %.4f [darkest %.4f, brightest %.4f], output (%.4f, %.4f, "
+            "%.4f) luminance %.4f [%.4f, %.4f], output / input %.3f",
+            slot, kDiagAfter, set_.intensity, set_.style, set_.preset, set_.autoMask, set_.uiCorrection,
+            gameDepth ? set_.depthMode : 0, set_.tonemap, set_.inputScale, set_.transfer ? "ratio" : "inverse",
+            mi.rgb[0], mi.rgb[1], mi.rgb[2], mi.lum, mi.lo, mi.hi, mo.rgb[0], mo.rgb[1], mo.rgb[2], mo.lum, mo.lo,
+            mo.hi, mi.lum > 0 ? mo.lum / mi.lum : 0.0);
+        const Edit e = MeasureEdit(c, in, out, before, after, w, h);
+        if (e.n > 0) {
+            Log("NR bridge: slot %d: model edit in its units: mean |change| luminance %.4f (signed %+.4f), RGB "
+                "(%.4f, %.4f, %.4f), 99th percentile %.4f, max %.4f; pixels changed > 1/255: %.1f%%, > 8/255: %.1f%%",
+                slot, e.absLum, e.signedLum, e.absRgb[0], e.absRgb[1], e.absRgb[2], e.p99Lum, e.maxLum,
+                e.over1 * 100.0, e.over8 * 100.0);
+            if (e.hdrN > 0)
+                Log("NR bridge: slot %d: in the HDR image: mean luminance %.4g -> %.4g (x%.3f), mean |change| %.2f%% "
+                    "of the mean, per pixel 50th / 99th percentile %.2f%% / %.2f%%, pixels changed > 2%%: %.1f%%, "
+                    "> 10%%: %.1f%%",
+                    slot, e.hdrBefore, e.hdrAfter, e.hdrBefore > 0 ? e.hdrAfter / e.hdrBefore : 0.0,
+                    e.hdrBefore > 0 ? e.hdrAbs / e.hdrBefore * 100.0 : 0.0, e.hdrP50 * 100.0, e.hdrP99 * 100.0,
+                    e.hdrOver2 * 100.0, e.hdrOver10 * 100.0);
+        }
+    }
+    Rel(in);
+    Rel(out);
+    Rel(before);
+    Rel(after);
+    Rel(imgTex);
+}
+
+bool Bridge::Process(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* srv, ID3D11UnorderedAccessView* uav,
+                     ID3D11ShaderResourceView* motion, ID3D11ShaderResourceView* depth, UINT w, UINT h, bool reset,
+                     bool guidesReady) {
+    if (!ready_ || failed_ || !c || !srv || !uav || slot < 0 || slot >= kSlots || !w || !h) return false;
+    Impl& m = *impl_;
+    LARGE_INTEGER t0, t1, qpf;
+    QueryPerformanceCounter(&t0);
+    HRESULT hr = S_OK;
+
+    if (!EnsureContext(c)) return false;
+    if (set_.model && !EnsureNgx()) return false;
+    Impl::Slot& s = m.slots[slot];
+    if (guidesReady && (s.guideW != w || s.guideH != h)) return false;  // no guides of this size: the image stays
+    if (!EnsureSlot(slot, w, h)) return false;
+    // The game's depth: from this call, or what the slot's Guides wrote.
+    const bool gameDepth = set_.model && set_.depthMode > 0 && (guidesReady ? s.guideDepth : depth != nullptr);
+
+    bool modelRan = false;
+    if (!Record(slot, w, h, reset, gameDepth, modelRan)) return false;
 
     // D3D11: color and motion into the shared inputs, then hand them over.
     const bool shaped = set_.model || set_.testShaders;  // the image goes to the model in its shape
@@ -1086,26 +1242,7 @@ bool Bridge::Process(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView*
     }
     c->CSSetShaderResources(0, 1, &noSrv);
     c->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
-    m.ctx4->Signal(m.ab11, ++m.vAB);
-    c->Flush();
-
-    // D3D12: wait for the inputs, run, signal the output.
-    m.queue->Wait(m.ab12, m.vAB);
-    ID3D12CommandList* lists[] = {cl};
-    m.queue->ExecuteCommandLists(1, lists);
-    m.queue->Signal(m.ba12, ++m.vBA);
-    m.allocValue[r] = m.vBA;
-    m.tsPending[r] = ts;
-    m.tsSlot[r] = slot;
-    ++m.ring;
-    if (FAILED(hr = m.dev12->GetDeviceRemovedReason())) {
-        // No D3D11 wait on a signal that may never come; the image keeps its D3D11 content.
-        c->CSSetShader(nullptr, nullptr, 0);
-        return Fail("D3D12 device removed", hr);
-    }
-
-    // D3D11: wait on the GPU for the output and write it back into the image.
-    m.ctx4->Wait(m.ba11, m.vBA);
+    if (!Submit(c, slot)) return false;
     ID3D11ShaderResourceView* back[3] = {s.outSrv, s.colorSrv, s.origSrv};
     ID3D11ShaderResourceView* noBack[3] = {};
     c->CSSetShader(four ? m.unpack4 : m.unpack, nullptr, 0);
@@ -1124,61 +1261,7 @@ bool Bridge::Process(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView*
 
     // After each new instance and each [nr] change: what the model got and gave back (in its units, after input_scale
     // and tonemap) and what reached the HDR image.
-    if (measured && s.diagLeft > 0 && --s.diagLeft == 0) {
-        ID3D11Resource* img = nullptr;
-        srv->GetResource(&img);
-        ID3D11Texture2D* imgTex = nullptr;
-        if (img) img->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&imgTex);
-        Rel(img);
-        auto staging = [&](ID3D11Texture2D* from) {
-            ID3D11Texture2D* t = nullptr;
-            if (!from) return t;
-            D3D11_TEXTURE2D_DESC d{};
-            from->GetDesc(&d);
-            d.MipLevels = 1;
-            d.ArraySize = 1;
-            d.Usage = D3D11_USAGE_STAGING;
-            d.BindFlags = 0;
-            d.MiscFlags = 0;
-            d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            if (FAILED(m.dev11->CreateTexture2D(&d, nullptr, &t))) return (ID3D11Texture2D*)nullptr;
-            c->CopySubresourceRegion(t, 0, 0, 0, 0, from, 0, nullptr);
-            return t;
-        };
-        // With debug=1 the image holds the edit picture, not the result: no HDR measurement.
-        ID3D11Texture2D *in = staging(s.color11), *out = staging(s.out11), *before = debugView ? nullptr : staging(s.orig11),
-                        *after = debugView ? nullptr : staging(imgTex);
-        if (in && out) {
-            const Mean mi = Measure(c, in, w, h), mo = Measure(c, out, w, h);
-            Log("NR bridge: slot %d after %d model images (intensity %.2f, style %u, preset %u, auto_mask %d, "
-                "ui_correction %d, depth %d, tonemap %d, input_scale %g, transfer %s): model "
-                "input mean RGB (%.4f, %.4f, %.4f) luminance %.4f [darkest %.4f, brightest %.4f], output (%.4f, %.4f, "
-                "%.4f) luminance %.4f [%.4f, %.4f], output / input %.3f",
-                slot, kDiagAfter, set_.intensity, set_.style, set_.preset, set_.autoMask, set_.uiCorrection,
-                gameDepth ? set_.depthMode : 0, set_.tonemap, set_.inputScale, set_.transfer ? "ratio" : "inverse",
-                mi.rgb[0], mi.rgb[1], mi.rgb[2], mi.lum, mi.lo, mi.hi, mo.rgb[0], mo.rgb[1], mo.rgb[2], mo.lum, mo.lo,
-                mo.hi, mi.lum > 0 ? mo.lum / mi.lum : 0.0);
-            const Edit e = MeasureEdit(c, in, out, before, after, w, h);
-            if (e.n > 0) {
-                Log("NR bridge: slot %d: model edit in its units: mean |change| luminance %.4f (signed %+.4f), RGB "
-                    "(%.4f, %.4f, %.4f), 99th percentile %.4f, max %.4f; pixels changed > 1/255: %.1f%%, > 8/255: %.1f%%",
-                    slot, e.absLum, e.signedLum, e.absRgb[0], e.absRgb[1], e.absRgb[2], e.p99Lum, e.maxLum,
-                    e.over1 * 100.0, e.over8 * 100.0);
-                if (e.hdrN > 0)
-                    Log("NR bridge: slot %d: in the HDR image: mean luminance %.4g -> %.4g (x%.3f), mean |change| %.2f%% "
-                        "of the mean, per pixel 50th / 99th percentile %.2f%% / %.2f%%, pixels changed > 2%%: %.1f%%, "
-                        "> 10%%: %.1f%%",
-                        slot, e.hdrBefore, e.hdrAfter, e.hdrBefore > 0 ? e.hdrAfter / e.hdrBefore : 0.0,
-                        e.hdrBefore > 0 ? e.hdrAbs / e.hdrBefore * 100.0 : 0.0, e.hdrP50 * 100.0, e.hdrP99 * 100.0,
-                        e.hdrOver2 * 100.0, e.hdrOver10 * 100.0);
-            }
-        }
-        Rel(in);
-        Rel(out);
-        Rel(before);
-        Rel(after);
-        Rel(imgTex);
-    }
+    if (measured && s.diagLeft > 0 && --s.diagLeft == 0) LogEdit(c, slot, srv, w, h, debugView, gameDepth);
     return true;
 }
 
@@ -1204,7 +1287,8 @@ void Bridge::Release() {
         Rel(m.pack);
         Rel(m.unpack);
         Rel(m.unpack4);
-        Rel(m.down);
+        Rel(m.packRegion);
+        Rel(m.unpackRegion);
         Rel(m.upEdit);
         Rel(m.motionCs);
         Rel(m.depthCs);

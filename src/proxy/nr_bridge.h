@@ -5,6 +5,7 @@
 //   D3D11: CSPack color -> shared color (RGBA16F), CSMotion motion -> shared motion (RG16F), Signal(fence AB), Flush
 //   D3D12: Wait(fence AB), the model (or a copy: passthrough) shared color -> shared output, Signal(fence BA)
 //   D3D11: Wait(fence BA) (on the GPU), CSUnpack shared output -> color
+// (an atlas: CSPackRegion per image, then the fences and the model once, then CSUnpackRegion or CSUpEdit per image)
 // The D3D12 commands are recorded before any D3D11 work, so a failure there leaves the image as it was.
 //
 // The model: NGX's capability parameter block from the driver's NGX core (_nvngx.dll), then feature 18 created either
@@ -63,7 +64,7 @@ struct Stats {
     uint64_t calls = 0;
     uint64_t modelCalls = 0;   // calls that ran the model (the rest copied)
     uint64_t modelFails = 0;   // model evaluations that failed (the image came back unchanged)
-    double cpuMs = 0;          // sum of the CPU time of Process (includes the Flush)
+    double cpuMs = 0;          // sum of the CPU time of Process and Evaluate (includes the Flush)
     double gpuMs = 0;          // sum of the D3D12 queue time between the timestamps
     uint64_t gpuSamples = 0;
     double slotGpuMs[kSlots] = {};  // the same per slot
@@ -101,18 +102,26 @@ public:
     bool Guides(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* motion, ID3D11ShaderResourceView* depth,
                 UINT w, UINT h, UINT x0 = 0, UINT y0 = 0, UINT fullW = 0, UINT fullH = 0, UINT step = 1, UINT srcX = 0,
                 UINT srcY = 0);
-    // An image at a lower resolution, or only its centre part, in the atlas (D3D11 only, `c` as above). Downsample:
-    // `src` (display-encoded, an UNORM view) from (srcX, srcY) averaged over step x step pixels into the w x h region at
-    // (x0, y0) of `dst`. UpsampleEdit: into `out` (fullW x fullH) the image `full` plus the model's edit of its region,
-    // bilinearly enlarged: the region at (x0, y0) of `after` (the atlas after the model) minus `before` (w x h, the
-    // region as it went in); with fade > 0 the edit fades out over `fade` pixels inside the part's edge (zero outside).
-    // Without an edit `out` gets `full` bit for bit.
-    bool Downsample(ID3D11DeviceContext* c, ID3D11ShaderResourceView* src, ID3D11UnorderedAccessView* dst, UINT x0,
-                    UINT y0, UINT w, UINT h, UINT step, UINT srcX = 0, UINT srcY = 0);
-    bool UpsampleEdit(ID3D11DeviceContext* c, ID3D11ShaderResourceView* full, ID3D11ShaderResourceView* before,
-                      ID3D11ShaderResourceView* after, UINT x0, UINT y0, UINT w, UINT h, UINT step,
-                      ID3D11UnorderedAccessView* out, UINT fullW, UINT fullH, UINT srcX = 0, UINT srcY = 0,
-                      UINT fade = 0);
+    // The atlas of final images (display-encoded, UNORM views; `c` as above), without a copy of the atlas: after the
+    // slot's Guides (which give it its size), each image goes into its region with PackRegion, the slot through the
+    // model once with Evaluate, and each image back out with UnpackRegion. False: nothing written (a failure is
+    // permanent: failed()).
+    // PackRegion: `src` from (srcX, srcY), averaged over step x step pixels, into the w x h region at (x0, y0) of the
+    // slot's model input. The gaps between the regions are black (also after ClearInput, e.g. for a new layout).
+    bool PackRegion(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* src, UINT x0, UINT y0, UINT w, UINT h,
+                    UINT step = 1, UINT srcX = 0, UINT srcY = 0);
+    void ClearInput(int slot);
+    // Evaluate: the slot's input through the model (or copied: passthrough); false without guides of its size or an
+    // image packed since it was made. reset as in Process.
+    bool Evaluate(ID3D11DeviceContext* c, int slot, bool reset);
+    // UnpackRegion: into `out` (fullW x fullH, the image's copy) the image `src` back from its region as PackRegion
+    // put it there. step 1 and the whole image: the region of the model's output itself (alpha from `src`); otherwise
+    // `src` plus the model's edit of the region bilinearly enlarged, with fade > 0 fading out over `fade` pixels
+    // inside the part's edge (zero outside; without an edit `out` gets `src` bit for bit). transfer 1 only for the
+    // whole image.
+    bool UnpackRegion(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* src, ID3D11UnorderedAccessView* out,
+                      UINT x0, UINT y0, UINT w, UINT h, UINT step, UINT fullW, UINT fullH, UINT srcX = 0,
+                      UINT srcY = 0, UINT fade = 0);
     void Release();  // waits for the D3D12 queue, then releases everything
 
     bool ready() const { return ready_; }
@@ -136,6 +145,10 @@ private:
     bool EnsureContext(ID3D11DeviceContext* c);
     bool EnsureSlot(int slot, UINT w, UINT h);
     bool EnsureNgx();
+    bool Record(int slot, UINT w, UINT h, bool reset, bool gameDepth, bool& modelRan);
+    bool Submit(ID3D11DeviceContext* c, int slot);
+    void LogEdit(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* srv, UINT w, UINT h, bool debugView,
+                 bool gameDepth);
     void WaitIdle();
     void ReleaseFeatures();
 };
