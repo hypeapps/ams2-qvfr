@@ -24,7 +24,7 @@
 namespace qvfr::nrbridge {
 
 // Independent images (one per view, or an atlas of several); each has its own shared textures and model instance.
-constexpr int kSlots = 5;
+constexpr int kSlots = 6;
 
 struct Settings {
     bool model = false;  // false: passthrough (the D3D12 side only copies)

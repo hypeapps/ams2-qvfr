@@ -56,23 +56,28 @@ InputSrv g_motion[kMotionCache];
 int g_motionNext = 0;
 bool g_motionLogged[2] = {};
 
-// The built-in test sequence (dlaa-plan D7, test 10: an A/B of the outer resolution): [nr] modifier + test_key goes to
-// the next step, on top of the ini. Step 0 is the ini as it is. `mode` 0 keeps the ini's mode, 1 after DLAA (focus), 2 the final image; `outer` and
-// `batch` -1 keep the ini's [nr] outer / batch, 0 off, 1 on; `outerStep` -1 keeps the ini's [nr] outer_resolution,
-// else the outer images go into the atlas at 1/outerStep of their size per axis; `smoothen` >= 0 replaces [quad]
-// smoothen_focus_view_edges at the composition. Earlier sequences (tests 5 to 9) are in dlaa-plan D7.
+// The built-in test sequence (dlaa-plan D7, test 13: the outer images with the focus or in their own evaluation):
+// [nr] modifier + test_key goes to the next step, on top of the ini. Step 0 is the ini as it is. `mode` 0 keeps the
+// ini's mode, 1 after DLAA (focus), 2 the final image; `outer`, `batch` and `separate` -1 keep the ini's [nr] outer /
+// batch / outer_atlas, 0 off, 1 on; `outerStep` -1 keeps the ini's [nr] outer_resolution, else the outer images go
+// into the atlas at 1/outerStep of their size per axis; `smoothen` >= 0 replaces [quad] smoothen_focus_view_edges at
+// the composition. Earlier sequences (tests 5 to 12) are in dlaa-plan D7.
 struct TestStep {
     const char* name;
     int mode;
     int outer;
     int batch;
     int outerStep;
+    int separate;
     float smoothen;
     void (*apply)(nrbridge::Settings&);
 };
 const TestStep kSteps[] = {
-    {"the ini as it is", 0, -1, -1, -1, -1.0f, [](nrbridge::Settings&) {}},
-    {"outer at full resolution (outer_resolution=1)", 0, 1, 1, 1, -1.0f, [](nrbridge::Settings&) {}},
+    {"the ini as it is", 0, -1, -1, -1, -1, -1.0f, [](nrbridge::Settings&) {}},
+    {"the outer images in their own evaluation (outer_atlas=separate)", 0, 1, 1, -1, 1, -1.0f,
+     [](nrbridge::Settings&) {}},
+    {"the outer images with the focus (outer_atlas=shared)", 0, 1, 1, -1, 0, -1.0f, [](nrbridge::Settings&) {}},
+    {"focus only (outer=0)", 0, 0, 1, -1, -1, -1.0f, [](nrbridge::Settings&) {}},
 };
 constexpr int kStepCount = (int)(sizeof(kSteps) / sizeof(kSteps[0]));
 std::atomic<int> g_step{0};
@@ -86,7 +91,7 @@ int ModeNow() {
 }
 
 // Benchmark sequence switches (quad.cpp, Knob): -1 keeps the ini's value; a test step still wins over them.
-std::atomic<int> g_knob[(int)Knob::Count] = {-1, -1, -1, -1, -1, -1, -1};
+std::atomic<int> g_knob[(int)Knob::Count] = {-1, -1, -1, -1, -1, -1, -1, -1};
 
 int KnobOr(Knob k, int ini) {
     const int v = g_knob[(int)k].load();
@@ -119,10 +124,21 @@ UINT OuterStepNow() {
 // benchmark switch); outside it the model's edit fades out (the far periphery keeps the game's image).
 UINT OuterAreaNow() { return (UINT)KnobOr(Knob::OuterArea, Cfg().nrOuterAreaPct); }
 
-// The atlas (batch=1): focus L and R in the top row, outer L and R (with outer on: their centre part at 1/step of its
-// size) below or right of them, kAtlasGap pixels apart. Its motion vectors and depth go into the bridge's slot
-// kAtlasSlot region by region at DLAA time; at the left eye's composition all images are copied (or downsampled) in, go
-// through the model once and are copied back out (or get the model's edit enlarged onto them).
+// The outer images in an atlas of their own and a second evaluation ([nr] outer_atlas=separate, a benchmark switch or
+// the test step's): the model judges the light of the whole image it gets, so the outer images in the focus images'
+// atlas change the focus's result (test 12: a lighter, flatter cockpit); separate, the focus looks as without the
+// outer, for about 1 ms more.
+bool SeparateNow() {
+    const int step = kSteps[g_step.load()].separate;
+    return step >= 0 ? step != 0 : KnobOr(Knob::OuterSeparate, Cfg().nrOuterSeparate) != 0;
+}
+
+// The atlases (batch=1). Shared: focus L and R in the top row, outer L and R (with outer on: their centre part at
+// 1/step of its size) below or right of them. Separate: the focus images in atlas 0, the outer images side by side in
+// atlas 1. Images kAtlasGap pixels apart. The motion vectors and depth go into the bridge's slot kAtlasSlot + atlas
+// region by region at DLAA time; at the left eye's composition all images are copied (or downsampled) in, each atlas
+// goes through the model once and the images are copied back out (or get the model's edit enlarged onto them).
+constexpr int kAtlases = 2;
 constexpr int kAtlasSlot = 4;
 constexpr UINT kAtlasGap = 16;
 struct Region {
@@ -132,29 +148,34 @@ struct Region {
     UINT cw = 0, ch = 0;
     UINT fade = 0;        // with a centre part: the edit's fade-out band inside its edge, source pixels
     bool edit = false;    // downsampled or a centre part: in through Downsample, back through UpsampleEdit
+    int atlas = 0;        // which atlas it is in
     UINT aw = 0, ah = 0;  // its size in the atlas
     UINT x = 0, y = 0;    // its place in the atlas
 };
 Region g_region[kImages];
-UINT g_atlasW = 0, g_atlasH = 0;  // 0: not all sizes known yet
+UINT g_atlasW[kAtlases] = {}, g_atlasH[kAtlases] = {};  // 0: not used, or not all sizes known yet
+int g_atlasCount = 0;             // atlases in the layout (0: not all sizes known yet)
 bool g_layoutOuter = false;
+bool g_layoutSeparate = false;    // the outer images in atlas 1
 UINT g_layoutStep = 1;            // the outer images' step in the layout
 UINT g_layoutArea = 100;          // and their centre part, percent
 uint32_t g_layoutGen = 1;
 uint32_t g_guided[kImages] = {};  // the layout generation of the region's guides written since the last atlas run
-uint32_t g_atlasRunGen = 0;       // the layout of the last atlas run (another one: the history starts over)
-bool g_atlasReset = false;        // DLAA reset a history since the last atlas run
-bool g_atlasOut = false;          // this frame's atlas ran: the eyes compose from g_final
+uint32_t g_atlasRunGen[kAtlases] = {};  // the layout of the atlas's last run (another one: the history starts over)
+bool g_atlasReset[kAtlases] = {};       // DLAA reset a history of its images since its last run
+bool g_atlasOut = false;          // this frame's atlases ran: the eyes compose from g_final
 bool g_atlasLogged = false, g_atlasSkipLogged = false;
-double g_atlasMp = 0;             // the atlas's size, for the benchmark summary
+double g_atlasMp = 0;             // the atlases' size together, for the benchmark summary
 
 void Relayout() {
     ++g_layoutGen;
-    g_atlasW = g_atlasH = 0;
+    g_atlasCount = 0;
+    for (int a = 0; a < kAtlases; ++a) g_atlasW[a] = g_atlasH[a] = 0;
     const int n = g_layoutOuter ? 4 : 2;
     for (int i = 0; i < n; ++i)
         if (!g_region[i].w) return;
     Region* r = g_region;
+    const bool separate = g_layoutOuter && g_layoutSeparate;
     for (int i = 0; i < n; ++i) {
         const bool outer = i >= 2;
         r[i].step = outer ? g_layoutStep : 1;
@@ -165,6 +186,7 @@ void Relayout() {
         r[i].cy = (r[i].h - r[i].ch) / 2;
         r[i].fade = area < 100 ? (std::max)(16u, (std::min)(r[i].cw, r[i].ch) / 10) : 0;
         r[i].edit = r[i].step > 1 || area < 100;
+        r[i].atlas = outer && separate ? 1 : 0;
         r[i].aw = (r[i].cw + r[i].step - 1) / r[i].step;
         r[i].ah = (r[i].ch + r[i].step - 1) / r[i].step;
     }
@@ -172,9 +194,15 @@ void Relayout() {
     r[0].y = 0;
     r[1].x = r[0].aw + kAtlasGap;
     r[1].y = 0;
-    UINT w = r[1].x + r[1].aw, h = r[0].ah > r[1].ah ? r[0].ah : r[1].ah;
+    UINT w = r[1].x + r[1].aw, h = (std::max)(r[0].ah, r[1].ah);
     bool column = false;
-    if (g_layoutOuter) {
+    if (separate) {  // the outer images side by side in atlas 1
+        r[2].x = 0;
+        r[2].y = r[3].y = 0;
+        r[3].x = r[2].aw + kAtlasGap;
+        g_atlasW[1] = r[3].x + r[3].aw;
+        g_atlasH[1] = (std::max)(r[2].ah, r[3].ah);
+    } else if (g_layoutOuter) {
         // The outer images in a row below the focus images, or (smaller ones) one above the other right of them:
         // whichever atlas is smaller, since the model pays for the empty pixels too.
         const UINT rowW = (std::max)(w, r[2].aw + kAtlasGap + r[3].aw);
@@ -196,11 +224,17 @@ void Relayout() {
             h = rowH;
         }
     }
-    g_atlasW = w;
-    g_atlasH = h;
-    g_atlasMp = (double)w * h / 1e6;
-    Log("NR: atlas %ux%u (%.1f MP) for one evaluation: focus %ux%u + %ux%u%s", w, h, g_atlasMp, r[0].aw, r[0].ah,
-        r[1].aw, r[1].ah, !g_layoutOuter ? "" : column ? ", outer right of them" : ", outer below");
+    g_atlasW[0] = w;
+    g_atlasH[0] = h;
+    g_atlasCount = separate ? 2 : 1;
+    g_atlasMp = ((double)g_atlasW[0] * g_atlasH[0] + (double)g_atlasW[1] * g_atlasH[1]) / 1e6;
+    Log("NR: atlas %ux%u (%.1f MP) for one evaluation: focus %ux%u + %ux%u%s", w, h, (double)w * h / 1e6, r[0].aw,
+        r[0].ah, r[1].aw, r[1].ah,
+        !g_layoutOuter ? "" : separate ? "; the outer images in a second atlas" : column ? ", outer right of them"
+                                                                                  : ", outer below");
+    if (separate)
+        Log("NR: atlas 2: %ux%u (%.1f MP) for a second evaluation: the outer images side by side", g_atlasW[1],
+            g_atlasH[1], (double)g_atlasW[1] * g_atlasH[1] / 1e6);
     if (g_layoutOuter)
         Log("NR: atlas: outer %ux%u + %ux%u: the centre %u%% (%ux%u) of %ux%u at 1/%u, the edit fading out over %u px",
             r[2].aw, r[2].ah, r[3].aw, r[3].ah, g_layoutArea, r[2].cw, r[2].ch, r[2].w, r[2].h, g_layoutStep,
@@ -215,7 +249,7 @@ struct FinalImage {
     D3D11_TEXTURE2D_DESC desc{};  // of the game's image it copies
 };
 FinalImage g_final[kImages];
-FinalImage g_atlas;  // batch=1: all images side by side, the model writes into it
+FinalImage g_atlas[kAtlases];  // batch=1: the images side by side, the model writes into them
 // An image at a lower resolution in the atlas: the image as it came (Downsample and UpsampleEdit read it) and its
 // region as it went into the model.
 FinalImage g_orig[kImages], g_small[kImages];
@@ -234,7 +268,7 @@ void DropFinal() {
     for (FinalImage& f : g_final) DropImage(f);
     for (FinalImage& f : g_orig) DropImage(f);
     for (FinalImage& f : g_small) DropImage(f);
-    DropImage(g_atlas);
+    for (FinalImage& f : g_atlas) DropImage(f);
     for (auto& g : g_guided) g = 0;
     g_atlasOut = false;
 }
@@ -432,23 +466,24 @@ void ProcessImpl(ID3D11DeviceContext* c, int view, ID3D11ShaderResourceView* srv
     if (lastMode[i] && lastMode[i] != mode) g_resetPending[i] = true;
     lastMode[i] = mode;
     if (mode == 2 && BatchNow()) {  // the image's motion vectors and depth into its region of the atlas
-        const bool outer = OuterNow();
+        const bool outer = OuterNow(), separate = SeparateNow();
         const UINT step = OuterStepNow(), area = OuterAreaNow();
         if (g_region[i].w != w || g_region[i].h != h || g_layoutOuter != outer ||
-            (outer && (g_layoutStep != step || g_layoutArea != area))) {
+            (outer && (g_layoutStep != step || g_layoutArea != area || g_layoutSeparate != separate))) {
             g_region[i].w = w;
             g_region[i].h = h;
             g_layoutOuter = outer;
             g_layoutStep = step;
             g_layoutArea = area;
+            g_layoutSeparate = separate;
             Relayout();
         }
-        if (!g_atlasW) return;  // not all images' sizes known yet
+        if (!g_atlasCount) return;  // not all images' sizes known yet
         const Region& r = g_region[i];
-        if (g_bridge->Guides(c, kAtlasSlot, mv, dp, r.aw, r.ah, r.x, r.y, g_atlasW, g_atlasH, r.step, r.cx,
-                             r.cy)) {
+        if (g_bridge->Guides(c, kAtlasSlot + r.atlas, mv, dp, r.aw, r.ah, r.x, r.y, g_atlasW[r.atlas],
+                             g_atlasH[r.atlas], r.step, r.cx, r.cy)) {
             g_guided[i] = g_layoutGen;
-            if (reset) g_atlasReset = true;
+            if (reset) g_atlasReset[r.atlas] = true;
         } else if (g_bridge->failed()) {
             TurnOff("bridge: " + g_bridge->why());
         }
@@ -589,14 +624,15 @@ ID3D11Texture2D* ProcessFinalImpl(ID3D11DeviceContext* c, int i, ID3D11Texture2D
 }
 
 // batch=1, at the left eye's composition: img = focus L, focus R, outer L, outer R (the outer ones only with the
-// layout's outer). True: g_final holds every image through the model.
+// layout's outer). Each atlas of the layout goes through the model once. True: g_final holds every image through the
+// model.
 bool RunAtlas(ID3D11DeviceContext* c, ID3D11Texture2D* const img[kImages]) {
     if (!g_bridge || !g_bridge->ready()) return false;
     const int n = g_layoutOuter ? 4 : 2;
     const char* why = nullptr;
     D3D11_TEXTURE2D_DESC d[kImages] = {};
     DXGI_FORMAT texFmt = DXGI_FORMAT_UNKNOWN, viewFmt = DXGI_FORMAT_UNKNOWN;
-    if (!g_atlasW) why = "not all images' sizes are known yet";
+    if (!g_atlasCount) why = "not all images' sizes are known yet";
     for (int i = 0; i < n && !why; ++i) {
         if (!img[i]) {
             why = "an image of this frame is missing";
@@ -618,12 +654,15 @@ bool RunAtlas(ID3D11DeviceContext* c, ID3D11Texture2D* const img[kImages]) {
         }
         return false;
     }
-    D3D11_TEXTURE2D_DESC a = d[0];
-    a.Width = g_atlasW;
-    a.Height = g_atlasH;
-    const bool fresh = !g_atlas.tex || g_atlas.desc.Width != a.Width || g_atlas.desc.Height != a.Height ||
-                       g_atlas.desc.Format != a.Format;
-    if (!EnsureImage(c, g_atlas, a, "atlas")) return false;
+    bool fresh[kAtlases] = {};
+    for (int a = 0; a < g_atlasCount; ++a) {
+        D3D11_TEXTURE2D_DESC ad = d[0];
+        ad.Width = g_atlasW[a];
+        ad.Height = g_atlasH[a];
+        const FinalImage& f = g_atlas[a];
+        fresh[a] = !f.tex || f.desc.Width != ad.Width || f.desc.Height != ad.Height || f.desc.Format != ad.Format;
+        if (!EnsureImage(c, g_atlas[a], ad, a ? "outer atlas" : "atlas")) return false;
+    }
     for (int i = 0; i < n; ++i) {
         if (!EnsureImage(c, g_final[i], d[i], kName[i])) return false;
         if (g_region[i].edit) {  // the image as it came (read by Downsample and UpsampleEdit) and its region before
@@ -635,36 +674,42 @@ bool RunAtlas(ID3D11DeviceContext* c, ID3D11Texture2D* const img[kImages]) {
     }
     CsState st;
     st.Save(c);
-    if (fresh) {  // the gaps between the images stay black
-        const float black[4] = {0, 0, 0, 1};
-        c->ClearUnorderedAccessViewFloat(g_atlas.uav, black);
-    }
+    for (int a = 0; a < g_atlasCount; ++a)
+        if (fresh[a]) {  // the gaps between the images stay black
+            const float black[4] = {0, 0, 0, 1};
+            c->ClearUnorderedAccessViewFloat(g_atlas[a].uav, black);
+        }
     bool ok = true;
     for (int i = 0; i < n && ok; ++i) {
         const Region& r = g_region[i];
+        FinalImage& at = g_atlas[r.atlas];
         if (!r.edit) {
-            c->CopySubresourceRegion(g_atlas.tex, 0, r.x, r.y, 0, img[i], 0, nullptr);
+            c->CopySubresourceRegion(at.tex, 0, r.x, r.y, 0, img[i], 0, nullptr);
             continue;
         }
         c->CopySubresourceRegion(g_orig[i].tex, 0, 0, 0, 0, img[i], 0, nullptr);
-        ok = g_bridge->Downsample(c, g_orig[i].srv, g_atlas.uav, r.x, r.y, r.aw, r.ah, r.step, r.cx, r.cy);
+        ok = g_bridge->Downsample(c, g_orig[i].srv, at.uav, r.x, r.y, r.aw, r.ah, r.step, r.cx, r.cy);
         const D3D11_BOX b{r.x, r.y, 0, r.x + r.aw, r.y + r.ah, 1};
-        c->CopySubresourceRegion(g_small[i].tex, 0, 0, 0, 0, g_atlas.tex, 0, &b);
+        c->CopySubresourceRegion(g_small[i].tex, 0, 0, 0, 0, at.tex, 0, &b);
     }
-    bool reset = g_atlasReset || g_atlasRunGen != g_layoutGen;
-    for (int i = 0; i < n; ++i) reset |= g_resetPending[i].exchange(false);
-    g_atlasReset = false;
-    g_atlasRunGen = g_layoutGen;
-    ok = ok && g_bridge->Process(c, kAtlasSlot, g_atlas.srv, g_atlas.uav, nullptr, nullptr, a.Width, a.Height, reset,
-                                 true);
+    bool reset[kAtlases] = {};
+    for (int a = 0; a < g_atlasCount; ++a) reset[a] = g_atlasReset[a] || g_atlasRunGen[a] != g_layoutGen;
+    for (int i = 0; i < n; ++i) reset[g_region[i].atlas] |= g_resetPending[i].exchange(false);
+    for (int a = 0; a < g_atlasCount && ok; ++a) {
+        g_atlasReset[a] = false;
+        g_atlasRunGen[a] = g_layoutGen;
+        ok = g_bridge->Process(c, kAtlasSlot + a, g_atlas[a].srv, g_atlas[a].uav, nullptr, nullptr, g_atlasW[a],
+                               g_atlasH[a], reset[a], true);
+    }
     for (auto& g : g_guided) g = 0;  // the next run needs the next frame's guides
     for (int i = 0; i < n && ok; ++i) {
         const Region& r = g_region[i];
+        const FinalImage& at = g_atlas[r.atlas];
         if (!r.edit) {
             const D3D11_BOX b{r.x, r.y, 0, r.x + r.w, r.y + r.h, 1};
-            c->CopySubresourceRegion(g_final[i].tex, 0, 0, 0, 0, g_atlas.tex, 0, &b);
+            c->CopySubresourceRegion(g_final[i].tex, 0, 0, 0, 0, at.tex, 0, &b);
         } else {
-            ok = g_bridge->UpsampleEdit(c, g_orig[i].srv, g_small[i].srv, g_atlas.srv, r.x, r.y, r.aw, r.ah, r.step,
+            ok = g_bridge->UpsampleEdit(c, g_orig[i].srv, g_small[i].srv, at.srv, r.x, r.y, r.aw, r.ah, r.step,
                                         g_final[i].uav, r.w, r.h, r.cx, r.cy, r.fade);
         }
     }
@@ -681,9 +726,10 @@ bool RunAtlas(ID3D11DeviceContext* c, ID3D11Texture2D* const img[kImages]) {
     for (int i = 0; i < n; ++i) ++g_calls[i];
     if (!g_atlasLogged) {
         g_atlasLogged = true;
-        Log("NR: first atlas (%ux%u fmt %d, %d images, outer at 1/%u, its centre %u%%) through %s in one evaluation; "
-            "the composition reads the copies",
-            a.Width, a.Height, (int)a.Format, n, g_region[2].step, g_layoutArea, g_bridge->modelPath());
+        Log("NR: first atlas run (%ux%u%s fmt %d, %d images, outer at 1/%u, its centre %u%%) through %s in %d "
+            "evaluation(s); the composition reads the copies",
+            g_atlasW[0], g_atlasH[0], g_atlasCount > 1 ? " and the outer atlas" : "", (int)d[0].Format, n,
+            g_region[2].step, g_layoutArea, g_bridge->modelPath(), g_atlasCount);
     }
     return true;
 }
@@ -772,6 +818,7 @@ int GetKnob(Knob k) {
         case Knob::Preset: return KnobOr(k, c.nrPreset);
         case Knob::Style: return KnobOr(k, c.nrStyle);
         case Knob::Strength: return KnobOr(k, (int)(c.nrStrength * 100.0f + 0.5f));
+        case Knob::OuterSeparate: return KnobOr(k, c.nrOuterSeparate);
         default: return 0;
     }
 }
@@ -827,7 +874,8 @@ void LogStats(bool totals) {
         }
     }
     // Per image how many went through, per evaluation (one image, or the atlas of all) the model's D3D12 GPU time.
-    static const char* const kSlotName[nrbridge::kSlots] = {"focus L", "focus R", "outer L", "outer R", "atlas"};
+    static const char* const kSlotName[nrbridge::kSlots] = {"focus L", "focus R", "outer L", "outer R", "atlas",
+                                                            "outer atlas"};
     std::string images, gpu;
     for (int i = 0; i < kImages; ++i) {
         const uint64_t n = totals ? g_calls[i] : g_calls[i] - g_lastCalls[i];
@@ -870,9 +918,11 @@ std::string Describe() {
                                                 : "NR: final focus images through ") +
                     g_bridge->modelPath() + " on " + g_bridge->adapter();
     if (BatchNow())
-        s += OuterNow() ? ", one evaluation per frame (atlas, outer at 1/" + std::to_string(OuterStepNow()) +
-                              ", its centre " + std::to_string(OuterAreaNow()) + "%)"
-                        : ", one evaluation per frame (atlas)";
+        s += !OuterNow()     ? ", one evaluation per frame (atlas)"
+             : SeparateNow() ? ", two evaluations per frame (focus atlas, outer atlas at 1/" +
+                                   std::to_string(OuterStepNow()) + ", its centre " + std::to_string(OuterAreaNow()) + "%)"
+                             : ", one evaluation per frame (atlas, outer at 1/" + std::to_string(OuterStepNow()) +
+                                   ", its centre " + std::to_string(OuterAreaNow()) + "%)";
     if (!g_active.load()) s += ", hotkey: off";
     if (g_step.load()) s += std::string(", test step ") + std::to_string(g_step.load()) + ": " + kSteps[g_step.load()].name;
     return s;

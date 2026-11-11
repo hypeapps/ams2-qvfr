@@ -40,8 +40,9 @@ bool Active();
 void SetActive(bool on);
 // Benchmark sequence switches (quad.cpp): nr_outer 0/1, nr_batch 0/1, nr_outer_res (source pixels per outer pixel in
 // the atlas, 1..4), nr_outer_area (the outer images' centre part through the model, percent 50..100), nr_preset 0..3,
-// nr_style 0..3, nr_strength (percent 0..300). GetKnob: the value now (the ini's until set).
-enum class Knob { Outer, Batch, OuterRes, OuterArea, Preset, Style, Strength, Count };
+// nr_style 0..3, nr_strength (percent 0..300), nr_outer_separate 0/1 (the outer images in their own evaluation).
+// GetKnob: the value now (the ini's until set).
+enum class Knob { Outer, Batch, OuterRes, OuterArea, Preset, Style, Strength, OuterSeparate, Count };
 int GetKnob(Knob k);
 void SetKnob(Knob k, int value);
 // The last statistics window's (a benchmark run's) D3D12 GPU time of the model per frame and the atlas's size.

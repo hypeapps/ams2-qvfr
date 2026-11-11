@@ -3268,6 +3268,8 @@ const Switch kSwitches[] = {
      [](int v) { nr::SetKnob(nr::Knob::Style, v); }},
     {"nr_strength", false, 0, 300, [] { return nr::GetKnob(nr::Knob::Strength); },
      [](int v) { nr::SetKnob(nr::Knob::Strength, v); }},
+    {"nr_outer_separate", false, 0, 1, [] { return nr::GetKnob(nr::Knob::OuterSeparate); },
+     [](int v) { nr::SetKnob(nr::Knob::OuterSeparate, v); }},
     {"queue_breakdown", false, 0, 1, [] { return (int)g_qbOn; }, [](int v) {
          g_qbOn = v != 0;
          g_qbWant = g_qbOn ? (1u << OuterL) | (1u << FocusL) : 0;

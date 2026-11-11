@@ -300,6 +300,10 @@ struct Config {
     // The outer images' centre part that goes through the model, percent per axis ([nr] outer_area 0.5..1); outside it
     // the model's edit fades out (the far periphery keeps the game's image).
     int nrOuterAreaPct = 100;
+    // batch=1: the outer images in an atlas of their own and a second evaluation ([nr] outer_atlas=separate): the focus
+    // looks as without the outer (the model judges the light of its whole input), for about 1 ms more; shared (default)
+    // puts them with the focus images.
+    bool nrOuterSeparate = false;
     // Into the model: DLAA's HDR color * input_scale (0.002 = DLAA's exposure), tonemap 0 none, 1 Reinhard,
     // 2 Reinhard and 2.2 gamma (a display-like image); undone after the model.
     float nrInputScale = 0.002f;
