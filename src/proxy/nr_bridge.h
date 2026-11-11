@@ -69,7 +69,15 @@ struct Stats {
     uint64_t gpuSamples = 0;
     double slotGpuMs[kSlots] = {};  // the same per slot
     uint64_t slotGpuSamples[kSlots] = {};
+    // The D3D11 GPU time of the frames that ran an atlas (the bridge's own timestamps on the game's context, see
+    // TimeMark): the guides at DLAA time, packing, the hand-off (D3D11 -> D3D12 with the model -> D3D11) and
+    // unpacking, summed over d11Frames.
+    double d11GuidesMs = 0, d11PackMs = 0, d11HandoffMs = 0, d11UnpackMs = 0;
+    uint64_t d11Frames = 0;
 };
+
+// What the D3D11 GPU does from a TimeMark to the next one (Other: not the bridge's work, not counted).
+enum class Mark { Other, Guides, Pack, Handoff, Unpack };
 
 class Bridge {
 public:
@@ -122,6 +130,12 @@ public:
     bool UnpackRegion(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* src, ID3D11UnorderedAccessView* out,
                       UINT x0, UINT y0, UINT w, UINT h, UINT step, UINT fullW, UINT fullH, UINT srcX = 0,
                       UINT srcY = 0, UINT fade = 0);
+    // D3D11 timestamps of an atlas frame: TimeMark opens the frame at its first mark (Guides before each Guides call,
+    // Other after it, Pack before the first PackRegion); Evaluate adds Handoff and Unpack itself in an open frame;
+    // TimeFrameEnd closes it (also when the atlas did not run: such a frame is not counted). Results arrive in stats()
+    // a few frames later, read without flushing. A frame whose earlier results are not ready yet is skipped.
+    void TimeMark(ID3D11DeviceContext* c, Mark k);
+    void TimeFrameEnd(ID3D11DeviceContext* c);
     void Release();  // waits for the D3D12 queue, then releases everything
 
     bool ready() const { return ready_; }
@@ -149,6 +163,7 @@ private:
     bool Submit(ID3D11DeviceContext* c, int slot);
     void LogEdit(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* srv, UINT w, UINT h, bool debugView,
                  bool gameDepth);
+    void HarvestTimed(ID3D11DeviceContext* c);
     void WaitIdle();
     void ReleaseFeatures();
 };

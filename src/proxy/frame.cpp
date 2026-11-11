@@ -681,6 +681,9 @@ void EndSequence(bool aborted) {
                 n += snprintf(buf + n, sizeof(buf) - n, " | fps %.1f | NR off", r.fps);
             if (r.nr.any && r.nr.atlasMp > 0)
                 n += snprintf(buf + n, sizeof(buf) - n, " atlas %.1f MP", r.nr.atlasMp);
+            if (r.nr.any && r.nr.d11)
+                n += snprintf(buf + n, sizeof(buf) - n, " | NR D3D11 guides %.2f pack %.2f hand-off %.2f unpack %.2f",
+                              r.nr.d11Guides, r.nr.d11Pack, r.nr.d11Handoff, r.nr.d11Unpack);
         }
         snprintf(buf + n, sizeof(buf) - n, " | %s", r.dir.c_str());
         lines.push_back(buf);

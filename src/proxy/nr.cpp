@@ -488,8 +488,11 @@ void ProcessImpl(ID3D11DeviceContext* c, int view, ID3D11ShaderResourceView* srv
         }
         if (!g_atlasCount) return;  // not all images' sizes known yet
         const Region& r = g_region[i];
-        if (g_bridge->Guides(c, kAtlasSlot + r.atlas, mv, dp, r.aw, r.ah, r.x, r.y, g_atlasW[r.atlas],
-                             g_atlasH[r.atlas], r.step, r.cx, r.cy)) {
+        g_bridge->TimeMark(c, nrbridge::Mark::Guides);
+        const bool guided = g_bridge->Guides(c, kAtlasSlot + r.atlas, mv, dp, r.aw, r.ah, r.x, r.y, g_atlasW[r.atlas],
+                                             g_atlasH[r.atlas], r.step, r.cx, r.cy);
+        g_bridge->TimeMark(c, nrbridge::Mark::Other);
+        if (guided) {
             g_guided[i] = g_layoutGen;
             if (reset) g_atlasReset[r.atlas] = true;
         } else if (g_bridge->failed()) {
@@ -733,6 +736,7 @@ bool RunAtlas(ID3D11DeviceContext* c, ID3D11Texture2D* const img[kImages]) {
         if (g_atlasRunGen[a] != g_layoutGen) g_bridge->ClearInput(kAtlasSlot + a);  // the new layout's gaps black
     }
     for (int i = 0; i < n; ++i) reset[g_region[i].atlas] |= g_resetPending[i].exchange(false);
+    g_bridge->TimeMark(c, nrbridge::Mark::Pack);
     for (int i = 0; i < n && ok; ++i) {
         const Region& r = g_region[i];
         ok = g_bridge->PackRegion(c, kAtlasSlot + r.atlas, view[i], r.x, r.y, r.aw, r.ah, r.step, r.cx, r.cy);
@@ -783,6 +787,7 @@ void FinalEyeImpl(ID3D11DeviceContext* c, int eye, ID3D11Texture2D*& focus, ID3D
     if (eye == 0) {
         ID3D11Texture2D* const img[kImages] = {focus, rightFocus, outer, rightOuter};
         g_atlasOut = RunAtlas(c, img);
+        if (g_bridge) g_bridge->TimeFrameEnd(c);  // the atlas frame's D3D11 timestamps (none counted without a run)
     }
     if (g_atlasOut) {
         focus = g_final[eye].tex;
@@ -910,6 +915,11 @@ void LogStats(bool totals) {
             d.slotGpuMs[i] -= g_last.slotGpuMs[i];
             d.slotGpuSamples[i] -= g_last.slotGpuSamples[i];
         }
+        d.d11GuidesMs -= g_last.d11GuidesMs;
+        d.d11PackMs -= g_last.d11PackMs;
+        d.d11HandoffMs -= g_last.d11HandoffMs;
+        d.d11UnpackMs -= g_last.d11UnpackMs;
+        d.d11Frames -= g_last.d11Frames;
     }
     // Per image how many went through, per evaluation (one image, or the atlas of all) the model's D3D12 GPU time.
     static const char* const kSlotName[nrbridge::kSlots] = {"focus L", "focus R", "outer L", "outer R", "atlas",
@@ -938,10 +948,25 @@ void LogStats(bool totals) {
         totals ? " (session total)" : "", images.c_str(), (unsigned long long)d.modelCalls,
         (unsigned long long)d.modelFails, gpu.empty() ? "none" : gpu.c_str(), perFrame,
         d.calls ? d.cpuMs / (double)d.calls : 0.0, Describe().c_str());
+    // The game's D3D11 queue around the atlas: what NR costs the frame there. The hand-off holds the model (D3D12
+    // time above) plus the switches between the queues.
+    const double f11 = (double)d.d11Frames;
+    const double g11 = f11 ? d.d11GuidesMs / f11 : 0, p11 = f11 ? d.d11PackMs / f11 : 0,
+                 h11 = f11 ? d.d11HandoffMs / f11 : 0, u11 = f11 ? d.d11UnpackMs / f11 : 0;
+    if (d.d11Frames)
+        Log("NR%s: D3D11 GPU ms per atlas frame (%llu frames): guides %.3f, pack %.3f, hand-off %.3f (D3D12 %.3f, so "
+            "%.3f between the queues), unpack %.3f; total %.3f",
+            totals ? " (session total)" : "", (unsigned long long)d.d11Frames, g11, p11, h11, perFrame,
+            h11 - perFrame, u11, g11 + p11 + h11 + u11);
     if (!totals) {
         g_window.any = frames > 0;
         g_window.gpuMsPerFrame = perFrame;
         g_window.atlasMp = BatchNow() ? g_atlasMp : 0.0;
+        g_window.d11 = d.d11Frames > 0;
+        g_window.d11Guides = g11;
+        g_window.d11Pack = p11;
+        g_window.d11Handoff = h11;
+        g_window.d11Unpack = u11;
     }
     g_last = s;
     for (int i = 0; i < kImages; ++i) g_lastCalls[i] = g_calls[i];

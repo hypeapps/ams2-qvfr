@@ -293,16 +293,39 @@ int RunNrBridge() {
                 printf("NR bridge: atlas test textures failed\n");
                 return 1;
             }
+            using qvfr::nrbridge::Mark;
             for (int r = 0; r < kAtlasRounds; ++r) {
-                if (!bridge.Guides(ctx, 4, nullptr, nullptr, kW, kH, 0, 0, aw, kH) ||
-                    !bridge.Guides(ctx, 4, nullptr, nullptr, kW, kH, kW + kGap, 0, aw, kH) ||
-                    !bridge.PackRegion(ctx, 4, ia.srv, 0, 0, kW, kH) ||
+                bridge.TimeMark(ctx, Mark::Guides);
+                const bool g0 = bridge.Guides(ctx, 4, nullptr, nullptr, kW, kH, 0, 0, aw, kH);
+                bridge.TimeMark(ctx, Mark::Other);
+                bridge.TimeMark(ctx, Mark::Guides);
+                const bool g1 = bridge.Guides(ctx, 4, nullptr, nullptr, kW, kH, kW + kGap, 0, aw, kH);
+                bridge.TimeMark(ctx, Mark::Pack);
+                if (!g0 || !g1 || !bridge.PackRegion(ctx, 4, ia.srv, 0, 0, kW, kH) ||
                     !bridge.PackRegion(ctx, 4, ib.srv, kW + kGap, 0, kW, kH) || !bridge.Evaluate(ctx, 4, r == 0) ||
                     !bridge.UnpackRegion(ctx, 4, ia.srv, oa.uav, 0, 0, kW, kH, 1, kW, kH) ||
                     !bridge.UnpackRegion(ctx, 4, ib.srv, ob.uav, kW + kGap, 0, kW, kH, 1, kW, kH)) {
                     printf("NR bridge: atlas failed in round %d: %s\n", r, bridge.why().c_str());
                     return 1;
                 }
+                bridge.TimeFrameEnd(ctx);
+            }
+            // The D3D11 timing of the atlas frames: results a few frames later, without flushing.
+            ctx->Flush();
+            for (int k = 0; k < 200 && bridge.stats().d11Frames < (uint64_t)kAtlasRounds; ++k) {
+                Sleep(5);
+                bridge.TimeFrameEnd(ctx);
+            }
+            {
+                const qvfr::nrbridge::Stats t = bridge.stats();
+                const double f = t.d11Frames ? (double)t.d11Frames : 1.0;
+                const bool sane = t.d11Frames >= (uint64_t)kAtlasRounds / 4 && t.d11GuidesMs > 0 && t.d11PackMs > 0 &&
+                                  t.d11HandoffMs > 0 && t.d11UnpackMs > 0;
+                printf("NR bridge: D3D11 timing of %llu of %d atlas frames: guides %.3f, pack %.3f, hand-off %.3f, "
+                       "unpack %.3f ms per frame%s\n",
+                       (unsigned long long)t.d11Frames, kAtlasRounds, t.d11GuidesMs / f, t.d11PackMs / f,
+                       t.d11HandoffMs / f, t.d11UnpackMs / f, sane ? "" : " (MISSING)");
+                if (!sane) ++fails;
             }
             size_t diffA = 0, diffB = 0;
             if (!read(oa.tex, kW, kH, got)) return 1;

@@ -50,6 +50,10 @@ struct Window {
     bool any = false;  // images went through the model in it
     double gpuMsPerFrame = 0;
     double atlasMp = 0;  // 0 without the atlas
+    // The D3D11 GPU time per atlas frame (0: not measured): the guides at DLAA time, packing, the hand-off (D3D11 ->
+    // D3D12 with the model -> D3D11), unpacking.
+    double d11Guides = 0, d11Pack = 0, d11Handoff = 0, d11Unpack = 0;
+    bool d11 = false;
 };
 Window LastWindow();
 void OnFrameStart();  // hotkey (render thread)

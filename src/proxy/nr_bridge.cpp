@@ -323,6 +323,18 @@ struct Bridge::Impl {
     ID3D11ComputeShader* motionCs = nullptr;
     ID3D11ComputeShader* depthCs = nullptr;
     ID3D11Buffer* cb = nullptr;
+    // TimeMark: a ring of frames of D3D11 timestamps.
+    static constexpr int kTimed = 8, kTimedMarks = 24;
+    struct Timed {
+        ID3D11Query* disjoint = nullptr;
+        ID3D11Query* ts[kTimedMarks] = {};
+        Mark kind[kTimedMarks] = {};
+        int n = 0;
+        bool open = false, pending = false;
+    } timed[kTimed];
+    int timedCur = 0;
+    bool timedFailed = false;
+    bool timedSkip = false;  // this frame is not measured (its slot's results were not ready at its first mark)
     Consts cbValue{-1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     HMODULE d3d12 = nullptr;
     ID3D12Device* dev12 = nullptr;
@@ -1044,6 +1056,8 @@ bool Bridge::Submit(ID3D11DeviceContext* c, int slot) {
     const UINT r = m.ring % kRing;
     const bool ts = m.tsHeap != nullptr;
     ID3D12GraphicsCommandList* cl = m.list;
+    const bool timed = m.timed[m.timedCur].open;
+    if (timed) TimeMark(c, Mark::Handoff);
     m.ctx4->Signal(m.ab11, ++m.vAB);
     c->Flush();
 
@@ -1064,6 +1078,7 @@ bool Bridge::Submit(ID3D11DeviceContext* c, int slot) {
 
     // D3D11: wait on the GPU for the output.
     m.ctx4->Wait(m.ba11, m.vBA);
+    if (timed) TimeMark(c, Mark::Unpack);
     return true;
 }
 
@@ -1265,6 +1280,80 @@ bool Bridge::Process(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView*
     return true;
 }
 
+void Bridge::TimeMark(ID3D11DeviceContext* c, Mark k) {
+    if (!ready_ || failed_ || !c || !impl_) return;
+    Impl& m = *impl_;
+    if (m.timedFailed || m.timedSkip) return;
+    Impl::Timed& t = m.timed[m.timedCur];
+    if (!t.open) {
+        if (t.pending) HarvestTimed(c);
+        if (t.pending) {  // its results are not ready yet: this frame is not measured
+            m.timedSkip = true;
+            return;
+        }
+        if (!t.disjoint) {
+            D3D11_QUERY_DESC qd{D3D11_QUERY_TIMESTAMP_DISJOINT, 0};
+            bool ok = SUCCEEDED(m.dev11->CreateQuery(&qd, &t.disjoint));
+            qd.Query = D3D11_QUERY_TIMESTAMP;
+            for (auto*& q : t.ts) ok = ok && SUCCEEDED(m.dev11->CreateQuery(&qd, &q));
+            if (!ok) {
+                m.timedFailed = true;
+                Log("NR bridge: no D3D11 timestamp queries; no D3D11 timing of the atlas");
+                return;
+            }
+        }
+        c->Begin(t.disjoint);
+        t.open = true;
+        t.n = 0;
+    }
+    if (t.n >= Impl::kTimedMarks) return;
+    c->End(t.ts[t.n]);
+    t.kind[t.n++] = k;
+}
+
+void Bridge::TimeFrameEnd(ID3D11DeviceContext* c) {
+    if (!ready_ || failed_ || !c || !impl_) return;
+    Impl& m = *impl_;
+    Impl::Timed& t = m.timed[m.timedCur];
+    if (t.open) {
+        TimeMark(c, Mark::Other);
+        c->End(t.disjoint);
+        t.open = false;
+        t.pending = true;
+        m.timedCur = (m.timedCur + 1) % Impl::kTimed;
+    }
+    m.timedSkip = false;
+    HarvestTimed(c);
+}
+
+// The finished frames of the ring into the stats (only frames with a hand-off: an atlas ran).
+void Bridge::HarvestTimed(ID3D11DeviceContext* c) {
+    Impl& m = *impl_;
+    for (auto& t : m.timed) {
+        if (!t.pending) continue;
+        D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj{};
+        if (c->GetData(t.disjoint, &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) != S_OK) continue;
+        UINT64 v[Impl::kTimedMarks] = {};
+        bool ready = true;
+        for (int i = 0; i < t.n && ready; ++i)
+            ready = c->GetData(t.ts[i], &v[i], sizeof(v[i]), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK;
+        if (!ready) continue;
+        t.pending = false;
+        if (dj.Disjoint || !dj.Frequency) continue;
+        double ms[5] = {};
+        for (int i = 0; i + 1 < t.n; ++i)
+            if (v[i + 1] >= v[i]) ms[(int)t.kind[i]] += (double)(v[i + 1] - v[i]) * 1000.0 / (double)dj.Frequency;
+        bool handoff = false;
+        for (int i = 0; i < t.n; ++i) handoff |= t.kind[i] == Mark::Handoff;
+        if (!handoff) continue;
+        stats_.d11GuidesMs += ms[(int)Mark::Guides];
+        stats_.d11PackMs += ms[(int)Mark::Pack];
+        stats_.d11HandoffMs += ms[(int)Mark::Handoff];
+        stats_.d11UnpackMs += ms[(int)Mark::Unpack];
+        ++stats_.d11Frames;
+    }
+}
+
 void Bridge::Release() {
     if (impl_) {
         Impl& m = *impl_;
@@ -1274,6 +1363,10 @@ void Bridge::Release() {
         if (m.coreInited && m.coreShutdown && m.dev12) m.coreShutdown(m.dev12);
 #endif
         for (auto& s : m.slots) m.ReleaseSlot(s);
+        for (auto& t : m.timed) {
+            Rel(t.disjoint);
+            for (auto*& q : t.ts) Rel(q);
+        }
         Rel(m.tsRead);
         Rel(m.tsHeap);
         Rel(m.list);
