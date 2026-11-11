@@ -464,8 +464,11 @@ Config ReadConfig(const fs::path& ini) {
             c.mvrDirectExtractKey, c.mvrNativeTargets, c.mvrNativeKey, c.mvrMsColorSkip, c.mvrMsColorSkipKey, c.mvrMsSlices,
             c.mvrLiveTrackSkip, c.mvrLiveTrackSkipKey, c.mvrEmptyQueue, c.queueBreakdown, c.mvrVelocityRecordSkip);
     const std::string dlaa = IniString(ini, L"dlaa", L"mode", L"off");
-    c.dlaa = dlaa == "dlaa";
-    if (dlaa != "off" && dlaa != "dlaa") Log("Settings: unknown [dlaa] mode=\"%s\", using off", dlaa.c_str());
+    c.dlaa = dlaa == "dlaa" || dlaa == "dlss";
+    c.dlaaSr = dlaa == "dlss";
+    if (dlaa != "off" && dlaa != "dlaa" && dlaa != "dlss")
+        Log("Settings: unknown [dlaa] mode=\"%s\", using off", dlaa.c_str());
+    c.dlaaRenderScale = std::clamp(IniFloat(ini, L"dlaa", L"render_scale", c.dlaaRenderScale), 0.33f, 1.0f);
     const std::string preset = IniString(ini, L"dlaa", L"preset", L"k");  // K: NVIDIA's DLAA default, set explicitly
     if (preset == "default") {
         c.dlaaPreset = 0;
@@ -491,12 +494,77 @@ Config ReadConfig(const fs::path& ini) {
     c.dlaaPresetKeyMod = IniInt(ini, L"dlaa", L"preset_modifier", c.dlaaPresetKeyMod);
     c.dlaaPresetKey = IniInt(ini, L"dlaa", L"preset_key", c.dlaaPresetKey);
     if (c.dlaa)
-        Log("Settings: [dlaa] mode=dlaa preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d auto_exposure=%d "
-            "exposure=%.4f exposure_scale=%.4f bias_mask=%.2f skip_locks=%d modifier=0x%X key=0x%X exposure_key=0x%X "
-            "preset_key=0x%X cockpit_taa=%d",
-            preset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY, c.dlaaMvJittered, c.dlaaAutoExposure,
+        Log("Settings: [dlaa] mode=%s render_scale=%.3f preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d "
+            "auto_exposure=%d exposure=%.4f exposure_scale=%.4f bias_mask=%.2f skip_locks=%d modifier=0x%X key=0x%X "
+            "exposure_key=0x%X preset_key=0x%X cockpit_taa=%d",
+            c.dlaaSr ? "dlss" : "dlaa", c.dlaaRenderScale, preset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY, c.dlaaMvJittered, c.dlaaAutoExposure,
             c.dlaaExposure, c.dlaaExposureScale, c.dlaaBiasMask, c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey,
             c.dlaaExpKey, c.dlaaPresetKey, c.dlaaCockpitTaa);
+    const std::string nr = IniString(ini, L"nr", L"mode", L"off");
+    c.nrMode = nr == "focus" ? 1 : nr == "final" ? 2 : 0;
+    if (nr != "off" && nr != "focus" && nr != "final") Log("Settings: unknown [nr] mode=\"%s\", using off", nr.c_str());
+    c.nrKeyMod = IniInt(ini, L"nr", L"modifier", c.nrKeyMod);
+    c.nrKey = IniInt(ini, L"nr", L"key", c.nrKey);
+    c.nrTestKey = IniInt(ini, L"nr", L"test_key", c.nrTestKey);
+    c.nrModel = IniInt(ini, L"nr", L"model", 1) != 0;
+    c.nrIntensity = std::clamp(IniFloat(ini, L"nr", L"intensity", c.nrIntensity), 0.0f, 2.0f);
+    c.nrStyle = std::clamp(IniInt(ini, L"nr", L"style", c.nrStyle), 0, 16);
+    c.nrPreset = std::clamp(IniInt(ini, L"nr", L"preset", c.nrPreset), 0, 16);
+    c.nrAutoMask = IniInt(ini, L"nr", L"auto_mask", 1) != 0;
+    c.nrUiCorrection = IniInt(ini, L"nr", L"ui_correction", 1) != 0;
+    c.nrLocalTone = std::clamp(IniFloat(ini, L"nr", L"local_tone", c.nrLocalTone), 0.0f, 2.0f);
+    c.nrLocalStructure = std::clamp(IniFloat(ini, L"nr", L"local_structure", c.nrLocalStructure), 0.0f, 2.0f);
+    c.nrSkinStructure = IniFloat(ini, L"nr", L"skin_structure", c.nrSkinStructure);
+    c.nrSkinStructure = c.nrSkinStructure < 0 ? -1.0f : (std::min)(c.nrSkinStructure, 1.0f);
+    c.nrLiveTuning = IniInt(ini, L"nr", L"live_tuning", 1) != 0;
+    c.nrDebug = std::clamp(IniInt(ini, L"nr", L"debug", 0), 0, 1);
+    c.nrStrength = std::clamp(IniFloat(ini, L"nr", L"strength", 1.0f), 0.0f, 5.0f);
+    c.nrOuter = IniInt(ini, L"nr", L"outer", 1) != 0;
+    c.nrBatch = IniInt(ini, L"nr", L"batch", 1) != 0;
+    const float outerRes = std::clamp(IniFloat(ini, L"nr", L"outer_resolution", 0.5f), 0.25f, 1.0f);
+    c.nrOuterStep = std::clamp((int)(1.0f / outerRes + 0.5f), 1, 4);
+    c.nrOuterAreaPct = std::clamp((int)(IniFloat(ini, L"nr", L"outer_area", 1.0f) * 100.0f + 0.5f), 50, 100);
+    const std::string outerAtlas = IniString(ini, L"nr", L"outer_atlas", L"shared");
+    c.nrOuterSeparate = outerAtlas == "separate";
+    if (outerAtlas != "shared" && outerAtlas != "separate")
+        Log("Settings: unknown [nr] outer_atlas=\"%s\", using shared", outerAtlas.c_str());
+    c.nrInputScale = IniFloat(ini, L"nr", L"input_scale", c.nrInputScale);
+    if (c.nrInputScale <= 0) c.nrInputScale = 1.0f;
+    c.nrTonemap = std::clamp(IniInt(ini, L"nr", L"tonemap", c.nrTonemap), 0, 2);
+    c.nrMotion = IniInt(ini, L"nr", L"motion_vectors", 1) != 0;
+    c.nrDepth = std::clamp(IniInt(ini, L"nr", L"depth", c.nrDepth), 0, 2);
+    c.nrDepthK = std::clamp(IniFloat(ini, L"nr", L"depth_k", c.nrDepthK), 1e-7f, 1.0f);
+    const std::string transfer = IniString(ini, L"nr", L"transfer", L"ratio");
+    c.nrTransfer = transfer == "inverse" ? 0 : 1;
+    if (transfer != "ratio" && transfer != "inverse")
+        Log("Settings: unknown [nr] transfer=\"%s\", using ratio", transfer.c_str());
+    const std::string ngx = IniString(ini, L"nr", L"ngx", L"auto");
+    c.nrNgx = ngx == "core" ? 1 : ngx == "direct" ? 2 : 0;
+    if (ngx != "auto" && ngx != "core" && ngx != "direct") Log("Settings: unknown [nr] ngx=\"%s\", using auto", ngx.c_str());
+    const std::string app = IniString(ini, L"nr", L"app_id", L"");
+    if (!app.empty()) c.nrAppId = strtoull(app.c_str(), nullptr, 0);
+    if (c.nrMode)
+        Log("Settings: [nr] mode=%s model=%d intensity=%.2f style=%d preset=%d auto_mask=%d ui_correction=%d "
+            "debug=%d strength=%.2f outer=%d batch=%d outer_resolution=1/%d outer_area=%d%% outer_atlas=%s "
+            "input_scale=%g tonemap=%d transfer=%s motion_vectors=%d depth=%d depth_k=%g ngx=%s app_id=0x%llX modifier=0x%X key=0x%X "
+            "test_key=0x%X (prototype NR-P1)",
+            c.nrMode == 2 ? "final" : "focus", c.nrModel, c.nrIntensity, c.nrStyle, c.nrPreset, c.nrAutoMask,
+            c.nrUiCorrection, c.nrDebug, c.nrStrength, c.nrOuter, c.nrBatch, c.nrOuterStep, c.nrOuterAreaPct,
+            c.nrOuterSeparate ? "separate" : "shared", c.nrInputScale, c.nrTonemap,
+            c.nrTransfer ? "ratio" : "inverse", c.nrMotion, c.nrDepth, c.nrDepthK, ngx.c_str(),
+            c.nrAppId, c.nrKeyMod, c.nrKey, c.nrTestKey);
+    if (c.nrMode)
+        Log("Settings: [nr] local_tone=%.2f local_structure=%.2f skin_structure=%.2f live_tuning=%d",
+            c.nrLocalTone, c.nrLocalStructure, c.nrSkinStructure, c.nrLiveTuning);
+    c.panelKeyMod = IniInt(ini, L"panel", L"modifier", c.panelKeyMod);
+    c.panelKey = IniInt(ini, L"panel", L"key", c.panelKey);
+    c.panelWidthM = std::clamp(IniFloat(ini, L"panel", L"width_m", c.panelWidthM), 0.1f, 2.0f);
+    c.panelDistanceM = std::clamp(IniFloat(ini, L"panel", L"distance_m", c.panelDistanceM), 0.2f, 3.0f);
+    c.panelDownM = std::clamp(IniFloat(ini, L"panel", L"down_m", c.panelDownM), -1.0f, 1.0f);
+    c.panelTiltDeg = std::clamp(IniFloat(ini, L"panel", L"tilt_deg", c.panelTiltDeg), -60.0f, 60.0f);
+    if (c.nrMode)
+        Log("Settings: [panel] modifier=0x%X key=0x%X width_m=%.2f distance_m=%.2f down_m=%.2f tilt_deg=%.0f",
+            c.panelKeyMod, c.panelKey, c.panelWidthM, c.panelDistanceM, c.panelDownM, c.panelTiltDeg);
     c.testFaultFrames = IniInt(ini, L"test", L"fault_frames", 0);
     if (c.testFaultFrames > 0) Log("Settings: [test] fault_frames=%d (deliberate fault for testing)", c.testFaultFrames);
     return c;
@@ -539,9 +607,9 @@ void LoadConfig() {
         c.benchSequence.c_str(), c.gazeRead, ExpModeName(c.expMode), c.expFocusSize, c.expCenterX, c.expCenterY, c.expPad);
 }
 
-bool ReloadConfig() {
+bool ReloadConfig(bool force) {
     const double now = NowMs();
-    if (now - g_iniCheckMs < 1000) return false;
+    if (!force && now - g_iniCheckMs < 1000) return false;
     g_iniCheckMs = now;
     WIN32_FILE_ATTRIBUTE_DATA a{};
     if (!GetFileAttributesExW(IniFile().c_str(), GetFileExInfoStandard, &a)) return false;
@@ -573,7 +641,8 @@ bool ReloadConfig() {
              n.fixedSectionX != c.fixedSectionX || n.fixedSectionY != c.fixedSectionY,
          "[quad] *_section");
     need(n.probeFrames != c.probeFrames || n.probeEngine != c.probeEngine || n.probeD3D != c.probeD3D, "[quad] probe_*");
-    need(n.dlaa != c.dlaa, "[dlaa] mode");
+    need(n.dlaa != c.dlaa || n.dlaaSr != c.dlaaSr, "[dlaa] mode");
+    need(n.dlaaRenderScale != c.dlaaRenderScale, "[dlaa] render_scale");
     need(n.mvr != c.mvr, "[mvr] mode");
     need(n.mvrVsPatch != c.mvrVsPatch, "[debug] mvr_vs_patch");
     need(n.mvrPsPatch != c.mvrPsPatch, "[debug] mvr_ps_patch");
@@ -594,6 +663,40 @@ bool ReloadConfig() {
     c.dlaaCockpitTaa = n.dlaaCockpitTaa;
     c.dlaaPresetKeyMod = n.dlaaPresetKeyMod;
     c.dlaaPresetKey = n.dlaaPresetKey;
+    c.nrMode = n.nrMode;
+    c.nrKeyMod = n.nrKeyMod;
+    c.nrKey = n.nrKey;
+    c.nrTestKey = n.nrTestKey;
+    c.nrModel = n.nrModel;
+    c.nrIntensity = n.nrIntensity;
+    c.nrStyle = n.nrStyle;
+    c.nrPreset = n.nrPreset;
+    c.nrAutoMask = n.nrAutoMask;
+    c.nrUiCorrection = n.nrUiCorrection;
+    c.nrLocalTone = n.nrLocalTone;
+    c.nrLocalStructure = n.nrLocalStructure;
+    c.nrSkinStructure = n.nrSkinStructure;
+    c.nrLiveTuning = n.nrLiveTuning;
+    c.panelKeyMod = n.panelKeyMod;
+    c.panelKey = n.panelKey;
+    c.panelWidthM = n.panelWidthM;
+    c.panelDistanceM = n.panelDistanceM;
+    c.panelDownM = n.panelDownM;
+    c.panelTiltDeg = n.panelTiltDeg;
+    c.nrDebug = n.nrDebug;
+    c.nrStrength = n.nrStrength;
+    c.nrOuter = n.nrOuter;
+    c.nrBatch = n.nrBatch;
+    c.nrOuterStep = n.nrOuterStep;
+    c.nrOuterAreaPct = n.nrOuterAreaPct;
+    c.nrOuterSeparate = n.nrOuterSeparate;
+    c.nrInputScale = n.nrInputScale;
+    c.nrTonemap = n.nrTonemap;
+    c.nrTransfer = n.nrTransfer;
+    c.nrMotion = n.nrMotion;
+    c.nrDepth = n.nrDepth;
+    c.nrDepthK = n.nrDepthK;
+    need(n.nrNgx != c.nrNgx || n.nrAppId != c.nrAppId, "[nr] ngx, app_id");
     c.statsIntervalS = n.statsIntervalS;
     c.warningBox = n.warningBox;
     c.benchKeyMod = n.benchKeyMod;

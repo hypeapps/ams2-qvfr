@@ -73,6 +73,21 @@ Settings Read(const IniFile& ini) {
     if (s.dlaaPreset.empty() || s.dlaaPreset == "default") s.dlaaPreset = "k";
     s.dlaaAutoExposure = ParseInt(ini.GetOr("dlaa", "auto_exposure", ""), 0) != 0;
     s.dlaaExposure = ParseFloat(ini.GetOr("dlaa", "exposure", ""), 0.002f);
+    // [nr], with the proxy's defaults and ranges (common.cpp).
+    const std::string nr = ini.GetOr("nr", "mode", "off");
+    s.nr = nr == "final" || nr == "focus";
+    s.nrIntensity = Clamp(ParseFloat(ini.GetOr("nr", "intensity", ""), 1.0f), 0, 2);
+    s.nrStrength = Clamp(ParseFloat(ini.GetOr("nr", "strength", ""), 1.0f), 0, 5);
+    s.nrLocalTone = Clamp(ParseFloat(ini.GetOr("nr", "local_tone", ""), 1.0f), 0, 2);
+    s.nrLocalStructure = Clamp(ParseFloat(ini.GetOr("nr", "local_structure", ""), 1.0f), 0, 2);
+    s.nrStyle = (int)Clamp((float)ParseInt(ini.GetOr("nr", "style", ""), 0), 0, 16);
+    s.nrPreset = (int)Clamp((float)ParseInt(ini.GetOr("nr", "preset", ""), 0), 0, 16);
+    s.nrAutoMask = ParseInt(ini.GetOr("nr", "auto_mask", ""), 1) != 0;
+    s.nrOuter = ParseInt(ini.GetOr("nr", "outer", ""), 1) != 0;
+    const float outerRes = Clamp(ParseFloat(ini.GetOr("nr", "outer_resolution", ""), 0.5f), 0.25f, 1);
+    s.nrOuterStep = (int)Clamp((float)(int)(1.0f / outerRes + 0.5f), 1, 4);
+    s.nrOuterArea = Clamp(ParseFloat(ini.GetOr("nr", "outer_area", ""), 1.0f), 0.5f, 1);
+    s.nrOuterSeparate = ini.GetOr("nr", "outer_atlas", "shared") == "separate";
     s.csvAlways = ParseInt(ini.GetOr("timing", "csv_always", ""), 0) != 0;
     s.benchKey = ParseInt(ini.GetOr("benchmark", "key", ""), 0);
     s.overlayKey = ParseInt(ini.GetOr("debug", "overlay_key", ""), 0);
@@ -101,6 +116,11 @@ std::string Num(float v) {
 
 void ClearPresetOverrides(IniFile& ini) {
     for (const char* k : kPresetKeys) ini.Set("quad", k, "");
+}
+
+void WriteNr(IniFile& ini, bool on) {
+    ini.Set("nr", "mode", on ? "final" : "off");
+    if (on) ini.Set("dlaa", "mode", "dlaa");
 }
 
 void WritePreset(IniFile& ini, int preset) {

@@ -36,6 +36,44 @@ add_custom_command(
   DEPENDS ${QVFR_DLAA_HLSL}
   COMMENT "fxc dlaa.hlsl"
   VERBATIM)
+set(QVFR_SR_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sr.hlsl)
+add_custom_command(
+  OUTPUT ${QVFR_SHADER_OUT}/sr_vs.h ${QVFR_SHADER_OUT}/sr_color_ps.h ${QVFR_SHADER_OUT}/sr_depth_ps.h
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${QVFR_SHADER_OUT}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T vs_5_0 /E VSFull /Vn kSrVS
+          /Fh ${QVFR_SHADER_OUT}/sr_vs.h ${QVFR_SR_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T ps_5_0 /E PSColor /Vn kSrColorPS
+          /Fh ${QVFR_SHADER_OUT}/sr_color_ps.h ${QVFR_SR_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T ps_5_0 /E PSDepth /Vn kSrDepthPS
+          /Fh ${QVFR_SHADER_OUT}/sr_depth_ps.h ${QVFR_SR_HLSL}
+  DEPENDS ${QVFR_SR_HLSL}
+  COMMENT "fxc sr.hlsl"
+  VERBATIM)
+set(QVFR_NR_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/shaders/nr.hlsl)
+add_custom_command(
+  OUTPUT ${QVFR_SHADER_OUT}/nr_pack_cs.h ${QVFR_SHADER_OUT}/nr_unpack_cs.h ${QVFR_SHADER_OUT}/nr_motion_cs.h
+         ${QVFR_SHADER_OUT}/nr_depth_cs.h ${QVFR_SHADER_OUT}/nr_unpack4_cs.h ${QVFR_SHADER_OUT}/nr_pack_region_cs.h
+         ${QVFR_SHADER_OUT}/nr_unpack_region_cs.h ${QVFR_SHADER_OUT}/nr_upedit_cs.h
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${QVFR_SHADER_OUT}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSPack /Vn kNrPackCS
+          /Fh ${QVFR_SHADER_OUT}/nr_pack_cs.h ${QVFR_NR_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSUnpack /Vn kNrUnpackCS
+          /Fh ${QVFR_SHADER_OUT}/nr_unpack_cs.h ${QVFR_NR_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSUnpack4 /Vn kNrUnpack4CS
+          /Fh ${QVFR_SHADER_OUT}/nr_unpack4_cs.h ${QVFR_NR_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSMotion /Vn kNrMotionCS
+          /Fh ${QVFR_SHADER_OUT}/nr_motion_cs.h ${QVFR_NR_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSDepth /Vn kNrDepthCS
+          /Fh ${QVFR_SHADER_OUT}/nr_depth_cs.h ${QVFR_NR_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSPackRegion /Vn kNrPackRegionCS
+          /Fh ${QVFR_SHADER_OUT}/nr_pack_region_cs.h ${QVFR_NR_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSUnpackRegion /Vn kNrUnpackRegionCS
+          /Fh ${QVFR_SHADER_OUT}/nr_unpack_region_cs.h ${QVFR_NR_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSUpEdit /Vn kNrUpEditCS
+          /Fh ${QVFR_SHADER_OUT}/nr_upedit_cs.h ${QVFR_NR_HLSL}
+  DEPENDS ${QVFR_NR_HLSL}
+  COMMENT "fxc nr.hlsl"
+  VERBATIM)
 set(QVFR_MVRPASS_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/shaders/mvr_pass.hlsl)
 add_custom_command(
   OUTPUT ${QVFR_SHADER_OUT}/mvr_pass_vs.h ${QVFR_SHADER_OUT}/mvr_pass_depth_ps.h ${QVFR_SHADER_OUT}/mvr_pass_mask_ps.h
@@ -80,10 +118,22 @@ add_library(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT}/compose_vs.h ${QVFR_SHADER
             ${QVFR_SHADER_OUT}/mvr_pass_mask_ps.h ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ps.h
             ${QVFR_SHADER_OUT}/mvr_pass_blit_ps.h ${QVFR_SHADER_OUT}/mvr_pass_color_in_ms_ps.h
             ${QVFR_SHADER_OUT}/mvr_pass_color_out_ms_ps.h ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ms_ps.h
-            ${QVFR_SHADER_OUT}/mvr_pass_depth_ms_ps.h ${QVFR_SHADER_OUT}/mvr_motion_cs.h)
+            ${QVFR_SHADER_OUT}/mvr_pass_depth_ms_ps.h ${QVFR_SHADER_OUT}/mvr_motion_cs.h
+            ${QVFR_SHADER_OUT}/sr_vs.h ${QVFR_SHADER_OUT}/sr_color_ps.h ${QVFR_SHADER_OUT}/sr_depth_ps.h
+            ${QVFR_SHADER_OUT}/nr_pack_cs.h ${QVFR_SHADER_OUT}/nr_unpack_cs.h ${QVFR_SHADER_OUT}/nr_motion_cs.h
+            ${QVFR_SHADER_OUT}/nr_depth_cs.h ${QVFR_SHADER_OUT}/nr_unpack4_cs.h ${QVFR_SHADER_OUT}/nr_pack_region_cs.h
+            ${QVFR_SHADER_OUT}/nr_unpack_region_cs.h ${QVFR_SHADER_OUT}/nr_upedit_cs.h)
 target_include_directories(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT})
 
 enable_language(ASM_MASM)  # export thunks (generated/thunks.asm)
+
+# The tuning panel (panel_ui.cpp): RmlUi's D3D11 renderer from its backends; its own Windows header defines
+# WIN32_LEAN_AND_MEAN again (C4005). The fonts in panel.rc.
+set(QVFR_RML_BACKENDS ${PROJECT_SOURCE_DIR}/third_party/rmlui-6.3/Backends)
+set_source_files_properties(${QVFR_RML_BACKENDS}/RmlUi_Renderer_DX11.cpp PROPERTIES COMPILE_OPTIONS "/wd4005")
+file(GLOB QVFR_PANEL_FONTS "${PROJECT_SOURCE_DIR}/third_party/fonts/inter/*.ttf"
+     "${PROJECT_SOURCE_DIR}/third_party/fonts/barlowcondensed/*.ttf")
+set_source_files_properties(panel.rc PROPERTIES OBJECT_DEPENDS "${QVFR_PANEL_FONTS}")
 
 add_library(qvfr_proxy SHARED
   exports.cpp
@@ -107,6 +157,9 @@ add_library(qvfr_proxy SHARED
   runtime.cpp
   diag.cpp
   dlaa.cpp
+  sr.cpp
+  nr.cpp
+  nr_bridge.cpp
   xr_layer.cpp
   sysinfo.cpp
   sun_fx.cpp
@@ -116,8 +169,19 @@ add_library(qvfr_proxy SHARED
   mvr_motion.cpp
   taa_views.cpp
   common.cpp
+  panel.cpp
+  panel_ui.cpp
+  panel_input.cpp
+  ${PROJECT_SOURCE_DIR}/src/config/ini_file.cpp
+  ${QVFR_RML_BACKENDS}/RmlUi_Renderer_DX11.cpp
+  panel.rc
 )
-target_link_libraries(qvfr_proxy PRIVATE qvfr_shaders qvfr_dxbc nvapi openvr_0912 openxr_headers minhook bcrypt version psapi shell32 ole32 windowscodecs)
+target_link_libraries(qvfr_proxy PRIVATE qvfr_shaders qvfr_dxbc nvapi openvr_0912 openxr_headers minhook bcrypt version psapi shell32 ole32 windowscodecs
+                      RmlUi::Core d3dcompiler delayimp dxguid)
+# The tuning panel's renderer compiles its shaders at run time; the system compiler loads only when the panel opens.
+target_link_options(qvfr_proxy PRIVATE /DELAYLOAD:d3dcompiler_47.dll)
+# The tuning panel saves qvfr.ini with the settings GUI's ini writer (comments and order kept).
+target_include_directories(qvfr_proxy PRIVATE ${QVFR_RML_BACKENDS} ${PROJECT_SOURCE_DIR}/src/config)
 target_compile_definitions(qvfr_proxy PRIVATE VR_API_EXPORT)
 # /EHa instead of the default /EHsc: an SEH fault caught by Guarded/Safe then unwinds C++ objects (lock_guard),
 # so no mutex stays locked after a fault in our code. Directory scope: only this target is built here.
@@ -128,7 +192,7 @@ target_compile_options(qvfr_proxy PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/W4;/EHa>")
 set(QVFR_DLSS_SDK ${PROJECT_SOURCE_DIR}/third_party/dlss-310.9.16)
 if(EXISTS ${QVFR_DLSS_SDK}/include/nvsdk_ngx.h AND EXISTS ${QVFR_DLSS_SDK}/lib/nvsdk_ngx_s.lib)
   message(STATUS "DLSS SDK found (${QVFR_DLSS_SDK}): DLAA built into the proxy")
-  target_compile_definitions(qvfr_proxy PRIVATE QVFR_HAVE_DLSS)
+  target_compile_definitions(qvfr_proxy PRIVATE QVFR_HAVE_DLSS QVFR_HAVE_NGX_HEADERS)
   target_include_directories(qvfr_proxy SYSTEM PRIVATE ${QVFR_DLSS_SDK}/include)
   target_link_libraries(qvfr_proxy PRIVATE
     $<IF:$<CONFIG:Debug>,${QVFR_DLSS_SDK}/lib/nvsdk_ngx_s_dbg.lib,${QVFR_DLSS_SDK}/lib/nvsdk_ngx_s.lib>)

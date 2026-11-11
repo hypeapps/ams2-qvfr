@@ -11,9 +11,11 @@
 #include "callers.h"
 #include "common.h"
 #include "dlaa.h"
+#include "sr.h"
 #include "experiment.h"
 #include "frame.h"
 #include "gpu.h"
+#include "panel.h"
 #include "generated/wrappers_0912.h"
 #include "probe.h"
 #include "quad.h"
@@ -134,6 +136,7 @@ public:
         // Outside Guarded: must not depend on the diagnostics kill-switch. At most one of them is on (quad wins).
         experiment::AdjustSize(real_, w, h);
         quad::AdjustSize(real_, w, h);
+        if (w && h) sr::NoteGameSize(*w, *h);  // DLSS SR: the clones' sizes (guards itself)
         Guarded("GetRecommendedRenderTargetSize", [&] {
             if (!w || !h) return;
             frame::NoteRecommendedSize(realW, realH, *w, *h);
@@ -224,6 +227,7 @@ public:
         probe::OnFrameStart();
         quad::OnFrameStart();
         dlaa::OnFrameStart();
+        sr::OnFrameStart(dlaa::SrWanted());
         double t0 = NowMs();
         vr::EVRCompositorError err = CompositorWrapBase::WaitGetPoses(render, nRender, game, nGame);
         double t1 = NowMs();
@@ -255,10 +259,12 @@ public:
         if (tex && tex->eType == vr::API_DirectX) gpu::OnSubmitTexture(tex->handle);
         probe::OnSubmitBegin(eye, tex);
         quad::OnSubmitBegin(eye, tex);
+        if (tex && tex->eType == vr::API_DirectX) sr::OnSubmit((int)eye, tex->handle);  // DLSS SR shot
         // Quad mode: the compositor gets the composed eye (outer upscaled to the grid, focus 1:1 in its window).
         vr::Texture_t composed{};
         out = quad::PrepareSubmit(eye, out, bounds, composed);
         if (eye == vr::Eye_Right) gpu::FrameEnd();
+        panel::OnSubmit(eye);  // the tuning panel's keys, picture and overlay (right eye)
         double t0 = NowMs();
         vr::EVRCompositorError err = CompositorWrapBase::Submit(eye, out, bounds, flags);
         probe::OnSubmitEnd(eye);

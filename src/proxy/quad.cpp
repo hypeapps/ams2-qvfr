@@ -30,6 +30,7 @@
 #include "mvr_pass.h"
 #include "mvr_ps.h"
 #include "mvr_vs.h"
+#include "nr.h"
 #include "shots.h"
 #include "sun_fx.h"
 #include "taa_views.h"
@@ -2097,7 +2098,7 @@ ID3D11Texture2D* ComposeLocked(int e, const vr::Texture_t* tex, const vr::VRText
     l.y0 = foc.y0;
     const Config& c = Cfg();
     l.marginPx = (float)c.quadMarginPx;
-    l.smoothen = c.smoothen;
+    l.smoothen = nr::Smoothen(c.smoothen);  // the ini's, the tuning panel's or the NR test step's
     l.legacyEdge = c.legacyEdge;
     l.featherPx = (float)c.quadFeatherPx;
     l.overlay = g_overlay;
@@ -2106,6 +2107,19 @@ ID3D11Texture2D* ComposeLocked(int e, const vr::Texture_t* tex, const vr::VRText
         l.gazeMode = g_gazeFrozen ? 2 : 1;
         l.gazeX = (g_gaze[e][0] + 1) * 0.5f * g.gridW;
         l.gazeY = (1 - g_gaze[e][1]) * 0.5f * g.gridH;
+    }
+    // [nr] mode=final: the finished focus image (and with [nr] outer the outer image) through NVIDIA's NR model;
+    // compose reads NR's copies (same size and format), the game's textures stay as they are.
+    if (nr::WantedFinal()) {
+        // The right eye's finished images for the left eye's call (one evaluation for the frame with [nr] batch=1):
+        // focus R is what its CEndEye wrote, outer R this frame's copy.
+        ID3D11Texture2D* rightFocus = nullptr;
+        ID3D11Texture2D* rightOuter = nullptr;
+        if (e == 0 && g_run[FocusR].out)
+            static_cast<IUnknown*>(g_run[FocusR].out)->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&rightFocus);
+        if (e == 0 && g_copy[CopyOuterR].frame) rightOuter = g_copy[CopyOuterR].tex;
+        nr::ProcessFinal(imm, e, focusTex, outerTex, rightFocus, rightOuter);
+        if (rightFocus) rightFocus->Release();
     }
     const gpu::Phase phase = e ? gpu::ComposeR : gpu::ComposeL;
     gpu::Begin(phase);
@@ -3238,6 +3252,23 @@ const Switch kSwitches[] = {
          g_vrOn = v != 0;
          if (g_vrOn) g_vrStopped = false;
      }},
+    {"nr", false, 0, 1, [] { return (int)nr::Active(); }, [](int v) { nr::SetActive(v != 0); }},
+    {"nr_outer", false, 0, 1, [] { return nr::GetKnob(nr::Knob::Outer); },
+     [](int v) { nr::SetKnob(nr::Knob::Outer, v); }},
+    {"nr_batch", false, 0, 1, [] { return nr::GetKnob(nr::Knob::Batch); },
+     [](int v) { nr::SetKnob(nr::Knob::Batch, v); }},
+    {"nr_outer_res", false, 1, 4, [] { return nr::GetKnob(nr::Knob::OuterRes); },
+     [](int v) { nr::SetKnob(nr::Knob::OuterRes, v); }},
+    {"nr_outer_area", false, 50, 100, [] { return nr::GetKnob(nr::Knob::OuterArea); },
+     [](int v) { nr::SetKnob(nr::Knob::OuterArea, v); }},
+    {"nr_preset", false, 0, 3, [] { return nr::GetKnob(nr::Knob::Preset); },
+     [](int v) { nr::SetKnob(nr::Knob::Preset, v); }},
+    {"nr_style", false, 0, 3, [] { return nr::GetKnob(nr::Knob::Style); },
+     [](int v) { nr::SetKnob(nr::Knob::Style, v); }},
+    {"nr_strength", false, 0, 300, [] { return nr::GetKnob(nr::Knob::Strength); },
+     [](int v) { nr::SetKnob(nr::Knob::Strength, v); }},
+    {"nr_outer_separate", false, 0, 1, [] { return nr::GetKnob(nr::Knob::OuterSeparate); },
+     [](int v) { nr::SetKnob(nr::Knob::OuterSeparate, v); }},
     {"queue_breakdown", false, 0, 1, [] { return (int)g_qbOn; }, [](int v) {
          g_qbOn = v != 0;
          g_qbWant = g_qbOn ? (1u << OuterL) | (1u << FocusL) : 0;

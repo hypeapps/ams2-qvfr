@@ -31,6 +31,8 @@ uint64_t Frame();
 bool FrameJitter(float out[2]);
 // Logs the next `calls` SetJitter calls (any thread): context, offset, frame counter, caller (MVR jitter diagnosis).
 void TraceJitter(int calls);
+// DLSS SR (sr.h, [dlaa] mode=dlss in stereo): DLSS can run now, so the scene may render at the render size.
+bool SrWanted();
 void LogStats(bool totals);
 std::string Describe();  // one line for summary.txt
 void Shutdown();         // VR_Shutdown: DLSS features and NGX released

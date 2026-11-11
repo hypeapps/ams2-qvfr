@@ -249,7 +249,11 @@ struct Config {
     bool mvrVelocityRecordSkip = true;
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
-    bool dlaa = false;                // mode=dlaa (a change needs a restart)
+    bool dlaa = false;                // mode=dlaa or dlss (a change needs a restart)
+    // mode=dlss (dlaa-plan S1, stereo only): the scene renders at render_scale of the eye size into the clones
+    // (sr.h) and DLSS Super Resolution scales it to the eye size at the TAA resolve. Restart for both.
+    bool dlaaSr = false;
+    float dlaaRenderScale = 0.67f;
     int dlaaPreset = 0;               // DLSS render preset hint for DLAA: 0 = DLSS default, 10 = J, 11 = K, ...
     float dlaaJitterScaleX = 0.5f;    // DLSS jitter in pixels = the engine's projection offset * scale
     float dlaaJitterScaleY = -0.5f;
@@ -270,6 +274,62 @@ struct Config {
     int dlaaCockpitTaa = 1;
     int dlaaPresetKeyMod = VK_RCONTROL;  // DLSS preset steps: ini, J, K, M, L (testers)
     int dlaaPresetKey = 0;               // testers: VK_HOME
+    // [nr] (prototype NR-P1, dlaa-plan D7; not in the default ini): 0 off, 1 focus = after DLAA the focus views go
+    // through the NR bridge (nr.h; step 1: passthrough without a model); 2 final = the finished focus images at the
+    // composition (motion vectors and depth from DLAA). Live, like its hotkey.
+    int nrMode = 0;
+    int nrKeyMod = VK_RCONTROL;  // NR on/off (A/B)
+    int nrKey = 0;
+    int nrTestKey = 0;           // with nrKeyMod: the next step of the built-in NR test sequence (nr.cpp kSteps)
+    bool nrModel = true;        // false: the bridge only copies (passthrough test)
+    // Model tuning (nr-bridge's names): a change recreates the model instances.
+    float nrIntensity = 1.0f;
+    int nrStyle = 0;
+    int nrPreset = 0;
+    bool nrAutoMask = true;      // DLSSNR.UseAutoMask
+    bool nrUiCorrection = true;  // DLSSNR.UICorrection
+    // DLSSNR.LocalToneStrength, LocalStructureStrength (0..2) and SkinStructureStrength (0..1, -1 = the model's own).
+    float nrLocalTone = 1.0f, nrLocalStructure = 1.0f, nrSkinStructure = -1.0f;
+    // 1: a change of intensity, local tone, local structure or skin structure goes into the next evaluations without
+    // new model instances (smooth sliders, if the model reads them there); 0: new instances.
+    bool nrLiveTuning = true;
+    // 0 off, 1 the focus views show the model's edit instead of the image: grey = unchanged, lighter or darker =
+    // what the model changed (x20, in the model's units).
+    int nrDebug = 0;
+    float nrStrength = 1.0f;     // the model's edit x this (DXL's "Self Layers"; 1 = as the model made it)
+    bool nrOuter = true;         // mode=final: the outer images through the model too (no tone step at the focus edge)
+    bool nrBatch = true;         // mode=final: all images of a frame in one atlas, one evaluation of the model
+    // batch=1: the outer images go into the atlas at 1/nrOuterStep of their size per axis ([nr] outer_resolution, 1 =
+    // full, 0.5 = half); the model's edit is enlarged back onto them.
+    int nrOuterStep = 2;
+    // The outer images' centre part that goes through the model, percent per axis ([nr] outer_area 0.5..1); outside it
+    // the model's edit fades out (the far periphery keeps the game's image).
+    int nrOuterAreaPct = 100;
+    // batch=1: the outer images in an atlas of their own and a second evaluation ([nr] outer_atlas=separate): the focus
+    // looks as without the outer (the model judges the light of its whole input), for about 1 ms more; shared (default)
+    // puts them with the focus images.
+    bool nrOuterSeparate = false;
+    // Into the model: DLAA's HDR color * input_scale (0.002 = DLAA's exposure), tonemap 0 none, 1 Reinhard,
+    // 2 Reinhard and 2.2 gamma (a display-like image); undone after the model.
+    float nrInputScale = 0.002f;
+    int nrTonemap = 2;
+    int nrTransfer = 1;          // back from the model: 1 ratio (output / input on the HDR image), 0 inverse
+    bool nrMotion = true;        // the game's motion vectors (0: zero vectors)
+    // Depth into the model: 0 constant 0.5 (as nr-bridge), 1 the game's linear TAA depth, 2 reversed device-like
+    // depth depth_k / linear. A change recreates the model instances.
+    int nrDepth = 0;
+    float nrDepthK = 2e-5f;
+    // Fixed for the session: 0 auto (the driver's NGX core, then the model directly), 1 core, 2 model directly.
+    int nrNgx = 0;
+    unsigned long long nrAppId = 0x24480451ull;  // NGX application id (nr-bridge's default)
+    // [panel] the tuning panel in the headset (dlaa-plan D7.P): hotkey (modifier + key, VK codes) and its place in the
+    // seated space: width, distance ahead of and drop below the seated origin, tilt towards the eyes (degrees).
+    int panelKeyMod = VK_RCONTROL;
+    int panelKey = VK_F2;
+    float panelWidthM = 0.50f;  // the rows and the measured values right of them
+    float panelDistanceM = 0.55f;
+    float panelDownM = 0.12f;
+    float panelTiltDeg = 15.0f;
     // [test] (not in the default ini; used by qvfr_proxy_smoke --fault)
     int testFaultFrames = 0;          // > 0: deliberate access violation in the diagnostics at this proxy frame
 };
@@ -277,8 +337,9 @@ struct Config {
 const Config& Cfg();
 void LoadConfig();                    // creates a default qvfr.ini if it does not exist
 // Render thread, every frame: at most once a second checks the ini date; a changed file updates the live settings
-// (listed at the end of the default ini) and logs the ones that need a restart. True when it reloaded.
-bool ReloadConfig();
+// (listed at the end of the default ini) and logs the ones that need a restart. True when it reloaded. now: check at
+// once (the tuning panel after it saved).
+bool ReloadConfig(bool now = false);
 
 fs::path ModuleDir();                 // folder of the proxy DLL (the game's x64\)
 fs::path BaseDir();                   // %QVFR_HOME% (tests) or x64\qvfr; %TEMP%\ams2-qvfr when x64\qvfr is not writable

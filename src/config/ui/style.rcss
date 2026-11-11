@@ -152,6 +152,9 @@ h1 {
 .banner-title { font-weight: 600; color: #ffffff; margin-right: 6dp; }
 /* Inside a card: the first thing in its body. */
 .banner.gaze-warn { margin: 12dp 0 4dp 0; font-size: 13.5dp; line-height: 19dp; }
+/* A warning with a button on its right (the text in a block span: bare text in a flex box is not drawn). */
+.banner.withbtn { display: flex; flex-direction: row; align-items: center; margin-bottom: 12dp; }
+.banner.withbtn .btext { display: block; flex: 1; margin-right: 14dp; }
 
 /* Card like the tiles of the game's Options menu: a lighter grey header strip with the title over a darker body,
    rounded corners, hairlines between the rows. */
@@ -458,6 +461,9 @@ input.range sliderarrowdec, input.range sliderarrowinc { width: 0; height: 0; }
     transition: left 0.12s cubic-out;
 }
 .switch input.checkbox:checked + .knob { left: 28dp; background-color: #ffffff; }
+/* Held by another setting (DLAA while DLSS 5 is on): greyed out, no click. */
+.row.locked .switch { opacity: 0.35; }
+.row.locked .switch input.checkbox { cursor: default; }
 
 /* Segmented control: one framed group, the chosen part filled. */
 .seg { display: flex; flex-direction: row; border: 1dp #3a3a3a; border-radius: 4dp; background-color: #141414; padding: 2dp; }

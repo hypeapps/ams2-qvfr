@@ -72,6 +72,25 @@ int RunSelfTest(const fs::path& dir) {
         const auto ch = ChangedRestartKeys(ini, d);
         Expect(Read(d).dlaa && ch.size() == 1 && ch[0] == "NVIDIA DLAA on/off", "DLAA on needs a restart");
     }
+    Expect(!s.nr && Near(s.nrIntensity, 1) && Near(s.nrStrength, 1) && s.nrStyle == 0 && s.nrPreset == 0 &&
+               s.nrAutoMask && s.nrOuter && s.nrOuterStep == 2 && Near(s.nrOuterArea, 1) && !s.nrOuterSeparate,
+           "default ini: DLSS 5 off, the proxy's defaults (outer on at 1/2)");
+    {
+        IniFile d = ini;
+        WriteNr(d, true);
+        Settings n = Read(d);
+        const auto ch = ChangedRestartKeys(ini, d);
+        Expect(n.nr && n.dlaa && d.GetOr("nr", "mode", "") == "final" && ch.size() == 1 && ch[0] == "NVIDIA DLAA on/off",
+               "DLSS 5 on: [nr] mode=final and DLAA on (only DLAA needs a restart)");
+        WriteNr(d, false);
+        n = Read(d);
+        Expect(!n.nr && n.dlaa, "DLSS 5 off: DLAA stays on");
+        d.Set("nr", "outer_resolution", "0.333");
+        d.Set("nr", "outer_atlas", "separate");
+        d.Set("nr", "intensity", "1.5");
+        n = Read(d);
+        Expect(n.nrOuterStep == 3 && n.nrOuterSeparate && Near(n.nrIntensity, 1.5f), "DLSS 5 options read back");
+    }
 
     Expect(ini.Set("quad", "peripheral_multiplier", Num(0.4f)), "set an empty key");
     s = Read(ini);
@@ -139,6 +158,20 @@ int RunSelfTest(const fs::path& dir) {
     Write(mod / L"nvngx_dlss.dll", "MZ dlss");
     f = CheckFiles(mod, false, true);
     Expect(f.dlss && dlssRow(f) == Status::Ok, "files: nvngx_dlss.dll present");
+    auto rowOf = [](const FileState& st, const char* item) {
+        for (const Check& c : st.checks)
+            if (c.item == item) return (int)c.status;
+        return -1;
+    };
+    Expect(rowOf(f, "x64\\qvfr\\nvngx_dlssnr.dll") == -1 &&
+               rowOf(CheckFiles(mod, false, true, true), "x64\\qvfr\\nvngx_dlssnr.dll") == (int)Status::Error,
+           "files: the DLSS 5 model is no row without DLSS 5, an error with it");
+    Write(mod / L"nvngx_dlssnr.dll", "MZ nr");
+    Write(mod / L"nvngx.dll_qvfr_nr.dll", "MZ fwd");
+    f = CheckFiles(mod, false, true, true);
+    Expect(f.nrModel && f.nrForwarder && rowOf(f, "x64\\qvfr\\nvngx_dlssnr.dll") == (int)Status::Ok &&
+               rowOf(f, "x64\\qvfr\\nvngx.dll_qvfr_nr.dll") == (int)Status::Ok,
+           "files: the DLSS 5 files present");
     Write(dir / L"x64" / L"openvr_api.dll", "MZ... OpenComposite ...");
     Expect(CheckFiles(mod, false).gameDll == GameDll::OpenComposite, "files: OpenComposite in x64");
     if (GameRunning()) {

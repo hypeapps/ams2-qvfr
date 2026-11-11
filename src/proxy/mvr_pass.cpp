@@ -3319,8 +3319,77 @@ struct TaskMap {
     // detail: distinct (slot, resource) of the PS shader resources and constant buffers at the draws
     std::vector<std::pair<UINT, void*>> srvs, cbs;
     bool srvMore = false;
+    // S1 probe (TaskMapOn and the functions after it)
+    DWORD tid = 0;
+    std::string events;
+    bool eventsMore = false;
+    struct Vp {
+        float w, h;
+        void* caller;
+        unsigned n;
+    };
+    std::vector<Vp> vps;
+    bool vpMore = false;
+    unsigned postColor = 0;   // draws into the TAA draw's color source after that draw
+    void* postDsv = nullptr;  // the depth target of the first of them (only compared)
+    bool postDsvMixed = false;
+    std::string sizesBegin;
 };
 TaskMap g_map;
+
+// S1 probe, frame-wide: the last TAA resolve draw's color source and linear depth (originals, only compared), the
+// engine sizes after the previous mapped task, events outside a mapped task in this frame.
+std::atomic<bool> g_s1Frame{false};
+std::atomic<bool> g_s1Fault{false};
+void* g_s1Color = nullptr;
+void* g_s1Depth = nullptr;
+std::string g_s1Sizes;
+std::atomic<int> g_s1Loose{0};
+
+template <class F>
+void S1Protect(const char* where, F&& f) {
+    if (g_s1Fault.load(std::memory_order_relaxed)) return;
+    unsigned long code = 0;
+    __try {
+        f();
+    } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+        g_s1Fault = true;
+        Log("MVR task map S1: exception 0x%08lX (%s); the S1 probe is off for this session", code, where);
+    }
+}
+
+// "AMS2AVX.exe+0x..." (or another module's name) of a code address.
+std::string CodeAt(void* p) {
+    HMODULE m = nullptr;
+    char b[128];
+    if (p && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                (LPCWSTR)p, &m) && m) {
+        wchar_t name[MAX_PATH] = {};
+        GetModuleFileNameW(m, name, MAX_PATH);
+        snprintf(b, sizeof(b), "%s+0x%llX", Narrow(fs::path(name).filename().wstring()).c_str(),
+                 (unsigned long long)((uintptr_t)p - (uintptr_t)m));
+    } else {
+        snprintf(b, sizeof(b), "%p", p);
+    }
+    return b;
+}
+
+std::string EngineSizesText() {
+    float rt[4][2] = {};
+    int post[2] = {};
+    if (!clones::EngineSizes(rt, post)) return "not readable";
+    char b[160];
+    snprintf(b, sizeof(b), "contexts %gx%g %gx%g %gx%g %gx%g, postprocess %dx%d", rt[0][0], rt[0][1], rt[1][0], rt[1][1],
+             rt[2][0], rt[2][1], rt[3][0], rt[3][1], post[0], post[1]);
+    return b;
+}
+
+void* OriginalOf(ID3D11View* v) {
+    if (!v) return nullptr;
+    ComPtr<ID3D11Resource> r;
+    v->GetResource(&r);
+    return clones::Original(r.Get());
+}
 
 // A short id of a resource for comparing map lines (low bits of its address), with "c" when it is a clone.
 std::string ResId(void* r) {
@@ -3878,7 +3947,101 @@ void SetLiveTrackSkip(bool on) {
     g_ltOn = on;
 }
 bool GetLiveTrackSkip() { return g_ltOn; }
-void SetTaskMapFrame(bool on) { g_ltMapFrame = on; }
+void SetTaskMapFrame(bool on) {
+    g_ltMapFrame = on;
+    g_s1Frame = on;
+    g_s1Color = g_s1Depth = nullptr;
+    g_s1Sizes.clear();
+    g_s1Loose = 0;
+    if (on) S1Protect("frame", [&] { Log("MVR task map S1 (frame %llu): engine sizes %s", (unsigned long long)g_frame,
+                                         EngineSizesText().c_str()); });
+}
+
+bool TaskMapOn() { return g_map.on && g_s1Frame.load(std::memory_order_relaxed); }
+bool TaskMapFrame() { return g_s1Frame.load(std::memory_order_relaxed); }
+
+void TaskMapEvent(const char* text) {
+    if (!g_s1Frame.load(std::memory_order_relaxed)) return;
+    S1Protect("event", [&] {
+        if (g_map.on && g_map.tid == GetCurrentThreadId()) {
+            if (g_map.events.size() > 1500) {
+                g_map.eventsMore = true;
+                return;
+            }
+            char b[48];
+            snprintf(b, sizeof(b), "%s[at draw %u] ", g_map.events.empty() ? "" : ", ", g_map.draws);
+            g_map.events += b;
+            g_map.events += text;
+            return;
+        }
+        if (g_s1Loose.fetch_add(1) < 48)
+            Log("MVR task map S1 (frame %llu): outside a mapped task (thread %lu%s): %s", (unsigned long long)g_frame,
+                GetCurrentThreadId(), g_map.on ? ", a task is mapped on another thread" : "", text);
+    });
+}
+
+// The TAA resolve's draw by what is bound (as dlaa.cpp IsTaaResolve): target and t2 history R11G11B10_FLOAT, t3
+// motion vectors R16G16_FLOAT, t5 locks R8_UNORM.
+void TaskMapDraw6(ID3D11DeviceContext* c, void* caller) {
+    if (t_internal || c != Imm()) return;
+    S1Protect("draw", [&] {
+        ID3D11ShaderResourceView* srv[6] = {};
+        c->PSGetShaderResources(0, 6, srv);
+        ID3D11RenderTargetView* rtv = nullptr;
+        ID3D11DepthStencilView* dsv = nullptr;
+        c->OMGetRenderTargets(1, &rtv, &dsv);
+        auto fmt = [](ID3D11ShaderResourceView* v) {
+            if (!v) return DXGI_FORMAT_UNKNOWN;
+            D3D11_SHADER_RESOURCE_VIEW_DESC d;
+            v->GetDesc(&d);
+            return d.Format;
+        };
+        bool taa = false;
+        if (rtv && srv[0] && srv[1] && srv[3]) {
+            D3D11_RENDER_TARGET_VIEW_DESC rd;
+            rtv->GetDesc(&rd);
+            taa = rd.Format == DXGI_FORMAT_R11G11B10_FLOAT && fmt(srv[2]) == DXGI_FORMAT_R11G11B10_FLOAT &&
+                  fmt(srv[3]) == DXGI_FORMAT_R16G16_FLOAT && fmt(srv[5]) == DXGI_FORMAT_R8_UNORM;
+        }
+        if (taa) {
+            g_s1Color = OriginalOf(srv[1]);
+            g_s1Depth = OriginalOf(srv[0]);
+            bool ok = false;
+            ComPtr<ID3D11Resource> col;
+            srv[1]->GetResource(&col);
+            const D3D11_TEXTURE2D_DESC d = DescOf(col.Get(), &ok);
+            char b[320];
+            snprintf(b, sizeof(b),
+                     "TAA resolve draw (target %s, color source %s %ux%u, linear depth %s, history %s, velocity %s, "
+                     "depth target %s) from %s",
+                     ResId(OriginalOf(rtv)).c_str(), ResId(g_s1Color).c_str(), ok ? d.Width : 0, ok ? d.Height : 0,
+                     ResId(g_s1Depth).c_str(), ResId(OriginalOf(srv[2])).c_str(), ResId(OriginalOf(srv[3])).c_str(),
+                     dsv ? ResId(OriginalOf(dsv)).c_str() : "none", CodeAt(caller).c_str());
+            TaskMapEvent(b);
+        }
+        for (auto* v : srv)
+            if (v) v->Release();
+        if (rtv) rtv->Release();
+        if (dsv) dsv->Release();
+    });
+}
+
+void TaskMapViewports(ID3D11DeviceContext* c, UINT n, const D3D11_VIEWPORT* vps, void* caller) {
+    if (!g_map.on || g_map.tid != GetCurrentThreadId() || t_internal || c != Imm() || !n || !vps) return;
+    S1Protect("viewports", [&] {
+        for (TaskMap::Vp& v : g_map.vps) {
+            if (v.w == vps[0].Width && v.h == vps[0].Height && v.caller == caller) {
+                ++v.n;
+                return;
+            }
+        }
+        if (g_map.vps.size() >= 8) {
+            g_map.vpMore = true;
+            return;
+        }
+        g_map.vps.push_back({vps[0].Width, vps[0].Height, caller, 1});
+    });
+}
 
 Kind KindOf(uint8_t* task) {
     uintptr_t vt = 0;
@@ -3985,11 +4148,42 @@ void TaskMapBegin(const char* group, const char* name, bool detail) {
     g_map.detail = detail;
     snprintf(g_map.group, sizeof(g_map.group), "%s", group ? group : "?");
     snprintf(g_map.name, sizeof(g_map.name), "%s", name ? name : "?");
+    g_map.tid = GetCurrentThreadId();
+    if (g_s1Frame.load(std::memory_order_relaxed))
+        S1Protect("task begin", [&] { g_map.sizesBegin = EngineSizesText(); });
+}
+
+// The S1 line of a mapped task (TaskMapEnd): only when it saw something S1 is after.
+void TaskMapS1Line() {
+    std::string sizesEnd = EngineSizesText();
+    std::string s;
+    if (!g_map.events.empty()) s += "; events: " + g_map.events + (g_map.eventsMore ? " ..." : "");
+    if (g_map.postColor) {
+        s += "; draws into the TAA color source after its draw " + std::to_string(g_map.postColor) + " (depth target " +
+             (g_map.postDsv ? ResId(g_map.postDsv) : std::string("none")) + (g_map.postDsvMixed ? ", others too" : "") +
+             ")";
+    }
+    if (!g_map.vps.empty()) {
+        s += "; viewports:";
+        for (const TaskMap::Vp& v : g_map.vps) {
+            char b[160];
+            snprintf(b, sizeof(b), " %gx%g from %s x%u", v.w, v.h, CodeAt(v.caller).c_str(), v.n);
+            s += b;
+        }
+        if (g_map.vpMore) s += " ...";
+    }
+    if (g_map.sizesBegin != g_s1Sizes) s += "; engine sizes at the start: " + g_map.sizesBegin;
+    if (sizesEnd != g_map.sizesBegin) s += "; engine sizes at the end: " + sizesEnd;
+    g_s1Sizes = sizesEnd;
+    if (s.empty()) return;
+    Log("MVR task map S1 (frame %llu): %s %s (draws %u)%s", (unsigned long long)g_frame, g_map.group, g_map.name,
+        g_map.draws, s.c_str());
 }
 
 void TaskMapEnd() {
     if (!g_map.on) return;
     g_map.on = false;
+    if (g_s1Frame.load(std::memory_order_relaxed)) S1Protect("task end", [&] { TaskMapS1Line(); });
     if (!g_map.draws && !g_map.binds && !g_map.clears) return;
     std::string det;
     if (g_map.detail) {
@@ -4543,6 +4737,22 @@ bool BeforeDraw(ID3D11DeviceContext* c) {
     if (g_map.on && !t_internal && c == Imm()) {
         ++g_map.draws;
         if (g_map.detail) MapDetail(c);
+        if (g_s1Color && g_s1Frame.load(std::memory_order_relaxed)) {
+            S1Protect("draw target", [&] {
+                ID3D11RenderTargetView* rtv = nullptr;
+                ID3D11DepthStencilView* dsv = nullptr;
+                c->OMGetRenderTargets(1, &rtv, &dsv);
+                if (rtv && OriginalOf(rtv) == g_s1Color) {
+                    void* d = OriginalOf(dsv);
+                    if (!g_map.postColor++)
+                        g_map.postDsv = d;
+                    else if (d != g_map.postDsv)
+                        g_map.postDsvMixed = true;
+                }
+                if (rtv) rtv->Release();
+                if (dsv) dsv->Release();
+            });
+        }
     }
     if (g_p.part == PartTail && !t_internal && c == Imm()) {
         ++g_p.tailDraws;

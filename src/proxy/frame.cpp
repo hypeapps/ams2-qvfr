@@ -22,6 +22,7 @@
 #include "gpu.h"
 #include "hook_prof.h"
 #include "modern_vr.h"
+#include "nr.h"
 #include "quad.h"
 #include "sysinfo.h"
 #include "xr_layer.h"
@@ -196,6 +197,7 @@ struct GpuSums {
     uint64_t frames = 0, n[gpu::kPhases] = {}, spanN[gpu::kSpans] = {};
     double frame = 0, phase[gpu::kPhases] = {}, span[gpu::kSpans] = {};
 } g_gpuSums;
+Totals g_live;  // LiveTotals
 
 bool g_frozen = false;
 vr::TrackedDevicePose_t g_frozenPose{};
@@ -347,6 +349,8 @@ void ProcessFrames(uint64_t current) {
             if (g.frameMs >= 0) {
                 ++g_gpuSums.frames;
                 g_gpuSums.frame += g.frameMs;
+                ++g_live.gpuFrames;
+                g_live.gpuMs += g.frameMs;
             }
             for (int k = 0; k < gpu::kPhases; ++k) {
                 if (g.phaseMs[k] < 0) continue;
@@ -428,6 +432,8 @@ struct SeqResult {
     uint64_t frames = 0;
     double cpu = 0, cpuP50 = 0, gpu = 0, gpuPhase[4] = {}, groupCpu[4] = {}, hooks[6] = {};
     bool hooksOn = false;
+    nr::Window nr;  // the NR model's D3D12 GPU time in the run (prototype NR-P1)
+    double fps = 0;
 };
 bool g_seqOn = false;
 size_t g_seqStep = 0;
@@ -657,6 +663,8 @@ void EndSequence(bool aborted) {
              "its hooks ([debug] hook_profile)", aborted ? "ABORTED" : "finished", g_seqRes.size(), g_seq.size());
     lines.push_back(buf);
     const SeqResult* first = g_seqRes.empty() ? nullptr : &g_seqRes[0];
+    bool anyNr = false;  // NR ran in some step: every line gets its frame rate and NR cost
+    for (const SeqResult& r : g_seqRes) anyNr |= r.nr.any;
     for (size_t i = 0; i < g_seqRes.size(); ++i) {
         const SeqResult& r = g_seqRes[i];
         int n = snprintf(buf, sizeof(buf),
@@ -668,6 +676,18 @@ void EndSequence(bool aborted) {
         if (r.hooksOn)
             n += snprintf(buf + n, sizeof(buf) - n, " | hooks oL %.3f oR %.3f fL %.3f fR %.3f outside %.3f", r.hooks[0],
                           r.hooks[1], r.hooks[2], r.hooks[3], r.hooks[4]);
+        if (anyNr) {
+            if (r.nr.any)
+                n += snprintf(buf + n, sizeof(buf) - n, " | fps %.1f | NR GPU %.2f%s", r.fps, r.nr.gpuMsPerFrame,
+                              r.nr.atlasMp > 0 ? "" : " (no atlas)");
+            else
+                n += snprintf(buf + n, sizeof(buf) - n, " | fps %.1f | NR off", r.fps);
+            if (r.nr.any && r.nr.atlasMp > 0)
+                n += snprintf(buf + n, sizeof(buf) - n, " atlas %.1f MP", r.nr.atlasMp);
+            if (r.nr.any && r.nr.d11)
+                n += snprintf(buf + n, sizeof(buf) - n, " | NR D3D11 guides %.2f pack %.2f hand-off %.2f unpack %.2f",
+                              r.nr.d11Guides, r.nr.d11Pack, r.nr.d11Handoff, r.nr.d11Unpack);
+        }
         snprintf(buf + n, sizeof(buf) - n, " | %s", r.dir.c_str());
         lines.push_back(buf);
     }
@@ -709,6 +729,8 @@ void SeqAfterRun(bool aborted, const vr::TrackedDevicePose_t& pose) {
     for (int k = 0; k < 4; ++k) res.gpuPhase[k] = Avg(r.gpuPhase[k].v);
     quad::LastWindowCpu(res.groupCpu);
     res.hooksOn = hookprof::LastTotals(res.hooks);
+    res.nr = nr::LastWindow();  // the forced stats window at the end of the run covers exactly the recording
+    res.fps = Cfg().benchDurationS > 0 ? (double)res.frames / Cfg().benchDurationS : 0.0;
     g_seqRes.push_back(res);
     if (aborted) {
         EndSequence(true);
@@ -985,6 +1007,10 @@ void OnWaitGetPosesBegin() {
         std::lock_guard lock(g_mutex);
         double now = NowMs();
         if (g_cur.wgpExit > 0) {
+            if (g_cur.submits && g_cur.lastSubmit >= g_cur.wgpExit) {
+                ++g_live.cpuFrames;
+                g_live.cpuMs += g_cur.lastSubmit - g_cur.wgpExit;
+            }
             if (g_cur.submits != 2 && g_badSubmitLogs < 5) {
                 ++g_badSubmitLogs;
                 Log("Frame %llu: %d Submit calls between WaitGetPoses (expected 2)",
@@ -996,7 +1022,11 @@ void OnWaitGetPosesBegin() {
         }
         g_cur = ProxyFrame{};
         g_cur.wgpEnter = now;
-        if (g_prevWgpEnter > 0) g_cur.intervalMs = (float)(now - g_prevWgpEnter);
+        if (g_prevWgpEnter > 0) {
+            g_cur.intervalMs = (float)(now - g_prevWgpEnter);
+            ++g_live.intervals;
+            g_live.intervalMs += g_cur.intervalMs;
+        }
         g_prevWgpEnter = now;
         g_frameHandle[0] = g_frameHandle[1] = nullptr;
     });
@@ -1254,5 +1284,7 @@ void OnShutdown() {
     });
     experiment::Shutdown();  // guards itself; runs even after a diagnostics fault
 }
+
+Totals LiveTotals() { return g_live; }
 
 }  // namespace qvfr::frame

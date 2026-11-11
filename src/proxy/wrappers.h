@@ -13,4 +13,7 @@ vr::IVROverlay* Overlay(vr::IVROverlay* real);
 // Wrapper for an interface obtained through VR_GetGenericInterface, if it is one of the supported versions.
 void* Generic(const char* version, void* real);
 
+// The backend's own overlay interface (not the wrapper), or nullptr before VR_Init.
+vr::IVROverlay* RealOverlay();
+
 }  // namespace qvfr::wrap
