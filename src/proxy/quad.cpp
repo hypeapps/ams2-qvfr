@@ -32,6 +32,8 @@
 #include "mvr_vs.h"
 #include "nr.h"
 #include "shots.h"
+#include "sr_cb.h"
+#include "sr_probe.h"
 #include "sun_fx.h"
 #include "taa_views.h"
 
@@ -40,6 +42,15 @@ namespace qvfr::quad {
 namespace {
 
 using hooks::Anchor;
+
+// DLSS SR in quad views (docs/dlaa-plan.md S2): [dlaa] mode=dlss in a proxy built with the DLSS SDK.
+bool SrConfigured() {
+#ifdef QVFR_HAVE_DLSS
+    return Cfg().dlaa && Cfg().dlaaSr;
+#else
+    return false;
+#endif
+}
 
 // Engine layout from M3 and M4.1 (docs/ams2-renderer.md), AMS2AVX.exe build aa43bd68.
 constexpr size_t kTaskCtx = 0x860;       // eye tasks: render context pointer
@@ -2756,6 +2767,17 @@ void SetupLocked(vr::IVRSystem* real) {
     g_focus.on = true;
     clones::SetSizes(g_focus.gameW, g_focus.gameH, g_focus.outerW, g_focus.outerH, g_focus.focusTexW,
                      g_focus.focusTexH);
+    if (SrConfigured()) {
+        // DLSS SR (S2): the scene phase of each view at its render scale of the view's size.
+        const uint32_t row = px(g_focus.outerW * (double)c.dlaaOuterRenderScale);
+        const uint32_t roh = px(g_focus.outerH * (double)c.dlaaOuterRenderScale);
+        const uint32_t rfw = px(g_focus.focusTexW * (double)c.dlaaFocusRenderScale);
+        const uint32_t rfh = px(g_focus.focusTexH * (double)c.dlaaFocusRenderScale);
+        clones::SetSceneSizes(row, roh, rfw, rfh);
+        Log("Quad: DLSS SR: outer's scene at %u x %u -> %u x %u, focus's at %u x %u -> %u x %u%s", row, roh,
+            g_focus.outerW, g_focus.outerH, rfw, rfh, g_focus.focusTexW, g_focus.focusTexH,
+            row >= rfw && roh >= rfh ? "" : " (outer's render size is smaller than focus's: MVR would need B20)");
+    }
     g_focus.engaged = true;
     for (int i = 0; i < 2; ++i) {
         float cx = 0, cy = 0;
@@ -2867,6 +2889,13 @@ void Install() {
         g_patched = WritePatch(true);
         // Clones (M7.3): the factory hooks must be in place before the engine creates its render target pool.
         if (g_patched) clones::InstallEngineHooks();
+        // DLSS SR (dlaa-plan S2): each group's scene phase in its kind's scene set at the render size.
+        if (g_patched && SrConfigured()) {
+            clones::SetSr(true);
+            Log("Quad: DLSS SR: the scene renders at outer_render_scale %.3f of outer's size and focus_render_scale "
+                "%.3f of focus's, DLSS scales it to the view size at the TAA resolve",
+                Cfg().dlaaOuterRenderScale, Cfg().dlaaFocusRenderScale);
+        }
         // Sun effects: the shader creation hook must be in place before the game makes its effect shaders.
         if (g_patched) sunfx::Install();
         // MVR gate B6: the vertex shader hook must be in place before the game makes its scene shaders.
@@ -2887,7 +2916,11 @@ void Install() {
         else if (g_patched)
             Log("Quad: no add-task hook; no quad <-> outer only switch");
         // MVR gate B8: needs the patched VS (mvr_vs) and the executor thunk (it skips the focus groups' pass).
-        if (Cfg().mvrGbuffer && g_execPatched && Cfg().mvrVsPatch) {
+        // S2.1: the MVR pass does not know the scene sets yet (S2.2).
+        if (Cfg().mvrGbuffer && g_execPatched && Cfg().mvrVsPatch && SrConfigured())
+            Log("WARNING: MVR: off with DLSS SR in quad views ([dlaa] mode=dlss) for now; the focus groups render "
+                "their own scene");
+        if (Cfg().mvrGbuffer && g_execPatched && Cfg().mvrVsPatch && !SrConfigured()) {
             mvrpass::SetJitterSource(&dlaa::FrameJitter);
             mvrpass::Install();
             fwdrec::Install();  // O2 step 3 (mvr_velocity_record_skip); logs it
@@ -2953,6 +2986,10 @@ void OnFrameStart() {
         HandleToolsLocked();
         mvrpass::OnFrameStart(g_mvrOn);  // reports the comparison of the previous shot frame
         HandleShotLocked();
+        // DLSS SR: the scene sets only while DLSS runs (setting, hotkey, no failure), else the views' own sizes.
+        srprobe::OnFrameStart(gpu::Context());  // S2.1: the probed frame's report, the hotkey
+        srcb::OnFrameStart();
+        clones::SetSrActive(SrConfigured() && dlaa::SrWanted());
         clones::OnFrameStart(gpu::Context(), g_clonesOn && g_focus.on);
         sunfx::OnFrameStart(gpu::Context(), g_sunOn && g_focus.on && !g_frameSkip);
         mvrvs::OnFrameStart(gpu::Context());
@@ -3077,6 +3114,8 @@ void OnSubmitBegin(vr::EVREye eye, const vr::Texture_t* tex) {
             g_d3dHooked ? "installed" : "FAILED");
         if (g_d3dHooked) clones::InstallD3DHooks(imm);
         if (g_d3dHooked) mvrpass::InstallD3DHooks(imm);
+        if (g_d3dHooked && SrConfigured()) srcb::Install(imm);     // S2.1: constants after TAA at the view size
+        if (g_d3dHooked && SrConfigured()) srprobe::Install(imm);  // S2.1 probe (only with [debug] sr_probe_key)
     });
 }
 
@@ -3186,6 +3225,7 @@ void LogStats(bool totals) {
         }
         g_st = Stats{};
         clones::LogStats(totals);
+        srcb::LogStats(totals);
         sunfx::LogStats(totals);
         mvrvs::LogStats(totals);
         mvrps::LogStats(totals);
@@ -3372,6 +3412,8 @@ const char* RunSuffix() {
 void Shutdown() {
     if (!g_installed) return;
     g_on = false;
+    srprobe::Shutdown();
+    srcb::Shutdown();
     // The patch goes first: a builder call without the ctor hooks must not see the patched loop.
     Guard("Shutdown", [&] {
         std::lock_guard lock(g_m);

@@ -64,6 +64,7 @@
 
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d11_1.h>
 
 #include <openvr.h>  // 0.9.12; functions are taken through GetProcAddress
 
@@ -81,6 +82,8 @@
 #include <vector>
 
 #include "clones.h"
+#include "sr_cb.h"
+#include "sr_probe.h"
 #include "common.h"
 #include "compose.h"
 
@@ -1648,9 +1651,242 @@ int RunClones() {
     cl::OnFrameStart(ctx, true);
     expect(cl::TestGet().arrays == 0 && !cl::IsArray(arr3), "slices: no array left");
     cl::Shutdown();
-    printf("Clones check %s: %d wrong (focus smaller %d, outer smaller %d, two-slice arrays %d, three-slice arrays %d); "
-           "%d translations, original pixel 0x%08X, clone pixel 0x%08X\n",
-           bad ? "FAILED" : "OK", bad, bad1, bad2 - bad1, bad3 - bad2, bad - bad3, translated1, pxA, pxClone);
+    const int bad4 = bad;
+
+    // Scenario 5 (DLSS SR in quad views, dlaa-plan S2): outer at the game size 64 x 48 (no post set), focus 32 x 24;
+    // scene sets outer 40 x 30, focus 20 x 15. T: written before the TAA draw and read after it (carried); U: written
+    // before it only; Hst: focus's TAA target, Ho outer's (the TAA history: no scene clone); a render target object RS
+    // with T's view.
+    for (int k = 0; k < 4; ++k) {
+        devSize(k)[0] = devInit[k][0];
+        devSize(k)[1] = devInit[k][1];
+        devDirty(k) = 0;
+    }
+    post.at<int32_t>(0x100) = 64;
+    post.at<int32_t>(0x104) = 48;
+    ID3D11Texture2D *texT = tex(64, 48), *texU = tex(64, 48), *texHst = tex(64, 48), *texHo = tex(64, 48);
+    ID3D11RenderTargetView *rtvT = rtv(texT), *rtvT2 = rtv(texT), *rtvU = rtv(texU), *rtvHst = rtv(texHst),
+                           *rtvHo = rtv(texHo);
+    ID3D11ShaderResourceView* srvT = srv(texT);
+    static const char* const names5[] = {"Fake T", "Fake U", "Fake Hst", "Fake Ho", "Fake RS"};
+    FakeObj T, U, Hst, Ho, RS;
+    FakeObj* objs5[] = {&T, &U, &Hst, &Ho};
+    ID3D11Texture2D* objTex5[] = {texT, texU, texHst, texHo};
+    void* objView5[] = {rtvT, rtvU, rtvHst, rtvHo};
+    for (int i = 0; i < 4; ++i) {
+        objs5[i]->at<void*>(0x58) = objTex5[i];
+        objs5[i]->at<void*>(0x80) = objView5[i];
+        objs5[i]->at<const char*>(0xf0) = names5[i];
+        objs5[i]->at<uint16_t>(0x68) = 64;
+        objs5[i]->at<uint16_t>(0x6a) = 48;
+    }
+    T.at<void*>(0x70) = srvT;
+    void* arr5[1] = {rtvT2};
+    RS.at<uint16_t>(0x24) = 64;
+    RS.at<uint16_t>(0x26) = 48;
+    RS.at<uint16_t>(0x64) = 0;
+    RS.at<uint16_t>(0x66) = 1;
+    RS.at<void**>(0x78) = arr5;
+    RS.at<const char*>(0xb8) = names5[4];
+    cl::SetSr(true);
+    cl::SetSizes(64, 48, 64, 48, 32, 24);
+    cl::SetSceneSizes(40, 30, 20, 15);
+    cl::SetSrActive(true);
+    for (FakeObj* o : objs5) cl::TestRegister(false, o);
+    cl::TestRegister(true, &RS);
+    ID3D11ShaderResourceView* noSrv = nullptr;
+    for (int f = 0; f < 17; ++f) {
+        cl::OnFrameStart(ctx, true);
+        if (f == 16) break;
+        for (cl::Set kind : {cl::Outer, cl::Focus}) {
+            cl::BeginGroup(ctx, kind);
+            ctx->ClearRenderTargetView(rtvT, green);
+            ctx->ClearRenderTargetView(rtvU, green);
+            ID3D11RenderTargetView* h = kind == cl::Outer ? rtvHo : rtvHst;
+            ctx->OMSetRenderTargets(1, &h, nullptr);
+            cl::OnOMSetRenderTargets(ctx, 1, &h, nullptr, nullptr);
+            cl::MarkTaa(ctx);  // the TAA draw, its target bound
+            ctx->OMSetRenderTargets(0, nullptr, nullptr);
+            ctx->PSSetShaderResources(0, 1, &srvT);  // a pass after TAA reads T
+            ctx->PSSetShaderResources(0, 1, &noSrv);
+            cl::EndGroup(ctx);
+        }
+    }
+    st = cl::TestGet();
+    expect(st.phase == 2 && st.textures == 4, "SR: ready, four textures listed");
+    expect(st.clones[cl::Outer] == 0 && st.clones[cl::Focus] == 3 && st.clones[cl::OuterScene] == 2 &&
+               st.clones[cl::FocusScene] == 2,
+           "SR: clones outer 0, focus 3 (T, U, Hst), outer scene 2 and focus scene 2 (T, U)");
+    cl::OnFrameStart(ctx, true);
+    ID3D11Texture2D* carryC[4] = {};
+    ID3D11Resource* carryD[4] = {};
+    // The SR probe (sr_probe.h): a PS constant buffer with the game size 64 in outer's scene phase (SUSPECT) and the
+    // render width 40 (as it should be), then focus's render width 20 after the TAA draw (SUSPECT) and 1/24 (focus's
+    // view height, as it should be).
+    auto cbWith = [&](float a, float b) {
+        const float data[8] = {a, 7.25f, b, 0};
+        D3D11_BUFFER_DESC bd{sizeof(data), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+        D3D11_SUBRESOURCE_DATA init{data, 0, 0};
+        ID3D11Buffer* b0 = nullptr;
+        dev->CreateBuffer(&bd, &init, &b0);
+        return b0;
+    };
+    ID3D11Buffer* cbOuter = cbWith(64.0f, 40.0f);
+    // Focus: like the engine, a window of a large buffer (1 MB) through PSSetConstantBuffers1 (constants 1008..1023);
+    // the probe copies only the window (a copy of each whole buffer crashed the game).
+    std::vector<float> big(65536 * 4, 0.0f);
+    big[4032] = 20.0f;
+    big[4033] = 7.25f;
+    big[4034] = 1.0f / 24.0f;
+    big[100] = 20.0f;  // outside the window: not seen
+    ID3D11Buffer* cbFocus = nullptr;
+    {
+        D3D11_BUFFER_DESC bd{(UINT)(big.size() * 4), D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER, 0, 0, 0};
+        D3D11_SUBRESOURCE_DATA init{big.data(), 0, 0};
+        dev->CreateBuffer(&bd, &init, &cbFocus);
+    }
+    ID3D11DeviceContext1* ctx1 = nullptr;
+    ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&ctx1);
+    qvfr::srprobe::TestArm(ctx);
+    // Outer: the scene set, then the originals at the TAA draw.
+    cl::BeginGroup(ctx, cl::Outer);
+    ctx->PSSetConstantBuffers(2, 1, &cbOuter);
+    qvfr::srprobe::OnDraw(ctx, nullptr, "Draw");
+    expect(cl::SceneIn() && size(T.at<ID3D11Texture2D*>(0x58)) == std::make_pair(40u, 30u) &&
+               size(U.at<ID3D11Texture2D*>(0x58)) == std::make_pair(40u, 30u) && Ho.at<void*>(0x58) == texHo,
+           "SR outer scene: T and U in 40 x 30 clones, its TAA target the original");
+    expect(devSize(0)[0] == 40 && devSize(0)[1] == 30 && RS.at<uint16_t>(0x24) == 40, "SR outer scene: sizes 40 x 30");
+    int nc = cl::CarryList(carryC, carryD, 4);
+    expect(nc == 1 && carryC[0] == T.at<ID3D11Texture2D*>(0x58) && carryD[0] == texT,
+           "SR outer: T carried from its scene clone into the original");
+    expect(cl::SceneEnd(ctx) && !cl::SceneIn() && T.at<void*>(0x58) == texT && devSize(0)[0] == 64 &&
+               RS.at<uint16_t>(0x24) == 64,
+           "SR outer after TAA: originals and the game size");
+    cl::EndGroup(ctx);
+    // Focus: the scene set with the TAA target in focus's post clone, then the post set at the TAA draw.
+    cl::BeginGroup(ctx, cl::Focus);
+    ID3D11Texture2D* hstPost = Hst.at<ID3D11Texture2D*>(0x58);
+    ID3D11ShaderResourceView* sceneSrvT = T.at<ID3D11ShaderResourceView*>(0x70);
+    expect(cl::SceneIn() && size(T.at<ID3D11Texture2D*>(0x58)) == std::make_pair(20u, 15u) &&
+               size(hstPost) == std::make_pair(32u, 24u),
+           "SR focus scene: T in a 20 x 15 clone, its TAA target in focus's 32 x 24 clone");
+    expect(devSize(0)[0] == 20 && devSize(0)[1] == 15 && RS.at<uint16_t>(0x24) == 20, "SR focus scene: sizes 20 x 15");
+    nc = cl::CarryList(carryC, carryD, 4);
+    expect(nc == 1 && carryC[0] == T.at<ID3D11Texture2D*>(0x58) && carryD[0] != texT &&
+               size((ID3D11Texture2D*)carryD[0]) == std::make_pair(32u, 24u),
+           "SR focus: T carried into focus's 32 x 24 clone");
+    expect(cl::SceneEnd(ctx) && T.at<void*>(0x58) == carryD[0] && Hst.at<void*>(0x58) == hstPost &&
+               devSize(0)[0] == 32 && devSize(0)[1] == 24 && RS.at<uint16_t>(0x24) == 32,
+           "SR focus after TAA: focus's clones and size");
+    const UINT winFirst = 1008, winNum = 16;  // D3D11.1 takes multiples of 16 constants only
+    if (ctx1) {
+        ctx1->PSSetConstantBuffers1(2, 1, &cbFocus, &winFirst, &winNum);
+    } else {
+        expect(false, "SR probe: ID3D11DeviceContext1");
+    }
+    qvfr::srprobe::OnDraw(ctx, nullptr, "Draw");
+    if (ctx1) ctx1->Release();
+    ID3D11Buffer* noCb = nullptr;
+    ctx->PSSetConstantBuffers(2, 1, &noCb);
+    size_t probeSuspects = 0;
+    const size_t probePlaces = qvfr::srprobe::TestReport(ctx, &probeSuspects);
+    expect(probePlaces == 4 && probeSuspects == 2,
+           "SR probe: 4 places with a size, 2 SUSPECT (G before TAA, R after it)");
+    // The SR constants fix (sr_cb.h): a window of a large buffer at PS slot 12 with focus's render size (20, 15, 20, 15),
+    // its reciprocal and a pair that is no size; after the fix the bound window is ours with focus's view size 32 x 24.
+    {
+        std::fill(big.begin(), big.end(), 0.0f);
+        const float win[8] = {20.0f, 15.0f, 20.0f, 15.0f, 1.0f / 20.0f, 1.0f / 15.0f, 7.25f, 20.0f};
+        std::copy(win, win + 8, big.begin() + 4032);
+        ctx->UpdateSubresource(cbFocus, 0, nullptr, big.data(), 0, 0);
+        ID3D11DeviceContext1* c1 = nullptr;
+        ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&c1);
+        qvfr::srcb::TestInit(ctx);
+        float got[8] = {};
+        ID3D11Buffer* fixBound = nullptr;
+        if (c1) {
+            c1->PSSetConstantBuffers1(12, 1, &cbFocus, &winFirst, &winNum);
+            qvfr::srcb::OnDraw(ctx);
+            UINT f0 = 0, n0 = 0;
+            c1->PSGetConstantBuffers1(12, 1, &fixBound, &f0, &n0);
+            if (fixBound && fixBound != cbFocus) {
+                D3D11_BUFFER_DESC sd{};
+                fixBound->GetDesc(&sd);
+                sd.Usage = D3D11_USAGE_STAGING;
+                sd.BindFlags = 0;
+                sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                ID3D11Buffer* fixSt = nullptr;
+                dev->CreateBuffer(&sd, nullptr, &fixSt);
+                if (fixSt) {
+                    ctx->CopyResource(fixSt, fixBound);
+                    D3D11_MAPPED_SUBRESOURCE m{};
+                    if (SUCCEEDED(ctx->Map(fixSt, 0, D3D11_MAP_READ, 0, &m))) {
+                        memcpy(got, m.pData, sizeof(got));
+                        ctx->Unmap(fixSt, 0);
+                    }
+                    fixSt->Release();
+                }
+            }
+            c1->PSSetConstantBuffers(12, 1, &noCb);
+            c1->Release();
+        }
+        const float want[8] = {32.0f, 24.0f, 32.0f, 24.0f, 1.0f / 32.0f, 1.0f / 24.0f, 7.25f, 20.0f};
+        bool same = true;
+        for (int i = 0; i < 8; ++i) same &= fabsf(got[i] - want[i]) <= fabsf(want[i]) * 1e-6f;
+        expect(fixBound && fixBound != cbFocus && qvfr::srcb::TestWindowsFixed() == 1 && same,
+               "SR constants fix: the window fixBound in its place has focus's view size (32, 24, 32, 24, 1/32, 1/24), the "
+               "pair that is no size stays (7.25, 20)");
+        if (!same)
+            printf("SR constants fix: got %g %g %g %g %g %g %g %g\n", got[0], got[1], got[2], got[3], got[4], got[5],
+                   got[6], got[7]);
+        if (fixBound) fixBound->Release();
+    }
+    cbOuter->Release();
+    cbFocus->Release();
+    // A pass recorded in the scene phase binds T's scene clone view: it gets the post clone's view.
+    ctx->PSSetShaderResources(0, 1, &sceneSrvT);
+    ID3D11ShaderResourceView* gotSrv = nullptr;
+    ctx->PSGetShaderResources(0, 1, &gotSrv);
+    expect(gotSrv && gotSrv == T.at<ID3D11ShaderResourceView*>(0x70) && gotSrv != sceneSrvT,
+           "SR focus after TAA: a scene clone view binds as the post clone's");
+    if (gotSrv) gotSrv->Release();
+    ctx->PSSetShaderResources(0, 1, &noSrv);
+    // A viewport recorded at the render size on focus's TAA target becomes focus's size.
+    ID3D11RenderTargetView* mapped5[8] = {};
+    ID3D11DepthStencilView* mapped5d = nullptr;
+    ID3D11RenderTargetView* const* bind5 =
+        cl::MapTargets(ctx, 1, &rtvHst, nullptr, mapped5, &mapped5d, nullptr) ? mapped5 : &rtvHst;
+    ctx->OMSetRenderTargets(1, bind5, nullptr);
+    cl::OnOMSetRenderTargets(ctx, 1, bind5, nullptr, nullptr);
+    viewport(20, 15);
+    expect(bind5 == mapped5 && boundViewport() == std::make_pair(32.0f, 24.0f),
+           "SR focus after TAA: viewport 20 x 15 set to 32 x 24 on the post clone");
+    ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    cl::EndGroup(ctx);
+    expect(!cl::SceneIn() && T.at<void*>(0x58) == texT && Hst.at<void*>(0x58) == texHst && devSize(0)[0] == 64 &&
+               RS.at<uint16_t>(0x24) == 64,
+           "SR focus: originals back after the group");
+    // DLSS not running: the groups stay in their post sets.
+    cl::SetSrActive(false);
+    cl::OnFrameStart(ctx, true);
+    cl::BeginGroup(ctx, cl::Focus);
+    expect(!cl::SceneIn() && size(T.at<ID3D11Texture2D*>(0x58)) == std::make_pair(32u, 24u),
+           "SR inactive: focus in its 32 x 24 clones the whole group");
+    cl::EndGroup(ctx);
+    cl::BeginGroup(ctx, cl::Outer);
+    expect(!cl::TestGet().swapped, "SR inactive: outer at the game size");
+    cl::EndGroup(ctx);
+    cl::Shutdown();
+    cl::SetSrActive(true);
+    cl::SetSceneSizes(0, 0, 0, 0);
+    cl::SetSr(false);
+    for (IUnknown* u : {(IUnknown*)texT, (IUnknown*)texU, (IUnknown*)texHst, (IUnknown*)texHo, (IUnknown*)rtvT,
+                        (IUnknown*)rtvT2, (IUnknown*)rtvU, (IUnknown*)rtvHst, (IUnknown*)rtvHo, (IUnknown*)srvT})
+        u->Release();
+    printf("Clones check %s: %d wrong (focus smaller %d, outer smaller %d, two-slice arrays %d, three-slice arrays %d, "
+           "DLSS SR scene sets %d); %d translations, original pixel 0x%08X, clone pixel 0x%08X\n",
+           bad ? "FAILED" : "OK", bad, bad1, bad2 - bad1, bad3 - bad2, bad4 - bad3, bad - bad4, translated1, pxA,
+           pxClone);
     for (IUnknown* u : {(IUnknown*)texH, (IUnknown*)rtvH, (IUnknown*)rtvH2}) u->Release();
     for (IUnknown* u : {(IUnknown*)texG, (IUnknown*)srvG, (IUnknown*)rtvG, (IUnknown*)rtvG2, (IUnknown*)rtvGX,
                         (IUnknown*)texS1})

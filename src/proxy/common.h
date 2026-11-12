@@ -187,6 +187,15 @@ struct Config {
     int mvrEarly = 1;
     int mvrEarlyKey = 0;
     int mvrMapKey = 0;
+    // DLSS SR in quad views (dlaa-plan S2.1, sr_probe.h): sr_probe_modifier + sr_probe_key (testers: VK_DELETE) reads the
+    // constant buffers of the next frame's draws in the eye groups and logs the ones that hold a render, view or game
+    // size (0 = off; the instanced draw hooks only exist with a key set).
+    int srProbeKeyMod = VK_RCONTROL;
+    int srProbeKey = 0;
+    // DLSS SR in quad views (sr_cb.h): the constants of the passes after the TAA resolve set to the view size (live);
+    // sr_probe_modifier + sr_cb_fix_key toggles it (testers: VK_PRIOR).
+    bool srCbFix = true;
+    int srCbFixKey = 0;
     // Live: a shot compares focus L's own G-buffer pass with outer's stash (B8); 0 = the shot shows the frame as it runs.
     bool mvrShotCompare = false;
     // Live, gate B9c (mvr_pass.h): with mvr_early=1 and mvr_ps_patch, a shot also runs outer L's forward pass
@@ -250,10 +259,13 @@ struct Config {
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
     bool dlaa = false;                // mode=dlaa or dlss (a change needs a restart)
-    // mode=dlss (dlaa-plan S1, stereo only): the scene renders at render_scale of the eye size into the clones
-    // (sr.h) and DLSS Super Resolution scales it to the eye size at the TAA resolve. Restart for both.
+    // mode=dlss (dlaa-plan S1 in stereo, S2 in quad views): the scene renders at a render scale of each view's size into
+    // the clones (sr.h, clones.h scene sets) and DLSS Super Resolution scales it to the view's size at the TAA resolve.
+    // Quad views: outer_render_scale and focus_render_scale, each render_scale when absent. Restart for all.
     bool dlaaSr = false;
     float dlaaRenderScale = 0.67f;
+    float dlaaOuterRenderScale = 0.67f;
+    float dlaaFocusRenderScale = 0.67f;
     int dlaaPreset = 0;               // DLSS render preset hint for DLAA: 0 = DLSS default, 10 = J, 11 = K, ...
     float dlaaJitterScaleX = 0.5f;    // DLSS jitter in pixels = the engine's projection offset * scale
     float dlaaJitterScaleY = -0.5f;

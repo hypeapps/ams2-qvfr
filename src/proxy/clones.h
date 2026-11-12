@@ -25,7 +25,13 @@
 
 namespace qvfr::clones {
 
-enum Set { Outer = 0, Focus = 1 };
+// Outer and Focus: a view's size (O), for the whole group, or with DLSS SR only after the TAA resolve. OuterScene and
+// FocusScene (DLSS SR, docs/dlaa-plan.md S1/S2): the render size (R) of the scene phase, until the TAA resolve's draw.
+// A group is of one kind (outer or focus); learning is per kind.
+enum Set { Outer = 0, Focus = 1, OuterScene = 2, FocusScene = 3 };
+constexpr int kSets = 4;
+inline Set KindOf(Set s) { return (Set)(s & 1); }
+inline Set SceneOf(Set s) { return (Set)((s & 1) | 2); }
 
 // VR_Init on the supported exe (quad mode): factory and destructor hooks. False: no clones in this process.
 bool InstallEngineHooks();
@@ -42,16 +48,39 @@ void SetSizes(uint32_t gameW, uint32_t gameH, uint32_t outerW, uint32_t outerH, 
 void OnFrameStart(ID3D11DeviceContext* imm, bool enabled);
 void BeginGroup(ID3D11DeviceContext* imm, Set set);  // eye group CBeginEye, before the engine's Execute
 void EndGroup(ID3D11DeviceContext* imm);             // eye group CEndEye, after the engine's Execute (no-op without Begin)
-// S1 (docs/dlaa-plan.md, sr.h): stereo with the outer set at the render size. Only the scene phase of an eye group
-// (until the TAA resolve's draw) renders into the clones. In the learning groups MarkTaa at the TAA draw ends the scene
-// phase: a texture gets a clone when it is written before it and is not the TAA draw's target; one used after it too is
-// carried (its clone's contents go into the original at the TAA draw).
-void SetStereoSr(bool on);                    // before the first frame
+// DLSS SR (docs/dlaa-plan.md S1 in stereo, S2 in quad views; sr.h, dlaa.cpp): the scene phase of an eye group (until
+// the TAA resolve's draw) renders into the scene set of its kind at the render size. In the learning groups MarkTaa at
+// the TAA draw ends the scene phase: a texture gets a scene clone when its kind writes it before the draw and it is not
+// the draw's target; one used after it too is carried (the scene clone's contents go into the kind's texture of the
+// view size, the post set's clone or the original, at the TAA draw). From SceneEnd to the group's end the group runs in
+// its kind's post set (Outer or Focus) when that has clones, else with the originals.
+void SetStereoSr(bool on);                    // before the first frame (stereo: no focus groups)
+void SetSr(bool on);                          // quad views, before the first frame
+// The scene sets' sizes (0 = no scene set for that kind): BeginGroup(kind) puts the kind's scene set in.
+void SetSceneSizes(uint32_t outerW, uint32_t outerH, uint32_t focusW, uint32_t focusH);
+// Quad views, render thread, before OnFrameStart: DLSS runs in this frame, so the groups use the scene sets (else
+// each group stays in its post set, as without DLSS SR). Stereo (SetStereoSr): always on.
+void SetSrActive(bool on);
 void MarkTaa(ID3D11DeviceContext* imm);       // learning: the TAA draw comes now (its target bound)
-// While the outer clones are in: the carried textures' clones and originals (not referenced; valid until frame start).
-int CarryList(ID3D11Texture2D** clone, ID3D11Resource** orig, int max);
-// At the TAA draw while the clones are in: they go out as at CEndEye (fields, size constants, viewport, the bound
-// state); until the group ends the bind fix sends views of clones to their originals. False: no clones were in.
+// While a scene set is in: the carried textures' scene clones and where they go (the post set's clone or the original;
+// not referenced; valid until frame start).
+int CarryList(ID3D11Texture2D** clone, ID3D11Resource** dest, int max);
+// A scene set is in now (the group's scene phase with clones).
+bool SceneIn();
+// The SR probe (sr_probe.h), render thread: an eye group with DLSS SR's scene sets runs now (its kind, the phase, its
+// number in the frame from 1, the render, view and game sizes). False outside one.
+struct SrGroup {
+    int kind = 0;       // Outer or Focus
+    bool post = false;  // after the TAA resolve's draw
+    int group = 0;
+    uint32_t rw = 0, rh = 0, ow = 0, oh = 0, gw = 0, gh = 0;
+};
+bool SrGroupNow(SrGroup& out);
+// Any thread, lock-free: an eye group with DLSS SR is after its TAA resolve's draw now (SceneEnd to the group's end).
+bool SrPostNow();
+// At the TAA draw while a scene set is in: it goes out as at CEndEye (fields, size constants, viewport, the bound
+// state) and the kind's post set goes in when it has clones; until the group ends the bind fix sends views of the
+// scene clones to the textures of the view size. False: no scene set was in.
 bool SceneEnd(ID3D11DeviceContext* imm);
 // From quad's OMSetRenderTargets hook, before the real call: the targets to bind instead of the engine's (bind fix;
 // `rtvOut` holds 8 entries). False: bind the engine's as they are.
@@ -155,7 +184,7 @@ void TestSetDevice(void* device);  // fake engine device (size per context at +0
 struct TestState {
     int phase = 0;  // 0 waiting, 1 learning, 2 ready, 3 failed, 4 not needed
     int textures = 0, renderTargets = 0, entries = 0;
-    int clones[2] = {};
+    int clones[kSets] = {};
     bool swapped = false;
     uint64_t cloneUses = 0, leaks = 0, translated = 0, viewportsFixed = 0, viewportMismatches = 0;
     uint64_t bindsToClone = 0, bindsToOriginal = 0, lazyViews = 0;

@@ -415,6 +415,13 @@ Config ReadConfig(const fs::path& ini) {
     c.mvrEarly = std::clamp(IniInt(ini, L"debug", L"mvr_early", 1), 0, 5);
     c.mvrEarlyKey = IniInt(ini, L"debug", L"mvr_early_key", c.mvrEarlyKey);
     c.mvrMapKey = IniInt(ini, L"debug", L"mvr_map_key", c.mvrMapKey);
+    c.srProbeKeyMod = IniInt(ini, L"debug", L"sr_probe_modifier", c.srProbeKeyMod);
+    c.srProbeKey = IniInt(ini, L"debug", L"sr_probe_key", c.srProbeKey);
+    c.srCbFix = IniInt(ini, L"debug", L"sr_cb_fix", 1) != 0;
+    c.srCbFixKey = IniInt(ini, L"debug", L"sr_cb_fix_key", c.srCbFixKey);
+    if (c.srProbeKey || !c.srCbFix || c.srCbFixKey)
+        Log("Settings: [debug] sr_probe_modifier=0x%X sr_probe_key=0x%X sr_cb_fix=%d sr_cb_fix_key=0x%X", c.srProbeKeyMod,
+            c.srProbeKey, c.srCbFix, c.srCbFixKey);
     c.mvrShotCompare = IniInt(ini, L"debug", L"mvr_shot_compare", 0) != 0;
     c.mvrForwardTest = IniInt(ini, L"debug", L"mvr_forward_test", 0) != 0;
     c.mvrForward = IniInt(ini, L"debug", L"mvr_forward", 1) != 0;
@@ -469,6 +476,10 @@ Config ReadConfig(const fs::path& ini) {
     if (dlaa != "off" && dlaa != "dlaa" && dlaa != "dlss")
         Log("Settings: unknown [dlaa] mode=\"%s\", using off", dlaa.c_str());
     c.dlaaRenderScale = std::clamp(IniFloat(ini, L"dlaa", L"render_scale", c.dlaaRenderScale), 0.33f, 1.0f);
+    c.dlaaOuterRenderScale =
+        std::clamp(IniFloat(ini, L"dlaa", L"outer_render_scale", c.dlaaRenderScale), 0.33f, 1.0f);
+    c.dlaaFocusRenderScale =
+        std::clamp(IniFloat(ini, L"dlaa", L"focus_render_scale", c.dlaaRenderScale), 0.33f, 1.0f);
     const std::string preset = IniString(ini, L"dlaa", L"preset", L"k");  // K: NVIDIA's DLAA default, set explicitly
     if (preset == "default") {
         c.dlaaPreset = 0;
@@ -494,10 +505,12 @@ Config ReadConfig(const fs::path& ini) {
     c.dlaaPresetKeyMod = IniInt(ini, L"dlaa", L"preset_modifier", c.dlaaPresetKeyMod);
     c.dlaaPresetKey = IniInt(ini, L"dlaa", L"preset_key", c.dlaaPresetKey);
     if (c.dlaa)
-        Log("Settings: [dlaa] mode=%s render_scale=%.3f preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d "
+        Log("Settings: [dlaa] mode=%s render_scale=%.3f outer_render_scale=%.3f focus_render_scale=%.3f preset=%s "
+            "jitter_scale=(%.3f, %.3f) mv_jittered=%d "
             "auto_exposure=%d exposure=%.4f exposure_scale=%.4f bias_mask=%.2f skip_locks=%d modifier=0x%X key=0x%X "
             "exposure_key=0x%X preset_key=0x%X cockpit_taa=%d",
-            c.dlaaSr ? "dlss" : "dlaa", c.dlaaRenderScale, preset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY, c.dlaaMvJittered, c.dlaaAutoExposure,
+            c.dlaaSr ? "dlss" : "dlaa", c.dlaaRenderScale, c.dlaaOuterRenderScale, c.dlaaFocusRenderScale,
+            preset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY, c.dlaaMvJittered, c.dlaaAutoExposure,
             c.dlaaExposure, c.dlaaExposureScale, c.dlaaBiasMask, c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey,
             c.dlaaExpKey, c.dlaaPresetKey, c.dlaaCockpitTaa);
     const std::string nr = IniString(ini, L"nr", L"mode", L"off");
@@ -642,12 +655,15 @@ bool ReloadConfig(bool force) {
          "[quad] *_section");
     need(n.probeFrames != c.probeFrames || n.probeEngine != c.probeEngine || n.probeD3D != c.probeD3D, "[quad] probe_*");
     need(n.dlaa != c.dlaa || n.dlaaSr != c.dlaaSr, "[dlaa] mode");
-    need(n.dlaaRenderScale != c.dlaaRenderScale, "[dlaa] render_scale");
+    need(n.dlaaRenderScale != c.dlaaRenderScale || n.dlaaOuterRenderScale != c.dlaaOuterRenderScale ||
+             n.dlaaFocusRenderScale != c.dlaaFocusRenderScale,
+         "[dlaa] *render_scale");
     need(n.mvr != c.mvr, "[mvr] mode");
     need(n.mvrVsPatch != c.mvrVsPatch, "[debug] mvr_vs_patch");
     need(n.mvrPsPatch != c.mvrPsPatch, "[debug] mvr_ps_patch");
     need(n.mvrGbuffer != c.mvrGbuffer, "[debug] mvr_gbuffer");
     c.dlaaPreset = n.dlaaPreset;
+    c.srCbFix = n.srCbFix;  // live (sr_cb.h)
     c.dlaaJitterScaleX = n.dlaaJitterScaleX;
     c.dlaaJitterScaleY = n.dlaaJitterScaleY;
     c.dlaaMvJittered = n.dlaaMvJittered;

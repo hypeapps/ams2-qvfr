@@ -13,6 +13,8 @@
 #include "hook_prof.h"
 #include "hooks.h"
 #include "mvr_pass.h"
+#include "sr_cb.h"
+#include "sr_probe.h"
 #include "sun_fx_ps.h"  // kSunFxPS (fxc from shaders/sun_fx.hlsl)
 #include "sun_fx_vs.h"  // kSunFxVS
 #include "taa_views.h"
@@ -602,6 +604,8 @@ void STDMETHODCALLTYPE D_DrawIndexed(ID3D11DeviceContext* c, UINT count, UINT st
         return;
     }
     if (count == 6 && mvrpass::TaskMapOn()) mvrpass::TaskMapDraw6(c, _ReturnAddress());  // S1 probe
+    srcb::OnDraw(c);  // S2.1: after the TAA resolve of a DLSS SR group, the constants at the view size
+    if (srprobe::Armed()) srprobe::OnDraw(c, _ReturnAddress(), "DrawIndexed");  // S2.1 probe frame only
     if (mvrpass::SkipDraw(c)) return;  // B11: a focus velocity pass whose target got outer's vectors
     if (const DrawReplaceFn replace = g_drawReplace.load(std::memory_order_relaxed)) {
         hookprof::SubScope sp(hookprof::SDlss);
@@ -640,6 +644,8 @@ void STDMETHODCALLTYPE D_Draw(ID3D11DeviceContext* c, UINT count, UINT start) {
         return;
     }
     if (mvrpass::SkipDraw(c)) return;  // B11
+    srcb::OnDraw(c);  // S2.1
+    if (srprobe::Armed()) srprobe::OnDraw(c, _ReturnAddress(), "Draw");  // S2.1 probe frame only
     bool taaFix;
     {
         hookprof::SubScope sp(hookprof::STaaDraw);

@@ -72,7 +72,7 @@ bool g_viewLogged[kViews] = {};  // first DLSS evaluation of the view logged
 bool g_keyDown = false;
 bool g_expKeyDown = false;
 bool g_presetKeyDown = false;
-bool g_sr = false;  // DLSS SR (sr.h): [dlaa] mode=dlss in stereo
+bool g_sr = false;  // DLSS SR: [dlaa] mode=dlss (sr.h in stereo, S2 in quad views)
 // Displays/cockpit from the game's TAA (ini, read live); not with DLSS SR (the game's TAA would run at the render size).
 int CockpitTaaNow() { return g_sr ? 0 : Cfg().dlaaCockpitTaa; }
 const char* CockpitText(int mode) {
@@ -1397,7 +1397,7 @@ bool Replace(ID3D11DeviceContext* c, UINT n) {
         bool taa = false;
         Protect("draw", [&] { taa = BoundIsTaa(c); });
         if (!taa) return false;
-        if (clones::SwappedIn(clones::Outer)) {
+        if (clones::SceneIn()) {
             {
                 clones::RawScope raw;  // our calls pass the clones' hooks as they are
                 Protect("draw", [&] { r = Evaluate(c, false); });
@@ -1580,9 +1580,7 @@ void Install() {
         SetState("off with [quad] mode=probe");
         return;
     }
-    g_sr = Cfg().dlaaSr && Cfg().quadMode == QuadMode::Off;
-    if (Cfg().dlaaSr && !g_sr)
-        Log("DLAA: [dlaa] mode=dlss is for stereo only so far ([quad] mode=off); DLAA at the render size instead");
+    g_sr = Cfg().dlaaSr && (Cfg().quadMode == QuadMode::Off || Cfg().quadMode == QuadMode::Quad);
     if (Cfg().quadMode == QuadMode::Quad && !Cfg().taaViews)
         Log("DLAA: [debug] taa_views=0: the focus views share outer R's TAA targets and get motion vectors without the "
             "focus window's motion (smearing in the focus area)");

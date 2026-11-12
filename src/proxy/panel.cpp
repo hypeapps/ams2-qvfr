@@ -312,7 +312,8 @@ void UpdateStats() {
 }
 
 int ValueOf(const Item& it) {
-    if (it.special == Special::NrOn) return nr::Active() ? 1 : 0;
+    // ON only while NR can run: [nr] mode=final in qvfr.ini and the live switch on (the note says which one is off).
+    if (it.special == Special::NrOn) return Cfg().nrMode == 2 && nr::Active() ? 1 : 0;
     if (it.knob == K::Count) return 0;
     const int v = nr::GetKnob(it.knob);
     return it.knob == K::SkinStructure && v < 0 ? it.min : v;  // the model's own: left of 0

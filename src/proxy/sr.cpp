@@ -129,8 +129,8 @@ void* __fastcall D_EndCtor(void* a, void* b, void* c, void* d) {
     return r;
 }
 
-// The clones go in before CBeginEye::Execute (it binds the view's targets) and out after CEndEye::Execute, as in quad
-// mode; at the TAA draw dlaa.cpp ends the scene phase earlier (clones::SceneEnd).
+// The clones (the outer scene set) go in before CBeginEye::Execute (it binds the view's targets) and out after
+// CEndEye::Execute, as in quad mode; at the TAA draw dlaa.cpp ends the scene phase earlier (clones::SceneEnd).
 void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
     Guard("CBeginEye", [&] {
         bool vr = false;
@@ -251,7 +251,8 @@ void NoteGameSize(uint32_t w, uint32_t h) {
         const float s = Cfg().dlaaRenderScale;
         const uint32_t rw = std::max(16u, (uint32_t)(w * s + 0.5f)), rh = std::max(16u, (uint32_t)(h * s + 0.5f));
         Log("DLSS SR: eye size %u x %u, scene at %u x %u (render scale %.3f)", w, h, rw, rh, s);
-        clones::SetSizes(w, h, rw, rh, w, h);
+        clones::SetSizes(w, h, w, h, w, h);    // the view size is the game's: no post set
+        clones::SetSceneSizes(rw, rh, 0, 0);  // the scene phase in the outer scene set
     });
 }
 
