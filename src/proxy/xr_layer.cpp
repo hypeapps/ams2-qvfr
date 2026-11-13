@@ -18,6 +18,7 @@
 
 #include "common.h"
 #include "diag.h"
+#include "fps_hud.h"
 
 namespace qvfr::xrlayer {
 
@@ -80,6 +81,9 @@ int g_sessions = 0;
 std::mutex g_gm;  // the gaze result (read by the proxy on the game's render thread)
 Gaze g_gaze;
 std::atomic<int64_t> g_periodNs{0};  // predictedDisplayPeriod of the last xrWaitFrame
+hud::Dispatch g_hudApi;
+hud::Overlay g_hud;
+bool g_shouldRender = false;
 
 constexpr double kOwnSyncAfterMs = 50;  // no xrSyncActions from OpenComposite for this long: we sync ourselves
 constexpr double kSampleForMs = 60000, kSampleEveryMs = 500;  // gaze samples in the log after the first gaze
@@ -197,6 +201,9 @@ void LogSystem(XrSystemId sys) {
 }
 
 void ResetSession() {
+    g_hud.Stop();  // destroy its swapchain before the session/VIEW space disappear
+    g_shouldRender = false;
+    g_periodNs = 0;
     if (g_next.destroySpace) {
         if (g_s.gazeSpace) g_next.destroySpace(g_s.gazeSpace);
         if (g_s.viewSpace) g_next.destroySpace(g_s.viewSpace);
@@ -368,6 +375,7 @@ XrResult XRAPI_CALL HookDestroyInstance(XrInstance instance) {
         std::lock_guard lock(g_m);
         Log("OpenXR layer: xrDestroyInstance");
         if (g_s.h) LogSessionStats("at instance end");
+        g_hud.Stop();
         g_s = Session{};
         g_set = XR_NULL_HANDLE;
         g_action = XR_NULL_HANDLE;
@@ -414,6 +422,14 @@ XrResult XRAPI_CALL HookCreateSession(XrInstance instance, const XrSessionCreate
                 Log("OpenXR layer: VIEW reference space = %d (%s)", (int)rr, R(rr));
             }
         }
+        ID3D11Device* device = nullptr;
+        for (auto b = gb; b; b = b->next)
+            if (b->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR)
+                device = reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(b)->device;
+        XrSystemProperties props{XR_TYPE_SYSTEM_PROPERTIES};
+        if (info && g_next.getSystemProperties)
+            g_next.getSystemProperties(instance, info->systemId, &props);
+        g_hud.Start(*session, g_s.viewSpace, device, props.graphicsProperties.maxLayerCount, g_hudApi);
     });
     return r;
 }
@@ -543,6 +559,7 @@ XrResult XRAPI_CALL HookWaitFrame(XrSession session, const XrFrameWaitInfo* info
         Guarded("xr WaitFrame", [&] {
             std::lock_guard lock(g_m);
             if (session != g_s.h) return;
+            g_shouldRender = state->shouldRender == XR_TRUE;
             if (g_s.waits++ == 0)
                 Log("OpenXR layer: session %d: first xrWaitFrame, period %.3f ms, shouldRender %d", g_s.number,
                     state->predictedDisplayPeriod / 1e6, state->shouldRender);
@@ -552,13 +569,30 @@ XrResult XRAPI_CALL HookWaitFrame(XrSession session, const XrFrameWaitInfo* info
 }
 
 XrResult XRAPI_CALL HookEndFrame(XrSession session, const XrFrameEndInfo* info) {
+    XrFrameEndInfo withHud{};
+    XrCompositionLayerQuad hudQuad{};
+    std::vector<const XrCompositionLayerBaseHeader*> hudLayers;
+    bool added = false, shouldRender = false;
     Guarded("xr EndFrame", [&] {
         std::lock_guard lock(g_m);
         if (session != g_s.h || !info) return;
+        shouldRender = g_shouldRender;
         ++g_s.endFrames;
         LogEndFrame(info);
+        // A HUD problem must not trip the proxy's global diagnostic kill switch or interrupt the scene.
+        try {
+            added = g_hud.Prepare(info, withHud, hudQuad, hudLayers, NowMs(), g_periodNs.load() / 1e6, shouldRender);
+        } catch (...) { g_hud.Disable("exception while preparing overlay"); }
     });
-    return g_next.endFrame(session, info);
+    const XrResult r = g_next.endFrame(session, added ? &withHud : info);  // exactly one downstream EndFrame
+    {
+        std::lock_guard lock(g_m);
+        if (session == g_s.h) {
+            try { g_hud.Ended(info, r, NowMs(), added, shouldRender); }
+            catch (...) { g_hud.Disable("exception while sampling frames"); }
+        }
+    }
+    return r;
 }
 
 // Session states and interaction profile changes: OpenComposite attaches its action sets only once the session is
@@ -630,6 +664,13 @@ XrResult XRAPI_CALL HookGetInstanceProcAddr(XrInstance instance, const char* nam
 }
 
 void ResolveNext(XrInstance inst) {
+    Get(inst, "xrEnumerateSwapchainFormats", g_hudApi.formats);
+    Get(inst, "xrCreateSwapchain", g_hudApi.create);
+    Get(inst, "xrDestroySwapchain", g_hudApi.destroy);
+    Get(inst, "xrEnumerateSwapchainImages", g_hudApi.images);
+    Get(inst, "xrAcquireSwapchainImage", g_hudApi.acquire);
+    Get(inst, "xrWaitSwapchainImage", g_hudApi.wait);
+    Get(inst, "xrReleaseSwapchainImage", g_hudApi.release);
     Get(inst, "xrDestroyInstance", g_next.destroyInstance);
     Get(inst, "xrGetInstanceProperties", g_next.getInstanceProperties);
     Get(inst, "xrGetSystem", g_next.getSystem);
