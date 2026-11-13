@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <string>
+#include "fov_crop.h"
 
 namespace qvfr {
 
@@ -34,6 +35,7 @@ enum class QuadMode { Off, Probe, Quad };
 const char* QuadModeName(QuadMode m);
 
 struct Config {
+    fovcrop::Settings fovCrop;        // [fov_crop], OpenXR only, fixed for the process
     // [runtime] (M8: what stands behind the proxy; read before the backend DLL is loaded, a change needs a restart)
     bool pathOpenXr = false;          // path=openvr: the Valve DLL; path=openxr: OpenComposite to the OpenXR runtime
     std::wstring openComposite;       // opencomposite=: OpenComposite DLL (empty = the default in x64\qvfr\opencomposite)

@@ -29,6 +29,8 @@ struct Next {
     PFN_xrGetInstanceProperties getInstanceProperties = nullptr;
     PFN_xrGetSystem getSystem = nullptr;
     PFN_xrGetSystemProperties getSystemProperties = nullptr;
+    PFN_xrEnumerateViewConfigurationViews enumerateViews = nullptr;
+    PFN_xrLocateViews locateViews = nullptr;
     PFN_xrCreateSession createSession = nullptr;
     PFN_xrDestroySession destroySession = nullptr;
     PFN_xrBeginSession beginSession = nullptr;
@@ -76,6 +78,8 @@ struct Session {
     double statsMs = 0;
 } g_s;
 int g_sessions = 0;
+fovcrop::Settings g_crop;  // immutable until the next instance; never hot-reload projection/size independently
+bool g_cropSizeLogged = false, g_cropFovLogged = false, g_cropInvalidLogged = false;
 
 std::mutex g_gm;  // the gaze result (read by the proxy on the game's render thread)
 Gaze g_gaze;
@@ -588,6 +592,65 @@ XrResult XRAPI_CALL HookPollEvent(XrInstance instance, XrEventDataBuffer* ev) {
     return r;
 }
 
+// OpenComposite derives both OpenVR projection APIs, the visibility mask coordinates, the gaze map and
+// submitted projection-layer FOVs from these views. Leave poses and xrEndFrame untouched: the compositor
+// must receive the same cropped FOV the game actually rendered, not stretch it over the original FOV.
+XrResult XRAPI_CALL HookEnumerateViews(XrInstance instance, XrSystemId system, XrViewConfigurationType type,
+                                      uint32_t capacity, uint32_t* count, XrViewConfigurationView* views) {
+    const XrResult r = g_next.enumerateViews(instance, system, type, capacity, count, views);
+    if (r != XR_SUCCESS || type != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO || !count || *count != 2 ||
+        capacity < 2 || !views) return r;
+    Guarded("xr FOV crop size", [&] {
+        std::lock_guard lock(g_m);
+        if (!g_crop.Active()) return;
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            auto& v = views[eye];
+            const uint32_t w = v.recommendedImageRectWidth, h = v.recommendedImageRectHeight;
+            v.recommendedImageRectWidth = fovcrop::Dimension(w, g_crop.Width());
+            v.recommendedImageRectHeight = fovcrop::Dimension(h, g_crop.Height());
+            if (!g_cropSizeLogged)
+                Log("FOV crop: eye %u recommended %u x %u -> %u x %u (density preserved; restart required)", eye,
+                    w, h, v.recommendedImageRectWidth, v.recommendedImageRectHeight);
+        }
+        g_cropSizeLogged = true;
+    });
+    return r;
+}
+
+XrResult XRAPI_CALL HookLocateViews(XrSession session, const XrViewLocateInfo* info, XrViewState* state,
+                                   uint32_t capacity, uint32_t* count, XrView* views) {
+    const XrResult r = g_next.locateViews(session, info, state, capacity, count, views);
+    if (r != XR_SUCCESS || !info || info->viewConfigurationType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO ||
+        !count || *count != 2 || capacity < 2 || !views) return r;
+    Guarded("xr FOV crop views", [&] {
+        std::lock_guard lock(g_m);
+        if (!g_crop.Active()) return;
+        XrFovf cropped[2];
+        // Validate both before changing either; some runtimes return zero FOVs during startup.
+        if (!fovcrop::Apply(g_crop, 0, views[0].fov, cropped[0]) ||
+            !fovcrop::Apply(g_crop, 1, views[1].fov, cropped[1])) {
+            if (!g_cropInvalidLogged) {
+                Log("FOV crop: runtime returned invalid/unavailable FOVs; this locate passes through unchanged");
+                g_cropInvalidLogged = true;
+            }
+            return;
+        }
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            const auto original = views[eye].fov;
+            views[eye].fov = cropped[eye];
+            if (!g_cropFovLogged) {
+                constexpr double deg = 57.29577951308232;
+                const auto& f = cropped[eye];
+                Log("FOV crop: eye %u angles L/R/U/D deg %.2f %.2f %.2f %.2f -> %.2f %.2f %.2f %.2f", eye,
+                    original.angleLeft * deg, original.angleRight * deg, original.angleUp * deg,
+                    original.angleDown * deg, f.angleLeft * deg, f.angleRight * deg, f.angleUp * deg, f.angleDown * deg);
+            }
+        }
+        g_cropFovLogged = true;
+    });
+    return r;
+}
+
 struct HookEntry {
     const char* name;
     PFN_xrVoidFunction fn;
@@ -599,6 +662,8 @@ HookEntry* Hooks(size_t& n) {
         {"xrGetInstanceProcAddr", (PFN_xrVoidFunction)HookGetInstanceProcAddr, &g_next.gipa},
         {"xrDestroyInstance", (PFN_xrVoidFunction)HookDestroyInstance, &g_next.destroyInstance},
         {"xrGetSystem", (PFN_xrVoidFunction)HookGetSystem, &g_next.getSystem},
+        {"xrEnumerateViewConfigurationViews", (PFN_xrVoidFunction)HookEnumerateViews, &g_next.enumerateViews},
+        {"xrLocateViews", (PFN_xrVoidFunction)HookLocateViews, &g_next.locateViews},
         {"xrCreateSession", (PFN_xrVoidFunction)HookCreateSession, &g_next.createSession},
         {"xrDestroySession", (PFN_xrVoidFunction)HookDestroySession, &g_next.destroySession},
         {"xrBeginSession", (PFN_xrVoidFunction)HookBeginSession, &g_next.beginSession},
@@ -634,6 +699,8 @@ void ResolveNext(XrInstance inst) {
     Get(inst, "xrGetInstanceProperties", g_next.getInstanceProperties);
     Get(inst, "xrGetSystem", g_next.getSystem);
     Get(inst, "xrGetSystemProperties", g_next.getSystemProperties);
+    Get(inst, "xrEnumerateViewConfigurationViews", g_next.enumerateViews);
+    Get(inst, "xrLocateViews", g_next.locateViews);
     Get(inst, "xrCreateSession", g_next.createSession);
     Get(inst, "xrDestroySession", g_next.destroySession);
     Get(inst, "xrBeginSession", g_next.beginSession);
@@ -720,6 +787,21 @@ XrResult XRAPI_CALL CreateApiLayerInstance(const XrInstanceCreateInfo* info, con
     g_set = XR_NULL_HANDLE;
     g_action = XR_NULL_HANDLE;
     ResolveNext(g_instance);
+    g_crop = Cfg().fovCrop;
+    g_cropSizeLogged = g_cropFovLogged = g_cropInvalidLogged = false;
+    if (!g_next.enumerateViews || !g_next.locateViews) g_crop.enabled = false;
+    Guarded("xr FOV crop settings", [&] {
+        if (g_crop.Active()) {
+            char summary[192];
+            snprintf(summary, sizeof(summary), "on: top %.0f%% bottom %.0f%% inner %.0f%% outer %.0f%%; image %.0f%% x %.0f%%",
+                     g_crop.top * 100, g_crop.bottom * 100, g_crop.inner * 100, g_crop.outer * 100,
+                     g_crop.Width() * 100, g_crop.Height() * 100);
+            Log("FOV crop: %s", summary);
+            diag::Set("FOV crop", summary);
+        } else {
+            diag::Set("FOV crop", Cfg().fovCrop.Active() ? "unavailable: OpenXR view functions missing" : "off / zero crop");
+        }
+    });
     Guarded("xr CreateInstance (after)", [&] {
         if (g_next.getInstanceProperties) {
             XrInstanceProperties p{XR_TYPE_INSTANCE_PROPERTIES};

@@ -18,6 +18,7 @@
         </div>
         <div class="nav" data-class-active="page == 0" data-event-click="page = 0"><span class="icon"></span><span class="ntext">Settings</span></div>
         <div class="nav" data-class-active="page == 1" data-event-click="page = 1"><span class="icon"></span><span class="ntext">Resolution</span></div>
+        <div class="nav" data-class-active="page == 5" data-event-click="page = 5"><span class="icon"></span><span class="ntext">FOV cropping</span></div>
         <div class="nav" data-class-active="page == 2" data-event-click="page = 2"><span class="icon"></span><span class="ntext">Status</span></div>
         <div class="nav" data-class-active="page == 3" data-event-click="page = 3"><span class="icon"></span><span class="ntext">Files</span></div>
         <div class="nav" data-class-active="page == 4" data-event-click="page = 4"><span class="icon"></span><span class="ntext">Log</span></div>
@@ -35,6 +36,51 @@
             <span class="banner-title">Restart the game to apply:</span> {{ restart }}
         </div>
         <div class="banner" data-if="save_error != ''">{{ save_error }}</div>
+
+        <!-- FOV cropping, independent of the quad-view quality controls. -->
+        <div data-if="page == 5">
+            <div class="phead"><h1>FOV cropping</h1><button class="ghost" data-event-click="crop_reset()">Reset crop</button></div>
+            <p class="lead">Remove edges before rendering, with a smaller render resolution at the same pixel density.
+                All changes apply after restarting the game.</p>
+            <div class="banner" data-if="!crop_available">Requires VR API = OpenXR and the QVFR OpenXR layer enabled (openxr_layer=1). Crop is inactive on OpenVR.</div>
+            <div class="card">
+                <div class="chead"><span class="ctitle">Crop the rendered view</span><span class="tag" data-if="rs_crop">Game restart needed</span></div>
+                <div class="cbody">
+                    <div class="row">
+                        <div class="label"><div class="name">Enable FOV cropping</div><div class="desc">Off keeps the full FOV supplied by your headset software and remembers the sliders below.</div></div>
+                        <div class="control"><div class="switch"><input type="checkbox" data-checked="crop_enabled"/><div class="knob"/></div></div>
+                    </div>
+                    <div class="row">
+                        <div class="label"><div class="name">Top</div><div class="desc">Image removed from above, in both eyes.</div></div>
+                        <div class="control"><div class="slider"><div class="rail"><div class="fill" data-style-width="(crop_top / 40 * 100) + '%'"/></div><input type="range" min="0" max="40" step="1" data-value="crop_top"/></div><div class="value"><span class="num">{{ crop_top }}</span><span class="unit">%</span></div></div>
+                    </div>
+                    <div class="row">
+                        <div class="label"><div class="name">Bottom</div><div class="desc">Image removed from below, in both eyes.</div></div>
+                        <div class="control"><div class="slider"><div class="rail"><div class="fill" data-style-width="(crop_bottom / 40 * 100) + '%'"/></div><input type="range" min="0" max="40" step="1" data-value="crop_bottom"/></div><div class="value"><span class="num">{{ crop_bottom }}</span><span class="unit">%</span></div></div>
+                    </div>
+                    <div class="row">
+                        <div class="label"><div class="name">Outer sides</div><div class="desc">Towards the temples: left edge of the left eye, right edge of the right eye.</div></div>
+                        <div class="control"><div class="slider"><div class="rail"><div class="fill" data-style-width="(crop_outer / 40 * 100) + '%'"/></div><input type="range" min="0" max="40" step="1" data-value="crop_outer"/></div><div class="value"><span class="num">{{ crop_outer }}</span><span class="unit">%</span></div></div>
+                    </div>
+                    <div class="row">
+                        <div class="label"><div class="name">Inner sides</div><div class="desc">Towards the nose: right edge of the left eye, left edge of the right eye.</div></div>
+                        <div class="control"><div class="slider"><div class="rail"><div class="fill" data-style-width="(crop_inner / 40 * 100) + '%'"/></div><input type="range" min="0" max="40" step="1" data-value="crop_inner"/></div><div class="value"><span class="num">{{ crop_inner }}</span><span class="unit">%</span></div></div>
+                    </div>
+                    <p class="cintro">0% removes nothing. Values are fractions of the whole image per edge, not degrees or the Toolkit's angular percentages. Crop from Pimax or another layer is applied as well.</p>
+                </div>
+            </div>
+            <div class="card">
+                <div class="chead"><span class="ctitle">Retained image: {{ crop_width }}% wide / {{ crop_height }}% high</span></div>
+                <div class="cbody">
+                    <div class="crop-eyes">
+                        <div class="crop-eye"><div class="crop-kept" data-style-left="crop_preview_left" data-style-top="crop_preview_top" data-style-width="crop_width + '%'" data-style-height="crop_height + '%'"/><span>LEFT EYE</span></div>
+                        <div class="crop-eye"><div class="crop-kept" data-style-left="crop_preview_right" data-style-top="crop_preview_top" data-style-width="crop_width + '%'" data-style-height="crop_height + '%'"/><span>RIGHT EYE</span></div>
+                    </div>
+                    <p class="cintro">{{ crop_area }}% of the incoming image area remains when this crop is applied. This is a pixel estimate, not an FPS prediction. Black areas are outside the new rendered FOV.</p>
+                    <p class="cintro">The QVFR focus size is relative to the cropped view. Recheck its width and height on the Resolution page after changing crop. The Status page reports the crop used at the last game start.</p>
+                </div>
+            </div>
+        </div>
 
         <!-- ============================================================ Settings -->
         <div data-if="page == 0">

@@ -153,6 +153,12 @@ std::wstring Prepare(HMODULE self) {
     const fs::path qvfr = dir / L"qvfr";
     const Config& c = Cfg();
     g_openxr = c.pathOpenXr;
+    if (c.fovCrop.Active()) {
+        diag::Set("FOV crop", "requested; OpenXR layer has not applied it yet");
+        if (!g_openxr || !c.openxrLayer)
+            diag::Report(diag::Level::Warning, "crop-path",
+                         "FOV cropping requires path=openxr and openxr_layer=1. The requested crop is not active.");
+    }
     if (!g_openxr) {
         g_backend = (qvfr / L"openvr" / L"openvr_api.dll").wstring();
         return g_backend;

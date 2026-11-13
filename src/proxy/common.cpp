@@ -283,6 +283,11 @@ Config ReadConfig(const fs::path& ini) {
     if (path != "openvr" && path != "openxr") Log("Settings: unknown [runtime] path=\"%s\", using openxr", path.c_str());
     c.openComposite = IniPathValue(ini, L"runtime", L"opencomposite");
     c.openxrLayer = IniInt(ini, L"runtime", L"openxr_layer", 1) != 0;
+    c.fovCrop.enabled = IniInt(ini, L"fov_crop", L"enabled", 0) != 0;
+    c.fovCrop.top = fovcrop::Limit(IniFloat(ini, L"fov_crop", L"top", 0));
+    c.fovCrop.bottom = fovcrop::Limit(IniFloat(ini, L"fov_crop", L"bottom", 0));
+    c.fovCrop.inner = fovcrop::Limit(IniFloat(ini, L"fov_crop", L"inner", 0));
+    c.fovCrop.outer = fovcrop::Limit(IniFloat(ini, L"fov_crop", L"outer", 0));
     c.wrap = IniInt(ini, L"proxy", L"wrap", 1) != 0;
     c.firstCalls = IniInt(ini, L"log", L"first_calls", c.firstCalls);
     c.statsIntervalS = IniInt(ini, L"log", L"stats_interval_s", c.statsIntervalS);
@@ -625,6 +630,7 @@ bool ReloadConfig(bool force) {
     need(n.pathOpenXr != c.pathOpenXr || n.openComposite != c.openComposite || n.openxrLayer != c.openxrLayer,
          "[runtime]");
     need(n.wrap != c.wrap, "[proxy] wrap");
+    need(n.fovCrop != c.fovCrop, "[fov_crop]");
     need(n.firstCalls != c.firstCalls, "[log] first_calls");
     need(n.csvAlways != c.csvAlways, "[timing] csv_always");
     need(n.gpuTiming != c.gpuTiming, "[timing] gpu");
