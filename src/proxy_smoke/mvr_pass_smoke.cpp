@@ -1193,15 +1193,16 @@ int RunMvrPass() {
                          kOL * 100 <= kOPx && kOD * 200 <= kOPx && kOMMax < 0.01 && kMag > 0 && kMag == kMagRef &&
                          kCov > kPx / 2 && kBig * 200 <= kPx && kLOff * 100 <= kPx && kDOff * 200 <= kPx &&
                          kMaskMax < 0.01;
-        // B20 K3: focus L ran early, focus R was refused for K4, the focus group skipped SSAO and lights too.
-        const bool earlyOne = !r.early || (r.earlyL && r.earlyBegan && !r.earlyR && r.earlyRWhy &&
-                                           strstr(r.earlyRWhy, "B20 K4") && r.skipSsao && r.skipPhase2);
+        // B20 K3: focus L ran early, the focus group skipped SSAO and lights too. B20 K4: focus R's run is wanted as well
+        // (the smoke's fake clones need no twins; with focus at the game's size they stand for the identity set).
+        const bool earlyOne =
+            !r.early || (r.earlyL && r.earlyBegan && r.earlyR && r.skipSsao && r.skipPhase2);
         cornerOk = cornerOk && one && earlyOne;
         std::string earlyText;
         if (r.early) {
             earlyText = std::string("; B20 K3 early run: focus L ") + (r.earlyBegan ? "ran" : r.earlyL ? "NOT BEGUN" : "REFUSED") +
-                        ", then outer R's pass; focus R " + (r.earlyR ? "RAN" : "refused") + " (" +
-                        (r.earlyRWhy ? r.earlyRWhy : "no reason") + "); the focus group's SSAO " +
+                        ", then outer R's pass; focus R " + (r.earlyR ? "wanted" : "REFUSED") + " (" +
+                        (r.earlyR ? "B20 K4" : r.earlyRWhy ? r.earlyRWhy : "no reason") + "); the focus group's SSAO " +
                         (r.skipSsao ? "skipped" : "RUN") + ", lights " + (r.skipPhase2 ? "skipped" : "RUN") + " (" +
                         (earlyOne ? "OK" : "WRONG") + ")";
         }

@@ -90,6 +90,7 @@
 int RunSunFx();  // sun_fx_smoke.cpp
 int RunMvrVs();  // mvr_vs_smoke.cpp
 int RunMvrPs();  // mvr_ps_smoke.cpp
+int RunPsPatchDir(const char* dir);  // mvr_ps_smoke.cpp (B20 K4)
 int RunMvrPass();  // mvr_pass_smoke.cpp
 int RunMvrForward();  // mvr_forward_smoke.cpp
 int RunTaaFix();  // taa_fix_smoke.cpp
@@ -1406,6 +1407,65 @@ int RunClones() {
     expect(!cl::TestGet().swapped && P.at<void*>(0x58) == texP, "focus group at the game size: no swap");
     cl::EndGroup(ctx);
     cl::Shutdown();
+    // Scenario 2b (MVR B20 K4): the same with the identity focus set (SetFocusIdentity): P, which focus writes, is its
+    // own focus clone (no memory), so focus R gets a twin of the engine's texture; eye 0 keeps the engine's texture.
+    for (int k = 0; k < 4; ++k) {
+        devSize(k)[0] = devInit[k][0];
+        devSize(k)[1] = devInit[k][1];
+        devDirty(k) = 0;
+    }
+    cl::SetSizes(64, 48, 32, 24, 64, 48);
+    cl::SetFocusIdentity(true);
+    for (FakeObj* o : objs2) cl::TestRegister(false, o);
+    for (int f = 0; f < 17; ++f) {
+        cl::OnFrameStart(ctx, true);
+        if (f == 16) break;
+        cl::BeginGroup(ctx, cl::Outer);
+        for (ID3D11RenderTargetView* v : {rtvP, rtvQ, rtvS}) ctx->ClearRenderTargetView(v, green);
+        cl::EndGroup(ctx);
+        cl::BeginGroup(ctx, cl::Focus);
+        ctx->ClearRenderTargetView(rtvP, blue);
+        ctx->PSSetShaderResources(0, 1, &srvQ);
+        cl::EndGroup(ctx);
+    }
+    st = cl::TestGet();
+    expect(st.phase == 2 && st.clones[cl::Outer] == 2 && st.clones[cl::Focus] == 1,
+           "identity: outer clones P and S, focus's identity clone P");
+    cl::OnFrameStart(ctx, true);
+    expect(cl::CloneOf(texP, cl::Focus) == texP && !cl::CloneOf(texQ, cl::Focus), "identity: P's focus clone is P");
+    expect(cl::IsClone(texP) && !cl::IsClone(texQ), "identity: P counts as a clone, Q not");
+    cl::WantTwin(texP);
+    expect(!cl::HasTwin(texP), "identity: no twin before the frame start");
+    cl::OnFrameStart(ctx, true);
+    expect(cl::HasTwin(texP) && cl::TestGet().twins == 1, "identity: P's twin made");
+    cl::SetFocusEye(1);
+    ID3D11Texture2D* twinP = cl::CloneOf(texP, cl::Focus);
+    expect(twinP && twinP != texP && size(twinP) == std::make_pair(64u, 48u), "identity eye 1: CloneOf gives P's twin");
+    expect(twinP && pixel(twinP) == pixel(texP), "identity: the twin starts with the engine texture's contents");
+    cl::BeginGroup(ctx, cl::Focus);
+    expect(cl::TestGet().swapped && P.at<void*>(0x58) == twinP && P.at<void*>(0x80) != rtvP && Q.at<void*>(0x58) == texQ,
+           "identity eye 1 swap: P's twin and its view in the fields, Q the original");
+    ctx->ClearRenderTargetView(P.at<ID3D11RenderTargetView*>(0x80), red);
+    cl::EndGroup(ctx);
+    expect(P.at<void*>(0x58) == texP && P.at<void*>(0x80) == rtvP, "identity: P's fields back after the eye 1 group");
+    expect(twinP && pixel(twinP) == 0xFF0000FFu && pixel(texP) == 0xFFFF0000u,
+           "identity eye 1 wrote the twin (red), the engine's texture kept focus L's (blue)");
+    cl::SetFocusEye(0);
+    expect(cl::CloneOf(texP, cl::Focus) == texP, "identity eye 0: CloneOf gives the engine's texture");
+    cl::BeginGroup(ctx, cl::Focus);
+    ID3D11RenderTargetView* idRtv = P.at<ID3D11RenderTargetView*>(0x80);
+    ID3D11Resource* idRes = nullptr;
+    if (idRtv) idRtv->GetResource(&idRes);
+    expect(P.at<void*>(0x58) == texP && idRes == texP, "identity eye 0 swap: the engine's texture (a view of ours on it)");
+    if (idRes) idRes->Release();
+    ctx->ClearRenderTargetView(idRtv, green);
+    cl::EndGroup(ctx);
+    expect(pixel(texP) == 0xFF00FF00u && pixel(twinP) == 0xFF0000FFu,
+           "identity eye 0 wrote the engine's texture (green), the twin kept eye 1's (red)");
+    st = cl::TestGet();
+    expect(st.leaks == 0, "identity: no leaks");
+    cl::Shutdown();
+    cl::SetFocusIdentity(false);
     const int bad2 = bad;
 
     // Scenario 3 (MVR B17): a two-slice array in place of an engine texture. G: eye size, written by outer and focus,
@@ -1866,6 +1926,37 @@ int RunClones() {
     expect(!cl::SceneIn() && T.at<void*>(0x58) == texT && Hst.at<void*>(0x58) == texHst && devSize(0)[0] == 64 &&
                RS.at<uint16_t>(0x24) == 64,
            "SR focus: originals back after the group");
+    // B20 K4: with DLSS running focus R's twin of T is one of its focus scene clone (the forward pass from outer writes
+    // the scene clones): with eye 1 the scene phase's T field is the twin, U stays shared, and CarryList carries from
+    // the twin into focus's post clone of T (it has no twin of its own).
+    {
+        ID3D11Texture2D* sceneT0 = cl::CloneOf(texT, cl::FocusScene);
+        ID3D11Texture2D* postT0 = cl::CloneOf(texT, cl::Focus);
+        cl::WantTwin(texT);
+        expect(!cl::HasTwin(texT), "K4 SR: no twin before the frame start");
+        cl::OnFrameStart(ctx, true);
+        expect(cl::HasTwin(texT) && !cl::HasTwin(texU) && cl::TestGet().twins == 1,
+               "K4 SR: T's twin (of its focus scene clone) made, U without one");
+        cl::SetFocusEye(1);
+        ID3D11Texture2D* twinT = cl::CloneOf(texT, cl::FocusScene);
+        expect(sceneT0 && twinT && twinT != sceneT0 && size(twinT) == std::make_pair(20u, 15u) &&
+                   cl::CloneOf(texT, cl::Focus) == postT0 && cl::CloneOf(texU, cl::FocusScene) != nullptr,
+               "K4 SR eye 1: T's scene clone is the 20 x 15 twin, its post clone and U's scene clone shared");
+        cl::BeginGroup(ctx, cl::Focus);
+        expect(cl::SceneIn() && T.at<void*>(0x58) == twinT &&
+                   U.at<void*>(0x58) == cl::CloneOf(texU, cl::FocusScene),
+               "K4 SR eye 1 scene: T's twin in the field, U's shared scene clone");
+        ctx->ClearRenderTargetView(T.at<ID3D11RenderTargetView*>(0x80), red);
+        nc = cl::CarryList(carryC, carryD, 4);
+        expect(nc == 1 && carryC[0] == twinT && carryD[0] == postT0,
+               "K4 SR eye 1: T carried from its twin into focus's post clone");
+        cl::SceneEnd(ctx);
+        cl::EndGroup(ctx);
+        expect(T.at<void*>(0x58) == texT && twinT && pixel(twinT) == 0xFF0000FFu && pixel(sceneT0) != 0xFF0000FFu,
+               "K4 SR: eye 1 wrote T's twin (red), not focus L's scene clone; originals back");
+        cl::SetFocusEye(0);
+        expect(cl::CloneOf(texT, cl::FocusScene) == sceneT0, "K4 SR eye 0: T's shared scene clone");
+    }
     // DLSS not running: the groups stay in their post sets.
     cl::SetSrActive(false);
     cl::OnFrameStart(ctx, true);
@@ -1952,6 +2043,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--nr-bridge")) return RunNrBridge();
         else if (!strcmp(argv[i], "--panel")) return RunPanel();
         else if (!strcmp(argv[i], "--mvr-vs")) mvrVsTest = true;
+        else if (!strcmp(argv[i], "--ps-patch-dir") && i + 1 < argc) return RunPsPatchDir(argv[i + 1]);
         else if (!strcmp(argv[i], "--mvr-ps")) mvrPsTest = true;
         else if (!strcmp(argv[i], "--mvr-pass")) mvrPassTest = true;
         else if (!strcmp(argv[i], "--mvr-forward")) mvrForwardTest = true;

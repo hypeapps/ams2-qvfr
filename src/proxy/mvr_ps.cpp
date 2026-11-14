@@ -128,6 +128,24 @@ void Refuse(std::atomic<uint64_t>& counter, std::string reason, const void* code
     }
 }
 
+// [debug] mvr_ps_dump (B20 K4): the original of a patched shader into x64\qvfr\ps_dump\<checksum>.dxbc (once per checksum).
+void DumpOriginal(const void* code, size_t len) {
+    static std::atomic<int> s_files{0}, s_logged{0};
+    char sum[40];
+    SumText(code, len, sum);
+    std::error_code ec;
+    const fs::path dir = BaseDir() / L"ps_dump";
+    fs::create_directories(dir, ec);
+    const fs::path file = dir / (std::string(sum) + ".dxbc");
+    if (fs::exists(file, ec)) return;
+    FILE* f = _wfopen(file.c_str(), L"wb");
+    if (!f) return;
+    const bool ok = fwrite(code, 1, len, f) == len;
+    fclose(f);
+    if (ok && s_files.fetch_add(1) == 0 && s_logged.fetch_add(1) == 0)
+        Log("MVR PS patch: [debug] mvr_ps_dump: the originals of the patched pixel shaders go to %ls", dir.c_str());
+}
+
 // The patched shader (kind Patched), or null and the kind of the original the caller makes.
 ID3D11PixelShader* MakePatched(ID3D11Device* dev, const void* code, SIZE_T len, ID3D11ClassLinkage* link,
                                ID3D11PixelShader** out, sunfx::CreatePsFn create, uintptr_t caller, Info& made) {
@@ -181,6 +199,7 @@ ID3D11PixelShader* MakePatched(ID3D11Device* dev, const void* code, SIZE_T len, 
     }
     QueryPerformanceCounter(&t1);
     kind = Kind::Patched;
+    if (Cfg().mvrPsDump && !g_testing) DumpOriginal(code, len);
     for (unsigned k = 0; k < kTextures && k < info.textureRegs.size(); ++k)
         if (info.textureRegs[k] < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT) made.slot[k] = (uint8_t)info.textureRegs[k];
     g_patchUs.fetch_add((uint64_t)Us(t0, t1), std::memory_order_relaxed);

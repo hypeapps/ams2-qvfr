@@ -103,10 +103,18 @@ bool SwappedIn(Set set);
 // (clones without a twin stay shared). Original() of a twin is the engine's texture.
 // Render thread, at the start of each eye group: the focus eye of the work that follows (0 L, 1 R).
 void SetFocusEye(int eye);
+// B20 K4: with DLSS SR running in this frame (SetSrActive) the twin is of the focus scene clone when the texture has one
+// (CloneOf(…, FocusScene) and the focus scene set's swap give it to eye 1 too), else of the focus clone.
 // Render thread: `original`'s focus clone gets a twin at the next frame start (no-op without a focus clone).
 void WantTwin(ID3D11Resource* original);
-// Render thread: `original`'s focus clone has its twin now.
+// Render thread: `original`'s focus clone (as WantTwin picks it) has its twin now.
 bool HasTwin(ID3D11Resource* original);
+// B20 K4: focus at the game's size with outer smaller (the MVR corner layout) gets an identity focus set: each texture
+// focus writes is its own focus clone (views of ours on the engine's texture, no memory), so focus R's twins of the
+// textures outer's groups write for it work as with clones of their own. A change drops the clones (learned again).
+void SetFocusIdentity(bool on);
+// Render thread: `res` is a clone or twin of any set (an identity focus clone too).
+bool IsClone(ID3D11Resource* res);
 // MVR gate B17 (docs/mvr.md): two-slice arrays in place of the engine's own textures. mvr_pass asks for the targets of
 // outer's G-buffer pass (B12: and the multisampled ones of its forward pass, the arrays then multisampled too); at the
 // next frame start each listed texture whose object still holds it gets a Texture2DArray

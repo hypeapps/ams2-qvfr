@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "mvr_ps.h"
+#include "mvr_ps_patch.h"
 #include "mvr_vs.h"
 #include "sun_fx.h"
 
@@ -257,4 +258,73 @@ int RunMvrPs() {
     printf("  debug layer %s, %d warnings, %d expected linkage reports\n", debugLayer ? "on" : "not installed", warnings,
            expected);
     return ok ? 0 : 1;
+}
+
+// --ps-patch-dir DIR (B20 K4): the MVR PS patch over a folder of the game's pixel shaders (*.dxbc, from [debug]
+// mvr_ps_dump), each result created on a D3D11 device. Reports patched / not needed / refused (with reasons), creation
+// failures and the screen constants replaced. Exit 1 when a patched shader cannot be created.
+int RunPsPatchDir(const char* dir) {
+    ComPtr<ID3D11Device> dev;
+    if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev,
+                                 nullptr, nullptr))) {
+        printf("D3D11CreateDevice failed\n");
+        return 1;
+    }
+    unsigned files = 0, patched = 0, notNeeded = 0, refused = 0, createFailed = 0, withConst = 0, reads = 0, dynamic = 0;
+    unsigned constMask[2] = {};
+    std::vector<std::pair<std::string, unsigned>> reasons;
+    WIN32_FIND_DATAA fd{};
+    const std::string pattern = std::string(dir) + "\\*.dxbc";
+    HANDLE h = FindFirstFileA(pattern.c_str(), &fd);
+    if (h == INVALID_HANDLE_VALUE) {
+        printf("PS patch dir: no *.dxbc in %s\n", dir);
+        return 1;
+    }
+    do {
+        const std::string path = std::string(dir) + "\\" + fd.cFileName;
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) continue;
+        std::vector<uint8_t> code;
+        uint8_t buf[65536];
+        for (size_t n; (n = fread(buf, 1, sizeof(buf), f)) > 0;) code.insert(code.end(), buf, buf + n);
+        fclose(f);
+        ++files;
+        qvfr::dxbc::MvrPsPatchOptions opt;
+        opt.screenTextures.push_back("GLOBAL_liveTrackTextureMap_tex");  // as mvr_ps.cpp
+        std::vector<uint8_t> out;
+        qvfr::dxbc::MvrPsPatchInfo info;
+        std::string err;
+        const auto r = qvfr::dxbc::PatchPsForMvr(code.data(), code.size(), opt, out, &info, &err);
+        if (r == qvfr::dxbc::MvrPsPatchResult::NotNeeded) {
+            ++notNeeded;
+            continue;
+        }
+        if (r == qvfr::dxbc::MvrPsPatchResult::Refused) {
+            ++refused;
+            if (const size_t at = err.find(" at token"); at != std::string::npos) err.resize(at);
+            bool seen = false;
+            for (auto& [t, n] : reasons)
+                if (t == err) seen = (++n, true);
+            if (!seen) reasons.emplace_back(err, 1);
+            continue;
+        }
+        ++patched;
+        ComPtr<ID3D11PixelShader> ps;
+        if (FAILED(dev->CreatePixelShader(out.data(), out.size(), nullptr, &ps))) {
+            ++createFailed;
+            if (createFailed <= 5) printf("  CreatePixelShader FAILED for the patched %s\n", fd.cFileName);
+        }
+        withConst += info.constantMask ? 1 : 0;
+        reads += info.constantReads;
+        dynamic += info.constantsDynamic;
+        for (int k = 0; k < 2; ++k) constMask[k] += (info.constantMask >> k) & 1;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    printf("PS patch dir %s: %u shaders, patched %u (created: failed %u), not needed %u, refused %u; screen constants "
+           "replaced in %u (viewportPixelDimensions %u, screenSpaceDimensions %u), operands rewritten %u, left in "
+           "dynamically indexed buffers %u\n",
+           createFailed ? "FAILED" : "OK", files, patched, createFailed, notNeeded, refused, withConst, constMask[0],
+           constMask[1], reads, dynamic);
+    for (const auto& [t, n] : reasons) printf("  refused %u: %s\n", n, t.c_str());
+    return createFailed ? 1 : 0;
 }

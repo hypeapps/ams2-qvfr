@@ -40,15 +40,18 @@ bool Install();
 // are at the slices' size, the game's size, view 0 (outer) lies in the top-left corner of slice 0 (its gated transform
 // in VS slot 3, mvr_vs.h) and view 1 (focus) in the top-left corner of slice 1, the whole slice when focus is at the
 // game's size. At the end slice 0's corner goes back into outer's clones and slice 1's into focus's targets: its clones,
-// or the engine's own textures when focus is at the game's size. The early SSAO and lights, the forward pass from outer
-// and what stands on them (B9a-B19) stay off in that layout (B20 K3-K5).
+// or the engine's own textures when focus is at the game's size. B20 K3, K4: the early SSAO and lights and the forward
+// pass from outer (single-sample; multisampled is K5) run in that layout too, and so does what stands on them (B11,
+// B13, B19). With focus at the game's size, outer smaller, mvr_corner and mvr_forward, the clones get an identity focus
+// set (clones::SetFocusIdentity) so that focus R has twins of the engine's textures outer R's group writes for it.
 void SetSizes(uint32_t gameW, uint32_t gameH, uint32_t outerW, uint32_t outerH, uint32_t focusW, uint32_t focusH);
 // DLSS SR in quad views (docs/dlaa-plan.md S2.2): the render sizes of outer's and focus's scene phases, as given to
 // clones::SetSceneSizes (0 = no SR). While SetSrActive says DLSS runs in this frame, the G-buffer pass takes them in
 // place of the view sizes: outer draws into its scene clones (the corner layout whenever they are smaller than the
 // game's size, the slices at the larger of the two render sizes per axis), focus's targets are its scene clones (else
 // its view-size clones, else the engine's textures), and focus's jitter is over its render size. The early SSAO and
-// lights and the forward pass from outer stay off then (B20 K3, K4: they would write focus's view-size clones).
+// lights and the forward pass from outer run then too (B20 K3, K4): the opaque forward lies before the TAA resolve, so
+// it writes focus's scene clones (focus R twins of them, clones::WantTwin).
 void SetSceneSizes(uint32_t outerW, uint32_t outerH, uint32_t focusW, uint32_t focusH);
 // Render thread, at the frame start: the groups use the scene sets in this frame (clones::SetSrActive).
 void SetSrActive(bool on);
@@ -100,7 +103,8 @@ void AfterTask(uint8_t* task);  // after the engine's Execute (not after a skipp
 // focus L: the focus clones are shared, and outer R's group (which would run focus R's) comes before focus L's group.
 // With mvr_forward (step 3, below) focus R's run in outer R's group as well, into focus R's own clones.
 // B20 K3: focus L's run also in the corner layout and with DLSS SR's scene sets (focus's targets: its clones, its scene
-// clones or the engine's textures, as the focus group's swap puts them in); focus R's is refused there until K4.
+// clones or the engine's textures, as the focus group's swap puts them in). B20 K4: focus R's too, into the twins of
+// those targets (refused at the game's size without the identity focus set, SetSizes).
 // The run order of quad's RunTask:
 //   EarlyWanted(eye) -> quad swaps focus's view in and puts focus's clones in -> EarlyBegin(eye, projected) -> the
 //   engine's CBeginEye, CSSAORender, CPhase2Render of the focus group without their Finish -> clones out, view back,
@@ -143,6 +147,10 @@ void EarlyWaited(double ms);                  // time quad waited for the engine
 // and the forward passes write (noted as they are bound, cleared or filled) gets focus R's own copy from the clones
 // module (clones::WantTwin, made at the next frame start), which focus R's work then uses (clones::SetFocusEye). Focus
 // R's early run (and with it its live pass) waits until every noted clone has one.
+// B20 K4: in the corner layout (outer smaller) the pass binds outer's clones; their copies are at the slices' size,
+// slice 0 gets outer's clone in its top-left corner (the depth by a pass), view 0 draws there through its gated
+// transform, and a pause at targets of another size keeps the game's viewports. Focus's targets are its clones, its
+// scene clones with DLSS SR or, at the game's size, the engine's textures (focus R's: their twins).
 void SetForward(bool on);
 bool GetForward();
 // The depth the live pass leaves in focus's clone ([debug] mvr_forward_depth): 0 as MVR drew it, 1 plus mvr_depth_bias

@@ -419,12 +419,17 @@ bool RunCase(bool debug, bool rtRegHigh) {
         c[4 + k] = vsPatch[4 + k] - (1 - 2 * ry) * vsPatch[12 + k];  // y_1 >= (1 - 2 fh / H) w
         c[8 + k] = c[12 + k] = vsPatch[12 + k];
     }
-    float psRows[12] = {sx, sy, 0.5f * (1 + ox - sx), 0.5f * (1 - oy - sy),
-                        static_cast<float>(kW) / kFw, static_cast<float>(kH) / kFh, 1, 1};
+    // Rows 3 and 4 (B20 K4): view 1's screen constants, here outer's own size (the classic layout).
+    static_assert(qvfr::dxbc::kMvrPsRows == 5, "five rows");
+    float psRows[20] = {sx, sy, 0.5f * (1 + ox - sx), 0.5f * (1 - oy - sy),
+                        static_cast<float>(kW) / kFw, static_cast<float>(kH) / kFh, 1, 1,
+                        0, 0, 0, 0,
+                        0, 0, static_cast<float>(kW), static_cast<float>(kH),
+                        0, 0, 1.0f / kW, 1.0f / kH};
     memcpy(&psRows[8], &qvfr::dxbc::kMvrPsMagic, 4);
     // A buffer of the game's in PS slot 3 (the patch's slot) during a layered pass: anything but the magic value.
-    float gameRows[12];
-    for (int i = 0; i < 12; ++i) gameRows[i] = 0.37f * (i + 1);
+    float gameRows[20];
+    for (int i = 0; i < 20; ++i) gameRows[i] = 0.37f * (i + 1);
     const float gOuter[8] = {0, 0, kW, kH, 0, 0, 1.0f / kW, 1.0f / kH};
     const float gFocus[8] = {0, 0, kFw, kFh, 0, 0, 1.0f / kFw, 1.0f / kFh};
     auto cbProj = MakeCb(g, proj, sizeof(proj)), cbProjF = MakeCb(g, projF, sizeof(projF));

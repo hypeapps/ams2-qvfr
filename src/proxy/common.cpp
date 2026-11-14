@@ -443,6 +443,7 @@ Config ReadConfig(const fs::path& ini) {
     c.mvrMsColorSkip = IniInt(ini, L"debug", L"mvr_ms_color_skip", 1) != 0;
     c.mvrMsColorSkipKey = IniInt(ini, L"debug", L"mvr_ms_color_skip_key", c.mvrMsColorSkipKey);
     c.mvrMsSlices = IniInt(ini, L"debug", L"mvr_ms_slices", 1) != 0;
+    c.mvrPsDump = IniInt(ini, L"debug", L"mvr_ps_dump", 0) != 0;
     c.mvrLiveTrackSkip = IniInt(ini, L"debug", L"mvr_livetrack_skip", 1) != 0;
     c.mvrLiveTrackSkipKey = IniInt(ini, L"debug", L"mvr_livetrack_skip_key", c.mvrLiveTrackSkipKey);
     c.mvrEmptyQueue = IniInt(ini, L"debug", L"mvr_empty_queue", 0) != 0;
