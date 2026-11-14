@@ -23,7 +23,8 @@ cbuffer DepthParams : register(b1) {
     float slopeScale;  // plus this many pixels' worth of the local depth slope
     uint2 cornerSize;  // focus's corner of slice 1 (neighbours are read inside it)
     uint dilate;       // 1: the farthest depth of the 3 x 3 neighbourhood first
-    uint3 pad1;
+    uint slice;        // PSDepth's slice: 1 (view 1's corner), 0 (outer's corner in the corner layout, B20 K2)
+    uint2 pad1;
 };
 
 Texture2DArray<float> depthArr : register(t0);
@@ -37,7 +38,7 @@ float4 VSMain(uint id : SV_VertexID) : SV_Position {
 }
 
 float DepthAt(int2 p) {
-    return depthArr.Load(int4(clamp(p, int2(0, 0), int2(cornerSize) - 1), 1, 0));
+    return depthArr.Load(int4(clamp(p, int2(0, 0), int2(cornerSize) - 1), slice, 0));
 }
 
 // The smaller one-sided difference per axis: a surface's slope without the jump at a silhouette.

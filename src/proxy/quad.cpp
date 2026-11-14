@@ -2767,6 +2767,8 @@ void SetupLocked(vr::IVRSystem* real) {
     g_focus.on = true;
     clones::SetSizes(g_focus.gameW, g_focus.gameH, g_focus.outerW, g_focus.outerH, g_focus.focusTexW,
                      g_focus.focusTexH);
+    mvrpass::SetSizes(g_focus.gameW, g_focus.gameH, g_focus.outerW, g_focus.outerH, g_focus.focusTexW,
+                      g_focus.focusTexH);
     if (SrConfigured()) {
         // DLSS SR (S2): the scene phase of each view at its render scale of the view's size.
         const uint32_t row = px(g_focus.outerW * (double)c.dlaaOuterRenderScale);

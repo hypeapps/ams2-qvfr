@@ -232,6 +232,9 @@ struct Config {
     // Live (docs/mvr.md B15, mvr_pass.h): the G-buffer pass's corners of slice 1 go straight into focus's clones instead
     // of through the stash. The hotkey (mvr_modifier + mvr_direct_extract_key) toggles it.
     bool mvrDirectExtract = true;
+    // B20 K2 (mvr_pass.h): with outer smaller than the game's size, outer's G-buffer pass in the corner layout.
+    // [debug] mvr_corner (live from the ini).
+    bool mvrCorner = true;
     int mvrDirectExtractKey = 0;
     // Live (docs/mvr.md B17, mvr_pass.h): the G-buffer pass's targets become the game's own two-slice arrays (no copy
     // of slice 0 in or back). The hotkey (mvr_modifier + mvr_native_key) toggles their use (off: copies as before).

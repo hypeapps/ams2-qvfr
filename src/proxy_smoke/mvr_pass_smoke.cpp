@@ -16,6 +16,11 @@
 //   jitter (color, linear depth, depth; edge pixels may round differently) and the mask as outer's read in the
 //   focus window (bilinear, computed on the CPU);
 // - the module's counters and the debug layer.
+// B20 K2, the corner layout (last frame): outer smaller than the game's size draws into fake outer clones (56 x 40), focus
+// at the game's size (96 x 80) has no clones and draws into the game's targets. Outer's clones must equal outer's pass
+// drawn without MVR (the refused VS's quad too), the game's targets focus's own pass (as above) and its mask outer's read
+// in the window; viewports at outer's size become the slices' (an RSSetViewports hook calls the module as the clones'
+// does).
 #include <windows.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -86,6 +91,7 @@ float PSMask(float4 pos : SV_Position) : SV_Target {
 )";
 
 constexpr UINT kW = 96, kH = 80, kFW = 64, kFH = 48;
+constexpr UINT kOW = 56, kOH = 40;  // B20 K2: outer's clones in the corner layout
 constexpr UINT kMW = kW / 4, kMH = kH / 4, kFMW = kFW / 4, kFMH = kFH / 4;
 constexpr UINT kQuads = 30;
 // Focus window in outer NDC (x right, y up).
@@ -156,6 +162,8 @@ using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT
                                                       ID3D11DepthStencilView*);
 using ClearRtvFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11RenderTargetView*, const FLOAT[4]);
 using ClearDsvFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11DepthStencilView*, UINT, FLOAT, UINT8);
+using RSSetViewportsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, const D3D11_VIEWPORT*);
+RSSetViewportsFn o_vp = nullptr;
 OMSetRenderTargetsFn o_om = nullptr;
 ClearRtvFn o_clearRtv = nullptr;
 ClearDsvFn o_clearDsv = nullptr;
@@ -170,6 +178,14 @@ void STDMETHODCALLTYPE D_OM(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetVi
     }
     o_om(c, n, rtv, dsv);
 }
+void STDMETHODCALLTYPE D_Vp(ID3D11DeviceContext* c, UINT n, const D3D11_VIEWPORT* vps) {
+    D3D11_VIEWPORT m[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    if (vps && n && n <= D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) {
+        memcpy(m, vps, n * sizeof(D3D11_VIEWPORT));
+        if (qvfr::mvrpass::MapViewports(c, n, m)) vps = m;
+    }
+    o_vp(c, n, vps);
+}
 void STDMETHODCALLTYPE D_ClearRtv(ID3D11DeviceContext* c, ID3D11RenderTargetView* v, const FLOAT col[4]) {
     o_clearRtv(c, qvfr::mvrpass::MapClear(c, v, col), col);
 }
@@ -182,7 +198,8 @@ bool HookContext(ID3D11DeviceContext* c) {
     // ID3D11DeviceContext vtable slots (d3d11.h order).
     return qvfr::hooks::CreateAt(vt[33], (void*)D_OM, (void**)&o_om, "OMSetRenderTargets") &&
            qvfr::hooks::CreateAt(vt[50], (void*)D_ClearRtv, (void**)&o_clearRtv, "ClearRenderTargetView") &&
-           qvfr::hooks::CreateAt(vt[53], (void*)D_ClearDsv, (void**)&o_clearDsv, "ClearDepthStencilView");
+           qvfr::hooks::CreateAt(vt[53], (void*)D_ClearDsv, (void**)&o_clearDsv, "ClearDepthStencilView") &&
+           qvfr::hooks::CreateAt(vt[44], (void*)D_Vp, (void**)&o_vp, "RSSetViewports");
 }
 
 void BindG(const Targets& t) {
@@ -251,11 +268,16 @@ FakeTask g_outer{g_vtOuter}, g_build{g_vtBuild};
 int g_finish = 0, g_buildRuns = 0, g_focusRuns = 0;
 
 void __fastcall FakeFinish(void*) { ++g_finish; }
+// Outer's targets and camera (B20 K2: its clones and its own camera in the corner layout).
+const Targets* g_outerT = nullptr;
+ID3D11Buffer* g_outerCam = nullptr;
+UINT g_outerW = kW, g_outerH = kH;
 void __fastcall OuterExecute(void* task) {
-    DrawG(g_s.game, g_s.camOuter.Get(), kW, kH, true);
-    DrawMask(g_s.game, kMW, kMH);
+    const Targets& t = g_outerT ? *g_outerT : g_s.game;
+    DrawG(t, g_outerCam ? g_outerCam : g_s.camOuter.Get(), g_outerW, g_outerH, true);
+    DrawMask(t, g_outerW / 4, g_outerH / 4);
     if (g_bindFirst) {  // the game binds its G-buffer again after the masks, draws nothing, unbinds (run 3 of B8)
-        BindG(g_s.game);
+        BindG(t);
         g_s.ctx->OMSetRenderTargets(0, nullptr, nullptr);
     }
     (*(TaskFn**)task)[0x38 / 8](task);  // the engine's jmp [vtable+0x38]
@@ -345,6 +367,16 @@ ID3D11Texture2D* CloneOf(ID3D11Resource* r) {
     if (r == g_s.game.depth.Get()) return g_s.focus.depth.Get();
     if (r == g_s.game.mask.Get()) return g_s.focus.mask.Get();
     return nullptr;
+}
+// B20 K2: no focus clones (focus at the game's size), outer's clones behind the game's targets.
+Targets g_oc;
+ID3D11Texture2D* NoClone(ID3D11Resource*) { return nullptr; }
+ID3D11Resource* OuterOriginal(ID3D11Resource* r) {
+    if (r == g_oc.color.Get()) return g_s.game.color.Get();
+    if (r == g_oc.lin.Get()) return g_s.game.lin.Get();
+    if (r == g_oc.depth.Get()) return g_s.game.depth.Get();
+    if (r == g_oc.mask.Get()) return g_s.game.mask.Get();
+    return r;
 }
 bool g_jitterOff = false;  // second frame: the engine's offset unknown (view 1 keeps outer's jitter)
 bool JitterOf(float out[2]) {
@@ -753,6 +785,72 @@ int RunMvrPass() {
         qvfr::mvrpass::SetNativeTargets(true);
         g_s.game = plainGame;
     }
+    // B20 K2 (last frame): the corner layout. References first, without a pass (the module does nothing then).
+    std::vector<uint32_t> kRefC, kRefL, kRefD, kRefM, kRefFC, kRefFL, kRefFD, kC, kL, kD, kM, kFC, kFL, kFD, kFM;
+    qvfr::mvrpass::TestState kSt{}, kSt2{};
+    bool kSkipBuild = false, kSkipFocus = false, kMade = MakeTargets(g_oc, kOW, kOH);
+    ComPtr<ID3D11Buffer> kCamO, kCamF;
+    {
+        float ko[16], kf[16];
+        OuterProj(ko);
+        FocusProj(ko, sx, ox, sy, oy, kf);
+        Jitter(ko, kJitter[0] / kOW, kJitter[1] / kOH);
+        Jitter(kf, kJitter[0] / kW, kJitter[1] / kH);
+        kMade = kMade && cbuf(ko, kCamO) && cbuf(kf, kCamF);
+    }
+    if (kMade) {
+        BindG(g_oc);
+        DrawG(g_oc, kCamO.Get(), kOW, kOH, true);
+        DrawMask(g_oc, kOW / 4, kOH / 4);
+        kRefC = Read(g_oc.color.Get());
+        kRefL = Read(g_oc.lin.Get());
+        kRefD = Read(g_oc.depth.Get());
+        kRefM = Read(g_oc.mask.Get());
+        BindG(g_s.game);
+        DrawG(g_s.game, kCamF.Get(), kW, kH, false);
+        kRefFC = Read(g_s.game.color.Get());
+        kRefFL = Read(g_s.game.lin.Get());
+        kRefFD = Read(g_s.game.depth.Get());
+        Spoil(g_oc);
+        Spoil(g_s.game);
+        qvfr::mvrpass::TestSetup(ctx.Get(), g_vtOuter, g_vtBuild, &NoClone, &JitterOf);
+        qvfr::mvrpass::TestOriginal(&OuterOriginal);
+        qvfr::mvrpass::SetSizes(kW, kH, kOW, kOH, kW, kH);
+        g_outerT = &g_oc;
+        g_outerCam = kCamO.Get();
+        g_outerW = kOW;
+        g_outerH = kOH;
+        qvfr::mvrpass::OnFrameStart(true);
+        qvfr::mvrpass::SetWindow(0, true, sx, ox, sy, oy, kW, kH);
+        ctx->VSSetConstantBuffers(qvfr::mvrvs::kCbSlot, 1, game3.GetAddressOf());
+        BindG(g_oc);
+        if (!qvfr::mvrpass::BeforeTask((uint8_t*)&g_outer, 0)) RunTask(g_outer);
+        qvfr::mvrpass::AfterTask((uint8_t*)&g_outer);
+        kSt = qvfr::mvrpass::TestGet();
+        kC = Read(g_oc.color.Get());
+        kL = Read(g_oc.lin.Get());
+        kD = Read(g_oc.depth.Get());
+        kM = Read(g_oc.mask.Get());
+        qvfr::mvrpass::FocusGroup(0, true);
+        BindG(g_s.game);
+        FakeTask focusCorner{g_vtOuter};
+        kSkipBuild = qvfr::mvrpass::BeforeTask((uint8_t*)&g_build, 2);
+        if (kSkipBuild) Finish(g_build);
+        kSkipFocus = qvfr::mvrpass::BeforeTask((uint8_t*)&focusCorner, 2);
+        if (kSkipFocus) Finish(focusCorner);
+        kSt2 = qvfr::mvrpass::TestGet();
+        kFC = Read(g_s.game.color.Get());
+        kFL = Read(g_s.game.lin.Get());
+        kFD = Read(g_s.game.depth.Get());
+        kFM = Read(g_s.game.mask.Get());
+        qvfr::mvrpass::TestEnd();
+        g_outerT = nullptr;
+        g_outerCam = nullptr;
+        g_outerW = kW;
+        g_outerH = kH;
+        qvfr::mvrpass::SetSizes(0, 0, 0, 0, 0, 0);
+        qvfr::mvrpass::TestOriginal(nullptr);
+    }
     if (refC.empty() || refFC.empty() || gC.empty() || fC.empty() || fM.empty() || gM.empty() || s1.empty()) {
         printf("MVR pass: read-back failed\n");
         return 1;
@@ -961,8 +1059,49 @@ int RunMvrPass() {
     }
     const bool nativeOk = arraysMade && wantOk && nCounts[0] && nCounts[1] && nOuter[0] == 0 && nOuter[1] == 0 &&
                           nFocus[0] == 0 && nFocus[1] == 0;
+    // B20 K2: outer's clones as without MVR and the game's targets as focus's own pass (view 0 goes through M_0 now:
+    // edge pixels may round differently, as view 1's), the mask as outer's read in the window. The refused VS's quad
+    // draws at outer's viewport: exact.
+    int kOC = 0, kOBig = 0, kOL = 0, kOD = 0, kMag = 0, kMagRef = 0, kCov = 0, kBig = 0, kLOff = 0, kDOff = 0;
+    double kMaskMax = 0, kODMax = 0, kOMMax = 0;
+    const bool kRead = kMade && !kC.empty() && !kRefC.empty() && !kFC.empty() && !kRefFC.empty() && !kFM.empty() &&
+                       kC.size() == kRefC.size() && kD.size() == kRefD.size() && kM.size() == kRefM.size();
+    if (kRead) {
+        for (size_t i = 0; i < kC.size(); ++i) {
+            kOC += kC[i] != kRefC[i];
+            kOBig += ChannelDiff(kC[i], kRefC[i]) > 2;
+            kOL += std::fabs(AsFloat(kL[i]) - AsFloat(kRefL[i])) > 1e-4f;
+            const double dd = std::fabs((double)AsFloat(kD[i]) - (double)AsFloat(kRefD[i]));
+            kOD += dd > 1e-5;
+            kODMax = std::max(kODMax, dd);
+            kMag += kC[i] == kMagenta;
+            kMagRef += kRefC[i] == kMagenta;
+        }
+        for (size_t i = 0; i < kM.size(); ++i)
+            kOMMax = std::max(kOMMax, (double)std::fabs(Half(kM[i]) - Half(kRefM[i])));
+        for (size_t i = 0; i < kRefFC.size(); ++i) {
+            kCov += kRefFC[i] != clear;
+            kBig += ChannelDiff(kFC[i], kRefFC[i]) > 2;
+            kLOff += std::fabs(AsFloat(kFL[i]) - AsFloat(kRefFL[i])) > 1e-4f;
+            kDOff += std::fabs((double)AsFloat(kFD[i]) - (double)AsFloat(kRefFD[i])) > 1e-5;
+        }
+        const UINT mw = kW / 4, mh = kH / 4;
+        for (UINT y = 0; y < mh; ++y)
+            for (UINT x = 0; x < mw; ++x) {
+                const float u = originU + (x + 0.5f) / mw * scaleU, v = originV + (y + 0.5f) / mh * scaleV;
+                kMaskMax = std::max(kMaskMax, (double)std::fabs(Half(kFM[(size_t)y * mw + x]) -
+                                                                Bilinear(kM, kOW / 4, kOH / 4, u, v)));
+            }
+    }
+    const int kPx = (int)(kW * kH), kOPx = (int)(kOW * kOH);
+    const bool cornerOk = kRead && kSt.corner && kSt.sw == kW && kSt.sh == kH && kSt.stashValid && kSt.stashed == 3 &&
+                          kSt.masks == 1 && kSt.mapFailures == 0 && kSt.oddViewports == 0 && kSt.copiedBack == 3 &&
+                          kSt.plainSets == 1 && kSt.native == 0 && kSkipBuild && kSkipFocus && kSt2.fills == 1 &&
+                          kSt2.failures == 0 && kOBig * 200 <= kOPx && kOL * 100 <= kOPx && kOD * 200 <= kOPx &&
+                          kOMMax < 0.01 && kMag > 0 && kMag == kMagRef && kCov > kPx / 2 && kBig * 200 <= kPx &&
+                          kLOff * 100 <= kPx && kDOff * 200 <= kPx && kMaskMax < 0.01;
     const bool ok = countsOk && outerOk && focusOk && jitterOk && lateOk && owOk && biasOk && slopeOk && dilateOk &&
-                    directOk && nativeOk && !warnings;
+                    directOk && nativeOk && cornerOk && !warnings;
     printf("MVR pass: %s; outer pass %u, stash %s (%u targets, %u masks), binds %u, clears %u, map failures %u, VS sets "
            "patched %u / unpatched %u, slot 3 rebinds %u, copied back %u, SetMultiViewMode failures %u, jitter %s; "
            "focus: build %s, pass %s (runs %d / %d, Finish %d), fills %u (failed %u) (%s)\n",
@@ -986,6 +1125,15 @@ int RunMvrPass() {
            "copied back %u, outer %d px, clones %d px (%s)\n",
            wanted.size(), wantOk ? "color, linear depth, depth" : "WRONG", stN[0].native, stN[0].copiedBack, nOuter[0],
            nFocus[0], stN[1].native, stN[1].copiedBack, nOuter[1], nFocus[1], nativeOk ? "OK" : "WRONG");
+    printf("  B20 K2 corner layout (outer %ux%u, focus and game %ux%u): %s, slices %ux%u, stash %s (%u targets, %u "
+           "masks), copied back %u, viewports of other sizes %u, unpatched VS sets %u; outer's clones vs without MVR: "
+           "color %d px differ (%d by > 2), linear depth %d px, depth %d px off (max %.2g), mask max %.4f, refused VS "
+           "quad %d px (without MVR %d); focus %s, game's targets vs focus's own pass: %d px covered, color %d px by > 2, "
+           "linear depth %d px, depth %d px off; mask vs outer's in the window max %.4f (%s)\n",
+           kOW, kOH, kW, kH, kSt.corner ? "on" : "OFF", kSt.sw, kSt.sh, kSt.stashValid ? "valid" : "INVALID",
+           kSt.stashed, kSt.masks, kSt.copiedBack, kSt.oddViewports, kSt.plainSets, kOC, kOBig, kOL, kOD, kODMax,
+           kOMMax, kMag, kMagRef,
+           kSkipBuild && kSkipFocus ? "skipped" : "RUN", kCov, kBig, kLOff, kDOff, kMaskMax, cornerOk ? "OK" : "WRONG");
     printf("  without the jitter fix (next frame, offset %s): focus color %d px differ, with it %d (%s)\n",
            noJitter ? "unknown" : "STILL KNOWN", nOff, cOff, jitterOk ? "OK" : "WRONG");
     printf("  game's order (nothing bound before outer's task): MVR part %s, stash %s (%u targets), clears %u, map "

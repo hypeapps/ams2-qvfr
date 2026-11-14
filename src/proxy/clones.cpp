@@ -1701,6 +1701,7 @@ void ApplyViewportsLocked(void* caller, bool force) {
             ++g_c.vpFixed;
         }
     }
+    mvrpass::MapViewports(g_imm, g_vpN, eff);  // B20 K2: outer's G-buffer pass in the corner layout
     if (!force && g_vpSetN == g_vpN && !memcmp(eff, g_vpSet, sizeof(D3D11_VIEWPORT) * g_vpN)) return;
     t_internal = true;
     o_rsVp(g_imm, g_vpN, eff);
@@ -2479,6 +2480,11 @@ void STDMETHODCALLTYPE D_RSSetViewports(ID3D11DeviceContext* c, UINT n, const D3
         return;
     }
     if (!g_vpActive.load(std::memory_order_relaxed) || t_internal || c != g_imm) {
+        D3D11_VIEWPORT mapped[kMaxViewports];
+        if (!t_internal && n && n <= kMaxViewports && vps) {  // B20 K2 (no clones in: not expected in that layout)
+            memcpy(mapped, vps, sizeof(D3D11_VIEWPORT) * n);
+            if (mvrpass::MapViewports(c, n, mapped)) vps = mapped;
+        }
         hookprof::Orig o;
         o_rsVp(c, n, vps);
         return;

@@ -35,6 +35,17 @@ using JitterFn = bool (*)(float out[2]);
 void SetJitterSource(JitterFn fn);
 // VR_Init in quad mode, once per process, with the VS patch installed and the executor patched. False: off.
 bool Install();
+// B20 K2 (docs/mvr.md): the sizes of this VR session, as given to clones::SetSizes. With outer smaller than the game's
+// size (it draws into its own clones) outer's G-buffer pass runs in the corner layout ([debug] mvr_corner): the copies
+// are at the slices' size, the game's size, view 0 (outer) lies in the top-left corner of slice 0 (its gated transform
+// in VS slot 3, mvr_vs.h) and view 1 (focus) in the top-left corner of slice 1, the whole slice when focus is at the
+// game's size. At the end slice 0's corner goes back into outer's clones and slice 1's into focus's targets: its clones,
+// or the engine's own textures when focus is at the game's size. The early SSAO and lights, the forward pass from outer
+// and what stands on them (B9a-B19) stay off in that layout (B20 K3-K5).
+void SetSizes(uint32_t gameW, uint32_t gameH, uint32_t outerW, uint32_t outerH, uint32_t focusW, uint32_t focusH);
+// B20 K2, from the clones' RSSetViewports hook before the real call (render thread): in the corner layout, while a
+// patched VS draws, viewports at outer's size (top left 0, 0) become the slices'. True: `vps` changed.
+bool MapViewports(ID3D11DeviceContext* c, UINT n, D3D11_VIEWPORT* vps);
 // First Submit: the module's D3D11 hooks on the immediate context (VSSetShader, VSSetConstantBuffers(1), the
 // instanced and indirect draws; the plain draws come from sun_fx).
 void InstallD3DHooks(ID3D11DeviceContext* imm);
@@ -248,6 +259,9 @@ using WantArrayFn = void (*)(ID3D11Resource* res, UINT slices);
 // B12 step 5: stand-in for clones::FocusSlice (null: no slice clones).
 using SliceFn = int (*)(ID3D11Resource* original, int eye, uint32_t* w, uint32_t* h);
 void TestNative(NativeFn isArray, WantArrayFn want, SliceFn slice = nullptr);
+// B20 K2 in the smoke: stand-in for clones::Original (outer's fake clones to the game's targets; null: none).
+using OriginalFn = ID3D11Resource* (*)(ID3D11Resource* res);
+void TestOriginal(OriginalFn fn);
 void TestSetup(ID3D11DeviceContext* ctx, const void* phase1Vtable, const void* buildVtable, CloneFn clone,
                JitterFn jitter);
 struct TestState {
@@ -260,6 +274,9 @@ struct TestState {
     bool liveTrack = false;
     unsigned direct = 0;  // B15: targets written straight into focus's clones (in the frame)
     unsigned native = 0;  // B17: the last pass's targets that were the game's own arrays
+    bool corner = false;  // B20 K2: the last pass ran in the corner layout (its slices sw x sh)
+    unsigned oddViewports = 0;
+    uint32_t sw = 0, sh = 0;
 };
 TestState TestGet();
 ID3D11Texture2D* TestArray(int k);

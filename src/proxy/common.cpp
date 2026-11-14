@@ -436,6 +436,7 @@ Config ReadConfig(const fs::path& ini) {
     c.mvrGbufferPs = IniInt(ini, L"debug", L"mvr_gbuffer_ps", 1) != 0;
     c.mvrGbufferPsKey = IniInt(ini, L"debug", L"mvr_gbuffer_ps_key", c.mvrGbufferPsKey);
     c.mvrDirectExtract = IniInt(ini, L"debug", L"mvr_direct_extract", 1) != 0;
+    c.mvrCorner = IniInt(ini, L"debug", L"mvr_corner", 1) != 0;
     c.mvrDirectExtractKey = IniInt(ini, L"debug", L"mvr_direct_extract_key", c.mvrDirectExtractKey);
     c.mvrNativeTargets = IniInt(ini, L"debug", L"mvr_native_targets", 1) != 0;
     c.mvrNativeKey = IniInt(ini, L"debug", L"mvr_native_key", c.mvrNativeKey);
@@ -796,6 +797,7 @@ bool ReloadConfig(bool force) {
     c.mvrGbufferPs = n.mvrGbufferPs;
     c.mvrGbufferPsKey = n.mvrGbufferPsKey;
     c.mvrDirectExtract = n.mvrDirectExtract;
+    c.mvrCorner = n.mvrCorner;
     c.mvrDirectExtractKey = n.mvrDirectExtractKey;
     c.mvrNativeTargets = n.mvrNativeTargets;
     c.mvrNativeKey = n.mvrNativeKey;
