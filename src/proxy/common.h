@@ -161,6 +161,9 @@ struct Config {
     // NVIDIA Multi-View Rendering, gate B6 (mvr_vs.h): the game's vertex shaders patched and made through NVAPI.
     // [debug] key for development (with [mvr] mode=mvr); a change needs a restart.
     bool mvrVsPatch = true;
+    // B20 K1 (mvr_vs.h): the patched vertex shaders also take view 0's transform from slot 3, only while its key row
+    // holds the magic value (view 0 draws as before otherwise). [debug] mvr_vs_view0; a change needs a restart.
+    bool mvrVsView0 = true;
     // Gate B9b (mvr_ps.h): with mvr_vs_patch, the game's pixel shaders that read screen inputs or screen textures are
     // patched for an extra MVR view (view 0 draws as before). [debug] key; a change needs a restart.
     bool mvrPsPatch = true;

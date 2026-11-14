@@ -13,6 +13,8 @@ enum : uint32_t {
     kOpDp4 = 0x11,
     kOpCustomData = 0x35,
     kOpMov = 0x36,
+    kOpMovc = 0x37,
+    kOpIeq = 0x20,
     kOpRet = 0x3E,
     kOpRetc = 0x3F,
     kOpDclConstantBuffer = 0x59,
@@ -34,7 +36,12 @@ constexpr uint32_t kDstOutputXyzw = 0x001020F2;  // o#.xyzw, 1D immediate index
 constexpr uint32_t kSrcTempXyzw = 0x00100E46;    // r#.xyzw
 constexpr uint32_t kSrcCbXyzw = 0x00208E46;      // cb#[#].xyzw, 2D immediate index
 constexpr uint32_t kSrcImm4 = 0x00004002;        // l(a, b, c, d), followed by 4 values
+constexpr uint32_t kSrcImm1 = 0x00004001;        // l(a), followed by 1 value
+constexpr uint32_t kSrcCbX = 0x0020800A;         // cb#[#].x
+constexpr uint32_t kSrcTempXxxx = 0x00100006;    // r#.xxxx
+constexpr uint32_t kDstTempX = 0x00100012;       // r#.x
 constexpr uint32_t DstOutputComp(uint32_t c) { return 0x00102002 | ((1u << c) << 4); }  // o#.x / .y / .z / .w
+constexpr uint32_t DstTempComp(uint32_t c) { return 0x00100002 | ((1u << c) << 4); }    // r#.x / .y / .z / .w
 
 uint32_t Opcode(uint32_t tok) { return tok & 0x7FF; }
 
@@ -196,10 +203,12 @@ bool PatchVsForMvr(const void* code, size_t size, const MvrVsPatchOptions& opt, 
     if (!firstInstr) return SetErr(err, "no instructions"), false;
     if (!lastOutput) return SetErr(err, "no output declarations"), false;
     if (!haveTemps) inf.tempReg = 0;
+    inf.scratchReg = opt.view0 ? inf.tempReg + 1 : 0;
+    const uint32_t newTemps = opt.view0 ? 3 : 1;
     const size_t cbInsert = lastCb ? lastCb : globalFlagsEnd;
 
     const uint32_t rows = MvrVsPatchOptions::RowsPerView(opt.clip);
-    const uint32_t cbDecl[4] = {kOpDclConstantBuffer | (4u << 24), kSrcCbXyzw, opt.cbSlot, rows * opt.extraViews};
+    const uint32_t cbDecl[4] = {kOpDclConstantBuffer | (4u << 24), kSrcCbXyzw, opt.cbSlot, opt.Rows()};
     std::vector<uint32_t> outDecls;
     if (opt.clip)  // dcl_output_siv o#.xyzw, clip_distance
         outDecls.insert(outDecls.end(), {kOpDclOutputSiv | (4u << 24), kDstOutputXyzw, inf.clipReg, kNameClipDistance});
@@ -208,16 +217,33 @@ bool PatchVsForMvr(const void* code, size_t size, const MvrVsPatchOptions& opt, 
     if (opt.clip)
         for (uint32_t v = 0; v < opt.extraViews; ++v)
             outDecls.insert(outDecls.end(), {kOpDclOutput | (3u << 24), kDstOutputXyzw, inf.viewClipReg + v});
-    std::vector<uint32_t> epilogue = {kOpMov | (5u << 24), kDstOutputXyzw, inf.positionReg, kSrcTempXyzw,
-                                      inf.tempReg};
-    if (opt.clip)  // view 0 keeps everything: mov o_clip.xyzw, l(1, 1, 1, 1)
-        epilogue.insert(epilogue.end(), {kOpMov | (8u << 24), kDstOutputXyzw, inf.clipReg, kSrcImm4, kFloatOne,
-                                         kFloatOne, kFloatOne, kFloatOne});
-    auto dp4Rows = [&](uint32_t dstReg, uint32_t firstRow) {
+    std::vector<uint32_t> epilogue;
+    auto dp4Rows = [&](uint32_t dstReg, uint32_t firstRow, bool temp = false) {
         for (uint32_t c = 0; c < 4; ++c)
-            epilogue.insert(epilogue.end(), {kOpDp4 | (8u << 24), DstOutputComp(c), dstReg, kSrcCbXyzw, opt.cbSlot,
-                                             firstRow + c, kSrcTempXyzw, inf.tempReg});
+            epilogue.insert(epilogue.end(), {kOpDp4 | (8u << 24), temp ? DstTempComp(c) : DstOutputComp(c), dstReg,
+                                             kSrcCbXyzw, opt.cbSlot, firstRow + c, kSrcTempXyzw, inf.tempReg});
     };
+    if (opt.view0) {
+        // ieq g.x, cb[K].x, l(magic); dp4 s.c, cb[M_0 + c], t; movc o_pos.xyzw, g.xxxx, s.xyzw, t.xyzw
+        const uint32_t s = inf.scratchReg, g = inf.scratchReg + 1, m0 = opt.View0Row();
+        epilogue.insert(epilogue.end(), {kOpIeq | (8u << 24), kDstTempX, g, kSrcCbX, opt.cbSlot, opt.View0KeyRow(),
+                                         kSrcImm1, kMvrVsMagic});
+        dp4Rows(s, m0, true);
+        epilogue.insert(epilogue.end(), {kOpMovc | (9u << 24), kDstOutputXyzw, inf.positionReg, kSrcTempXxxx, g,
+                                         kSrcTempXyzw, s, kSrcTempXyzw, inf.tempReg});
+        if (opt.clip) {
+            // dp4 s.c, cb[C_0 + c], t; movc o_clip.xyzw, g.xxxx, s.xyzw, l(1, 1, 1, 1)
+            dp4Rows(s, m0 + 4, true);
+            epilogue.insert(epilogue.end(), {kOpMovc | (12u << 24), kDstOutputXyzw, inf.clipReg, kSrcTempXxxx, g,
+                                             kSrcTempXyzw, s, kSrcImm4, kFloatOne, kFloatOne, kFloatOne, kFloatOne});
+        }
+    } else {
+        epilogue.insert(epilogue.end(), {kOpMov | (5u << 24), kDstOutputXyzw, inf.positionReg, kSrcTempXyzw,
+                                         inf.tempReg});
+        if (opt.clip)  // view 0 keeps everything: mov o_clip.xyzw, l(1, 1, 1, 1)
+            epilogue.insert(epilogue.end(), {kOpMov | (8u << 24), kDstOutputXyzw, inf.clipReg, kSrcImm4, kFloatOne,
+                                             kFloatOne, kFloatOne, kFloatOne});
+    }
     for (uint32_t v = 0; v < opt.extraViews; ++v) {
         dp4Rows(inf.viewPositionReg + v, rows * v);
         if (opt.clip) dp4Rows(inf.viewClipReg + v, rows * v + 4);
@@ -232,13 +258,13 @@ bool PatchVsForMvr(const void* code, size_t size, const MvrVsPatchOptions& opt, 
         if (pc == cbInsert) res.insert(res.end(), cbDecl, cbDecl + 4);
         if (pc == lastOutput) {
             res.insert(res.end(), outDecls.begin(), outDecls.end());
-            if (!haveTemps) res.insert(res.end(), {kOpDclTemps | (2u << 24), 1u});
+            if (!haveTemps) res.insert(res.end(), {kOpDclTemps | (2u << 24), newTemps});
         }
         const uint32_t op = Opcode(in[pc]);
         const uint32_t len = InstrLength(&in[pc], in.size() - pc);
         if (len == 0 || pc + len > in.size()) return SetErr(err, "bad instruction length"), false;
         std::vector<uint32_t> ins(in.begin() + pc, in.begin() + pc + len);
-        if (pc == tempsAt && haveTemps) ins[1] += 1;
+        if (pc == tempsAt && haveTemps) ins[1] += newTemps;
         if (pc >= firstInstr && op != kOpCustomData && !IsDeclaration(op)) {
             if (op == kOpInterfaceCall) return SetErr(err, "interface calls are not supported"), false;
             size_t k = 1;

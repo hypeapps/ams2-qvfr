@@ -182,23 +182,31 @@ std::string MvrVsSource(int views, bool viewportMask, bool viewId) {
 // Pixel shader: R = view id * 64, G = 255 marks coverage.
 // Reference for the patch with clip distances: kPlainVs with the outputs and the buffer layout of PatchVsForMvr(clip),
 // i.e. view n = rows 8(n-1)..8(n-1)+3 and its clip planes = the next 4 rows of b2, both applied to view 0's position.
-std::string MvrClipVsSource(int views) {
+// With view0 (B20 K1), view 0's M_0, its planes C_0 and the key row follow at row 8(views-1).
+std::string MvrClipVsSource(int views, bool view0 = false) {
     std::string s =
         "cbuffer Views : register(b0) { float4 Rows[16]; };\n"
         "cbuffer Obj : register(b1) { float4 Offset; };\n"
-        "cbuffer Patch : register(b2) { float4 P[24]; };\n"
+        "cbuffer Patch : register(b2) { float4 P[40]; };\n"
         "float4 Xf(uint first, float4 p) { return float4(dot(P[first], p), dot(P[first+1], p),"
         " dot(P[first+2], p), dot(P[first+3], p)); }\n"
         "struct VSOut {\n  float4 pos0 : SV_Position;\n  float4 clip0 : SV_ClipDistance0;\n";
     for (int v = 1; v < views; ++v) s += "  float4 pos" + std::to_string(v) + " : " + qvfr::dxbc::MvrPositionSemantic(v) + ";\n";
     for (int v = 1; v < views; ++v) s += "  float4 clip" + std::to_string(v) + " : " + qvfr::dxbc::MvrClipSemantic(v) + ";\n";
     s += "};\nVSOut main(float4 pos : POSITION) {\n  VSOut o; float4 p = pos + Offset;\n"
-         "  o.pos0 = float4(dot(Rows[0], p), dot(Rows[1], p), dot(Rows[2], p), dot(Rows[3], p));\n"
-         "  o.clip0 = float4(1, 1, 1, 1);\n";
+         "  float4 q = float4(dot(Rows[0], p), dot(Rows[1], p), dot(Rows[2], p), dot(Rows[3], p));\n";
+    if (view0) {
+        const std::string b = std::to_string(8 * (views - 1));
+        s += "  bool on = asuint(P[" + b + " + 8].x) == " + std::to_string(qvfr::dxbc::kMvrVsMagic) + "u;\n";
+        s += "  o.pos0 = on ? Xf(" + b + ", q) : q;\n";
+        s += "  o.clip0 = on ? Xf(" + b + " + 4, q) : float4(1, 1, 1, 1);\n";
+    } else {
+        s += "  o.pos0 = q;\n  o.clip0 = float4(1, 1, 1, 1);\n";
+    }
     for (int v = 1; v < views; ++v) {
         const std::string n = std::to_string(v), first = std::to_string(8 * (v - 1));
-        s += "  o.pos" + n + " = Xf(" + first + ", o.pos0);\n";
-        s += "  o.clip" + n + " = Xf(" + first + " + 4, o.pos0);\n";
+        s += "  o.pos" + n + " = Xf(" + first + ", q);\n";
+        s += "  o.clip" + n + " = Xf(" + first + " + 4, q);\n";
     }
     s += "  return o;\n}\n";
     return s;
@@ -732,16 +740,17 @@ bool RunPatchChecks() {
     }
 
     // The patched output signature must declare the extra views as the compiler does for the HLSL MVR shader.
-    for (int run = 0; run < 4; ++run) {
+    for (int run = 0; run < 6; ++run) {
         const int views = run % 2 ? 4 : 2;
-        const bool clip = run >= 2;
+        const bool clip = run >= 2, view0 = run >= 4;
         auto plain = Compile(kPlainVs, "vs_5_0", "plain_vs");
-        auto ref = Compile(clip ? MvrClipVsSource(views) : MvrVsSource(views, false, false), "vs_5_0", "mvr_vs");
+        auto ref = Compile(clip ? MvrClipVsSource(views, view0) : MvrVsSource(views, false, false), "vs_5_0", "mvr_vs");
         if (!plain || !ref) return false;
         qvfr::dxbc::MvrVsPatchOptions opt;
         opt.cbSlot = kPatchCbSlot;
         opt.extraViews = static_cast<uint32_t>(views - 1);
         opt.clip = clip;
+        opt.view0 = view0;
         std::vector<uint8_t> patched;
         std::string err;
         if (!qvfr::dxbc::PatchVsForMvr(plain->GetBufferPointer(), plain->GetBufferSize(), opt, patched, nullptr,
@@ -763,8 +772,8 @@ bool RunPatchChecks() {
             same = a[i].name == b[i].name && a[i].semanticIndex == b[i].semanticIndex &&
                    a[i].systemValue == b[i].systemValue && a[i].componentType == b[i].componentType &&
                    a[i].reg == b[i].reg && a[i].mask == b[i].mask && a[i].rwMask == b[i].rwMask;
-        Log("  output signature, %d views%s: %s\n", views, clip ? " with clip distances" : "",
-            same ? "same as HLSL MVR shader" : "DIFFERENT");
+        Log("  output signature, %d views%s%s: %s\n", views, clip ? " with clip distances" : "",
+            view0 ? " and view 0's transform" : "", same ? "same as HLSL MVR shader" : "DIFFERENT");
         if (!same) {
             for (const auto* list : {&a, &b}) {
                 Log("    %s:\n", list == &a ? "patched" : "HLSL");
@@ -777,7 +786,7 @@ bool RunPatchChecks() {
         if (views == 2 && g_verbose) {
             ComPtr<ID3DBlob> dis;
             if (SUCCEEDED(D3DDisassemble(patched.data(), patched.size(), 0, nullptr, &dis)))
-                Log("  patched plain VS, 2 views%s:\n%s\n", clip ? ", clip" : "",
+                Log("  patched plain VS, 2 views%s%s:\n%s\n", clip ? ", clip" : "", view0 ? ", view 0" : "",
                     static_cast<const char*>(dis->GetBufferPointer()));
             else
                 Log("  D3DDisassemble of the patched shader failed\n");
@@ -790,18 +799,22 @@ bool RunPatchChecks() {
 // Patch with clip distances (B5): the plain VS patched with clip against the HLSL reference with the same outputs.
 // Every extra view keeps only the top-left quarter of its visible rectangle (planes in its own clip space), view 0
 // stays whole. Both shaders must give the expected boxes and the same pixels.
-bool RunPatchedClipCase(bool debug, int views, int samples) {
+// With view0 (B20 K1), view 0 goes into the top-left quarter of slice 0 (M_0: x_c = x/2 - w/2, y_c = y/2 + w/2) and
+// its planes C_0 keep only x <= 0 of view 0.
+bool RunPatchedClipCase(bool debug, int views, int samples, bool view0 = false) {
     Gpu g;
     if (!CreateDevice(g, debug)) return false;
-    Log("\n[B5 patched VS with clip distances] views=%d samples=%d\n", views, samples);
+    Log("\n[B5 patched VS with clip distances%s] views=%d samples=%d\n", view0 ? ", view 0 in the corner (B20 K1)" : "",
+        views, samples);
     auto plainCode = Compile(kPlainVs, "vs_5_0", "plain_vs");
-    auto refCode = Compile(MvrClipVsSource(views), "vs_5_0", "clip_ref_vs");
+    auto refCode = Compile(MvrClipVsSource(views, view0), "vs_5_0", "clip_ref_vs");
     auto psCode = Compile(kRtIndexPs, "ps_5_0", "rt_ps");
     if (!plainCode || !refCode || !psCode) return false;
     qvfr::dxbc::MvrVsPatchOptions opt;
     opt.cbSlot = kPatchCbSlot;
     opt.extraViews = static_cast<uint32_t>(views - 1);
     opt.clip = true;
+    opt.view0 = view0;
     std::vector<uint8_t> patched;
     qvfr::dxbc::MvrVsPatchInfo info;
     std::string err;
@@ -830,7 +843,14 @@ bool RunPatchedClipCase(bool debug, int views, int samples) {
         cx = 0.5f * (std::max(-1.0f, std::min(xa, xb)) + std::min(1.0f, std::max(xa, xb)));
         cy = 0.5f * (std::max(-1.0f, std::min(ya, yb)) + std::min(1.0f, std::max(ya, yb)));
     };
-    float patch[24 * 4] = {};
+    float patch[40 * 4] = {};
+    if (view0) {
+        float rows0[9][4] = {{0.5f, 0, 0, -0.5f}, {0, 0.5f, 0, 0.5f}, {0, 0, 1, 0}, {0, 0, 0, 1},  // M_0
+                             {-1, 0, 0, 0},       {0, 0, 0, 1},       {0, 0, 0, 1}, {0, 0, 0, 1},  // C_0: x <= 0
+                             {}};                                                                  // key
+        memcpy(&rows0[8][0], &qvfr::dxbc::kMvrVsMagic, sizeof(uint32_t));
+        memcpy(patch + 4 * opt.View0Row(), rows0, sizeof(rows0));
+    }
     for (int v = 1; v < views; ++v) {
         float* m = patch + 32 * (v - 1);
         ViewRows(kViews[v], m);
@@ -885,6 +905,13 @@ bool RunPatchedClipCase(bool debug, int views, int samples) {
     bool ok = true;
     for (int v = 0; v < views; ++v) {
         Box exp = ExpectedBox(kViews[v], kW, kH);
+        if (v == 0 && view0 && !exp.empty) {  // x <= 0, then the top-left quarter
+            exp.x1 = std::min(exp.x1, kW / 2);
+            exp.x0 /= 2;
+            exp.x1 /= 2;
+            exp.y0 /= 2;
+            exp.y1 /= 2;
+        }
         if (v > 0) {
             float cx, cy;
             visible(kViews[v], cx, cy);
@@ -1654,10 +1681,11 @@ int main(int argc, char** argv) {
     if (only < 0) {
         passed += RunPatchChecks() ? 1 : 0;
         ++run;
-        for (const auto& pc : {std::make_pair(2, 1), std::make_pair(4, 8)}) {
-            passed += RunPatchedClipCase(debug, pc.first, pc.second) ? 1 : 0;
-            ++run;
-        }
+        for (const bool view0 : {false, true})
+            for (const auto& pc : {std::make_pair(2, 1), std::make_pair(4, 8)}) {
+                passed += RunPatchedClipCase(debug, pc.first, pc.second, view0) ? 1 : 0;
+                ++run;
+            }
     }
     for (int i = 0; i < static_cast<int>(std::size(cases)); ++i) {
         if (only >= 0 && i != only) continue;

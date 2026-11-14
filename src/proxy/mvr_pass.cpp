@@ -217,7 +217,7 @@ bool EnsureGpu(ID3D11DeviceContext* c) {
     rd.DepthClipEnable = TRUE;
     if (SUCCEEDED(hr)) hr = g.dev->CreateRasterizerState(&rd, &g.rs);
     D3D11_BUFFER_DESC bd{};
-    bd.ByteWidth = 8 * 4 * sizeof(float);
+    bd.ByteWidth = mvrvs::kCbRows * 4 * sizeof(float);
     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     bd.Usage = D3D11_USAGE_DEFAULT;
     if (SUCCEEDED(hr)) hr = g.dev->CreateBuffer(&bd, nullptr, &g.rowsCb);
@@ -465,7 +465,7 @@ struct Pass {
     bool mFilled = false, jitterKnown = false;
     int jitterTries = 0;
     float jit[2] = {};
-    float rows[8][4] = {};
+    float rows[mvrvs::kCbRows][4] = {};  // VS slot 3 (mvr_vs.h); view 0's key row stays zero (off) until B20 K2
     NvU32 views = 1;
     ID3D11Buffer* slot3 = nullptr;  // the game's binding of VS slot 3 (referenced)
     UINT slot3First = 0, slot3Num = 0;

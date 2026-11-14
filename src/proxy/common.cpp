@@ -403,6 +403,7 @@ Config ReadConfig(const fs::path& ini) {
     c.mvr = mvr != "off";
     if (mvr != "off" && mvr != "mvr") Log("Settings: unknown [mvr] mode=\"%s\", using mvr", mvr.c_str());
     c.mvrVsPatch = c.mvr && IniInt(ini, L"debug", L"mvr_vs_patch", 1) != 0;
+    c.mvrVsView0 = IniInt(ini, L"debug", L"mvr_vs_view0", 1) != 0;
     c.mvrPsPatch = c.mvr && IniInt(ini, L"debug", L"mvr_ps_patch", 1) != 0;
     c.mvrGbuffer = c.mvr && IniInt(ini, L"debug", L"mvr_gbuffer", 1) != 0;
     c.mvrKeyMod = IniInt(ini, L"debug", L"mvr_modifier", c.mvrKeyMod);
@@ -453,7 +454,7 @@ Config ReadConfig(const fs::path& ini) {
             "cull_key=0x%X sun_effects=%d sun_effects_modifier=0x%X sun_effects_key=0x%X taa_views=%d "
             "taa_views_modifier=0x%X taa_views_key=0x%X taa_motion_fix=%d taa_motion_fix_key=0x%X task_profile=%d "
             "hook_profile=%d clones_map_cache=%d mvr_bind_skip=%d mvr_state_track=%d mvr_vs_patch=%d "
-            "mvr_ps_patch=%d mvr_gbuffer=%d mvr_modifier=0x%X mvr_key=0x%X mvr_jitter_fix=%d mvr_mode_key=0x%X mvr_depth_bias=%d mvr_depth_slope=%.3f mvr_depth_dilate=%d "
+            "mvr_vs_view0=%d mvr_ps_patch=%d mvr_gbuffer=%d mvr_modifier=0x%X mvr_key=0x%X mvr_jitter_fix=%d mvr_mode_key=0x%X mvr_depth_bias=%d mvr_depth_slope=%.3f mvr_depth_dilate=%d "
             "mvr_early=%d mvr_early_key=0x%X mvr_map_key=0x%X mvr_shot_compare=%d mvr_forward_test=%d "
             "mvr_forward=%d mvr_forward_key=0x%X mvr_forward_depth=%d mvr_forward_depth_key=0x%X mvr_velocity=%d "
             "mvr_velocity_key=0x%X mvr_velocity_skip=%d mvr_velocity_skip_key=0x%X mvr_gbuffer_ps=%d "
@@ -463,7 +464,7 @@ Config ReadConfig(const fs::path& ini) {
             c.overlay, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey,
             c.gazeKeyMod, c.gazeKey, c.clones, c.clonesKeyMod, c.clonesKey, c.clonesViewportFix, c.clonesBindFix,
             c.shotClones, c.focusCull, c.cullKeyMod, c.cullKey, c.sunEffects, c.sunKeyMod, c.sunKey, c.taaViews,
-            c.taaViewsKeyMod, c.taaViewsKey, c.taaMotionFix, c.taaMotionFixKey, c.taskProfile, c.hookProfile, c.clonesMapCache, c.mvrBindSkip, c.mvrStateTrack, c.mvrVsPatch, c.mvrPsPatch, c.mvrGbuffer, c.mvrKeyMod, c.mvrKey,
+            c.taaViewsKeyMod, c.taaViewsKey, c.taaMotionFix, c.taaMotionFixKey, c.taskProfile, c.hookProfile, c.clonesMapCache, c.mvrBindSkip, c.mvrStateTrack, c.mvrVsPatch, c.mvrVsView0, c.mvrPsPatch, c.mvrGbuffer, c.mvrKeyMod, c.mvrKey,
             c.mvrJitterFix, c.mvrModeKey, c.mvrDepthBias, c.mvrDepthSlope, c.mvrDepthDilate,
             c.mvrEarly, c.mvrEarlyKey, c.mvrMapKey, c.mvrShotCompare, c.mvrForwardTest, c.mvrForward,
             c.mvrForwardKey, c.mvrForwardDepth, c.mvrForwardDepthKey, c.mvrVelocity, c.mvrVelocityKey,
@@ -660,6 +661,7 @@ bool ReloadConfig(bool force) {
          "[dlaa] *render_scale");
     need(n.mvr != c.mvr, "[mvr] mode");
     need(n.mvrVsPatch != c.mvrVsPatch, "[debug] mvr_vs_patch");
+    need(n.mvrVsView0 != c.mvrVsView0, "[debug] mvr_vs_view0");
     need(n.mvrPsPatch != c.mvrPsPatch, "[debug] mvr_ps_patch");
     need(n.mvrGbuffer != c.mvrGbuffer, "[debug] mvr_gbuffer");
     c.dlaaPreset = n.dlaaPreset;

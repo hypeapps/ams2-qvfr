@@ -6,6 +6,10 @@
 // - With Multi-View Rendering on (2 views, slices 0 and 1) and the module's constant buffer in slot 3 (view 1: M = a
 //   shift by 0.25 in x, clip planes keep x >= 0 of view 0), slice 1 must hold the shifted right half of the rectangle.
 // - A vertex shader that already has a clip distance output is refused and created as the original.
+// - B20 K1, view 0's gated transform: with slot 3 unbound, and with a buffer of other data in it (as the game's own
+//   buffers left there), the patched shader draws exactly as the original; with view 0's rows and the key (M_0 = the
+//   top-left quarter, C_0 keeps x <= 0 of view 0) it draws like an HLSL shader that does the same directly (colors
+//   within 1/255, the same coverage).
 // Checks the module's counters and the debug layer.
 #include <windows.h>
 #include <d3d11.h>
@@ -15,9 +19,11 @@
 #include <nvapi.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
+#include "mvr_patch.h"
 #include "mvr_vs.h"
 
 using Microsoft::WRL::ComPtr;
@@ -40,6 +46,14 @@ ClipOut VSClip(uint id : SV_VertexID) {
     o.pos = v.pos;
     o.uv = v.uv;
     o.clip = float4(1, 1, 1, 1);
+    return o;
+}
+ClipOut VSCorner(uint id : SV_VertexID) {
+    VsOut v = VS(id);
+    ClipOut o;
+    o.pos = float4(0.5 * v.pos.x - 0.5 * v.pos.w, 0.5 * v.pos.y + 0.5 * v.pos.w, v.pos.z, v.pos.w);
+    o.uv = v.uv;
+    o.clip = float4(-v.pos.x, v.pos.w, v.pos.w, v.pos.w);
     return o;
 }
 float4 PS(VsOut i) : SV_Target { return float4(i.uv, 0.5, 1); }
@@ -146,12 +160,14 @@ int RunMvrVs() {
     }
 
     ComPtr<ID3DBlob> vsCode = Compile("VS", "vs_5_0"), clipCode = Compile("VSClip", "vs_5_0"),
-                     psCode = Compile("PS", "ps_5_0");
-    if (!vsCode || !clipCode || !psCode) return 1;
-    ComPtr<ID3D11VertexShader> vsOrig, vsPatched, vsClip;
+                     cornerCode = Compile("VSCorner", "vs_5_0"), psCode = Compile("PS", "ps_5_0");
+    if (!vsCode || !clipCode || !cornerCode || !psCode) return 1;
+    ComPtr<ID3D11VertexShader> vsOrig, vsPatched, vsClip, vsCorner;
     ComPtr<ID3D11PixelShader> ps;
     qvfr::mvrvs::TestSetEnabled(false);
     bool made = SUCCEEDED(dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &vsOrig));
+    made = made && SUCCEEDED(dev->CreateVertexShader(cornerCode->GetBufferPointer(), cornerCode->GetBufferSize(),
+                                                     nullptr, &vsCorner));
     const qvfr::mvrvs::TestState off = qvfr::mvrvs::TestGet();
     qvfr::mvrvs::TestSetEnabled(true);
     made = made &&
@@ -163,8 +179,9 @@ int RunMvrVs() {
     made = made && SUCCEEDED(dev->CreatePixelShader(psCode->GetBufferPointer(), psCode->GetBufferSize(), nullptr, &ps));
     Target t;
     made = made && MakeTarget(dev.Get(), t);
-    // Constant buffer of the patch (mvr_patch.h): view 1 = M_1 (4 rows), then its 4 clip planes in view 0's clip space.
-    const float rows[8][4] = {
+    // Constant buffer of the patch (mvr_vs.h): view 1 = M_1 (4 rows), then its 4 clip planes in view 0's clip space;
+    // view 0's rows (8..16) zero: view 0 as before.
+    float rows[qvfr::mvrvs::kCbRows][4] = {
         {1, 0, 0, kShift}, {0, 1, 0, 0}, {0, 0, 1, 0}, {0, 0, 0, 1},  // M_1
         {1, 0, 0, 0},      {0, 0, 0, 1}, {0, 0, 0, 1}, {0, 0, 0, 1},  // x >= 0 (w > 0 for the rest)
     };
@@ -173,8 +190,19 @@ int RunMvrVs() {
     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     bd.Usage = D3D11_USAGE_IMMUTABLE;
     D3D11_SUBRESOURCE_DATA init{rows, 0, 0};
-    ComPtr<ID3D11Buffer> cb;
+    ComPtr<ID3D11Buffer> cb, cornerCb, otherCb;
     made = made && SUCCEEDED(dev->CreateBuffer(&bd, &init, &cb));
+    // View 0 in the top-left quarter (x_c = x/2 - w/2, y_c = y/2 + w/2), x <= 0 of view 0 kept, the key set.
+    float view0[9][4] = {{0.5f, 0, 0, -0.5f}, {0, 0.5f, 0, 0.5f}, {0, 0, 1, 0}, {0, 0, 0, 1},  // M_0
+                         {-1, 0, 0, 0},       {0, 0, 0, 1},       {0, 0, 0, 1}, {0, 0, 0, 1},  // C_0
+                         {}};                                                                  // key
+    memcpy(&view0[8][0], &qvfr::dxbc::kMvrVsMagic, sizeof(uint32_t));
+    memcpy(rows[qvfr::mvrvs::kCbView0Row], view0, sizeof(view0));
+    made = made && SUCCEEDED(dev->CreateBuffer(&bd, &init, &cornerCb));
+    // A buffer of other data (a game's buffer left in slot 3): view 0's rows set, the key not.
+    view0[8][0] = 0.37f;
+    memcpy(rows[qvfr::mvrvs::kCbView0Row], view0, sizeof(view0));
+    made = made && SUCCEEDED(dev->CreateBuffer(&bd, &init, &otherCb));
     if (!made) {
         printf("MVR VS: D3D11 objects could not be created\n");
         return 1;
@@ -194,7 +222,30 @@ int RunMvrVs() {
     Draw(ctx.Get(), t, vsPatched.Get(), ps.Get());
     const bool mvrOff = SetViews(ctx.Get(), 1);
     const std::vector<uint32_t> mvr = Read(ctx.Get(), t);
-    if (ref.empty() || pat.empty() || clipImg.empty() || mvr.empty()) {
+    // B20 K1: slot 3 unbound (as in the game outside the MVR pass; the debug layer's note about it is muted here).
+    if (info) {
+        D3D11_MESSAGE_ID deny[] = {D3D11_MESSAGE_ID_DEVICE_DRAW_CONSTANT_BUFFER_NOT_SET};
+        D3D11_INFO_QUEUE_FILTER f{};
+        f.DenyList.NumIDs = 1;
+        f.DenyList.pIDList = deny;
+        info->PushStorageFilter(&f);
+    }
+    ID3D11Buffer* none = nullptr;
+    ctx->VSSetConstantBuffers(qvfr::mvrvs::kCbSlot, 1, &none);
+    Draw(ctx.Get(), t, vsPatched.Get(), ps.Get());
+    const std::vector<uint32_t> unbound = Read(ctx.Get(), t);
+    if (info) info->PopStorageFilter();
+    ctx->VSSetConstantBuffers(qvfr::mvrvs::kCbSlot, 1, otherCb.GetAddressOf());
+    Draw(ctx.Get(), t, vsPatched.Get(), ps.Get());
+    const std::vector<uint32_t> other = Read(ctx.Get(), t);
+    // View 0 in the corner: the patched shader with view 0's rows, the HLSL reference.
+    ctx->VSSetConstantBuffers(qvfr::mvrvs::kCbSlot, 1, cornerCb.GetAddressOf());
+    Draw(ctx.Get(), t, vsPatched.Get(), ps.Get());
+    const std::vector<uint32_t> corner = Read(ctx.Get(), t);
+    Draw(ctx.Get(), t, vsCorner.Get(), ps.Get());
+    const std::vector<uint32_t> cornerRef = Read(ctx.Get(), t);
+    if (ref.empty() || pat.empty() || clipImg.empty() || mvr.empty() || unbound.empty() || other.empty() ||
+        corner.empty() || cornerRef.empty()) {
         printf("MVR VS: read-back failed\n");
         return 1;
     }
@@ -216,6 +267,27 @@ int RunMvrVs() {
             rightHalf += expect != 0;
             diffMvr1 += mvr[i1] != expect;
         }
+    int diffUnbound = 0, diffOther = 0, cornerCovered = 0, cornerCoverage = 0, cornerColor = 0, cornerOutside = 0;
+    for (size_t i = 0; i < unbound.size(); ++i) {
+        diffUnbound += unbound[i] != ref[i];
+        diffOther += other[i] != ref[i];
+    }
+    for (UINT y = 0; y < kH; ++y)
+        for (UINT x = 0; x < kW; ++x) {
+            const size_t i = y * kW + x;
+            const uint32_t a = corner[i], b = cornerRef[i];
+            cornerCovered += b != 0;
+            cornerOutside += a != 0 && (x >= kW / 4 || y >= kH / 2);  // x <= 0 of view 0 lands left of kW / 4
+            if ((a != 0) != (b != 0)) {
+                ++cornerCoverage;
+                continue;
+            }
+            for (int c = 0; c < 32; c += 8)
+                if (abs((int)((a >> c) & 0xFF) - (int)((b >> c) & 0xFF)) > 1) {
+                    ++cornerColor;
+                    break;
+                }
+        }
     const qvfr::mvrvs::TestState s = qvfr::mvrvs::TestGet();
 
     int warnings = 0;
@@ -235,7 +307,9 @@ int RunMvrVs() {
                           afterClip.refused == 1 && afterClip.patched == 1 && s.nvapiFailed == 0 && s.faults == 0;
     const bool imageOk = covered > 0 && diffOff == 0 && slice1Off == 0 && diffClip == 0;
     const bool mvrOk = mvrSet && mvrOff && rightHalf > 0 && diffMvr0 == 0 && diffMvr1 == 0;
-    const bool ok = countsOk && imageOk && mvrOk && !warnings;
+    const bool view0Ok = diffUnbound == 0 && diffOther == 0 && cornerCovered > 0 && cornerCoverage == 0 && cornerColor == 0 &&
+                         cornerOutside == 0;
+    const bool ok = countsOk && imageOk && mvrOk && view0Ok && !warnings;
     printf("MVR VS: %s; counters: made %llu, patched %llu, refused %llu, NVAPI failures %llu, skipped %llu, faults %llu, "
            "largest output register o%u (%s)\n",
            ok ? "PASS" : "FAIL", s.made, s.patched, s.refused, s.nvapiFailed, s.skipped, s.faults, s.maxOutputReg,
@@ -246,6 +320,10 @@ int RunMvrVs() {
     printf("  MVR on (2 views, test only): set %s, view 0 %d px differ, view 1 (shifted right half, %d px) %d px differ "
            "(%s)\n",
            mvrSet && mvrOff ? "ok" : "FAILED", diffMvr0, rightHalf, diffMvr1, mvrOk ? "OK" : "WRONG");
+    printf("  view 0's transform (B20 K1): vs the original, slot 3 unbound %d px and other data in slot 3 %d px differ; "
+           "view 0 in the corner %d px, vs HLSL reference %d px coverage and %d px color differ, %d px outside the "
+           "corner (%s)\n",
+           diffUnbound, diffOther, cornerCovered, cornerCoverage, cornerColor, cornerOutside, view0Ok ? "OK" : "WRONG");
     printf("  debug layer %s, %d warnings\n", debugLayer ? "on" : "not installed", warnings);
     return ok ? 0 : 1;
 }

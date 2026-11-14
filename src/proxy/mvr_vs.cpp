@@ -197,6 +197,10 @@ ID3D11VertexShader* MakePatched(ID3D11Device* dev, const void* code, SIZE_T len,
     opt.cbSlot = kCbSlot;
     opt.extraViews = 1;
     opt.clip = true;
+    opt.view0 = Cfg().mvrVsView0;
+    static_assert(dxbc::MvrVsPatchOptions::RowsPerView(true) == kCbView0Row &&
+                      kCbView0Row + dxbc::MvrVsPatchOptions::View0Rows(true) == kCbRows,
+                  "the slot 3 layout of mvr_vs.h");
     std::vector<uint8_t> patched;
     dxbc::MvrVsPatchInfo info;
     std::string err;
@@ -238,8 +242,10 @@ ID3D11VertexShader* MakePatched(ID3D11Device* dev, const void* code, SIZE_T len,
     if (n == 1) {
         char sum[40];
         SumText(code, len, sum);
-        Log("MVR VS patch: first patched vertex shader %s (%zu -> %zu bytes, position o%u, view 1 o%u, clip o%u/o%u)",
-            sum, len, patched.size(), info.positionReg, info.viewPositionReg, info.clipReg, info.viewClipReg);
+        Log("MVR VS patch: first patched vertex shader %s (%zu -> %zu bytes, position o%u, view 1 o%u, clip o%u/o%u, "
+            "view 0's transform %s)",
+            sum, len, patched.size(), info.positionReg, info.viewPositionReg, info.clipReg, info.viewClipReg,
+            opt.view0 ? "on" : "off");
     }
     return vs;
 }
@@ -331,9 +337,9 @@ bool Install() {
                             : E_NOINTERFACE;
         if (SUCCEEDED(hr) && dev) ok = Hook(dev);
         if (dev) dev->Release();
-        Log("MVR VS patch: D3D11 hook %s (CreateVertexShader; cb slot %u, 1 extra view with clip distances; MVR stays "
-            "off)%s",
-            ok ? "installed" : "FAILED", kCbSlot, SUCCEEDED(hr) ? "" : "; no WARP device");
+        Log("MVR VS patch: D3D11 hook %s (CreateVertexShader; cb slot %u, 1 extra view with clip distances, view 0's "
+            "gated transform %s; MVR stays off)%s",
+            ok ? "installed" : "FAILED", kCbSlot, Cfg().mvrVsView0 ? "on" : "off", SUCCEEDED(hr) ? "" : "; no WARP device");
     });
     g_installed = ok;
     g_on = ok;
