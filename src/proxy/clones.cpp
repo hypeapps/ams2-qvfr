@@ -3116,11 +3116,12 @@ bool EngineSizes(float rt[4][2], int post[2]) {
     return true;
 }
 
-bool IsReady() {
+bool IsReady(bool outerIn) {
     bool out = false;
     Protect("IsReady", [&] {
         std::lock_guard lock(g_cm);
-        out = !g_failed && g_phase == Ready && g_enabled && !g_dirty && !g_swapped;
+        const bool outerSet = g_inGroup && g_kind == Outer && (g_cur == Outer || g_cur == OuterScene);
+        out = !g_failed && g_phase == Ready && g_enabled && !g_dirty && (!g_swapped || (outerIn && outerSet));
     });
     return out;
 }

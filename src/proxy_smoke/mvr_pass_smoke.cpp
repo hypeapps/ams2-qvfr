@@ -265,6 +265,9 @@ void DrawMask(const Targets& t, UINT w, UINT h) {
 using TaskFn = void(__fastcall*)(void*);
 void* g_vtOuter[32];
 void* g_vtBuild[32];
+void* g_vtSsao[32];    // B20 K3: CSSAORender, CPhase2Render and CPhase3Render (only their identity: never run)
+void* g_vtPhase2[32];
+void* g_vtPhase3[32];
 struct FakeTask {
     void** vt;
 };
@@ -460,6 +463,9 @@ float Bilinear(const std::vector<uint32_t>& img, UINT w, UINT h, float u, float 
 // B20 K2 and S2.2: one frame in the corner layout and what it gave.
 struct CornerRun {
     bool made = false, sr = false, skipBuild = false, skipFocus = false;
+    // B20 K3: focus L's early run after outer L's pass, then outer R's pass, then the focus L group.
+    bool early = false, earlyL = false, earlyBegan = false, earlyR = true, skipSsao = false, skipPhase2 = false;
+    const char* earlyRWhy = nullptr;
     UINT ow = 0, oh = 0, fw = 0, fh = 0, sw = 0, sh = 0;
     qvfr::mvrpass::TestState st{}, st2{};
     std::vector<uint32_t> refC, refL, refD, refM, refFC, refFL, refFD, c, l, d, m, fc, fl, fd, fm;
@@ -811,8 +817,12 @@ int RunMvrPass() {
     // Outer draws into its clones (ow x oh); focus's targets are the game's (K2: focus at the game's size, no clones) or,
     // with DLSS SR (S2.2), fake scene clones at fw x fh. The game is kW x kH, the views outer kW x kH and focus kFW x kFH
     // with SR.
-    auto corner = [&](UINT ow, UINT oh, UINT fw, UINT fh, bool sr) {
+    // B20 K3 (`early`): focus L's early run right after outer L's pass (the stash goes into focus's targets now), then
+    // outer R's pass (its focus R into the stash only: it must not touch focus L's targets), focus R's early run
+    // refused, and the focus L group skips its G-buffer pass, SSAO and lights without a second fill.
+    auto corner = [&](UINT ow, UINT oh, UINT fw, UINT fh, bool sr, bool early = false) {
         CornerRun r;
+        r.early = early;
         r.ow = ow;
         r.oh = oh;
         r.fw = fw;
@@ -872,13 +882,35 @@ int RunMvrPass() {
         r.l = Read(oc.lin.Get());
         r.d = Read(oc.depth.Get());
         r.m = Read(oc.mask.Get());
-        qvfr::mvrpass::FocusGroup(0, true);
+        if (early) {
+            qvfr::mvrpass::TestEarly(g_vtSsao, g_vtPhase2, g_vtPhase3);
+            r.earlyL = qvfr::mvrpass::EarlyWanted(0);
+            r.earlyBegan = r.earlyL && qvfr::mvrpass::EarlyBegin(0, true);
+            if (r.earlyBegan) qvfr::mvrpass::EarlyEnd(0, 0, true);
+            // Outer R's pass (outer's clones were read above), with the forward setting on for focus R's question.
+            qvfr::mvrpass::SetWindow(1, true, sx, ox, sy, oy, kW, kH);
+            BindG(oc);
+            if (!qvfr::mvrpass::BeforeTask((uint8_t*)&g_outer, 1)) RunTask(g_outer);
+            qvfr::mvrpass::AfterTask((uint8_t*)&g_outer);
+            qvfr::mvrpass::SetForward(true);
+            r.earlyR = qvfr::mvrpass::EarlyWanted(1);
+            r.earlyRWhy = qvfr::mvrpass::TestGet().earlyWhy;
+            qvfr::mvrpass::SetForward(false);
+        } else {
+            qvfr::mvrpass::FocusGroup(0, true);
+        }
         BindG(ft);
         FakeTask focusCorner{g_vtOuter};
         r.skipBuild = qvfr::mvrpass::BeforeTask((uint8_t*)&g_build, 2);
         if (r.skipBuild) Finish(g_build);
         r.skipFocus = qvfr::mvrpass::BeforeTask((uint8_t*)&focusCorner, 2);
         if (r.skipFocus) Finish(focusCorner);
+        if (early) {
+            FakeTask ssao{g_vtSsao}, phase2{g_vtPhase2};
+            r.skipSsao = qvfr::mvrpass::BeforeTask((uint8_t*)&ssao, 2);
+            r.skipPhase2 = qvfr::mvrpass::BeforeTask((uint8_t*)&phase2, 2);
+            qvfr::mvrpass::TestEarly(nullptr, nullptr, nullptr);
+        }
         r.st2 = qvfr::mvrpass::TestGet();
         r.fc = Read(ft.color.Get());
         r.fl = Read(ft.lin.Get());
@@ -902,6 +934,9 @@ int RunMvrPass() {
         corner(40, 32, 56, 48, true),     // S2.2: R_o < R_f, slices 56 x 48
         corner(64, 56, 48, 40, true),     // S2.2: R_o >= R_f, slices outer's own 64 x 56
         corner(64, 32, 48, 48, true),     // S2.2: mixed, slices 64 x 48
+        corner(kOW, kOH, kW, kH, false, true),  // B20 K3: focus L's early run into the game's targets
+        corner(40, 32, 56, 48, true, true),     // B20 K3: ... into focus's scene clones (DLSS SR)
+        corner(64, 32, 48, 48, true, true),     // B20 K3: ... mixed sizes
     };
     if (refC.empty() || refFC.empty() || gC.empty() || fC.empty() || fM.empty() || gM.empty() || s1.empty()) {
         printf("MVR pass: read-back failed\n");
@@ -1158,20 +1193,31 @@ int RunMvrPass() {
                          kOL * 100 <= kOPx && kOD * 200 <= kOPx && kOMMax < 0.01 && kMag > 0 && kMag == kMagRef &&
                          kCov > kPx / 2 && kBig * 200 <= kPx && kLOff * 100 <= kPx && kDOff * 200 <= kPx &&
                          kMaskMax < 0.01;
-        cornerOk = cornerOk && one;
-        char b[1200];
+        // B20 K3: focus L ran early, focus R was refused for K4, the focus group skipped SSAO and lights too.
+        const bool earlyOne = !r.early || (r.earlyL && r.earlyBegan && !r.earlyR && r.earlyRWhy &&
+                                           strstr(r.earlyRWhy, "B20 K4") && r.skipSsao && r.skipPhase2);
+        cornerOk = cornerOk && one && earlyOne;
+        std::string earlyText;
+        if (r.early) {
+            earlyText = std::string("; B20 K3 early run: focus L ") + (r.earlyBegan ? "ran" : r.earlyL ? "NOT BEGUN" : "REFUSED") +
+                        ", then outer R's pass; focus R " + (r.earlyR ? "RAN" : "refused") + " (" +
+                        (r.earlyRWhy ? r.earlyRWhy : "no reason") + "); the focus group's SSAO " +
+                        (r.skipSsao ? "skipped" : "RUN") + ", lights " + (r.skipPhase2 ? "skipped" : "RUN") + " (" +
+                        (earlyOne ? "OK" : "WRONG") + ")";
+        }
+        char b[1800];
         snprintf(b, sizeof(b),
                  "  %s corner layout (outer %ux%u, focus %ux%u%s): %s, slices %ux%u, stash %s (%u targets, %u masks), "
                  "copied back %u, viewports of other sizes %u, unpatched VS sets %u; outer's clones vs without MVR: "
                  "color %d px differ (%d by > 2), linear depth %d px, depth %d px off (max %.2g), mask max %.4f, refused "
                  "VS quad %d px (without MVR %d); focus %s, its targets vs focus's own pass: %d px covered, color %d px "
-                 "by > 2, linear depth %d px, depth %d px off; mask vs outer's in the window max %.4f (%s)\n",
-                 r.sr ? "S2.2 DLSS SR" : "B20 K2", r.ow, r.oh, r.fw, r.fh,
+                 "by > 2, linear depth %d px, depth %d px off; mask vs outer's in the window max %.4f (%s)%s\n",
+                 r.early ? (r.sr ? "B20 K3 + DLSS SR" : "B20 K3") : r.sr ? "S2.2 DLSS SR" : "B20 K2", r.ow, r.oh, r.fw, r.fh,
                  r.sr ? ", their render sizes" : " = the game's", kSt.corner ? "on" : "OFF", kSt.sw, kSt.sh,
                  kSt.stashValid ? "valid" : "INVALID", kSt.stashed, kSt.masks, kSt.copiedBack, kSt.oddViewports,
                  kSt.plainSets, kOC, kOBig, kOL, kOD, kODMax, kOMMax, kMag, kMagRef,
                  r.skipBuild && r.skipFocus ? "skipped" : "RUN", kCov, kBig, kLOff, kDOff, kMaskMax,
-                 one ? "OK" : "WRONG");
+                 one ? "OK" : "WRONG", earlyText.c_str());
         cornerText += b;
     }
     const bool ok = countsOk && outerOk && focusOk && jitterOk && lateOk && owOk && biasOk && slopeOk && dilateOk &&

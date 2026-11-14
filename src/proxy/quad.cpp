@@ -2519,7 +2519,7 @@ void EarlyFocus(int eye) {
             why = "a view swap is active";
             return;
         }
-        if (!clones::IsReady()) {
+        if (!clones::IsReady(true)) {  // outer's clones may be in (B20 K3: corner layout, DLSS SR)
             why = "the clones are not ready";
             return;
         }
@@ -2545,7 +2545,9 @@ void EarlyFocus(int eye) {
     const gpu::Span span = eye ? gpu::EarlyR : gpu::EarlyL;
     gpu::SpanBegin(span);
     ID3D11DeviceContext* imm = gpu::Context();
-    clones::EndGroup(imm);  // outer's (no clones of its own in the game's render size)
+    // Outer's set out (its clones in the corner layout, B20 K3; its scene clones with DLSS SR), focus's in (its clones,
+    // its scene clones, or none at the game's size: the engine's textures); BeginGroup(Outer) below puts outer's back.
+    clones::EndGroup(imm);
     clones::BeginGroup(imm, clones::Focus);
     bool ran = false, ok = true;
     if (mvrpass::GetEarly() == 3) {  // diagnosis: the swap and both CBeginEye, no task moved

@@ -150,7 +150,8 @@ private:
 };
 // Render thread: the clones are made, wanted in this frame and their list unchanged (a group of a set with clones
 // would get them now). MVR forward step 1 swaps focus's in inside outer's group only then (not while learning).
-bool IsReady();
+// `outerIn`: outer's own set may be in (B20 K3: outer's clones or scene clones during its group), no other set.
+bool IsReady(bool outerIn = false);
 // For a shot: up to `max` clones of `set` (not referenced; valid until the next frame start) with a label each
 // ("<set>_NN_<w>x<h>_f<format>_<role>", NN as in the list order of the log). Returns the count.
 int ListForShot(Set set, ID3D11Resource** out, char (*labels)[64], int max);

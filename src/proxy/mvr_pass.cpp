@@ -4282,6 +4282,7 @@ const char* EarlyName(int mode) {
 
 void EarlyRefused(int eye, const char* why) {
     if (eye < 0 || eye > 1 || !why) return;
+    g_test.earlyWhy = why;  // static text
     AddReason(g_st.earlyReasons, why);
     AddReason(g_tot.earlyReasons, why);
 }
@@ -4298,10 +4299,12 @@ bool EarlyWanted(int eye) {
         why = "shot frame";
     else if (!g_stash[eye].valid || g_stash[eye].frame != g_frame)
         why = "no stash from outer's pass in this frame";
-    else if (g_stash[eye].corner)
-        why = "outer smaller than focus (SSAO and lights from outer: B20 K3)";
-    else if (SrScene())
-        why = "DLSS SR (SSAO and lights from outer with the scene sets: B20 K3)";
+    // B20 K3: focus L also in the corner layout and with DLSS SR's scene sets (the run puts focus's targets in: its
+    // clones, scene clones or the engine's textures). Focus R's run would write the targets focus L still needs (the
+    // engine's textures and the scene clones have no twins of focus R yet), and without the forward pass it gains nothing.
+    else if (eye == 1 && (g_stash[eye].corner || SrScene()))
+        why = g_stash[eye].corner ? "focus R in the corner layout (its own targets with the forward pass: B20 K4)"
+                                  : "focus R with DLSS SR (its own scene clones with the forward pass: B20 K4)";
     else if (g_focus[eye].decided)
         why = "the focus group already decided";
     else if (eye == 1 && !TwinsReady())
@@ -4329,7 +4332,9 @@ bool EarlyBegin(int eye, bool projected) {
             ++g_tot.switches[eye];
         }
         g_lastSkip[eye] = 1;
-        g_track = g_forwardOn;  // the clones the early tasks write: each gets focus R's twin
+        // The clones the early tasks write: each gets focus R's twin (not yet in the corner layout or with DLSS SR,
+        // which have no forward pass from outer: B20 K4).
+        g_track = g_forwardOn && !g_stash[eye].corner && !SrScene();
         Fill(Imm(), eye);
         ok = true;
     });
@@ -4453,6 +4458,8 @@ const char* LiveWanted(int e) {
     if (!g_enabled) return "MVR G-buffer off (hotkey)";
     if (g_mode != Mode::Skip) return "a diagnosis mode of the G-buffer is on";
     if (SrScene()) return "DLSS SR (the forward pass from outer with the scene sets: B20 K4)";
+    if (g_stash[e].valid && g_stash[e].frame == g_frame && g_stash[e].corner)
+        return "outer smaller than focus (the forward pass from outer: B20 K4)";
     if (g_earlyOk[e] != g_frame) return "focus's SSAO and lights did not run early in this frame";
     if (g_p.part != PartNone) return "another MVR pass is running";
     if (!mvrps::On()) return "the PS patch is off";
@@ -5316,9 +5323,9 @@ void SetSceneSizes(uint32_t outerW, uint32_t outerH, uint32_t focusW, uint32_t f
     const bool cloned = g_sz.gw && (outerW != g_sz.gw || outerH != g_sz.gh);
     Log("MVR G-buffer: DLSS SR: outer's scene %u x %u, focus's %u x %u; while DLSS runs the G-buffer pass takes them%s",
         outerW, outerH, focusW, focusH,
-        cloned ? " in the corner layout (B20, the slices at the larger per axis); no early SSAO and lights or forward "
-                 "pass from outer (B20 K3, K4)"
-               : "; no early SSAO and lights or forward pass from outer (B20 K3, K4)");
+        cloned ? " in the corner layout (B20, the slices at the larger per axis); early SSAO and lights of focus L only, "
+                 "no forward pass from outer (B20 K4)"
+               : "; early SSAO and lights of focus L only, no forward pass from outer (B20 K4)");
 }
 
 void SetSrActive(bool on) { g_srActive = on; }
@@ -5402,6 +5409,13 @@ void TestForwardLive(const void* phase3Vtable) {
     g_earlyOk[0] = g_frame;
     FocusState& f = g_focus[0];
     f.decided = f.skip = f.early = f.earlyLights = true;
+}
+
+void TestEarly(const void* ssaoVtable, const void* phase2Vtable, const void* phase3Vtable) {
+    g_ssaoVt = (uintptr_t)ssaoVtable;
+    g_phase2Vt = (uintptr_t)phase2Vtable;
+    g_phase3Vt = (uintptr_t)phase3Vtable;
+    g_early = ssaoVtable ? 1 : 0;
 }
 
 void TestEarlyMark(int eye) {

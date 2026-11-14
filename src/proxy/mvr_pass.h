@@ -99,6 +99,8 @@ void AfterTask(uint8_t* task);  // after the engine's Execute (not after a skipp
 // before its CPhase3Render (the forward pass that a later step draws with MVR), and the focus group skips them. Only
 // focus L: the focus clones are shared, and outer R's group (which would run focus R's) comes before focus L's group.
 // With mvr_forward (step 3, below) focus R's run in outer R's group as well, into focus R's own clones.
+// B20 K3: focus L's run also in the corner layout and with DLSS SR's scene sets (focus's targets: its clones, its scene
+// clones or the engine's textures, as the focus group's swap puts them in); focus R's is refused there until K4.
 // The run order of quad's RunTask:
 //   EarlyWanted(eye) -> quad swaps focus's view in and puts focus's clones in -> EarlyBegin(eye, projected) -> the
 //   engine's CBeginEye, CSSAORender, CPhase2Render of the focus group without their Finish -> clones out, view back,
@@ -290,6 +292,7 @@ struct TestState {
     bool sr = false;      // S2.2: ... at DLSS SR's render sizes (SetSceneSizes, SetSrActive)
     unsigned oddViewports = 0;
     uint32_t sw = 0, sh = 0;
+    const char* earlyWhy = nullptr;  // B20 K3: the latest reason an early run did not go (static text)
 };
 TestState TestGet();
 ID3D11Texture2D* TestArray(int k);
@@ -314,6 +317,9 @@ ID3D11Texture2D* TestForwardStash(int k);  // the corner of slice 1 of forward t
 void TestForwardLive(const void* phase3Vtable);
 // As if the eye's early run began now.
 void TestEarlyMark(int eye);
+// B20 K3 in the smoke --mvr-pass: stand-ins for CSSAORender's, CPhase2Render's and CPhase3Render's vtables and
+// mvr_early = 1, so quad's calls of the early run (EarlyWanted, EarlyBegin, EarlyEnd) can be made by hand; null: off.
+void TestEarly(const void* ssaoVtable, const void* phase2Vtable, const void* phase3Vtable);
 struct TestLiveState {
     unsigned passes = 0, ok = 0, focusSkipped = 0, buildSkipped = 0, otherClears = 0, otherClearMisses = 0;
     unsigned twinEntries = 0, velBinds = 0;  // focus clones noted for focus R's twins
