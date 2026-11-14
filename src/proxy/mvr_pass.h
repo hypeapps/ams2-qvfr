@@ -43,12 +43,24 @@ bool Install();
 // or the engine's own textures when focus is at the game's size. The early SSAO and lights, the forward pass from outer
 // and what stands on them (B9a-B19) stay off in that layout (B20 K3-K5).
 void SetSizes(uint32_t gameW, uint32_t gameH, uint32_t outerW, uint32_t outerH, uint32_t focusW, uint32_t focusH);
+// DLSS SR in quad views (docs/dlaa-plan.md S2.2): the render sizes of outer's and focus's scene phases, as given to
+// clones::SetSceneSizes (0 = no SR). While SetSrActive says DLSS runs in this frame, the G-buffer pass takes them in
+// place of the view sizes: outer draws into its scene clones (the corner layout whenever they are smaller than the
+// game's size, the slices at the larger of the two render sizes per axis), focus's targets are its scene clones (else
+// its view-size clones, else the engine's textures), and focus's jitter is over its render size. The early SSAO and
+// lights and the forward pass from outer stay off then (B20 K3, K4: they would write focus's view-size clones).
+void SetSceneSizes(uint32_t outerW, uint32_t outerH, uint32_t focusW, uint32_t focusH);
+// Render thread, at the frame start: the groups use the scene sets in this frame (clones::SetSrActive).
+void SetSrActive(bool on);
 // B20 K2, from the clones' RSSetViewports hook before the real call (render thread): in the corner layout, while a
 // patched VS draws, viewports at outer's size (top left 0, 0) become the slices'. True: `vps` changed.
 bool MapViewports(ID3D11DeviceContext* c, UINT n, D3D11_VIEWPORT* vps);
 // First Submit: the module's D3D11 hooks on the immediate context (VSSetShader, VSSetConstantBuffers(1), the
 // instanced and indirect draws; the plain draws come from sun_fx).
 void InstallD3DHooks(ID3D11DeviceContext* imm);
+// S2.2: InstallD3DHooks hooked DrawIndexedInstanced and DrawInstanced; their detours also call srcb::OnDraw and the SR
+// probe, so sr_cb does not hook them again (a second hook on a function fails).
+bool InstancedDrawHooks();
 bool On();  // installed and not stopped (cheap)
 
 // Render thread, every frame start before the shot is prepared: `enabled` = the setting and the hotkey. Reports the
@@ -275,6 +287,7 @@ struct TestState {
     unsigned direct = 0;  // B15: targets written straight into focus's clones (in the frame)
     unsigned native = 0;  // B17: the last pass's targets that were the game's own arrays
     bool corner = false;  // B20 K2: the last pass ran in the corner layout (its slices sw x sh)
+    bool sr = false;      // S2.2: ... at DLSS SR's render sizes (SetSceneSizes, SetSrActive)
     unsigned oddViewports = 0;
     uint32_t sw = 0, sh = 0;
 };

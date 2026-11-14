@@ -2776,9 +2776,9 @@ void SetupLocked(vr::IVRSystem* real) {
         const uint32_t rfw = px(g_focus.focusTexW * (double)c.dlaaFocusRenderScale);
         const uint32_t rfh = px(g_focus.focusTexH * (double)c.dlaaFocusRenderScale);
         clones::SetSceneSizes(row, roh, rfw, rfh);
-        Log("Quad: DLSS SR: outer's scene at %u x %u -> %u x %u, focus's at %u x %u -> %u x %u%s", row, roh,
-            g_focus.outerW, g_focus.outerH, rfw, rfh, g_focus.focusTexW, g_focus.focusTexH,
-            row >= rfw && roh >= rfh ? "" : " (outer's render size is smaller than focus's: MVR would need B20)");
+        mvrpass::SetSceneSizes(row, roh, rfw, rfh);
+        Log("Quad: DLSS SR: outer's scene at %u x %u -> %u x %u, focus's at %u x %u -> %u x %u", row, roh,
+            g_focus.outerW, g_focus.outerH, rfw, rfh, g_focus.focusTexW, g_focus.focusTexH);
     }
     g_focus.engaged = true;
     for (int i = 0; i < 2; ++i) {
@@ -2918,11 +2918,8 @@ void Install() {
         else if (g_patched)
             Log("Quad: no add-task hook; no quad <-> outer only switch");
         // MVR gate B8: needs the patched VS (mvr_vs) and the executor thunk (it skips the focus groups' pass).
-        // S2.1: the MVR pass does not know the scene sets yet (S2.2).
-        if (Cfg().mvrGbuffer && g_execPatched && Cfg().mvrVsPatch && SrConfigured())
-            Log("WARNING: MVR: off with DLSS SR in quad views ([dlaa] mode=dlss) for now; the focus groups render "
-                "their own scene");
-        if (Cfg().mvrGbuffer && g_execPatched && Cfg().mvrVsPatch && !SrConfigured()) {
+        // S2.2: with DLSS SR the G-buffer pass runs at the scene sets' render sizes (mvrpass::SetSceneSizes).
+        if (Cfg().mvrGbuffer && g_execPatched && Cfg().mvrVsPatch) {
             mvrpass::SetJitterSource(&dlaa::FrameJitter);
             mvrpass::Install();
             fwdrec::Install();  // O2 step 3 (mvr_velocity_record_skip); logs it
@@ -2991,7 +2988,9 @@ void OnFrameStart() {
         // DLSS SR: the scene sets only while DLSS runs (setting, hotkey, no failure), else the views' own sizes.
         srprobe::OnFrameStart(gpu::Context());  // S2.1: the probed frame's report, the hotkey
         srcb::OnFrameStart();
-        clones::SetSrActive(SrConfigured() && dlaa::SrWanted());
+        const bool srNow = SrConfigured() && dlaa::SrWanted();
+        clones::SetSrActive(srNow);
+        mvrpass::SetSrActive(srNow);
         clones::OnFrameStart(gpu::Context(), g_clonesOn && g_focus.on);
         sunfx::OnFrameStart(gpu::Context(), g_sunOn && g_focus.on && !g_frameSkip);
         mvrvs::OnFrameStart(gpu::Context());
@@ -3116,7 +3115,8 @@ void OnSubmitBegin(vr::EVREye eye, const vr::Texture_t* tex) {
             g_d3dHooked ? "installed" : "FAILED");
         if (g_d3dHooked) clones::InstallD3DHooks(imm);
         if (g_d3dHooked) mvrpass::InstallD3DHooks(imm);
-        if (g_d3dHooked && SrConfigured()) srcb::Install(imm);     // S2.1: constants after TAA at the view size
+        // S2.1: constants after TAA at the view size (S2.2: the instanced draws through mvr_pass's hooks when it has them)
+        if (g_d3dHooked && SrConfigured()) srcb::Install(imm, !mvrpass::InstancedDrawHooks());
         if (g_d3dHooked && SrConfigured()) srprobe::Install(imm);  // S2.1 probe (only with [debug] sr_probe_key)
     });
 }

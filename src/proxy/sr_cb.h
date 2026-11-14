@@ -19,10 +19,11 @@
 
 namespace qvfr::srcb {
 
-// Quad views with DLSS SR, first frame with a context: the shader, ID3D11DeviceContext1 and the instanced draw hooks.
-void Install(ID3D11DeviceContext* imm);
+// Quad views with DLSS SR, first frame with a context: the shader, ID3D11DeviceContext1 and the instanced draw hooks
+// (hookDraws false: mvr_pass hooked them already and its detours call OnDraw and the probe).
+void Install(ID3D11DeviceContext* imm, bool hookDraws = true);
 // Render thread, before a draw of the immediate context (Draw and DrawIndexed from sun_fx's hooks, the instanced ones from
-// this module's): in the phase after the TAA resolve of an SR group, the bound windows fixed. Guards itself.
+// this module's or mvr_pass's): in the phase after the TAA resolve of an SR group, the bound windows fixed. Guards itself.
 void OnDraw(ID3D11DeviceContext* c);
 // Render thread, frame start: the setting and the hotkey.
 void OnFrameStart();

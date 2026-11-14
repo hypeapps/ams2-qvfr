@@ -276,7 +276,7 @@ void STDMETHODCALLTYPE D_DrawInstanced(ID3D11DeviceContext* c, UINT n, UINT inst
 
 }  // namespace
 
-void Install(ID3D11DeviceContext* imm) {
+void Install(ID3D11DeviceContext* imm, bool hookDraws) {
     if (g_installed || !imm) return;
     g_installed = true;
     Guard("Install", [&] {
@@ -287,14 +287,15 @@ void Install(ID3D11DeviceContext* imm) {
             return;
         }
         void** vt = *(void***)imm;
-        const bool a = hooks::CreateAt(vt[kSlotDrawIndexedInstanced], (void*)D_DrawIndexedInstanced, (void**)&o_dii,
-                                       "DrawIndexedInstanced");
-        const bool b = hooks::CreateAt(vt[kSlotDrawInstanced], (void*)D_DrawInstanced, (void**)&o_di, "DrawInstanced");
+        const bool a = !hookDraws || hooks::CreateAt(vt[kSlotDrawIndexedInstanced], (void*)D_DrawIndexedInstanced,
+                                                     (void**)&o_dii, "DrawIndexedInstanced");
+        const bool b =
+            !hookDraws || hooks::CreateAt(vt[kSlotDrawInstanced], (void*)D_DrawInstanced, (void**)&o_di, "DrawInstanced");
         g_on = Cfg().srCbFix;
         Log("SR constants fix: %s; after the TAA resolve the windows of VS and PS constant buffer slots %u..%u get the view "
             "size in place of the render size; instanced draw hooks %s; hotkey 0x%X+0x%X",
             g_on.load() ? "on" : "off ([debug] sr_cb_fix=0)", kFirstSlot, kFirstSlot + kSlotCount - 1,
-            a && b ? "installed" : "INCOMPLETE", Cfg().srProbeKeyMod, Cfg().srCbFixKey);
+            !hookDraws ? "from mvr_pass" : a && b ? "installed" : "INCOMPLETE", Cfg().srProbeKeyMod, Cfg().srCbFixKey);
     });
 }
 

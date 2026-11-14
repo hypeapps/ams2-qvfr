@@ -32,6 +32,8 @@
 #include "mvr_patch.h"     // dxbc::kMvrVsMagic
 #include "mvr_ps_patch.h"  // dxbc::kMvrPsMagic
 #include "mvr_vs.h"
+#include "sr_cb.h"
+#include "sr_probe.h"
 #include "sun_fx.h"
 
 namespace qvfr::mvrpass {
@@ -83,17 +85,41 @@ bool g_enabled = false;  // this frame
 ID3D11DeviceContext* Imm() { return g_testCtx ? g_testCtx : gpu::Context(); }
 
 // The focus clone of an engine target (bound as it is: clones::Original gives the engine's texture behind a clone).
-ID3D11Texture2D* FocusClone(ID3D11Resource* r) {
-    if (!r) return nullptr;
-    if (g_cloneFn) return g_cloneFn(r);
-    return clones::CloneOf((ID3D11Resource*)clones::Original(r), clones::Focus);
-}
-bool FocusSwapped() { return g_cloneFn ? true : clones::SwappedIn(clones::Focus); }
 // B20 K2: the sizes of this VR session (SetSizes): the game's render size, outer's and focus's.
 struct Sizes {
     uint32_t gw = 0, gh = 0, ow = 0, oh = 0, fw = 0, fh = 0;
 };
 Sizes g_sz;
+// S2.2 (DLSS SR in quad views): the scene phases' render sizes (SetSceneSizes; ow 0 = no SR) and whether the groups
+// use them in this frame (SetSrActive).
+Sizes g_scene;
+bool g_srActive = false;
+bool SrScene() { return g_srActive && g_scene.ow && g_scene.fw; }
+// The sizes outer's and focus's G-buffers have in this frame: the render sizes while DLSS SR runs, else the views'.
+Sizes Cur() {
+    Sizes s = g_sz;
+    if (SrScene()) {
+        s.ow = g_scene.ow;
+        s.oh = g_scene.oh;
+        s.fw = g_scene.fw;
+        s.fh = g_scene.fh;
+    }
+    return s;
+}
+// With DLSS SR the scene phase's focus clone (else the view-size one: a texture without a scene clone, or focus's
+// render size equal to its view size).
+ID3D11Texture2D* FocusClone(ID3D11Resource* r) {
+    if (!r) return nullptr;
+    if (g_cloneFn) return g_cloneFn(r);
+    ID3D11Resource* o = (ID3D11Resource*)clones::Original(r);
+    if (SrScene())
+        if (ID3D11Texture2D* t = clones::CloneOf(o, clones::FocusScene)) return t;
+    return clones::CloneOf(o, clones::Focus);
+}
+bool FocusSwapped() {
+    if (g_cloneFn) return true;
+    return clones::SwappedIn(clones::Focus) || (SrScene() && clones::SwappedIn(clones::FocusScene));
+}
 OriginalFn g_origFn = nullptr;  // the smoke's stand-in for clones::Original
 // The engine's texture behind a bound one (an outer clone in the corner layout), or `r` itself.
 ID3D11Resource* EngineOf(ID3D11Resource* r) {
@@ -103,9 +129,15 @@ ID3D11Resource* EngineOf(ID3D11Resource* r) {
     return (ID3D11Resource*)clones::Original(r);
 }
 // Focus at the game's size in both axes: it has no clones and draws into the engine's textures (outer smaller).
-bool FocusAtGame() { return g_sz.gw && g_sz.fw == g_sz.gw && g_sz.fh == g_sz.gh; }
-// Outer smaller than the game's size in an axis: outer draws into its own clones.
-bool OuterCloned() { return g_sz.gw && (g_sz.ow != g_sz.gw || g_sz.oh != g_sz.gh); }
+bool FocusAtGame() {
+    const Sizes s = Cur();
+    return s.gw && s.fw == s.gw && s.fh == s.gh;
+}
+// Outer smaller than the game's size in an axis: outer draws into its own clones (with DLSS SR its scene clones).
+bool OuterCloned() {
+    const Sizes s = Cur();
+    return s.gw && (s.ow != s.gw || s.oh != s.gh);
+}
 // What focus's work draws into for the engine target behind `r`: its focus clone, or with focus at the game's size the
 // engine's texture itself (not referenced: the engine holds it).
 ID3D11Texture2D* FocusTarget(ID3D11Resource* r) {
@@ -502,6 +534,7 @@ struct Pass {
     // turned into the slices' while a patched VS draws; vpOuter: an unpatched VS draws, the viewport at outer's size).
     uint32_t sw = 0, sh = 0;
     bool corner = false, vpOuter = false;
+    bool sr = false;  // S2.2: DLSS SR's render sizes (the scene sets)
     unsigned oddViewports = 0;  // viewports of other sizes set while a patched VS draws in the corner layout
     bool mFilled = false, jitterKnown = false;
     int jitterTries = 0;
@@ -630,6 +663,7 @@ struct Stats {
     // B17: targets of the MVR parts (0 G-buffer, 1 forward) that were the game's own arrays, that were copied back.
     uint64_t nativeT[2] = {}, copiedT[2] = {};
     uint64_t corner[2] = {}, oddViewports = 0;  // B20 K2: passes in the corner layout per eye
+    uint64_t sr[2] = {};  // S2.2: passes at DLSS SR's render sizes per eye
 };
 Stats g_st, g_tot;
 std::string g_lastFail;  // the latest pass failure (logged once per text)
@@ -2342,7 +2376,9 @@ const char* StartMvr(ID3D11DeviceContext* c, ID3D11Resource* main, int e, uint8_
     const D3D11_TEXTURE2D_DESC md = DescOf(main, &ok);
     // B20 K2: outer smaller than the game's size draws into its clones; with [debug] mvr_corner its G-buffer pass runs
     // in the corner layout (focus's targets: its clones or, at the game's size, the engine's textures).
-    const bool outerSize = ok && OuterCloned() && md.Width == g_sz.ow && md.Height == g_sz.oh;
+    // S2.2: with DLSS SR outer's scene clones at its render size, focus's scene clones.
+    const Sizes cur = Cur();
+    const bool outerSize = ok && OuterCloned() && md.Width == cur.ow && md.Height == cur.oh;
     const bool corner = outerSize && !forward && !live && Cfg().mvrCorner;
     ID3D11Texture2D* clone = !ok ? nullptr : corner ? FocusTarget(main) : FocusClone(main);
     D3D11_TEXTURE2D_DESC cd{};
@@ -2355,6 +2391,8 @@ const char* StartMvr(ID3D11DeviceContext* c, ID3D11Resource* main, int e, uint8_
     // B12: the forward pass may be multisampled (MSAA in the game: its targets go in and out sample by sample); the
     // G-buffer pass's corners are copied as single-sample textures.
     const char* why = !ok ? "no 2D target in outer's pass"
+                      : (forward || live) && SrScene()
+                          ? "DLSS SR (the forward pass from outer with the scene sets: B20 K4)"
                       : outerSize && !corner
                           ? (forward || live ? "outer smaller than focus (the forward pass from outer: B20 K4)"
                                              : "outer smaller than focus ([debug] mvr_corner=0)")
@@ -2367,8 +2405,9 @@ const char* StartMvr(ID3D11DeviceContext* c, ID3D11Resource* main, int e, uint8_
                       : cd.SampleDesc.Count != md.SampleDesc.Count || cd.SampleDesc.Quality != md.SampleDesc.Quality
                           ? "focus's depth clone has another sample count"
                       : !corner && (cd.Width > md.Width || cd.Height > md.Height) ? "focus clones larger than outer"
-                      : corner && (std::max(md.Width, cd.Width) != g_sz.gw || std::max(md.Height, cd.Height) != g_sz.gh)
-                          ? "the corner layout's slices would not be at the game's size"
+                      : corner && (cd.Width != cur.fw || cd.Height != cur.fh)
+                          ? (SrScene() ? "focus's target is not at focus's render size (DLSS SR)"
+                                       : "focus's target is not at focus's size")
                                                                        : nullptr;
     if (why) return why;
     p = Pass{};
@@ -2380,6 +2419,7 @@ const char* StartMvr(ID3D11DeviceContext* c, ID3D11Resource* main, int e, uint8_
     p.fw = cd.Width;
     p.fh = cd.Height;
     p.corner = corner;
+    p.sr = SrScene();
     p.sw = corner ? std::max(md.Width, cd.Width) : md.Width;
     p.sh = corner ? std::max(md.Height, cd.Height) : md.Height;
     p.t0 = t0;
@@ -2503,8 +2543,9 @@ bool StartAtFirst(ID3D11DeviceContext* c, ID3D11Resource* main) {
     const Win& win = g_win[e];
     bool ok = false;
     const D3D11_TEXTURE2D_DESC md = DescOf(main, &ok);
-    // B20 K2: outer's clones are at outer's size
-    const bool outerSize = ok && OuterCloned() && md.Width == g_sz.ow && md.Height == g_sz.oh;
+    // B20 K2: outer's clones are at outer's size (S2.2: its render size with DLSS SR)
+    const Sizes cur = Cur();
+    const bool outerSize = ok && OuterCloned() && md.Width == cur.ow && md.Height == cur.oh;
     if (ok && win.w && !outerSize && (md.Width != win.w || md.Height != win.h)) {  // not the G-buffer yet: wait on
         ++p.waitBinds;
         return false;
@@ -2588,6 +2629,10 @@ void PassEnd(ID3D11DeviceContext* c) {
         ++g_st.corner[p.eye];
         ++g_tot.corner[p.eye];
     }
+    if (p.sr) {
+        ++g_st.sr[p.eye];
+        ++g_tot.sr[p.eye];
+    }
     g_st.oddViewports += p.oddViewports;
     g_tot.oddViewports += p.oddViewports;
     const Win& win = g_win[p.eye];
@@ -2647,6 +2692,7 @@ void PassEnd(ID3D11DeviceContext* c) {
     t.jitterKnown = p.jitterKnown;
     t.lateStart = p.lateStarts != 0;
     t.corner = p.corner;
+    t.sr = p.sr;
     t.oddViewports = p.oddViewports;
     t.sw = p.sw;
     t.sh = p.sh;
@@ -3753,6 +3799,9 @@ void STDMETHODCALLTYPE D_PSSetCb1(ID3D11DeviceContext1* c, UINT start, UINT num,
 
 void STDMETHODCALLTYPE D_DrawIndexedInstanced(ID3D11DeviceContext* c, UINT a, UINT b, UINT d, INT e, UINT f) {
     hookprof::Scope prof(hookprof::KDraw);
+    // S2.2: sr_cb's instanced draws come through here when both are in (one hook per function).
+    srcb::OnDraw(c);
+    if (srprobe::Armed()) srprobe::OnDraw(c, _ReturnAddress(), "DrawIndexedInstanced");
     if (SkipDraw(c)) return;
     BeforeDraw(c);
     hookprof::Orig orig;
@@ -3760,6 +3809,8 @@ void STDMETHODCALLTYPE D_DrawIndexedInstanced(ID3D11DeviceContext* c, UINT a, UI
 }
 void STDMETHODCALLTYPE D_DrawInstanced(ID3D11DeviceContext* c, UINT a, UINT b, UINT d, UINT e) {
     hookprof::Scope prof(hookprof::KDraw);
+    srcb::OnDraw(c);  // S2.2
+    if (srprobe::Armed()) srprobe::OnDraw(c, _ReturnAddress(), "DrawInstanced");
     if (SkipDraw(c)) return;
     BeforeDraw(c);
     hookprof::Orig orig;
@@ -3844,6 +3895,8 @@ bool Install() {
     return g_installed;
 }
 
+static bool g_instHooks = false;  // S2.2: DrawIndexedInstanced and DrawInstanced hooked here (sr_cb's go through them)
+
 void InstallD3DHooks(ID3D11DeviceContext* imm) {
     if (!g_installed || g_d3dHooked || !imm) return;
     g_d3dHooked = true;
@@ -3865,6 +3918,7 @@ void InstallD3DHooks(ID3D11DeviceContext* imm) {
         g_cbTracked = p && (!c1 || p1);  // else PS slot 3 is read back at each MVR draw
         const bool d = hooks::CreateAt(vt[20], (void*)D_DrawIndexedInstanced, (void**)&o_dii, "DrawIndexedInstanced");
         const bool e = hooks::CreateAt(vt[21], (void*)D_DrawInstanced, (void**)&o_di, "DrawInstanced");
+        g_instHooks = d && e;
         const bool f = hooks::CreateAt(vt[38], (void*)D_DrawAuto, (void**)&o_da, "DrawAuto");
         const bool g = hooks::CreateAt(vt[39], (void*)D_DrawIndexedInstancedIndirect, (void**)&o_diii,
                                        "DrawIndexedInstancedIndirect");
@@ -3885,6 +3939,8 @@ void InstallD3DHooks(ID3D11DeviceContext* imm) {
 void SetJitterSource(JitterFn fn) { g_jitterFn = fn; }
 
 bool On() { return g_on.load(std::memory_order_relaxed); }
+
+bool InstancedDrawHooks() { return g_instHooks; }
 
 void OnFrameStart(bool enabled) {
     if (!g_installed) return;
@@ -4244,6 +4300,8 @@ bool EarlyWanted(int eye) {
         why = "no stash from outer's pass in this frame";
     else if (g_stash[eye].corner)
         why = "outer smaller than focus (SSAO and lights from outer: B20 K3)";
+    else if (SrScene())
+        why = "DLSS SR (SSAO and lights from outer with the scene sets: B20 K3)";
     else if (g_focus[eye].decided)
         why = "the focus group already decided";
     else if (eye == 1 && !TwinsReady())
@@ -4394,6 +4452,7 @@ const char* LiveWanted(int e) {
     if (!g_forwardOn) return "";
     if (!g_enabled) return "MVR G-buffer off (hotkey)";
     if (g_mode != Mode::Skip) return "a diagnosis mode of the G-buffer is on";
+    if (SrScene()) return "DLSS SR (the forward pass from outer with the scene sets: B20 K4)";
     if (g_earlyOk[e] != g_frame) return "focus's SSAO and lights did not run early in this frame";
     if (g_p.part != PartNone) return "another MVR pass is running";
     if (!mvrps::On()) return "the PS patch is off";
@@ -5102,7 +5161,8 @@ void LogStats(bool totals) {
         "/ R %llu targets, through the stash L %llu / R %llu, direct writes failed %llu; the game's own two-slice "
         "arrays (mvr_native_targets %s) G-buffer %llu / forward %llu targets, copied in and back G-buffer %llu / "
         "forward %llu; corner layout (B20, outer %u x %u, focus %u x %u, game %u x %u) L %llu / R %llu passes, "
-        "viewports of other sizes %llu",
+        "viewports of other sizes %llu; at DLSS SR's render sizes (outer %u x %u, focus %u x %u) L %llu / R %llu "
+        "passes",
         totals ? " (session)" : "", (unsigned long long)s.frames, (unsigned long long)s.passes[0],
         (unsigned long long)s.passes[1], (unsigned long long)s.passFailed[0], (unsigned long long)s.passFailed[1],
         ms(0), ms(1), (unsigned long long)s.lateStarts, (unsigned long long)s.waitBinds,
@@ -5122,7 +5182,8 @@ void LogStats(bool totals) {
         g_nativeOn ? "on" : "off", (unsigned long long)s.nativeT[0], (unsigned long long)s.nativeT[1],
         (unsigned long long)s.copiedT[0], (unsigned long long)s.copiedT[1],
         g_sz.ow, g_sz.oh, g_sz.fw, g_sz.fh, g_sz.gw, g_sz.gh, (unsigned long long)s.corner[0],
-        (unsigned long long)s.corner[1], (unsigned long long)s.oddViewports);
+        (unsigned long long)s.corner[1], (unsigned long long)s.oddViewports, g_scene.ow, g_scene.oh, g_scene.fw,
+        g_scene.fh, (unsigned long long)s.sr[0], (unsigned long long)s.sr[1]);
     if (g_early || s.earlyRuns[0] || s.earlyRuns[1] || !s.earlyReasons.empty()) {
         std::string er;
         for (const Reason& r : s.earlyReasons) {
@@ -5244,10 +5305,23 @@ void TestSetup(ID3D11DeviceContext* ctx, const void* phase1Vtable, const void* b
 
 void SetSizes(uint32_t gameW, uint32_t gameH, uint32_t outerW, uint32_t outerH, uint32_t focusW, uint32_t focusH) {
     g_sz = Sizes{gameW, gameH, outerW, outerH, focusW, focusH};
+    const bool cloned = gameW && (outerW != gameW || outerH != gameH);
     Log("MVR G-buffer: game %u x %u, outer %u x %u, focus %u x %u%s", gameW, gameH, outerW, outerH, focusW, focusH,
-        OuterCloned() ? "; outer is smaller than the game's size: its G-buffer pass runs in the corner layout (B20)"
-                      : "");
+        cloned ? "; outer is smaller than the game's size: its G-buffer pass runs in the corner layout (B20)" : "");
 }
+
+void SetSceneSizes(uint32_t outerW, uint32_t outerH, uint32_t focusW, uint32_t focusH) {
+    g_scene = Sizes{g_sz.gw, g_sz.gh, outerW, outerH, focusW, focusH};
+    if (!outerW || !focusW) return;
+    const bool cloned = g_sz.gw && (outerW != g_sz.gw || outerH != g_sz.gh);
+    Log("MVR G-buffer: DLSS SR: outer's scene %u x %u, focus's %u x %u; while DLSS runs the G-buffer pass takes them%s",
+        outerW, outerH, focusW, focusH,
+        cloned ? " in the corner layout (B20, the slices at the larger per axis); no early SSAO and lights or forward "
+                 "pass from outer (B20 K3, K4)"
+               : "; no early SSAO and lights or forward pass from outer (B20 K3, K4)");
+}
+
+void SetSrActive(bool on) { g_srActive = on; }
 
 bool MapViewports(ID3D11DeviceContext* c, UINT n, D3D11_VIEWPORT* vps) {
     if (!t_pass || t_internal || !g_p.corner || g_p.vpOuter || !vps || c != Imm()) return false;
