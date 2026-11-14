@@ -27,7 +27,20 @@ cbuffer Params : register(b0) {
     uint srcX;
     uint srcY;
     uint fade;  // CSUpEdit: with a centre part, the model's edit fades out over this many source pixels to its edge
+    // CSMotion, CSDepth with DLSS super resolution: the game's motion vectors and depth are at the render size, the
+    // image at the output size. srcScale: render pixels per image pixel in each axis (0: the same size); imageW x
+    // imageH: the image's size, the unit of the motion vectors (0: the source texture's size).
+    float srcScaleX;
+    float srcScaleY;
+    uint imageW;
+    uint imageH;
 };
+
+// CSMotion, CSDepth: the source texel of region pixel id (point-sampled; at the render size with DLSS SR).
+uint2 GuidePos(uint2 id) {
+    const uint2 p = uint2(srcX, srcY) + id * srcStep;
+    return srcScaleX > 0 ? uint2((float2(p) + 0.5) * float2(srcScaleX, srcScaleY)) : p;
+}
 
 // transfer 1: the model's input (t1) and the original HDR image (t2). The ratio is taken in linear display values
 // (after the gamma, before Reinhard), so a small edit in the highlights stays small in HDR; inverting Reinhard there
@@ -121,12 +134,12 @@ RWTexture2D<float> depthOut : register(u0);
 [numthreads(8, 8, 1)]
 void CSDepth(uint3 id : SV_DispatchThreadID) {
     if (id.x >= regionW || id.y >= regionH) return;
-    const float z = src.Load(int3(uint2(srcX, srcY) + id.xy * srcStep, 0)).r;
+    const float z = src.Load(int3(GuidePos(id.xy), 0)).r;
     depthOut[id.xy + uint2(offsetX, offsetY)] = depthMode == 2 ? saturate(depthK / max(z, 1e-7)) : saturate(z);
 }
 
 // The game stores uv now - uv before (as DLAA reads it); the model, like DLSS, wants the offset from the current pixel
-// to its previous position in pixels (of the region: the source's size / srcStep). In the atlas the previous position
+// to its previous position in pixels (of the region: the image's size / srcStep). In the atlas the previous position
 // is held inside the pixel's own region, so the model's history never reaches into the neighbouring one.
 RWTexture2D<float2> motion : register(u0);
 
@@ -138,7 +151,8 @@ void CSMotion(uint3 id : SV_DispatchThreadID) {
     src.GetDimensions(sw, sh);
     float2 m = 0;
     if (mvScale != 0) {
-        m = src.Load(int3(uint2(srcX, srcY) + id.xy * srcStep, 0)).xy * -mvScale * float2(sw, sh) / (float)srcStep;
+        const float2 size = imageW ? float2(imageW, imageH) : float2(sw, sh);  // uv of the image, not of the render
+        m = src.Load(int3(GuidePos(id.xy), 0)).xy * -mvScale * size / (float)srcStep;
         if (regionW != w || regionH != h)
             m = clamp(float2(id.xy) + m, 0.0, float2(regionW, regionH) - 1.0) - float2(id.xy);
     }

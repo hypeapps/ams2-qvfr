@@ -444,7 +444,7 @@ bool Same(const nrbridge::Settings& a, const nrbridge::Settings& b) {
 }
 
 void ProcessImpl(ID3D11DeviceContext* c, int view, ID3D11ShaderResourceView* srv, ID3D11UnorderedAccessView* uav,
-                 ID3D11Resource* motion, ID3D11Resource* depth, UINT w, UINT h, bool reset) {
+                 ID3D11Resource* motion, ID3D11Resource* depth, UINT w, UINT h, UINT inW, UINT inH, bool reset) {
     if (g_bridge && g_gen != gpu::Generation()) {
         Log("NR: the device changed; the bridge starts again");
         Drop();
@@ -484,6 +484,7 @@ void ProcessImpl(ID3D11DeviceContext* c, int view, ID3D11ShaderResourceView* srv
     dev->Release();
     const int i = ImageOf(view);
     if (i < 0) return;
+    g_bridge->SetSource(w, h, inW, inH);  // DLSS SR: the vectors and depth at the render size
     // A change between after-DLAA and final images: the model's history is of the other kind of image.
     static int lastMode[kImages] = {};
     const int mode = ModeNow();
@@ -851,11 +852,11 @@ void ProcessFinal(ID3D11DeviceContext* c, int eye, ID3D11Texture2D*& focus, ID3D
 }
 
 void Process(ID3D11DeviceContext* c, int view, ID3D11ShaderResourceView* srv, ID3D11UnorderedAccessView* uav,
-             ID3D11Resource* motion, ID3D11Resource* depth, UINT w, UINT h, bool reset) {
+             ID3D11Resource* motion, ID3D11Resource* depth, UINT w, UINT h, UINT inW, UINT inH, bool reset) {
     if (!c || !srv || !uav) return;
     unsigned long code = 0;
     __try {
-        ProcessImpl(c, view, srv, uav, motion, depth, w, h, reset);
+        ProcessImpl(c, view, srv, uav, motion, depth, w, h, inW, inH, reset);
     } __except (code = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
         if (!g_faultLogged) {
             g_faultLogged = true;

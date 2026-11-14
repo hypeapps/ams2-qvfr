@@ -1314,7 +1314,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             // NR prototype (nr.h, [nr] mode=focus): the focus views' DLAA result through the D3D12 bridge, still in
             // DLAA's own context state.
             if (NVSDK_NGX_SUCCEED(r) && nr::Wanted(view))
-                nr::Process(c, view, SrvFor(out), UavFor(out), mv, in[0], w, h, e.InReset != 0);
+                nr::Process(c, view, SrvFor(out), UavFor(out), mv, in[0], w, h, iw, ih, e.InReset != 0);
         });
         t_inside = false;
         g_ctx1->SwapDeviceContextState(prev, nullptr);

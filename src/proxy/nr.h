@@ -18,11 +18,12 @@ namespace qvfr::nr {
 // view: dlaa's view index (1 outer L, 2 outer R, 3 focus L, 4 focus R; outer only in mode=final with outer on).
 bool Wanted(int view);
 // The DLAA result (w x h, an SRV and a UAV of the same texture) through the bridge. motion: the motion vectors DLAA
-// used (R16G16_FLOAT, uv now - uv before), depth: its linear depth (R32_FLOAT); either may be null. reset: DLAA reset
-// its history in this evaluation. Guards itself (SEH); a failure turns NR off for the session and leaves the DLAA
+// used (R16G16_FLOAT, uv now - uv before), depth: its linear depth (R32_FLOAT); either may be null; both rendered at
+// inW x inH (the top left of their textures; smaller than w x h with DLSS super resolution). reset: DLAA reset its
+// history in this evaluation. Guards itself (SEH); a failure turns NR off for the session and leaves the DLAA
 // result.
 void Process(ID3D11DeviceContext* c, int view, ID3D11ShaderResourceView* srv, ID3D11UnorderedAccessView* uav,
-             ID3D11Resource* motion, ID3D11Resource* depth, UINT w, UINT h, bool reset);
+             ID3D11Resource* motion, ID3D11Resource* depth, UINT w, UINT h, UINT inW, UINT inH, bool reset);
 // Render thread, at the composition (quad.cpp, before compose::Draw): true when the eyes' final images go through the
 // model (mode=final; the outer ones too with [nr] outer).
 bool WantedFinal();
