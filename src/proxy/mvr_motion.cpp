@@ -38,6 +38,7 @@ struct Tex {
 
 struct DepthView {
     ID3D11Texture2D* tex = nullptr;  // compared only (the view keeps it alive)
+    UINT slice = 0;
     ComPtr<ID3D11ShaderResourceView> srv;
 };
 
@@ -144,18 +145,30 @@ bool EnsureTex(Tex& t, UINT w, UINT h, bool uav, DXGI_FORMAT fmt = DXGI_FORMAT_R
     return true;
 }
 
-ID3D11ShaderResourceView* DepthSrv(ID3D11Texture2D* tex) {
+// B20 K5b: `slice` of an array (focus's slice of the engine's three-slice array; the shader reads a Texture2D, which a
+// one-slice view of an array feeds, as the MVR PS patch's screen textures).
+ID3D11ShaderResourceView* DepthSrv(ID3D11Texture2D* tex, UINT slice = 0) {
     for (DepthView& v : g_depth)
-        if (v.tex == tex && v.srv) return v.srv.Get();
+        if (v.tex == tex && v.slice == slice && v.srv) return v.srv.Get();
+    D3D11_TEXTURE2D_DESC td{};
+    tex->GetDesc(&td);
     D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
     sd.Format = DXGI_FORMAT_R32_FLOAT;
-    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-    sd.Texture2D.MipLevels = 1;
+    if (td.ArraySize > 1) {
+        if (slice >= td.ArraySize) return nullptr;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        sd.Texture2DArray = {0, 1, slice, 1};
+    } else {
+        if (slice) return nullptr;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sd.Texture2D.MipLevels = 1;
+    }
     DepthView& v = g_depth[g_depthNext];
     g_depthNext = (g_depthNext + 1) % (int)std::size(g_depth);
     v = DepthView{};
     if (FAILED(g_dev->CreateShaderResourceView(tex, &sd, &v.srv))) return nullptr;
     v.tex = tex;
+    v.slice = slice;
     return v.srv.Get();
 }
 
@@ -362,7 +375,7 @@ ID3D11Texture2D* ForFocus(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* dept
 }
 
 bool FillFocus(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Texture2D* target, uint64_t frame,
-               const char** why) {
+               const char** why, UINT slice) {
     const char* no = nullptr;
     [&] {
         if (eye < 0 || eye > 1 || !depth || !target) {
@@ -404,7 +417,7 @@ bool FillFocus(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Te
             no = "device or texture";
             return;
         }
-        ID3D11ShaderResourceView* ds = DepthSrv(depth);
+        ID3D11ShaderResourceView* ds = DepthSrv(depth, slice);
         if (!ds) {
             no = "depth view";
             return;

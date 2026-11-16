@@ -443,6 +443,7 @@ Config ReadConfig(const fs::path& ini) {
     c.mvrMsColorSkip = IniInt(ini, L"debug", L"mvr_ms_color_skip", 1) != 0;
     c.mvrMsColorSkipKey = IniInt(ini, L"debug", L"mvr_ms_color_skip_key", c.mvrMsColorSkipKey);
     c.mvrMsSlices = IniInt(ini, L"debug", L"mvr_ms_slices", 1) != 0;
+    c.mvrGbufferSlices = IniInt(ini, L"debug", L"mvr_gbuffer_slices", 1) != 0;
     c.mvrPsDump = IniInt(ini, L"debug", L"mvr_ps_dump", 0) != 0;
     c.mvrLiveTrackSkip = IniInt(ini, L"debug", L"mvr_livetrack_skip", 1) != 0;
     c.mvrLiveTrackSkipKey = IniInt(ini, L"debug", L"mvr_livetrack_skip_key", c.mvrLiveTrackSkipKey);
@@ -462,7 +463,7 @@ Config ReadConfig(const fs::path& ini) {
             "mvr_velocity_key=0x%X mvr_velocity_skip=%d mvr_velocity_skip_key=0x%X mvr_gbuffer_ps=%d "
             "mvr_gbuffer_ps_key=0x%X mvr_direct_extract=%d mvr_direct_extract_key=0x%X mvr_native_targets=%d "
             "mvr_native_key=0x%X mvr_ms_color_skip=%d mvr_ms_color_skip_key=0x%X mvr_ms_slices=%d "
-            "mvr_livetrack_skip=%d mvr_livetrack_skip_key=0x%X mvr_empty_queue=%d queue_breakdown=%d mvr_velocity_record_skip=%d",
+            "mvr_gbuffer_slices=%d mvr_livetrack_skip=%d mvr_livetrack_skip_key=0x%X mvr_empty_queue=%d queue_breakdown=%d mvr_velocity_record_skip=%d",
             c.overlay, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey,
             c.gazeKeyMod, c.gazeKey, c.clones, c.clonesKeyMod, c.clonesKey, c.clonesViewportFix, c.clonesBindFix,
             c.shotClones, c.focusCull, c.cullKeyMod, c.cullKey, c.sunEffects, c.sunKeyMod, c.sunKey, c.taaViews,
@@ -472,7 +473,7 @@ Config ReadConfig(const fs::path& ini) {
             c.mvrForwardKey, c.mvrForwardDepth, c.mvrForwardDepthKey, c.mvrVelocity, c.mvrVelocityKey,
             c.mvrVelocitySkip, c.mvrVelocitySkipKey, c.mvrGbufferPs, c.mvrGbufferPsKey, c.mvrDirectExtract,
             c.mvrDirectExtractKey, c.mvrNativeTargets, c.mvrNativeKey, c.mvrMsColorSkip, c.mvrMsColorSkipKey, c.mvrMsSlices,
-            c.mvrLiveTrackSkip, c.mvrLiveTrackSkipKey, c.mvrEmptyQueue, c.queueBreakdown, c.mvrVelocityRecordSkip);
+            c.mvrGbufferSlices, c.mvrLiveTrackSkip, c.mvrLiveTrackSkipKey, c.mvrEmptyQueue, c.queueBreakdown, c.mvrVelocityRecordSkip);
     const std::string dlaa = IniString(ini, L"dlaa", L"mode", L"off");
     c.dlaa = dlaa == "dlaa" || dlaa == "dlss";
     c.dlaaSr = dlaa == "dlss";

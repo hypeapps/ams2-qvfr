@@ -536,8 +536,13 @@ struct Copy {
     DXGI_FORMAT viewFmt = DXGI_FORMAT_UNKNOWN;
     ComPtr<ID3D11RenderTargetView> slice1Rtv;
     ComPtr<ID3D11ShaderResourceView> colorSrv;
-    // B12 step 5: slices of `arr` (3: the game's multisampled forward target as a three-slice array, mvr_ms_slices).
+    // B12 step 5: slices of `arr` (3: the game's multisampled forward target as a three-slice array, mvr_ms_slices;
+    // B20 K5b: the corner layout's copies with mvr_gbuffer_slices).
     UINT slices = 2;
+    // B20 K5b: `arr` is the engine's three-slice array behind outer's clone `orig` (a G-buffer color), focus's clones its
+    // slices 1 and 2: view 1 draws straight into focus's slice, slice 0 (the engine's views, used by no group) holds
+    // view 0 whose corner goes back into outer's clone.
+    bool fslice = false;
     // B20 K2: `arr`'s size (the slices' in the corner layout, else the game texture's) and, for a depth in the corner
     // layout, a view of the game texture (outer's clone) for the copy of slice 0's corner back.
     UINT aw = 0, ah = 0;
@@ -712,6 +717,7 @@ struct Stats {
     uint64_t gbufPsDraws = 0, gbufPsKept = 0, liveTracks = 0, liveTrackFails = 0;
     // B15: targets whose corner went straight into focus's clone, through the stash, direct writes that failed.
     uint64_t direct[2] = {}, viaStash[2] = {}, directFails = 0;
+    uint64_t sliceDirect[2] = {};  // B20 K5b: of the direct ones, colors focus reads in their slice (nothing written)
     // B17: targets of the MVR parts (0 G-buffer, 1 forward) that were the game's own arrays, that were copied back.
     uint64_t nativeT[2] = {}, copiedT[2] = {};
     uint64_t corner[2] = {}, oddViewports = 0;  // B20 K2: passes in the corner layout per eye
@@ -805,6 +811,7 @@ bool g_forwardOn = false;       // [debug] mvr_forward and its hotkey
 int g_fwdDepth = 3;             // [debug] mvr_forward_depth and its hotkey (mvr_pass.h)
 bool g_msColorSkip = true;      // [debug] mvr_ms_color_skip and its hotkey (mvr_pass.h)
 bool g_msSlices = true;         // B12 step 5: [debug] mvr_ms_slices (restart only)
+bool g_gbufSlices = true;       // B20 K5b: [debug] mvr_gbuffer_slices (restart only)
 // Mode 3: per eye a conservative copy of the forward depth, bound in place of focus's depth clone while the focus
 // group's velocity pass (an R16G16 target at the focus size) draws.
 struct VelDepth {
@@ -934,6 +941,27 @@ void WantCornerMs(UINT n, ID3D11RenderTargetView* const* rtv, ID3D11DepthStencil
     for (UINT i = 0; i < n && rtv; ++i) want(rtv[i]);
     want(dsv);
 }
+// B20 K5b (mvr_gbuffer_slices): the corner layout without DLSS SR, focus at the game's size. The G-buffer pass's colors
+// (outer's clones bound) ask for their engine textures as three-slice arrays at the game's size (clones::WantArray:
+// slice 0 the engine's views, focus L's clone slice 1, focus R's twin slice 2; outer's clone stays a texture of its
+// own); the pass then draws view 1 into focus's slice (no extract copy). Its other copies (the depth: focus gets it
+// conservative; and the forward pass's, which bind that depth) get three slices too, so outer R draws view 1 into slice
+// 2 of all its targets (renderTargetIndexOffset is one per pass).
+bool GbufSlices() { return g_gbufSlices && FocusAtGame() && !SrScene(); }
+// The engine's array behind outer's clone `res` (described by d) when it is a three-slice array of aw x ah whose focus
+// clone is its slice 1 (the clones module's), else null. Not referenced (the engine holds it).
+ID3D11Texture2D* FocusSliceArray(ID3D11Resource* res, const D3D11_TEXTURE2D_DESC& d, UINT aw, UINT ah) {
+    if ((d.BindFlags & D3D11_BIND_DEPTH_STENCIL) || d.SampleDesc.Count != 1 || d.MipLevels != 1) return nullptr;
+    ID3D11Resource* e = EngineOf(res);
+    if (!e || e == res || !IsNative(e) || FocusSliceOf(res, 0, nullptr, nullptr) != 1) return nullptr;
+    ID3D11Texture2D* t = FocusTarget(res);
+    if (!t || (ID3D11Resource*)t != e) return nullptr;
+    const D3D11_TEXTURE2D_DESC ad = DescOf(e);
+    if (ad.ArraySize < 3 || ad.Width != aw || ad.Height != ah || ad.MipLevels != 1 || ad.Format != d.Format ||
+        ad.SampleDesc.Count != 1)
+        return nullptr;
+    return t;
+}
 
 // Jitter diagnosis (B9c run 2: view 1 about 0.27 px off focus's own forward pass in x, the sign changing between
 // frames): in a forward test shot frame the game's camera constants at the first draw of each eye group's
@@ -1048,11 +1076,20 @@ int CopyFor(ID3D11DeviceContext* c, ID3D11Resource* res) {
         if (g_p.forward) WantCornerMs(res);
         return -1;
     }
+    // B20 K5b: three slices in the corner layout; a G-buffer color whose engine texture is focus's slice array draws
+    // into that array, one that is not yet asks for it (made at the next frame start).
+    const bool three = corner && GbufSlices();
+    ID3D11Texture2D* const fsArr = three && g_nativeOn ? FocusSliceArray(res, d, aw, ah) : nullptr;
+    const UINT slices = native ? d.ArraySize : fsArr ? DescOf(fsArr).ArraySize : three ? 3 : 2;
+    if (three && g_nativeOn && !fsArr && t_pass && !g_p.forward && !(d.BindFlags & D3D11_BIND_DEPTH_STENCIL) &&
+        d.SampleDesc.Count == 1 && d.MipLevels == 1)
+        if (ID3D11Resource* e = EngineOf(res); e && e != res && !IsNative(e)) WantNative(e, 3);
     int slot = -1;
     for (int k = 0; k < (int)g_copies.size(); ++k) {
         Copy& cp = g_copies[k];
         if (cp.orig != res) continue;
-        if (SameLayout(cp.desc, d) && cp.native == native && cp.aw == aw && cp.ah == ah) {
+        if (SameLayout(cp.desc, d) && cp.native == native && cp.aw == aw && cp.ah == ah && cp.slices == slices &&
+            cp.fslice == (fsArr != nullptr) && (!fsArr || cp.arr.Get() == fsArr)) {
             cp.used = true;
             cp.lastFrame = g_frame;
             if (isArray && cp.lastSeen != g_frame) {  // B20 K5: outer's slice clone made after the copy
@@ -1091,7 +1128,8 @@ int CopyFor(ID3D11DeviceContext* c, ID3D11Resource* res) {
     cp.lastSeen = g_frame;
     cp.depth = (d.BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0;
     cp.native = native;
-    cp.slices = native ? d.ArraySize : 2;
+    cp.fslice = fsArr != nullptr;
+    cp.slices = slices;
     cp.aw = aw;
     cp.ah = ah;
     DXGI_FORMAT dsvF, srvF;
@@ -1102,9 +1140,11 @@ int CopyFor(ID3D11DeviceContext* c, ID3D11Resource* res) {
     if (native) {
         if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&cp.arr))) return -1;
         if (!(d.BindFlags & D3D11_BIND_SHADER_RESOURCE)) srvF = DXGI_FORMAT_UNKNOWN;  // no depth view: no stash
+    } else if (fsArr) {
+        cp.arr = fsArr;  // B20 K5b: the engine's array (a color: no depth view)
     } else {
         D3D11_TEXTURE2D_DESC a = d;
-        a.ArraySize = 2;
+        a.ArraySize = slices;
         a.Width = aw;
         a.Height = ah;
         a.MiscFlags &= ~(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
@@ -1269,11 +1309,16 @@ bool OuterSize(ID3D11View* v) {
 }
 
 // B12 step 5: the slice view 1 of this pass draws into for copy cp: 2 in outer R's live forward pass on a three-slice
-// array (slice 1 holds focus L's forward until focus L's group), else 1.
-NvU32 SliceFor(const Copy& cp) { return g_p.live && g_p.eye == 1 && cp.slices >= 3 ? 2 : 1; }
+// array of the game (slice 1 holds focus L's forward until focus L's group), and (B20 K5b) in outer R's G-buffer pass on
+// the corner layout's three-slice copies (slice 1 holds focus L's G-buffer colors), else 1 (the forward pass's own
+// three-slice copies in K5b: they are bound with the G-buffer's depth copy).
+NvU32 SliceFor(const Copy& cp) {
+    if (g_p.eye != 1 || cp.slices < 3) return 1;
+    return !g_p.forward || (g_p.live && cp.native) ? 2 : 1;
+}
 // The slice of cp's array that is focus's clone for the pass's eye (0: a clone of its own; only three-slice arrays).
 int FocusSliceOfCopy(const Copy& cp) {
-    return cp.native && cp.slices >= 3 && g_p.eye >= 0 ? FocusSliceOf(cp.orig, g_p.eye) : 0;
+    return (cp.native || cp.fslice) && cp.slices >= 3 && g_p.eye >= 0 ? FocusSliceOf(cp.orig, g_p.eye) : 0;
 }
 
 // ---------------------------------------------------------------- B9d: focus clones written, focus R's twins, views
@@ -1931,12 +1976,27 @@ ID3D11ShaderResourceView* CloneSrv(ID3D11ShaderResourceView* v, bool& held) {
     e.game = v;
     ComPtr<ID3D11Resource> r;
     v->GetResource(&r);
-    // B12 step 5: a slice clone's array has no view of focus's own here (the draw counts as a screen texture miss).
     // B20 K4: FocusTarget (focus's screen textures at the game's size are the engine's, or focus R's twins of them).
-    if (ID3D11Texture2D* clone = FocusSliceOf(r.Get(), g_p.eye) ? nullptr : FocusTarget(r.Get())) {
+    // B20 K5b: a slice clone (the G-buffer's colors) gets a view of focus's slice of the array; a multisampled one has
+    // none here (B12 step 5: no screen texture of its own pass; the draw counts as a screen texture miss).
+    const int fs = FocusSliceOf(r.Get(), g_p.eye);
+    if (ID3D11Texture2D* clone = FocusTarget(r.Get())) {
         D3D11_SHADER_RESOURCE_VIEW_DESC d{};
         v->GetDesc(&d);
-        if (FAILED(g_g.dev->CreateShaderResourceView(clone, &d, &e.clone))) e.clone.Reset();
+        bool ok = true;
+        if (fs) {
+            if (d.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D) {
+                const D3D11_TEX2D_SRV t = d.Texture2D;
+                d.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+                d.Texture2DArray = {t.MostDetailedMip, t.MipLevels, (UINT)fs, 1};
+            } else if (d.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY) {
+                d.Texture2DArray.FirstArraySlice = (UINT)fs;
+                d.Texture2DArray.ArraySize = 1;
+            } else {
+                ok = false;
+            }
+        }
+        if (!ok || FAILED(g_g.dev->CreateShaderResourceView(clone, &d, &e.clone))) e.clone.Reset();
     }
     held = g_srvClones.size() < kSrvClonesMax;
     if (!held) return nullptr;  // e's views go with it: nothing to bind (a screen texture miss)
@@ -2209,8 +2269,9 @@ bool DirectOk(int eye, ID3D11Resource* orig) {
     return !g_cloneFn && clones::HasTwin(EngineOf(orig));  // B20 K4: outer's clone in the corner layout
 }
 
-// The corner of slice 1 of copy `cp` straight into focus's clone (true) or nothing written (false).
-bool ExtractDirect(ID3D11DeviceContext* c, Copy& cp, ID3D11Texture2D* clone) {
+// The corner of view 1's slice `vs` of copy `cp` straight into focus's clone (B20 K5b: into its slice `fs` of the
+// engine's array; 0: a texture of its own) (true) or nothing written (false).
+bool ExtractDirect(ID3D11DeviceContext* c, Copy& cp, ID3D11Texture2D* clone, NvU32 vs, int fs) {
     Pass& p = g_p;
     clones::RawScope raw;  // outer's group: the bind fix would put the original in place of focus's clone
     if (cp.depth) {
@@ -2222,13 +2283,14 @@ bool ExtractDirect(ID3D11DeviceContext* c, Copy& cp, ID3D11Texture2D* clone) {
         dv.Format = dsvF;
         dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
         auto* dsv = static_cast<ID3D11DepthStencilView*>(CloneViewOf(clone, 1, &dv, sizeof(dv)));
-        if (!dsv) return false;
-        DepthPass(c, cp.depthSrv.Get(), dsv, p.fw, p.fh, DepthBias(), DepthSlope(), DepthDilate());
+        if (!dsv || fs) return false;
+        DepthPass(c, cp.depthSrv.Get(), dsv, p.fw, p.fh, DepthBias(), DepthSlope(), DepthDilate(), nullptr, vs);
         return true;
     }
     const D3D11_BOX box{0, 0, 0, p.fw, p.fh, 1};
     Internal in;
-    c->CopySubresourceRegion(clone, 0, 0, 0, 0, cp.arr.Get(), D3D11CalcSubresource(0, 1, cp.desc.MipLevels), &box);
+    c->CopySubresourceRegion(clone, fs ? D3D11CalcSubresource(0, (UINT)fs, 1) : 0, 0, 0, 0, cp.arr.Get(),
+                             D3D11CalcSubresource(0, vs, cp.desc.MipLevels), &box);
     return true;
 }
 
@@ -2245,6 +2307,18 @@ void Extract(ID3D11DeviceContext* c) {
         if (!clone) return PassFailed(p, "a target without a focus clone");
         D3D11_TEXTURE2D_DESC cd{};
         clone->GetDesc(&cd);
+        // B20 K5b: view 1 drew into slice `vs`; focus's clone may be slice `fs` of the engine's array (its corner in
+        // focus's size).
+        const NvU32 vs = SliceFor(cp);
+        uint32_t sw = 0, sh = 0;
+        const int fs = FocusSliceOf(cp.orig, p.eye, &sw, &sh);
+        if (fs) {
+            if (cd.ArraySize <= (UINT)fs || cd.MipLevels != 1) return PassFailed(p, "a focus slice clone outside its array");
+            cd.Width = sw;
+            cd.Height = sh;
+            cd.ArraySize = 1;
+            cd.MiscFlags = 0;
+        }
         if (cd.Width != p.fw || cd.Height != p.fh || cd.Format != cp.desc.Format || cd.ArraySize != 1 ||
             cd.SampleDesc.Count != 1)
             return PassFailed(p, "a focus clone of another size or format");
@@ -2254,8 +2328,18 @@ void Extract(ID3D11DeviceContext* c) {
         g.desc = cd;
         g.depth = cp.depth;
         g.direct = false;
-        if (DirectOk(p.eye, cp.orig)) {
-            g.direct = ExtractDirect(c, cp, clone);
+        if (fs && cp.fslice && fs == (int)vs && cp.arr.Get() == clone) {
+            // B20 K5b: focus reads view 1's corner where the pass drew it (nothing to write). Not in a shot frame or a
+            // diagnosis mode (they read the stash), nor for focus R before its twin (its view 1 is in slice 2, focus R
+            // shares slice 1): through the stash, and Fill copies it into focus's slice.
+            if (DirectOk(p.eye, cp.orig)) {
+                g.direct = true;
+                ++g_st.sliceDirect[p.eye];
+                ++g_tot.sliceDirect[p.eye];
+                ++g_test.sliceDirect;
+            }
+        } else if (DirectOk(p.eye, cp.orig)) {
+            g.direct = ExtractDirect(c, cp, clone, vs, fs);
             if (!g.direct) {
                 ++g_st.directFails;
                 ++g_tot.directFails;
@@ -2290,12 +2374,14 @@ void Extract(ID3D11DeviceContext* c) {
         }
         if (g.depth) {
             if (!cp.depthSrv) return PassFailed(p, "the depth format has no shader view");
-            DepthPass(c, cp.depthSrv.Get(), g.dsv.Get(), p.fw, p.fh, DepthBias(), DepthSlope(), DepthDilate());
+            DepthPass(c, cp.depthSrv.Get(), g.dsv.Get(), p.fw, p.fh, DepthBias(), DepthSlope(), DepthDilate(), nullptr,
+                      vs);
         } else {
             const D3D11_BOX box{0, 0, 0, p.fw, p.fh, 1};
             Internal in;
+            clones::RawScope raw;  // outer's group: the engine's array (B20 K5b) would be read as outer's clone
             c->CopySubresourceRegion(g.tex.Get(), 0, 0, 0, 0, cp.arr.Get(),
-                                     D3D11CalcSubresource(0, 1, cp.desc.MipLevels), &box);
+                                     D3D11CalcSubresource(0, vs, cp.desc.MipLevels), &box);
         }
         ++g_st.viaStash[p.eye];
         ++g_tot.viaStash[p.eye];
@@ -2400,6 +2486,7 @@ void EndMvr(ID3D11DeviceContext* c, bool rebind) {
     if (spans) gpu::SpanBegin(p.eye ? gpu::CopyBackR : gpu::CopyBackL);
     {
         Internal in;
+        clones::RawScope raw;  // outer's group: the engine's array (B20 K5b) would be read as outer's clone
         for (Copy& cp : g_copies) {
             if (!cp.used) continue;
             if (cp.native) {  // B17: slice 0 is the game's texture
@@ -3293,6 +3380,11 @@ const char* Decide(int eye) {
     for (int k = 0; k < s.n; ++k) {
         ID3D11Texture2D* t = FocusTarget(s.g[k].orig);
         if (!t) return "a stashed target lost its focus clone";
+        uint32_t sw = 0, sh = 0;  // B20 K5b: a slice clone, its corner in focus's size
+        if (FocusSliceOf(s.g[k].orig, eye, &sw, &sh)) {
+            if (sw != s.g[k].desc.Width || sh != s.g[k].desc.Height) return "a focus clone changed";
+            continue;
+        }
         D3D11_TEXTURE2D_DESC d{};
         t->GetDesc(&d);
         if (d.Width != s.g[k].desc.Width || d.Height != s.g[k].desc.Height || d.Format != s.g[k].desc.Format ||
@@ -3311,7 +3403,15 @@ void Fill(ID3D11DeviceContext* c, int eye, bool depth = true) {
     for (int k = 0; k < s.n; ++k) {
         if (s.g[k].depth && !depth) continue;
         if (ID3D11Texture2D* t = FocusTarget(s.g[k].orig)) {
-            if (!s.g[k].direct) c->CopyResource(t, s.g[k].tex.Get());  // B15: else the pass wrote it already
+            if (s.g[k].direct) {
+                // B15: the pass wrote it already (B20 K5b: or focus reads it in its slice)
+            } else if (const int fs = FocusSliceOf(s.g[k].orig, eye)) {
+                clones::RawScope raw;  // B20 K5b: into the corner of focus's slice of the engine's array
+                c->CopySubresourceRegion(t, D3D11CalcSubresource(0, (UINT)fs, 1), 0, 0, 0, s.g[k].tex.Get(), 0,
+                                         nullptr);
+            } else {
+                c->CopyResource(t, s.g[k].tex.Get());
+            }
             // B20 K4: also the engine's texture (focus at the game's size: an identity focus clone gets a twin)
             NoteOrig(s.g[k].orig);
         } else {
@@ -3684,12 +3784,35 @@ void CompareColor(ID3D11DeviceContext* c, const char* what, ID3D11Texture2D* own
 }
 
 // After focus L's own pass: its targets.
+// B20 K5b: the corner of focus's slice of an engine array as a texture like `d` (null: not a slice clone or no copy).
+ComPtr<ID3D11Texture2D> SliceCorner(ID3D11DeviceContext* c, ID3D11Resource* orig, int eye, const D3D11_TEXTURE2D_DESC& d) {
+    ComPtr<ID3D11Texture2D> out;
+    uint32_t w = 0, h = 0;
+    const int fs = FocusSliceOf(orig, eye, &w, &h);
+    ID3D11Texture2D* arr = fs ? FocusTarget(orig) : nullptr;
+    if (!arr || (d.BindFlags & D3D11_BIND_DEPTH_STENCIL)) return out;
+    D3D11_TEXTURE2D_DESC cd = d;
+    cd.ArraySize = 1;
+    cd.MipLevels = 1;
+    cd.MiscFlags = 0;
+    if (FAILED(g_g.dev->CreateTexture2D(&cd, nullptr, &out))) return out;
+    D3D11_TEXTURE2D_DESC ad{};
+    arr->GetDesc(&ad);
+    const D3D11_BOX box{0, 0, 0, w, h, 1};
+    Internal in;
+    clones::RawScope raw;
+    c->CopySubresourceRegion(out.Get(), 0, 0, 0, 0, arr, D3D11CalcSubresource(0, (UINT)fs, ad.MipLevels), &box);
+    return out;
+}
+
 void ShotFocusAfter(ID3D11DeviceContext* c) {
     Shot& sh = g_shot;
     sh.focusDone = true;
     const Stash& s = g_stash[0];
     for (int k = 0; k < sh.n; ++k) {
-        ID3D11Texture2D* t = FocusTarget(s.g[k].orig);  // B20 K2: the engine's texture with focus at the game's size
+        // B20 K2: the engine's texture with focus at the game's size; B20 K5b: the corner of focus L's slice of it
+        ComPtr<ID3D11Texture2D> corner = SliceCorner(c, s.g[k].orig, 0, s.g[k].desc);
+        ID3D11Texture2D* t = corner ? corner.Get() : FocusSliceOf(s.g[k].orig, 0) ? nullptr : FocusTarget(s.g[k].orig);
         const DXGI_FORMAT f = s.g[k].desc.Format;
         if (t && s.g[k].tex && f >= DXGI_FORMAT_R16G16B16A16_TYPELESS && f <= DXGI_FORMAT_R16G16B16A16_SINT)
             CompareRgba16(c, k, t, s.g[k].tex.Get());
@@ -4190,6 +4313,7 @@ bool Install() {
         g_nativeOn = Cfg().mvrNativeTargets;
         g_msColorSkip = Cfg().mvrMsColorSkip;
         g_msSlices = Cfg().mvrMsSlices;
+        g_gbufSlices = Cfg().mvrGbufferSlices;
         g_ltOn = Cfg().mvrLiveTrackSkip;
         g_installed = true;
         Log("MVR G-buffer: on; outer L's and outer R's G-buffer pass draw the eye's focus too (MVR, view 1 in the "
@@ -4273,6 +4397,9 @@ void OnFrameStart(bool enabled) {
             g_cloneGen = cg;
             g_cloneViews.clear();
             g_srvClones.clear();
+            // B20 K5b: a copy may now draw into an engine array (or no more): made again at the next bind
+            g_views.clear();
+            for (Copy& cp : g_copies) cp = Copy{};
         }
         // Copies not used for a while (B17: the game's targets became arrays, or the other mode) are released.
         for (int k = 0; k < (int)g_copies.size(); ++k)
@@ -5110,7 +5237,9 @@ bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* r
         if (p.forward) {  // their content goes in before the next draw (a clear first makes it unneeded)
             for (UINT i = 0; i < n && i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) MarkPending(rtvOut[i]);
             MarkPending(*dsvOut);
-            // B12 step 5: view 1's slice for the bound copies (all of them must agree).
+        }
+        {
+            // B12 step 5, B20 K5b: view 1's slice for the bound copies (all of them must agree).
             NvU32 want = 0;
             bool split = false;
             auto slice = [&](ID3D11View* v) {
@@ -5204,11 +5333,13 @@ bool SliceDesc(D3D11_DEPTH_STENCIL_VIEW_DESC& d, UINT slice) {
 ID3D11View* ClearOwnSlices(ID3D11DeviceContext* c, ID3D11View* m, ID3D11View* game, const FLOAT* col, UINT flags,
                            FLOAT d, UINT8 st) {
     const int k = CopyOfView(m);
-    if (k < 0 || !g_copies[k].native || g_copies[k].slices < 3 || !g_copies[k].arr) return nullptr;
+    if (k < 0 || !(g_copies[k].native || g_copies[k].fslice) || g_copies[k].slices < 3 || !g_copies[k].arr)
+        return nullptr;
     Copy& cp = g_copies[k];
     ComPtr<ID3D11Resource> gr;
     game->GetResource(&gr);
-    if (gr.Get() != (ID3D11Resource*)cp.arr.Get()) return nullptr;
+    // B20 K5b: the game clears outer's clone's view (the slices' descriptions from it: the same format)
+    if (gr.Get() != (ID3D11Resource*)cp.arr.Get() && !(cp.fslice && gr.Get() == cp.orig)) return nullptr;
     const UINT slice = SliceFor(cp);
     ID3D11View *one = nullptr, *zero = nullptr;
     if (!cp.depth) {
@@ -5254,11 +5385,9 @@ ID3D11RenderTargetView* MapClear(ID3D11DeviceContext* c, ID3D11RenderTargetView*
         ++g_p.clears;
         if (ID3D11RenderTargetView* m = ArrayRtv(c, v)) {
             out = m;
-            if (g_p.forward) {
-                FillCopy(c, m, true);  // B12: the clear covers both slices
-                // B12 step 5: not the other eye's slice
-                if (ID3D11View* z = ClearOwnSlices(c, m, v, col, 0, 0, 0)) out = static_cast<ID3D11RenderTargetView*>(z);
-            }
+            if (g_p.forward) FillCopy(c, m, true);  // B12: the clear covers both slices
+            // B12 step 5, B20 K5b (the G-buffer pass too): not the other eye's slice
+            if (ID3D11View* z = ClearOwnSlices(c, m, v, col, 0, 0, 0)) out = static_cast<ID3D11RenderTargetView*>(z);
         }
     });
     return out;
@@ -5287,9 +5416,9 @@ ID3D11DepthStencilView* MapClear(ID3D11DeviceContext* c, ID3D11DepthStencilView*
                 const bool hasStencil = dd.Format == DXGI_FORMAT_D24_UNORM_S8_UINT ||
                                         dd.Format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
                 FillCopy(c, m, (flags & D3D11_CLEAR_DEPTH) && (!hasStencil || (flags & D3D11_CLEAR_STENCIL)));
-                if (ID3D11View* z = ClearOwnSlices(c, m, v, nullptr, flags, depth, stencil))  // B12 step 5
-                    out = static_cast<ID3D11DepthStencilView*>(z);
             }
+            if (ID3D11View* z = ClearOwnSlices(c, m, v, nullptr, flags, depth, stencil))  // B12 step 5, B20 K5b
+                out = static_cast<ID3D11DepthStencilView*>(z);
         }
     });
     return out;
@@ -5346,11 +5475,14 @@ bool BeforeDraw(ID3D11DeviceContext* c) {
 void AfterDraw(ID3D11DeviceContext*) {}
 
 // B11: the linear depth among the PS shader resources of the velocity pass's first draw (its camera motion pass reads
-// it): an R32 float view of a plain w x h texture. Null when none or more than one distinct texture.
-static ComPtr<ID3D11Texture2D> LinearDepthOfDraw(ID3D11DeviceContext* c, UINT w, UINT h) {
+// it): an R32 float view of a plain w x h texture, or (B20 K5b: a G-buffer color as focus's slice of the engine's
+// three-slice array; run 2 of 2026-11-16 found none) a view of one slice of such an array (`slice`). Null when none or
+// more than one distinct one.
+static ComPtr<ID3D11Texture2D> LinearDepthOfDraw(ID3D11DeviceContext* c, UINT w, UINT h, UINT& slice) {
     ID3D11ShaderResourceView* srv[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
     c->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, srv);
     ComPtr<ID3D11Texture2D> found;
+    UINT foundSlice = 0;
     bool twice = false;
     for (ID3D11ShaderResourceView* v : srv) {
         if (!v) continue;
@@ -5359,17 +5491,22 @@ static ComPtr<ID3D11Texture2D> LinearDepthOfDraw(ID3D11DeviceContext* c, UINT w,
         ComPtr<ID3D11Resource> r;
         v->GetResource(&r);
         ComPtr<ID3D11Texture2D> t;
-        if (vd.Format == DXGI_FORMAT_R32_FLOAT && vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D && r &&
-            SUCCEEDED(r.As(&t))) {
+        const bool plain = vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D;
+        const bool oneSlice = vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY && vd.Texture2DArray.ArraySize == 1;
+        if (vd.Format == DXGI_FORMAT_R32_FLOAT && (plain || oneSlice) && r && SUCCEEDED(r.As(&t))) {
             D3D11_TEXTURE2D_DESC d{};
             t->GetDesc(&d);
-            if (d.Width == w && d.Height == h && d.ArraySize == 1 && d.SampleDesc.Count == 1) {
-                if (found && found.Get() != t.Get()) twice = true;
+            const UINT s = oneSlice ? vd.Texture2DArray.FirstArraySlice : 0;
+            if (d.Width == w && d.Height == h && (plain ? d.ArraySize == 1 : s < d.ArraySize) && d.MipLevels == 1 &&
+                d.SampleDesc.Count == 1) {
+                if (found && (found.Get() != t.Get() || foundSlice != s)) twice = true;
                 found = t;
+                foundSlice = s;
             }
         }
         v->Release();
     }
+    slice = foundSlice;
     return twice ? nullptr : found;
 }
 
@@ -5400,12 +5537,13 @@ static bool VelocityDraw(ID3D11DeviceContext* c, int e) {
             } else {
                 D3D11_TEXTURE2D_DESC td{};
                 target->GetDesc(&td);
-                const ComPtr<ID3D11Texture2D> depth = LinearDepthOfDraw(c, td.Width, td.Height);
+                UINT slice = 0;
+                const ComPtr<ID3D11Texture2D> depth = LinearDepthOfDraw(c, td.Width, td.Height, slice);
                 if (!depth) {
                     why = "no linear depth (R32 at the target's size) at the pass's first draw";
                 } else {
                     Internal in;
-                    if (g_velFill(c, e, depth.Get(), target.Get(), &why)) v.state = VelFilled;
+                    if (g_velFill(c, e, depth.Get(), slice, target.Get(), &why)) v.state = VelFilled;
                 }
             }
         }
@@ -5506,7 +5644,8 @@ void LogStats(bool totals) {
         "buffers %llu), mixed binds %llu, late binds %llu (draws after them %llu), map failures %llu, SetMultiViewMode failures %llu; "
         "patched PS with view 1's rows (mvr_gbuffer_ps %s) %llu draws, kept as before (screen textures) %llu, live "
         "track maps from outer %llu (failed %llu); slice 1 straight into focus's clones (mvr_direct_extract %s) L %llu "
-        "/ R %llu targets, through the stash L %llu / R %llu, direct writes failed %llu; the game's own two-slice "
+        "/ R %llu targets (of them read in their slice, mvr_gbuffer_slices %s, L %llu / R %llu), through the stash L "
+        "%llu / R %llu, direct writes failed %llu; the game's own two-slice "
         "arrays (mvr_native_targets %s) G-buffer %llu / forward %llu targets, copied in and back G-buffer %llu / "
         "forward %llu; corner layout (B20, outer %u x %u, focus %u x %u, game %u x %u) L %llu / R %llu passes, "
         "viewports of other sizes %llu, set to the slices' before a draw G-buffer %llu / forward %llu; at DLSS SR's "
@@ -5526,6 +5665,7 @@ void LogStats(bool totals) {
         (unsigned long long)s.viewsFailures, g_gbufPsOn ? "on" : "off", (unsigned long long)s.gbufPsDraws,
         (unsigned long long)s.gbufPsKept, (unsigned long long)s.liveTracks, (unsigned long long)s.liveTrackFails,
         g_directOn ? "on" : "off", (unsigned long long)s.direct[0], (unsigned long long)s.direct[1],
+        g_gbufSlices ? "on" : "off", (unsigned long long)s.sliceDirect[0], (unsigned long long)s.sliceDirect[1],
         (unsigned long long)s.viaStash[0], (unsigned long long)s.viaStash[1], (unsigned long long)s.directFails,
         g_nativeOn ? "on" : "off", (unsigned long long)s.nativeT[0], (unsigned long long)s.nativeT[1],
         (unsigned long long)s.copiedT[0], (unsigned long long)s.copiedT[1],
@@ -5714,9 +5854,19 @@ void TestNative(NativeFn isArray, WantArrayFn want, SliceFn slice, OuterSliceFn 
     g_wantFn = want;
     g_sliceFn = slice;
     g_outerSliceFn = outerSlice;
+    // As a clone generation change in the game (OnFrameStart): the copies are made again at their next bind.
+    g_views.clear();
+    for (Copy& cp : g_copies) cp = Copy{};
 }
 
 TestState TestGet() { return g_test; }
+
+ID3D11Texture2D* TestLinearDepth(ID3D11DeviceContext* c, UINT w, UINT h, UINT* slice) {
+    UINT s = 0;
+    const ComPtr<ID3D11Texture2D> t = LinearDepthOfDraw(c, w, h, s);
+    if (slice) *slice = s;
+    return t.Get();  // the bound view keeps it
+}
 
 void TestDepthBias(int steps, float slope, bool dilate) {
     g_testBias = steps;

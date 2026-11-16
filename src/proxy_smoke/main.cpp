@@ -1859,6 +1859,28 @@ int RunClones() {
         resO->Release();
         resF->Release();
     }
+    {
+        // B20 K5b: a focus group's copy of J's array as the game's single texture goes to its slice (1 focus L, 2 focus
+        // R's twin), CopyResource and CopySubresourceRegion alike.
+        ID3D11Texture2D* cpF = tex(64, 48);
+        const uint64_t c0 = cl::TestGet().sliceCopies;
+        auto copyIn = [&](int eye, bool region) {
+            cl::SetFocusEye(eye);
+            cl::BeginGroup(ctx, cl::Focus);
+            if (region)
+                ctx->CopySubresourceRegion(cpF, 0, 0, 0, 0, J.at<ID3D11Texture2D*>(0x58), 0, nullptr);
+            else
+                ctx->CopyResource(cpF, J.at<ID3D11Texture2D*>(0x58));
+            cl::EndGroup(ctx);
+            cl::SetFocusEye(0);
+            return pixel(cpF);
+        };
+        const uint32_t cL = copyIn(0, false), cR = copyIn(1, false), cRr = copyIn(1, true);
+        expect(cL == 0xFFFF0000u && cR == 0xFF0000FFu && cRr == 0xFF0000FFu && cl::TestGet().sliceCopies - c0 == 3,
+               "outer slice: focus L's copy of J's array from slice 1, focus R's (CopyResource, CopySubresourceRegion) "
+               "from slice 2");
+        cpF->Release();
+    }
     ID3D11Resource* shotList[8] = {};
     char shotLabels[8][64] = {};
     expect(cl::ListForShot(cl::Outer, shotList, shotLabels, 8) == 0, "outer slice: no outer clone of its own to shoot");

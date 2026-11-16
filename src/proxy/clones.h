@@ -205,7 +205,7 @@ struct TestState {
     int twins = 0, twinViews = 0;
     int arrays = 0;  // B17
     uint64_t arrayFixes = 0, arrayLazy = 0, arrayCopies = 0;
-    uint64_t sliceResolves = 0, sliceResolveFails = 0;  // B20 K5
+    uint64_t sliceResolves = 0, sliceResolveFails = 0, sliceCopies = 0;  // B20 K5
 };
 TestState TestGet();
 

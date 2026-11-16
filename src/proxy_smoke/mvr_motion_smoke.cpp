@@ -265,8 +265,8 @@ int RunMvrMotion() {
         if (uavTex) dev->CreateUnorderedAccessView(uavTex, nullptr, &gameUav);
         dev->CreateShaderResourceView(outerDepthTex, nullptr, &gameSrv);
         dev->CreateBuffer(&bd, nullptr, &gameCb);
-        bool fillOk = false, refusedOk = false, stateOk = false, forFocusOk = false;
-        int same = -1;
+        bool fillOk = false, refusedOk = false, stateOk = false, forFocusOk = false, sliceOk = false;
+        int same = -1, sliceSame = -1;
         if (target && gameUav && gameSrv && gameCb && !ref.empty()) {
             // The game's CS state while its pass runs.
             ctx->CSSetShaderResources(2, 1, &gameSrv);
@@ -296,14 +296,44 @@ int RunMvrMotion() {
             same = 0;
             for (size_t i = 0; i < got.size() && i < ref.size(); ++i) same += got[i] == ref[i];
             forFocusOk = !qvfr::mvrmotion::ForFocus(ctx, 0, depthTex, nullptr, kFW, kFH, 7, false);
+            // B20 K5b: the linear depth as slice 1 of a three-slice array (slices 0 and 2 hold another depth): the
+            // same vectors.
+            sliceSame = 0;
+            D3D11_TEXTURE2D_DESC ad{};
+            depthTex->GetDesc(&ad);
+            ad.ArraySize = 3;
+            ID3D11Texture2D* arr = nullptr;
+            if (SUCCEEDED(dev->CreateTexture2D(&ad, nullptr, &arr)) && arr) {
+                const std::vector<float> other((size_t)kFW * kFH, 3.5f);
+                for (UINT k : {0u, 2u})
+                    ctx->UpdateSubresource(arr, D3D11CalcSubresource(0, k, 1), nullptr, other.data(), kFW * 4, 0);
+                ctx->CopySubresourceRegion(arr, D3D11CalcSubresource(0, 1, 1), 0, 0, 0, depthTex, 0, nullptr);
+                const float zero[4] = {};
+                ID3D11RenderTargetView* rtv = nullptr;
+                D3D11_RENDER_TARGET_VIEW_DESC rv{};
+                rv.Format = DXGI_FORMAT_R16G16_FLOAT;
+                rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                if (SUCCEEDED(dev->CreateRenderTargetView(target, &rv, &rtv)) && rtv) {
+                    ctx->ClearRenderTargetView(rtv, zero);
+                    rtv->Release();
+                }
+                const char* why3 = "unset";
+                sliceOk = qvfr::mvrmotion::FillFocus(ctx, 0, arr, target, 7, &why3, 1) && !why3;
+                const std::vector<uint32_t> got3 = ReadTexels(dev, ctx, target);
+                for (size_t i = 0; i < got3.size() && i < ref.size(); ++i) sliceSame += got3[i] == ref[i];
+                arr->Release();
+            }
             printf("MVR motion fill (B11): written %s, refused without outer's copy of the frame %s (%s), CS state put "
-                   "back %s, target equals the compute pass %d / %u px, ForFocus leaves it %s\n",
+                   "back %s, target equals the compute pass %d / %u px, ForFocus leaves it %s; the depth as slice 1 of an "
+                   "array (B20 K5b) %s, %d / %u px equal\n",
                    fillOk ? "ok" : "FAIL", refusedOk ? "ok" : "FAIL", why2 ? why2 : "-", stateOk ? "ok" : "FAIL", same,
-                   kFW * kFH, forFocusOk ? "ok" : "FAIL");
+                   kFW * kFH, forFocusOk ? "ok" : "FAIL", sliceOk ? "ok" : "FAIL", sliceSame, kFW * kFH);
         } else {
             printf("MVR motion fill (B11): objects failed\n");
         }
-        if (!fillOk || !refusedOk || !stateOk || !forFocusOk || same != (int)(kFW * kFH)) ++fails;
+        if (!fillOk || !refusedOk || !stateOk || !forFocusOk || same != (int)(kFW * kFH) || !sliceOk ||
+            sliceSame != (int)(kFW * kFH))
+            ++fails;
         for (IUnknown* o : {(IUnknown*)target, (IUnknown*)uavTex, (IUnknown*)gameUav, (IUnknown*)gameSrv,
                             (IUnknown*)gameCb})
             if (o) o->Release();

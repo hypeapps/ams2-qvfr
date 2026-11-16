@@ -284,7 +284,7 @@ struct FillCall {
     ID3D11RenderTargetView* rtv = nullptr;
 };
 FillCall g_fill;
-bool FakeFill(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Texture2D* target, const char** why) {
+bool FakeFill(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, UINT, ID3D11Texture2D* target, const char** why) {
     ++g_fill.calls;
     g_fill.eye = eye;
     g_fill.depth = depth;
@@ -1586,6 +1586,103 @@ int RunMvrForward() {
         qvfr::mvrpass::SetSizes(0, 0, 0, 0, 0, 0);
         qvfr::mvrpass::TestOriginal(nullptr);
     }
+    // B20 K5b: the same corner pass with focus's screen texture gt0 as slice 1 of a three-slice array (a G-buffer color
+    // with mvr_gbuffer_slices; slices 0 and 2 hold something else). The patched PS declares a Texture2D, which no view of
+    // an array is: view 1 must read the slice through a texture of its own. Focus's targets as in the corner run above.
+    static ComPtr<ID3D11Texture2D> s_gtArr;
+    std::vector<uint64_t> kfC, kfD;
+    qvfr::mvrpass::TestLiveState klv{};
+    if (cornerMade) {
+        D3D11_TEXTURE2D_DESC ad{};
+        g_s.focus.gt0->GetDesc(&ad);
+        ad.ArraySize = 3;
+        std::vector<float> other((size_t)ad.Width * ad.Height * 4, 7.0f);
+        if (SUCCEEDED(dev->CreateTexture2D(&ad, nullptr, &s_gtArr))) {
+            for (UINT k : {0u, 2u})
+                ctx->UpdateSubresource(s_gtArr.Get(), D3D11CalcSubresource(0, k, 1), nullptr, other.data(), ad.Width * 16, 0);
+            ctx->CopySubresourceRegion(s_gtArr.Get(), D3D11CalcSubresource(0, 1, 1), 0, 0, 0, g_s.focus.gt0.Get(), 0,
+                                       nullptr);
+            ctx->ClearRenderTargetView(s_oc.rtv.Get(), kOuterColor);
+            ctx->ClearDepthStencilView(s_oc.dsv.Get(), D3D11_CLEAR_DEPTH, kDepthLeft, 0);
+            Restore();
+            ctx->ClearRenderTargetView(g_s.focus.halfRtv.Get(), mark);
+            ctx->ClearDepthStencilView(g_s.focus.halfDsv.Get(), D3D11_CLEAR_DEPTH, 0.25f, 0);
+            qvfr::mvrpass::TestOriginal([](ID3D11Resource* r) -> ID3D11Resource* {
+                const Set& o = s_oc;
+                const Set& f = g_s.focus;
+                if (r == o.color.Get()) return f.color.Get();
+                if (r == o.depth.Get()) return f.depth.Get();
+                if (r == o.gt0.Get()) return s_gtArr.Get();
+                if (r == o.gt2.Get()) return f.gt2.Get();
+                if (r == o.half.Get()) return f.half.Get();
+                if (r == o.halfDepth.Get()) return f.halfDepth.Get();
+                return r;
+            });
+            qvfr::mvrpass::TestNative(nullptr, nullptr, [](ID3D11Resource* r, int, uint32_t* w, uint32_t* h) {
+                if (r != s_oc.gt0.Get() && r != s_gtArr.Get()) return 0;
+                if (w) *w = kFW;
+                if (h) *h = kFH;
+                return 1;
+            });
+            qvfr::mvrpass::SetSizes(kFW, kFH, kOW, kOH, kFW, kFH);
+            qvfr::mvrpass::OnFrameStart(true);
+            qvfr::mvrpass::SetWindow(0, true, sx, ox, sy, oy, kFW, kFH);
+            qvfr::mvrpass::TestForwardLive(g_vtPhase3);
+            g_outerSet = &s_oc;
+            FakeTask outerK5{g_vtPhase3};
+            if (!qvfr::mvrpass::BeforeTask((uint8_t*)&outerK5, 0)) RunTask(outerK5);
+            qvfr::mvrpass::AfterTask((uint8_t*)&outerK5);
+            g_outerSet = nullptr;
+            klv = qvfr::mvrpass::TestLiveGet();
+            kfC = Read(g_s.focus.color.Get());
+            kfD = Read(g_s.focus.depth.Get());
+            qvfr::mvrpass::TestEnd();
+            qvfr::mvrpass::TestNative(nullptr, nullptr);
+            qvfr::mvrpass::SetSizes(0, 0, 0, 0, 0, 0);
+            qvfr::mvrpass::TestOriginal(nullptr);
+        }
+    }
+    // B20 K5b, B11: the velocity pass's linear depth as a view of slice 1 of an R32 three-slice array is found with its
+    // slice; a view of all three slices is not.
+    bool k5bDepthOk = false;
+    {
+        ComPtr<ID3D11Texture2D> la = Tex(kFW, kFH, DXGI_FORMAT_R32_TYPELESS, D3D11_BIND_SHADER_RESOURCE);
+        D3D11_TEXTURE2D_DESC ld{};
+        if (la) la->GetDesc(&ld);
+        la.Reset();
+        ld.ArraySize = 3;
+        ComPtr<ID3D11ShaderResourceView> one, all;
+        if (ld.Width && SUCCEEDED(dev->CreateTexture2D(&ld, nullptr, &la))) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+            sv.Format = DXGI_FORMAT_R32_FLOAT;
+            sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+            sv.Texture2DArray = {0, 1, 1, 1};
+            dev->CreateShaderResourceView(la.Get(), &sv, &one);
+            sv.Texture2DArray = {0, 1, 0, 3};
+            dev->CreateShaderResourceView(la.Get(), &sv, &all);
+        }
+        if (one && all) {
+            UINT s1 = 9, s2 = 9;
+            ID3D11ShaderResourceView* v = one.Get();
+            ctx->PSSetShaderResources(0, 1, &v);
+            ID3D11Texture2D* f1 = qvfr::mvrpass::TestLinearDepth(ctx.Get(), kFW, kFH, &s1);
+            v = all.Get();
+            ctx->PSSetShaderResources(0, 1, &v);
+            ID3D11Texture2D* f2 = qvfr::mvrpass::TestLinearDepth(ctx.Get(), kFW, kFH, &s2);
+            ID3D11ShaderResourceView* none = nullptr;
+            ctx->PSSetShaderResources(0, 1, &none);
+            k5bDepthOk = f1 == la.Get() && s1 == 1 && !f2;
+        }
+    }
+    printf("  B20 K5b, B11: the linear depth as one slice of an array found with its slice, a view of all slices not "
+           "(%s)\n", k5bDepthOk ? "OK" : "WRONG");
+    int k5bDiff = 0;
+    if (kfC.size() != cfC.size() || kfD.size() != cfD.size() || kfC.empty()) {
+        k5bDiff = 1 << 30;
+    } else {
+        for (size_t i = 0; i < kfC.size(); ++i) k5bDiff += kfC[i] != cfC[i] || kfD[i] != cfD[i];
+    }
+    const bool k5bOk = cornerMade && klv.passes == 1 && klv.ok == 1 && k5bDiff == 0 && k5bDepthOk;
     const int opx = (int)(kOW * kOH);
     int cOuterC = 0, cOuterD = 0, cFC = 0, cFD = 0, cHalf = 0, cHalfD = 0, cCovered = 0;
     float cOuterMax = 0, cOuterDMax = 0;
@@ -1738,7 +1835,10 @@ int RunMvrForward() {
     const unsigned long long psReads = qvfr::sunfx::PsReads();
     const bool trackOk = trkChecks > 0 && trkMis == 0;
     const bool ok = countsOk && outerOk && focusOk && liveOk && velSkipOk && gbufOk && nativeOk && msaa.ok && ltOk &&
-                    trackOk && cornerOk && !warnings;
+                    trackOk && cornerOk && k5bOk && !warnings;
+    printf("  B20 K5b: the same with focus's screen texture as slice 1 of a three-slice array: passes %u, ok %u (%s); "
+           "focus's color and depth vs the corner run %d px differ (%s)\n",
+           klv.passes, klv.ok, klv.why.empty() ? "-" : klv.why.c_str(), k5bDiff, k5bOk ? "OK" : "WRONG");
     printf("  B20 K4: live pass in the corner layout (outer %ux%u, focus at the game's size %ux%u): passes %u, ok %u "
            "(%s); outer vs its own pass: color %d px by > 2/255 (max %.4f), depth %d px off (max %.2g); focus vs its own "
            "pass: %d px covered, color %d px by > 0.02, depth %d px off; 1/2 clears %u (missed %u), left %d / %d px; "

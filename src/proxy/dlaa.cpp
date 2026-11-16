@@ -1171,7 +1171,16 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             }
             ID3D11Texture2D* s = ScratchFor(d[i], vf[i], D3D11_BIND_SHADER_RESOURCE);
             if (!s) return;
-            c->CopyResource(s, tex[i]);
+            // B20 K5b: the slice the game's view reads (focus's slice of the engine's three-slice array; MVR B17's
+            // arrays: slice 0), not the array as a whole (a copy of it sees slice 0 without the clones' hooks).
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+            static_cast<ID3D11ShaderResourceView*>(views[i])->GetDesc(&sd);
+            const UINT slice = sd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY ? sd.Texture2DArray.FirstArraySlice : 0;
+            if (d[i].ArraySize == 1)
+                c->CopyResource(s, tex[i]);
+            else
+                for (UINT m = 0; m < d[i].MipLevels; ++m)
+                    c->CopySubresourceRegion(s, m, 0, 0, 0, tex[i], D3D11CalcSubresource(m, slice, d[i].MipLevels), nullptr);
             in[i] = s;
         }
         ID3D11Texture2D* out = ScratchFor(d[3], d[3].Format, D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);

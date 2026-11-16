@@ -178,14 +178,24 @@ bool GetMsColorSkip();
 // outer's views like the engine's, its sizes outer's, the corner at the top left), slices 1 and 2 focus's as above.
 // Until they are made the pass refuses (D3D11 copies no part of a multisampled texture); then it runs like B12 step 5
 // with view 0 in the corner of slice 0 (B20 K2) and copies nothing.
+// B20 K5b (docs/mvr.md), [debug] mvr_gbuffer_slices (restart only, default on): in the corner layout without DLSS SR
+// (focus at the game's size) the G-buffer pass's colors ask for their engine textures as three-slice arrays at the
+// game's size (clones::WantArray: focus L's clone slice 1, focus R's twin slice 2, the engine's views slice 0; outer's
+// clone stays a texture of its own). The pass then draws into the array: view 0 into slice 0's corner (copied back into
+// outer's clone as before), view 1 straight into focus's slice (no extract copy, counted "read in their slice"; a shot
+// frame, a diagnosis mode or focus R before its twin go through the stash, and Fill copies it into focus's slice). The
+// corner layout's other copies (the G-buffer's depth: focus gets it conservative; the forward pass's, bound with that
+// depth) get three slices, so outer R's G-buffer pass draws view 1 into slice 2 of all its targets; each clear of a
+// slice array covers slice 0 and the eye's slice only.
 // B11 (docs/mvr.md), [debug] mvr_velocity_skip (live, hotkey mvr_modifier + mvr_velocity_skip_key), mode 3 only: at the
 // first draw of the focus group's velocity pass (the bind above) the fill source writes the focus view's motion vectors
 // from outer (mvr_motion, B10) into the pass's target, and the pass's draws are skipped (the engine's object loop
 // stays, its draw calls go). The camera motion pass at its start reads the linear depth: the fill gets it from the PS
 // shader resources of that draw (R32 at the target's size). When the source refuses (shot frame, DLAA off, the forward
 // not from outer, ...) the pass draws as before.
-using VelocityFillFn = bool (*)(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Texture2D* target,
-                                const char** why);
+// `slice`: the linear depth's slice (B20 K5b: a G-buffer color as focus's slice of the engine's three-slice array).
+using VelocityFillFn = bool (*)(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, UINT slice,
+                                ID3D11Texture2D* target, const char** why);
 void SetVelocityFill(VelocityFillFn fn);
 void SetVelocitySkip(bool on);
 // B11: focus eye `eye`'s velocity pass got outer's vectors (and dropped its draws) in this frame, or in the previous
@@ -302,6 +312,7 @@ struct TestState {
     unsigned gbufPsDraws = 0, gbufPsKept = 0, srvMisses = 0;
     bool liveTrack = false;
     unsigned direct = 0;  // B15: targets written straight into focus's clones (in the frame)
+    unsigned sliceDirect = 0;  // B20 K5b: of them, colors focus reads in their slice (nothing written)
     unsigned native = 0;  // B17: the last pass's targets that were the game's own arrays
     bool corner = false;  // B20 K2: the last pass ran in the corner layout (its slices sw x sh)
     bool sr = false;      // S2.2: ... at DLSS SR's render sizes (SetSceneSizes, SetSrActive)
@@ -310,6 +321,9 @@ struct TestState {
     const char* earlyWhy = nullptr;  // B20 K3: the latest reason an early run did not go (static text)
 };
 TestState TestGet();
+// B11 in the smoke: the linear depth B11 finds among the bound PS shader resources for a w x h target (null: none) and
+// its slice.
+ID3D11Texture2D* TestLinearDepth(ID3D11DeviceContext* c, UINT w, UINT h, UINT* slice);
 ID3D11Texture2D* TestArray(int k);
 // Overrides mvr_depth_bias, mvr_depth_slope and mvr_depth_dilate (steps < 0: the settings).
 void TestDepthBias(int steps, float slope, bool dilate);  // the two-slice copy of target k (not referenced), null when none

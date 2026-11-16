@@ -248,6 +248,10 @@ struct Config {
     // outer R draws focus R into slice 2, and focus's clones of them are slices 1 (focus L) and 2 (focus R) of the
     // array itself (no copy out of the corner).
     bool mvrMsSlices = true;
+    // Restart only (docs/mvr.md B20 K5b, mvr_pass.h): in the corner layout without DLSS SR (focus at the game's size) the
+    // G-buffer pass's colors become three-slice arrays whose slices 1 and 2 are focus L's and focus R's clones of them
+    // (no extract copy), and the pass's other copies get three slices (outer R draws view 1 into slice 2).
+    bool mvrGbufferSlices = true;
     // Restart only (docs/mvr.md B20 K4): the original bytecode of every pixel shader the MVR PS patch changes goes to
     // x64\qvfr\ps_dump\<checksum>.dxbc (for a disassembly: how the game's forward PS read their screen textures).
     bool mvrPsDump = false;

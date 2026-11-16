@@ -353,13 +353,13 @@ bool MotionWindows(int eye, mvrmotion::Map* cur, mvrmotion::Map* prev, bool* fro
 
 // mvr_pass's velocity fill (B11): mvr_motion writes into the focus velocity pass's target, except in a shot frame
 // (the shot compares mvr_motion's vectors with the velocity pass's).
-bool FillFocusMotion(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Texture2D* target,
+bool FillFocusMotion(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, UINT slice, ID3D11Texture2D* target,
                      const char** why) {
     if (g_shotFrame) {
         *why = "shot frame";
         return false;
     }
-    return mvrmotion::FillFocus(c, eye, depth, target, dlaa::Frame(), why);
+    return mvrmotion::FillFocus(c, eye, depth, target, dlaa::Frame(), why, slice);
 }
 bool g_mvrMapKeyDown = false;
 bool g_mapFrame = false;  // a task map with PS resources in this frame (mvr_map_key)

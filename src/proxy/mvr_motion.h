@@ -57,9 +57,10 @@ ID3D11Texture2D* ForFocus(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* dept
 // The focus group's velocity pass of the eye, at its first draw (B11): `depth` = the focus view's linear depth (R32),
 // `target` = the velocity pass's target (R16G16, the same size). Writes this module's vectors into `target` when they
 // are on, the eye's focus image comes from outer in this frame and outer's copy is from `frame` (DLAA's counter).
-// False: nothing written (the velocity pass must draw); the reason goes to *why (static text).
+// False: nothing written (the velocity pass must draw); the reason goes to *why (static text). `slice`: the depth's
+// slice (B20 K5b: focus's slice of the engine's three-slice array).
 bool FillFocus(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Texture2D* target, uint64_t frame,
-               const char** why);
+               const char** why, UINT slice = 0);
 
 std::string Describe();
 void LogStats(bool totals);
