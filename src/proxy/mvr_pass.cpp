@@ -157,6 +157,15 @@ int FocusSliceOf(ID3D11Resource* orig, int eye, uint32_t* w = nullptr, uint32_t*
     return clones::FocusSlice((ID3D11Resource*)clones::Original(orig), eye, w, h);
 }
 bool FrameJitter(float j[2]) { return g_jitterFn && g_jitterFn(j); }
+// B20 K5: an array of the game's size whose outer clone is its own slice 0 (outer's corner w x h): the multisampled
+// forward targets in the corner layout (clones::OuterSlice; the smoke's stand-in).
+OuterSliceFn g_outerSliceFn = nullptr;
+bool OuterSliceOf(ID3D11Resource* r, uint32_t* w, uint32_t* h) {
+    if (!r) return false;
+    if (g_outerSliceFn) return g_outerSliceFn(r, w, h);
+    if (g_cloneFn) return false;
+    return clones::OuterSlice(r, w, h);
+}
 
 thread_local bool t_pass = false;      // the MVR part of a pass runs on this thread
 thread_local bool t_internal = false;  // the module's own D3D11 calls
@@ -198,6 +207,16 @@ D3D11_TEXTURE2D_DESC DescOf(ID3D11Resource* r, bool* ok = nullptr) {
     const bool got = r && SUCCEEDED(r->QueryInterface(IID_PPV_ARGS(&t)));
     if (got) t->GetDesc(&d);
     if (ok) *ok = got;
+    return d;
+}
+// DescOf with the size outer's work sees (B20 K5: an outer slice array's corner, else the texture's).
+D3D11_TEXTURE2D_DESC SeenDescOf(ID3D11Resource* r, bool* ok = nullptr) {
+    D3D11_TEXTURE2D_DESC d = DescOf(r, ok);
+    uint32_t w = 0, h = 0;
+    if (d.ArraySize >= 3 && OuterSliceOf(r, &w, &h)) {
+        d.Width = w;
+        d.Height = h;
+    }
     return d;
 }
 
@@ -523,6 +542,9 @@ struct Copy {
     // layout, a view of the game texture (outer's clone) for the copy of slice 0's corner back.
     UINT aw = 0, ah = 0;
     ComPtr<ID3D11DepthStencilView> backDsv;
+    // B20 K5: the size outer's work sees (an array whose outer clone is its slice 0: outer's corner; else desc's).
+    UINT tw = 0, th = 0;
+    uint64_t lastSeen = 0;  // the frame tw, th were read for an array
 };
 struct ViewMap {
     void* orig = nullptr;  // the game's view (only compared)
@@ -551,6 +573,13 @@ struct Pass {
     bool corner = false, vpOuter = false;
     bool sr = false;  // S2.2: DLSS SR's render sizes (the scene sets)
     unsigned oddViewports = 0;  // viewports of other sizes set while a patched VS draws in the corner layout
+    // B20 K5a (the run of 2026-11-14 20:24: view 0 squeezed, view 1 cut at outer's size): before a draw with two views
+    // the bound viewport is checked once after each change that may move it (vpCheck); one at outer's size there is
+    // set to the slices' (vpFixes; the first ones logged with what set it).
+    bool vpCheck = false;
+    unsigned vpFixes = 0;
+    bool diag = false;      // B20 K5a: this pass's draws are logged (the first corner passes of the session)
+    unsigned diagDraws = 0, diagOdd = 0, diagSeen = 0;  // logged, logged with another viewport, all checked
     bool mFilled = false, jitterKnown = false;
     int jitterTries = 0;
     float jit[2] = {};
@@ -603,6 +632,12 @@ struct Pass {
 Pass g_p;
 // The module's rows with view 0's key are in VS slot 3 now (the MVR part of a pass in the corner layout).
 bool CornerKeyBound() { return t_pass && g_p.corner; }
+// B20 K5a: viewport sizes compared within half a pixel (the clones' viewport fix scales 2117 to 1996.0001).
+bool Near(float a, float b) { return std::fabs(a - b) < 0.5f; }
+void CheckPassViewport(ID3D11DeviceContext* c, const char* where);  // below
+struct Pass;
+void DiagStart(Pass& p);                                              // below (B20 K5a diagnosis)
+void DiagDraw(ID3D11DeviceContext* c, const char* what, int psKind);  // below
 
 struct StashG {
     ID3D11Resource* orig = nullptr;  // the game's target as bound (only compared)
@@ -680,6 +715,7 @@ struct Stats {
     // B17: targets of the MVR parts (0 G-buffer, 1 forward) that were the game's own arrays, that were copied back.
     uint64_t nativeT[2] = {}, copiedT[2] = {};
     uint64_t corner[2] = {}, oddViewports = 0;  // B20 K2: passes in the corner layout per eye
+    uint64_t vpFixes[2] = {};  // B20 K5a: viewports set to the slices' before a draw (G-buffer, forward)
     uint64_t sr[2] = {};  // S2.2: passes at DLSS SR's render sizes per eye
 };
 Stats g_st, g_tot;
@@ -866,11 +902,37 @@ uint32_t g_cloneGen = 0;  // clones::Generation() last seen
 NativeFn g_nativeFn = nullptr;
 WantArrayFn g_wantFn = nullptr;
 bool IsNative(ID3D11Resource* r) { return g_nativeFn ? g_nativeFn(r) : clones::IsArray(r); }
-void WantNative(ID3D11Resource* r, UINT slices) {
+void WantNative(ID3D11Resource* r, UINT slices, bool outerSlice = false) {
     if (g_wantFn)
-        g_wantFn(r, slices);
+        g_wantFn(r, slices, outerSlice);
     else if (!g_cloneFn)
-        clones::WantArray(r, slices);
+        clones::WantArray(r, slices, outerSlice);
+}
+// B20 K5: a multisampled forward target in the corner layout that is outer's own clone (outer's size): its engine
+// texture becomes a three-slice array at the next frame start, outer's clone its slice 0 (the corner), focus's clones
+// its slices 1 and 2 (clones::WantArray with outerSlice). Then the pass copies nothing in or out (as B12 step 5).
+bool WantCornerMs(ID3D11Resource* r) {
+    if (!r || !g_nativeOn || !g_msSlices) return false;
+    bool ok = false;
+    const D3D11_TEXTURE2D_DESC d = DescOf(r, &ok);
+    const Sizes cur = Cur();
+    if (!ok || d.SampleDesc.Count == 1 || d.ArraySize != 1 || d.MipLevels != 1 || d.Width != cur.ow ||
+        d.Height != cur.oh)
+        return false;
+    ID3D11Resource* e = EngineOf(r);
+    if (!e || e == r) return false;
+    WantNative(e, 3, true);
+    return true;
+}
+void WantCornerMs(UINT n, ID3D11RenderTargetView* const* rtv, ID3D11DepthStencilView* dsv) {
+    auto want = [](ID3D11View* v) {
+        if (!v) return;
+        ComPtr<ID3D11Resource> r;
+        v->GetResource(&r);
+        WantCornerMs(r.Get());
+    };
+    for (UINT i = 0; i < n && rtv; ++i) want(rtv[i]);
+    want(dsv);
 }
 
 // Jitter diagnosis (B9c run 2: view 1 about 0.27 px off focus's own forward pass in x, the sign changing between
@@ -886,6 +948,18 @@ struct Probe {
 };
 Probe g_probe;
 const char* const kGroupName[4] = {"outer L", "outer R", "focus L", "focus R"};
+
+// B20 K5a diagnosis: in a shot frame (mvr_shot_compare=0) the slices of outer L's multisampled forward color, resolved
+// right after its live pass (slice 0 outer's corner, 1 focus L, 2 focus R from the last frame).
+constexpr int kSliceShots = 3;
+struct SliceShot {
+    bool armed = false;
+    int base = -1;
+    uint64_t frame = 0;
+    ComPtr<ID3D11Texture2D> tex[kSliceShots];
+};
+SliceShot g_sliceShot;
+char g_sliceShotNames[kSliceShots][32] = {};
 
 void FwdRefused(const char* why) {
     if (g_fshot.armed && g_fshot.why.empty() && why) g_fshot.why = why;
@@ -968,6 +1042,12 @@ int CopyFor(ID3D11DeviceContext* c, ID3D11Resource* res) {
     // B20 K2: in the corner layout an outer-size target (outer's clone) gets a copy at the slices' size.
     const bool corner = t_pass && g_p.corner && !isArray && d.Width == g_p.w && d.Height == g_p.h;
     const UINT aw = corner ? g_p.sw : d.Width, ah = corner ? g_p.sh : d.Height;
+    // B20 K5: D3D11 copies no part of a multisampled texture, so outer's multisampled clone has no copy in the corner
+    // layout (the mapping fails, the rest of the pass runs plain); its engine texture becomes an outer slice array.
+    if (corner && d.SampleDesc.Count > 1) {
+        if (g_p.forward) WantCornerMs(res);
+        return -1;
+    }
     int slot = -1;
     for (int k = 0; k < (int)g_copies.size(); ++k) {
         Copy& cp = g_copies[k];
@@ -975,6 +1055,12 @@ int CopyFor(ID3D11DeviceContext* c, ID3D11Resource* res) {
         if (SameLayout(cp.desc, d) && cp.native == native && cp.aw == aw && cp.ah == ah) {
             cp.used = true;
             cp.lastFrame = g_frame;
+            if (isArray && cp.lastSeen != g_frame) {  // B20 K5: outer's slice clone made after the copy
+                const D3D11_TEXTURE2D_DESC seen = SeenDescOf(res);
+                cp.tw = seen.Width;
+                cp.th = seen.Height;
+                cp.lastSeen = g_frame;
+            }
             return k;
         }
         slot = k;  // a new texture at the address of a released one (or the other B17 mode)
@@ -999,6 +1085,10 @@ int CopyFor(ID3D11DeviceContext* c, ID3D11Resource* res) {
     Copy cp;
     cp.orig = res;
     cp.desc = d;
+    const D3D11_TEXTURE2D_DESC seen = isArray ? SeenDescOf(res) : d;  // B20 K5: outer's corner of a slice array
+    cp.tw = seen.Width;
+    cp.th = seen.Height;
+    cp.lastSeen = g_frame;
     cp.depth = (d.BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0;
     cp.native = native;
     cp.slices = native ? d.ArraySize : 2;
@@ -1159,13 +1249,22 @@ void* OrigView(ID3D11View* v) {
     return v;
 }
 
-// True when the view's texture has the pass's outer size.
+// True when the view's texture has the pass's outer size (B20 K5: an outer slice array's corner has it).
 bool OuterSize(ID3D11View* v) {
     int k = -1;
-    if (FindView(v, &k) && k >= 0) return g_copies[k].desc.Width == g_p.w && g_copies[k].desc.Height == g_p.h;
+    if (FindView(v, &k) && k >= 0) {
+        Copy& cp = g_copies[k];
+        if (cp.native && cp.slices >= 3 && cp.lastSeen != g_frame) {  // outer's slice clone made after the copy
+            const D3D11_TEXTURE2D_DESC seen = SeenDescOf(cp.arr.Get());
+            cp.tw = seen.Width;
+            cp.th = seen.Height;
+            cp.lastSeen = g_frame;
+        }
+        return cp.tw == g_p.w && cp.th == g_p.h;
+    }
     ComPtr<ID3D11Resource> res;
     v->GetResource(&res);
-    const D3D11_TEXTURE2D_DESC d = DescOf(res.Get());
+    const D3D11_TEXTURE2D_DESC d = SeenDescOf(res.Get());
     return d.Width == g_p.w && d.Height == g_p.h;
 }
 
@@ -1536,7 +1635,7 @@ void FillCopyAt(ID3D11DeviceContext* c, int k, bool cleared) {
     const bool corner = cp.aw != cp.desc.Width || cp.ah != cp.desc.Height;
     if (!cp.native && !skip) {  // B17: a native copy's slice 0 is the game's texture
         if (corner && ms) {
-            PassFailed(p, "a multisampled forward target in the corner layout (B20 K5)");
+            PassFailed(p, "a multisampled forward target in the corner layout without its array (B20 K5)");
         } else if (corner && cp.depth) {
             ComPtr<ID3D11Texture2D> src;
             if (cp.desc.MipLevels != 1 || FAILED(cp.orig->QueryInterface(IID_PPV_ARGS(&src))) ||
@@ -1549,7 +1648,7 @@ void FillCopyAt(ID3D11DeviceContext* c, int k, bool cleared) {
                                          cp.orig, m, nullptr);
         }
     }
-    const bool outerSize = cp.desc.Width == p.w && cp.desc.Height == p.h;
+    const bool outerSize = cp.tw == p.w && cp.th == p.h;  // B20 K5: an outer slice array's corner too
     // B20 K4: focus's target (outer's clone bound in the corner layout; at the game's size the engine's texture)
     ID3D11Texture2D* clone = outerSize ? FocusTarget(cp.orig) : nullptr;
     D3D11_TEXTURE2D_DESC cd{};
@@ -1854,6 +1953,7 @@ void ForwardDraw(ID3D11DeviceContext* c) {
         ++p.draws;
         ++p.plainDraws;
         if (p.views != 1 && SetViews(c, 1)) p.views = 1;
+        if (p.diag) DiagDraw(c, "forward (paused)", -1);
         return;
     }
     mvrps::Info info;
@@ -1899,6 +1999,8 @@ void ForwardDraw(ID3D11DeviceContext* c) {
         ++(info.kind == mvrps::Kind::Original ? p.psOriginalDraws : p.psUnknownDraws);
     const NvU32 want = p.vsPatched && psOk ? 2 : 1;
     if (want != p.views && SetViews(c, want)) p.views = want;
+    if (p.views == 2 && p.vpCheck) CheckPassViewport(c, "forward");  // B20 K5a
+    if (p.diag) DiagDraw(c, "forward", (int)info.kind);
     ++p.draws;
     if (p.views != 2) ++p.plainDraws;
 }
@@ -2136,7 +2238,7 @@ void Extract(ID3D11DeviceContext* c) {
     Stash& s = g_stash[p.eye];
     s.n = 0;
     for (Copy& cp : g_copies) {
-        if (!cp.used || cp.desc.Width != p.w || cp.desc.Height != p.h) continue;
+        if (!cp.used || cp.tw != p.w || cp.th != p.h) continue;
         if (s.n >= kMaxTargets) return PassFailed(p, "more than 4 outer-size targets");
         if (cp.desc.SampleDesc.Count > 1) return PassFailed(p, "a multisampled target");
         ID3D11Texture2D* clone = FocusTarget(cp.orig);
@@ -2208,7 +2310,7 @@ void ExtractForward(ID3D11DeviceContext* c) {
     Pass& p = g_p;
     g_fwdN = 0;
     for (Copy& cp : g_copies) {
-        if (!cp.used || !cp.filled || cp.desc.Width != p.w || cp.desc.Height != p.h) continue;
+        if (!cp.used || !cp.filled || cp.tw != p.w || cp.th != p.h) continue;
         if (g_fwdN >= kMaxTargets) return PassFailed(p, "more than 4 outer-size forward targets");
         if (cp.desc.SampleDesc.Count > 1)
             return PassFailed(p, "a multisampled forward target (the test compares single-sample targets)");
@@ -2427,12 +2529,14 @@ const char* StartMvr(ID3D11DeviceContext* c, ID3D11Resource* main, int e, uint8_
     Pass& p = g_p;
     const Win& win = g_win[e];
     bool ok = false;
-    const D3D11_TEXTURE2D_DESC md = DescOf(main, &ok);
+    // B20 K5: an outer slice array (the multisampled forward depth in the corner layout) at outer's corner size.
+    const D3D11_TEXTURE2D_DESC md = SeenDescOf(main, &ok);
     // B20 K2: outer smaller than the game's size draws into its clones; with [debug] mvr_corner its G-buffer pass runs
     // in the corner layout (focus's targets: its clones or, at the game's size, the engine's textures).
     // S2.2: with DLSS SR outer's scene clones at its render size, focus's scene clones.
     const Sizes cur = Cur();
     const bool outerSize = ok && OuterCloned() && md.Width == cur.ow && md.Height == cur.oh;
+    const bool outerSlice = outerSize && md.ArraySize >= 3 && IsNative(main);
     // B20 K4: the forward pass from outer too (its targets outer's clones, focus's its targets as the G-buffer pass's).
     const bool corner = outerSize && Cfg().mvrCorner;
     ID3D11Texture2D* clone = !ok ? nullptr : corner ? FocusTarget(main) : FocusClone(main);
@@ -2447,10 +2551,13 @@ const char* StartMvr(ID3D11DeviceContext* c, ID3D11Resource* main, int e, uint8_
     // G-buffer pass's corners are copied as single-sample textures.
     const char* why = !ok ? "no 2D target in outer's pass"
                       : outerSize && !corner ? "outer smaller than focus ([debug] mvr_corner=0)"
-                      // B20 K4: D3D11 copies no part of a multisampled texture (slice 0's copy-in), and with DLSS SR
-                      // the game has no MSAA anyway
-                      : corner && forward && md.SampleDesc.Count != 1
-                          ? "a multisampled forward pass in the corner layout (B20 K5)"
+                      // B20 K5: D3D11 copies no part of a multisampled texture, so outer's clones must be slice 0 of
+                      // three-slice arrays first (WantCornerMs, made at the next frame start)
+                      : corner && forward && md.SampleDesc.Count != 1 && !outerSlice
+                          ? (g_nativeOn && g_msSlices
+                                 ? "a multisampled forward pass in the corner layout before its three-slice arrays"
+                                 : "a multisampled forward pass in the corner layout without three-slice arrays "
+                                   "(mvr_native_targets or mvr_ms_slices off)")
                       : !corner && win.w && (md.Width != win.w || md.Height != win.h)
                           ? "the first target of outer's pass is not at the game's size"
                       : md.ArraySize != 1 && !((md.ArraySize == 2 || (forward && md.ArraySize == 3)) && IsNative(main))
@@ -2464,7 +2571,10 @@ const char* StartMvr(ID3D11DeviceContext* c, ID3D11Resource* main, int e, uint8_
                           ? (SrScene() ? "focus's target is not at focus's render size (DLSS SR)"
                                        : "focus's target is not at focus's size")
                                                                        : nullptr;
-    if (why) return why;
+    if (why) {
+        if (corner && forward && md.SampleDesc.Count != 1 && !outerSlice) WantCornerMs(main);  // the callers: the colors
+        return why;
+    }
     p = Pass{};
     p.part = PartMvr;
     p.eye = e;
@@ -2510,6 +2620,7 @@ const char* StartMvr(ID3D11DeviceContext* c, ID3D11Resource* main, int e, uint8_
         p.vpOuter = !patched;
         if (patched) SetPassViewport(c, true);
     }
+    DiagStart(p);  // B20 K5a
     return nullptr;
 }
 
@@ -2525,14 +2636,112 @@ void SetPassViewport(ID3D11DeviceContext* c, bool slices) {
         D3D11_VIEWPORT& v = vp[i];
         if (v.TopLeftX != 0 || v.TopLeftY != 0) continue;
         const float fw = slices ? (float)p.w : (float)p.sw, fh = slices ? (float)p.h : (float)p.sh;
-        if (v.Width != fw || v.Height != fh) continue;
+        if (!Near(v.Width, fw) || !Near(v.Height, fh)) continue;
         v.Width = slices ? (float)p.sw : (float)p.w;
         v.Height = slices ? (float)p.sh : (float)p.h;
         changed = true;
     }
+    p.vpCheck = true;
     if (!changed) return;
     Internal in;
     c->RSSetViewports(n, vp);
+}
+
+// B20 K5a: before a draw with two views in the corner layout, once after each change that may move the viewport: the
+// slices' viewport, else set (a viewport left at outer's size draws view 0 squeezed by M_0 and view 1 cut off).
+std::string g_vpFixLog;
+int g_vpFixLogs = 0;
+void CheckPassViewport(ID3D11DeviceContext* c, const char* where) {
+    Pass& p = g_p;
+    if (!p.vpCheck || !p.corner || p.vpOuter || p.paused) return;
+    p.vpCheck = false;
+    D3D11_VIEWPORT vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    UINT n = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    c->RSGetViewports(&n, vp);
+    if (n && vp[0].TopLeftX == 0 && vp[0].TopLeftY == 0 && vp[0].Width == (float)p.sw && vp[0].Height == (float)p.sh)
+        return;
+    ++p.vpFixes;
+    char b[256];
+    snprintf(b, sizeof(b), "%s pass of outer %s at a %s draw: %u viewports, the first %.4f x %.4f at (%.1f, %.1f)",
+             p.forward ? "forward" : "G-buffer", kEye[p.eye < 0 ? 0 : p.eye & 1], where, n, n ? vp[0].Width : 0.0f,
+             n ? vp[0].Height : 0.0f, n ? vp[0].TopLeftX : 0.0f, n ? vp[0].TopLeftY : 0.0f);
+    if (g_vpFixLogs < 12 && g_vpFixLog != b) {
+        ++g_vpFixLogs;
+        g_vpFixLog = b;
+        Log("MVR G-buffer: B20 corner layout: the %s; set to the slices' %u x %u (outer %u x %u)", b, p.sw, p.sh, p.w,
+            p.h);
+    }
+    if (!n) n = 1;
+    for (UINT i = 0; i < n; ++i) {
+        if (vp[i].TopLeftX != 0 || vp[i].TopLeftY != 0) continue;
+        vp[i].Width = (float)p.sw;
+        vp[i].Height = (float)p.sh;
+    }
+    Internal in;
+    clones::RawScope raw;  // as it is: the clones' viewport fix would scale it to outer's clone again
+    c->RSSetViewports(n, vp);
+}
+
+// B20 K5a diagnosis (run 2 of 2026-11-14: view 0 still squeezed by M_0's scale, no viewport fix logged): the first
+// corner passes of the session log their first draws as the GPU gets them: views, VS and PS, the flags that gate the
+// viewport mapping, the viewport, the scissor and the bound target.
+int g_diagPasses[2] = {};  // per kind (0 G-buffer, 1 forward)
+constexpr int kDiagPasses = 2, kDiagDraws = 48;
+void DiagStart(Pass& p) {
+    const int k = p.forward ? 1 : 0;
+    // the first two, then both eyes' in every 1500th frame (six in all per kind: after the clones settled too)
+    p.diag = p.corner && (g_diagPasses[k] < kDiagPasses || (g_frame % 1500 == 0 && g_diagPasses[k] < 3 * kDiagPasses));
+    if (!p.diag) return;
+    ++g_diagPasses[k];
+    Log("MVR diag: %s pass of outer %s (corner): outer %u x %u, focus %u x %u, slices %u x %u, M0 a %.5f b %.5f, M1 a "
+        "%.5f b %.5f, vs patched %d, vpOuter %d, view 1's slice %u",
+        p.forward ? "forward" : "G-buffer", kEye[p.eye & 1], p.w, p.h, p.fw, p.fh, p.sw, p.sh,
+        p.rows[mvrvs::kCbView0Row][0], p.rows[mvrvs::kCbView0Row + 1][1], p.rows[0][0], p.rows[1][1],
+        (int)p.vsPatched, (int)p.vpOuter, (unsigned)p.viewSlice);
+}
+void DiagDraw(ID3D11DeviceContext* c, const char* what, int psKind) {
+    Pass& p = g_p;
+    if (!p.diag) return;
+    ++p.diagSeen;
+    D3D11_VIEWPORT vp{};
+    UINT n = 1;
+    c->RSGetViewports(&n, &vp);
+    // the first 8 draws, then (run 4 of 2026-11-16: part of view 1 cut at outer's width) every draw whose viewport is
+    // not the slices' (up to 40 per pass)
+    const bool slices = n && vp.TopLeftX == 0 && vp.TopLeftY == 0 && vp.Width == (float)p.sw && vp.Height == (float)p.sh;
+    if (p.diagDraws >= 8 && (slices || p.diagOdd >= 40)) return;
+    if (p.diagDraws >= 8) ++p.diagOdd;
+    ++p.diagDraws;
+    ID3D11RasterizerState* rs = nullptr;
+    c->RSGetState(&rs);
+    D3D11_RASTERIZER_DESC rd{};
+    if (rs) {
+        rs->GetDesc(&rd);
+        rs->Release();
+    }
+    D3D11_RECT sc{};
+    UINT ns = 1;
+    c->RSGetScissorRects(&ns, &sc);
+    ID3D11RenderTargetView* rtv = nullptr;
+    ID3D11DepthStencilView* dsv = nullptr;
+    c->OMGetRenderTargets(1, &rtv, &dsv);
+    char t[96] = "-";
+    if (rtv || dsv) {
+        ComPtr<ID3D11Resource> r;
+        (rtv ? (ID3D11View*)rtv : (ID3D11View*)dsv)->GetResource(&r);
+        const D3D11_TEXTURE2D_DESC d = DescOf(r.Get());
+        int k = -1;
+        FindView(rtv ? (ID3D11View*)rtv : (ID3D11View*)dsv, &k);
+        snprintf(t, sizeof(t), "%s %ux%u arr %u x%u%s", rtv ? "rt" : "ds", d.Width, d.Height, d.ArraySize,
+                 d.SampleDesc.Count, k >= 0 ? " (a copy's view)" : " (not a copy's view)");
+    }
+    if (rtv) rtv->Release();
+    if (dsv) dsv->Release();
+    Log("MVR diag:   %s draw %u (of the pass %u): views %u, vs patched %d, ps kind %d, vpOuter %d, paused %d, vpCheck %d, vp %.4f x %.4f "
+        "at (%.1f, %.1f) (%u), scissor %s %ld,%ld..%ld,%ld, %s",
+        what, p.diagDraws, p.diagSeen, (unsigned)p.views, (int)p.vsPatched, psKind, (int)p.vpOuter, (int)p.paused,
+        (int)p.vpCheck, vp.Width, vp.Height, vp.TopLeftX, vp.TopLeftY, n, rd.ScissorEnable ? "on" : "off",
+        sc.left, sc.top, sc.right, sc.bottom, t);
 }
 
 // A pass that runs plain: the G-buffer's focus group runs its own pass, the forward test has no comparison, the live
@@ -2582,6 +2791,7 @@ void PassBegin(uint8_t* task, int e, bool forward, bool live = false) {
         return;
     }
     if (const char* why = StartMvr(c, main.Get(), e, task, NowMs(), forward, live)) {
+        if (forward && OuterCloned() && Cfg().mvrCorner) WantCornerMs(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, rt, ds);
         release();
         return PassRefused(forward, live, e, why);
     }
@@ -2592,12 +2802,13 @@ void PassBegin(uint8_t* task, int e, bool forward, bool live = false) {
 
 // A bind or clear while outer's pass waits for its first targets: the MVR part starts on them (true) or the pass runs
 // plain (false, the reason counted).
-bool StartAtFirst(ID3D11DeviceContext* c, ID3D11Resource* main) {
+bool StartAtFirst(ID3D11DeviceContext* c, ID3D11Resource* main, UINT n = 0, ID3D11RenderTargetView* const* rtv = nullptr,
+                  ID3D11DepthStencilView* dsv = nullptr) {
     Pass& p = g_p;
     const int e = p.eye;
     const Win& win = g_win[e];
     bool ok = false;
-    const D3D11_TEXTURE2D_DESC md = DescOf(main, &ok);
+    const D3D11_TEXTURE2D_DESC md = SeenDescOf(main, &ok);  // B20 K5: an outer slice array's corner
     // B20 K2: outer's clones are at outer's size (S2.2: its render size with DLSS SR)
     const Sizes cur = Cur();
     const bool outerSize = ok && OuterCloned() && md.Width == cur.ow && md.Height == cur.oh;
@@ -2608,6 +2819,7 @@ bool StartAtFirst(ID3D11DeviceContext* c, ID3D11Resource* main) {
     const unsigned waited = p.waitBinds;
     const bool forward = p.forward, live = p.live;
     if (const char* why = StartMvr(c, main, e, p.task, p.t0, forward, live)) {
+        if (forward && OuterCloned() && Cfg().mvrCorner) WantCornerMs(n, rtv, dsv);  // B20 K5: the colors too
         p = Pass{};
         PassRefused(forward, live, e, why);
         return false;
@@ -2690,6 +2902,8 @@ void PassEnd(ID3D11DeviceContext* c) {
     }
     g_st.oddViewports += p.oddViewports;
     g_tot.oddViewports += p.oddViewports;
+    g_st.vpFixes[0] += p.vpFixes;
+    g_tot.vpFixes[0] += p.vpFixes;
     const Win& win = g_win[p.eye];
     s.sx = win.sx;
     s.ox = win.ox;
@@ -2834,7 +3048,7 @@ void ForwardToClones(ID3D11DeviceContext* c) {
     std::vector<Target> ts;
     std::vector<Copy*> sliced;  // B12 step 5: focus's clone is the slice view 1 drew into (nothing to copy)
     for (Copy& cp : g_copies) {
-        if (!cp.used || !cp.filled || cp.desc.Width != p.w || cp.desc.Height != p.h) continue;
+        if (!cp.used || !cp.filled || cp.tw != p.w || cp.th != p.h) continue;
         if (const int fs = FocusSliceOfCopy(cp)) {
             if (fs != (int)SliceFor(cp))
                 return PassFailed(p, "focus's clone of a forward target is another slice than view 1 drew into");
@@ -2951,6 +3165,38 @@ void LiveEnd(ID3D11DeviceContext* c) {
         return FwdReason(e, "outer's forward pass bound no target at the game's size");
     }
     if (p.part == PartMvr) EndMvr(c, true);
+    if (g_sliceShot.armed && g_sliceShot.frame == g_frame && e == 0) {  // B20 K5a diagnosis
+        g_sliceShot.armed = false;
+        for (Copy& cp : g_copies) {
+            if (!cp.used || !cp.native || cp.slices < 3 || cp.depth || cp.desc.SampleDesc.Count < 2) continue;
+            const DXGI_FORMAT f = cp.viewFmt != DXGI_FORMAT_UNKNOWN ? cp.viewFmt : cp.desc.Format;
+            D3D11_TEXTURE2D_DESC d = cp.desc;
+            d.ArraySize = 1;
+            d.MipLevels = 1;
+            d.Format = f;
+            d.SampleDesc = {1, 0};
+            d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            d.MiscFlags = 0;
+            d.CPUAccessFlags = 0;
+            d.Usage = D3D11_USAGE_DEFAULT;
+            Internal in;
+            clones::RawScope raw;
+            for (int k = 0; k < kSliceShots; ++k) {
+                ComPtr<ID3D11Texture2D>& t = g_sliceShot.tex[k];
+                if (!t || !SameLayout(DescOf(t.Get()), d)) {
+                    t.Reset();
+                    if (FAILED(g_g.dev->CreateTexture2D(&d, nullptr, &t))) break;
+                }
+                c->ResolveSubresource(t.Get(), 0, cp.arr.Get(), D3D11CalcSubresource(0, k, 1), f);
+                shots::Grab(c, t.Get(), g_sliceShot.base + k);
+            }
+            Log("MVR diag: shot of outer L's forward color slices: %u x %u fmt %d x%u (outer %u x %u in slice 0's corner)",
+                cp.desc.Width, cp.desc.Height, (int)f, cp.desc.SampleDesc.Count, p.w, p.h);
+            break;
+        }
+    }
+    g_st.vpFixes[1] += p.vpFixes;  // B20 K5a
+    g_tot.vpFixes[1] += p.vpFixes;
     if (p.lateDraws) PassFailed(p, "draws into an outer-size target after the MVR part");
     if (p.pausedDraws) PassFailed(p, "draws into targets of other sizes (focus would miss them)");
     if (p.plainDraws > p.pausedDraws) PassFailed(p, "draws with one view (VS or PS without the patch)");
@@ -4099,6 +4345,18 @@ int PrepareShot(const char** names, int base, int max, shots::Pair* pairs, int m
         }
         if (!Cfg().mvrShotCompare) {
             Log("MVR G-buffer: no comparison in this shot (mvr_shot_compare=0: the shot shows the frame as it runs)");
+            // B20 K5a diagnosis: outer L's multisampled forward color slices as its live pass left them (resolved).
+            if (g_forwardOn && max >= kSliceShots) {
+                g_sliceShot = SliceShot{};
+                g_sliceShot.armed = true;
+                g_sliceShot.base = base;
+                g_sliceShot.frame = g_frame;
+                for (int k = 0; k < kSliceShots; ++k) {
+                    snprintf(g_sliceShotNames[k], sizeof(g_sliceShotNames[k]), "mvr_fwd_l_slice%d", k);
+                    names[base + k] = g_sliceShotNames[k];
+                }
+                n = kSliceShots;
+            }
             return;
         }
         if (g_early) {  // the comparison needs focus's own G-buffer pass, the early tasks need it skipped
@@ -4531,7 +4789,7 @@ const char* LiveWanted(int e) {
     if (!g_forwardOn) return "";
     if (!g_enabled) return "MVR G-buffer off (hotkey)";
     if (g_mode != Mode::Skip) return "a diagnosis mode of the G-buffer is on";
-    // B20 K4: also with DLSS SR's scene sets and in the corner layout (StartMvr refuses a multisampled one there, K5).
+    // B20 K4: also with DLSS SR's scene sets and in the corner layout (B20 K5: a multisampled one on outer slice arrays).
     if (g_earlyOk[e] != g_frame) return "focus's SSAO and lights did not run early in this frame";
     if (g_p.part != PartNone) return "another MVR pass is running";
     if (!mvrps::On()) return "the PS patch is off";
@@ -4804,7 +5062,7 @@ bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* r
         }
         if (p.part == PartWait) {
             const ComPtr<ID3D11Resource> main = MainOf(n, rtv, dsv);
-            if (!main || !StartAtFirst(c, main.Get())) return;  // an unbind waits on; a refused start runs plain
+            if (!main || !StartAtFirst(c, main.Get(), n, rtv, dsv)) return;  // an unbind waits on; a refused start runs plain
         }
         if (!t_pass) return;
         ++p.binds;
@@ -4848,6 +5106,7 @@ bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* r
             EndMvr(c, false);
             return;
         }
+        p.vpCheck = true;  // B20 K5a: the clones' viewport fix runs again at a bind
         if (p.forward) {  // their content goes in before the next draw (a clear first makes it unneeded)
             for (UINT i = 0; i < n && i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) MarkPending(rtvOut[i]);
             MarkPending(*dsvOut);
@@ -5072,6 +5331,8 @@ bool BeforeDraw(ID3D11DeviceContext* c) {
         });
         return false;
     }
+    if (g_p.views == 2 && g_p.vpCheck) Protect("Draw", [&] { CheckPassViewport(c, "G-buffer"); });  // B20 K5a
+    if (g_p.diag && !g_p.forward) Protect("Draw", [&] { DiagDraw(c, "G-buffer", -1); });
     if (g_gbufPsOn) {
         hookprof::SubScope prof(hookprof::SGbufDraw);
         Protect("Draw", [&] { GbufDraw(c); });
@@ -5248,8 +5509,8 @@ void LogStats(bool totals) {
         "/ R %llu targets, through the stash L %llu / R %llu, direct writes failed %llu; the game's own two-slice "
         "arrays (mvr_native_targets %s) G-buffer %llu / forward %llu targets, copied in and back G-buffer %llu / "
         "forward %llu; corner layout (B20, outer %u x %u, focus %u x %u, game %u x %u) L %llu / R %llu passes, "
-        "viewports of other sizes %llu; at DLSS SR's render sizes (outer %u x %u, focus %u x %u) L %llu / R %llu "
-        "passes",
+        "viewports of other sizes %llu, set to the slices' before a draw G-buffer %llu / forward %llu; at DLSS SR's "
+        "render sizes (outer %u x %u, focus %u x %u) L %llu / R %llu passes",
         totals ? " (session)" : "", (unsigned long long)s.frames, (unsigned long long)s.passes[0],
         (unsigned long long)s.passes[1], (unsigned long long)s.passFailed[0], (unsigned long long)s.passFailed[1],
         ms(0), ms(1), (unsigned long long)s.lateStarts, (unsigned long long)s.waitBinds,
@@ -5269,7 +5530,8 @@ void LogStats(bool totals) {
         g_nativeOn ? "on" : "off", (unsigned long long)s.nativeT[0], (unsigned long long)s.nativeT[1],
         (unsigned long long)s.copiedT[0], (unsigned long long)s.copiedT[1],
         g_sz.ow, g_sz.oh, g_sz.fw, g_sz.fh, g_sz.gw, g_sz.gh, (unsigned long long)s.corner[0],
-        (unsigned long long)s.corner[1], (unsigned long long)s.oddViewports, g_scene.ow, g_scene.oh, g_scene.fw,
+        (unsigned long long)s.corner[1], (unsigned long long)s.oddViewports, (unsigned long long)s.vpFixes[0],
+        (unsigned long long)s.vpFixes[1], g_scene.ow, g_scene.oh, g_scene.fw,
         g_scene.fh, (unsigned long long)s.sr[0], (unsigned long long)s.sr[1]);
     if (g_early || s.earlyRuns[0] || s.earlyRuns[1] || !s.earlyReasons.empty()) {
         std::string er;
@@ -5429,23 +5691,29 @@ bool MapViewports(ID3D11DeviceContext* c, UINT n, D3D11_VIEWPORT* vps) {
     for (UINT i = 0; i < n; ++i) {
         D3D11_VIEWPORT& v = vps[i];
         const bool at0 = v.TopLeftX == 0 && v.TopLeftY == 0;
-        if (at0 && v.Width == (float)p.w && v.Height == (float)p.h) {
+        if (at0 && Near(v.Width, (float)p.w) && Near(v.Height, (float)p.h)) {
             v.Width = (float)p.sw;
             v.Height = (float)p.sh;
             changed = true;
-        } else if (!(at0 && v.Width == (float)p.sw && v.Height == (float)p.sh)) {
+        } else if (at0 && Near(v.Width, (float)p.sw) && Near(v.Height, (float)p.sh)) {
+            changed |= v.Width != (float)p.sw || v.Height != (float)p.sh;
+            v.Width = (float)p.sw;
+            v.Height = (float)p.sh;
+        } else {
             ++p.oddViewports;
         }
     }
+    p.vpCheck = true;
     return changed;
 }
 
 void TestOriginal(OriginalFn fn) { g_origFn = fn; }
 
-void TestNative(NativeFn isArray, WantArrayFn want, SliceFn slice) {
+void TestNative(NativeFn isArray, WantArrayFn want, SliceFn slice, OuterSliceFn outerSlice) {
     g_nativeFn = isArray;
     g_wantFn = want;
     g_sliceFn = slice;
+    g_outerSliceFn = outerSlice;
 }
 
 TestState TestGet() { return g_test; }

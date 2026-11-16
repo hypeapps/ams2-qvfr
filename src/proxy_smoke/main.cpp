@@ -1711,6 +1711,165 @@ int RunClones() {
     cl::OnFrameStart(ctx, true);
     expect(cl::TestGet().arrays == 0 && !cl::IsArray(arr3), "slices: no array left");
     cl::Shutdown();
+
+    // Scenario 4b (MVR B20 K5): the corner layout, outer 48 x 36 smaller than focus at the game's size 64 x 48 (the
+    // identity focus set). J: written by outer and focus; its engine texture becomes a three-slice array whose slice 0
+    // is outer's clone too (WantArray with outerSlice), slices 1 and 2 focus L's and focus R's.
+    cl::SetSizes(64, 48, 48, 36, 64, 48);
+    cl::SetFocusIdentity(true);
+    ID3D11Texture2D* texJ = tex(64, 48);
+    ID3D11RenderTargetView *rtvJ = rtv(texJ), *rtvJ2 = rtv(texJ);
+    static const char* const names4b[] = {"Fake J", "Fake RT J"};
+    FakeObj J, RJ;
+    J.at<void*>(0x58) = texJ;
+    J.at<void*>(0x80) = rtvJ;
+    J.at<const char*>(0xf0) = names4b[0];
+    J.at<uint16_t>(0x68) = 64;
+    J.at<uint16_t>(0x6a) = 48;
+    void* arrJ[1] = {rtvJ2};
+    RJ.at<uint16_t>(0x24) = 64;
+    RJ.at<uint16_t>(0x26) = 48;
+    RJ.at<uint16_t>(0x66) = 1;
+    RJ.at<void**>(0x78) = arrJ;
+    RJ.at<const char*>(0xb8) = names4b[1];
+    // K: multisampled (2x) like the game's forward target, resolved by each group into a texture of its size (the
+    // game's ResolveSubresource in outer groups).
+    D3D11_TEXTURE2D_DESC kd{};
+    kd.Width = 64;
+    kd.Height = 48;
+    kd.MipLevels = kd.ArraySize = 1;
+    kd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    kd.SampleDesc.Count = 2;
+    kd.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    ID3D11Texture2D* texK = nullptr;
+    dev->CreateTexture2D(&kd, nullptr, &texK);
+    ID3D11RenderTargetView* rtvK = rtv(texK);
+    static const char* const nameK = "Fake K";
+    FakeObj K;
+    K.at<void*>(0x58) = texK;
+    K.at<void*>(0x80) = rtvK;
+    K.at<const char*>(0xf0) = nameK;
+    K.at<uint16_t>(0x68) = 64;
+    K.at<uint16_t>(0x6a) = 48;
+    cl::TestRegister(false, &J);
+    cl::TestRegister(true, &RJ);
+    cl::TestRegister(false, &K);
+    for (int f = 0; f < 17; ++f) {
+        cl::OnFrameStart(ctx, true);
+        if (f == 16) break;
+        cl::BeginGroup(ctx, cl::Outer);
+        ctx->ClearRenderTargetView(J.at<ID3D11RenderTargetView*>(0x80), green);
+        ctx->ClearRenderTargetView(K.at<ID3D11RenderTargetView*>(0x80), green);
+        cl::EndGroup(ctx);
+        cl::BeginGroup(ctx, cl::Focus);
+        ctx->ClearRenderTargetView(J.at<ID3D11RenderTargetView*>(0x80), blue);
+        ctx->ClearRenderTargetView(K.at<ID3D11RenderTargetView*>(0x80), blue);
+        cl::EndGroup(ctx);
+    }
+    expect(texK && cl::TestGet().phase == 2 && cl::TestGet().clones[0] == 2 && cl::CloneOf(texJ, cl::Focus) == texJ &&
+               cl::CloneOf(texK, cl::Focus) == texK,
+           "outer slice: ready with J's and K's outer clones and their identity focus clones");
+    cl::WantArray(texJ, 3, true);
+    cl::WantArray(texK, 3, true);
+    cl::OnFrameStart(ctx, true);
+    ID3D11Texture2D* arrJ3 = J.at<ID3D11Texture2D*>(0x58);
+    ID3D11Texture2D* arrK3 = K.at<ID3D11Texture2D*>(0x58);
+    expect(arrK3 != texK && cl::IsArray(arrK3) && arraySize(arrK3) == 3 && cl::OuterSlice(arrK3),
+           "outer slice: K's multisampled texture a three-slice array with outer's clone as slice 0");
+    uint32_t ow = 0, oh = 0, jw = 0, jh = 0;
+    expect(arrJ3 != texJ && cl::IsArray(arrJ3) && arraySize(arrJ3) == 3 && size(arrJ3) == size(texJ) &&
+               cl::OuterSlice(arrJ3, &ow, &oh) && ow == 48 && oh == 36 && cl::CloneOf(arrJ3, cl::Outer) == arrJ3 &&
+               cl::CloneOf(arrJ3, cl::Focus) == arrJ3 && cl::FocusSlice(arrJ3, 0, &jw, &jh) == 1 && jw == 64 &&
+               jh == 48 && !cl::OuterSlice(texJ),
+           "outer slice: J's texture a three-slice array, outer's clone its slice 0 (48 x 36), focus's slice 1 (64 x 48)");
+    // The array's own view bound and the original's viewport set before the group: slice 0 at outer's size.
+    ID3D11RenderTargetView* jOwn = J.at<ID3D11RenderTargetView*>(0x80);
+    ctx->OMSetRenderTargets(1, &jOwn, nullptr);
+    viewport(64, 48);
+    cl::BeginGroup(ctx, cl::Outer);
+    ID3D11RenderTargetView* jBound = nullptr;
+    ctx->OMGetRenderTargets(1, &jBound, nullptr);
+    expect(jBound && resOf(jBound) == arrJ3 && rtvSlice(jBound) == -1 &&
+               boundViewport() == std::make_pair(48.0f, 36.0f),
+           "outer slice: the bound view stays on slice 0, the original's viewport scaled to outer's size");
+    if (jBound) jBound->Release();
+    ctx->OMSetRenderTargets(0, nullptr, nullptr);
+    void* jRtv = J.at<void*>(0x80);
+    expect(cl::TestGet().swapped && J.at<void*>(0x58) == arrJ3 && resOf(jRtv) == arrJ3 && rtvSlice(jRtv) == -1 &&
+               resOf(arrJ[0]) == arrJ3 && J.at<uint16_t>(0x68) == 48 && J.at<uint16_t>(0x6a) == 36 &&
+               RJ.at<uint16_t>(0x24) == 48,
+           "outer slice: outer's fields hold the array, views of slice 0 and outer's size");
+    ctx->ClearRenderTargetView((ID3D11RenderTargetView*)jRtv, green);
+    {
+        // The MVR pass's own view of all three slices (rebound after its passes): left as it is, no clone of it (run 5
+        // of 2026-11-16: its clone was noted at outer's size and the viewport scaled back to outer's).
+        D3D11_RENDER_TARGET_VIEW_DESC av{};
+        av.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        av.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+        av.Texture2DArray = {0, 0, 3};
+        ID3D11RenderTargetView* allJ = nullptr;
+        dev->CreateRenderTargetView(arrJ3, &av, &allJ);
+        ID3D11RenderTargetView* mappedJ[8] = {};
+        ID3D11DepthStencilView* mappedJd = nullptr;
+        const bool mappedJok = allJ && cl::MapTargets(ctx, 1, &allJ, nullptr, mappedJ, &mappedJd, nullptr);
+        expect(allJ && (!mappedJok || mappedJ[0] == allJ),
+               "outer slice: a view of all the array's slices stays as it is in an outer group");
+        if (allJ) allJ->Release();
+    }
+    cl::EndGroup(ctx);
+    expect(J.at<uint16_t>(0x68) == 64, "outer slice: the engine's size back after the outer group");
+    cl::BeginGroup(ctx, cl::Focus);
+    expect(rtvSlice(J.at<void*>(0x80)) == 1 && rtvSlice(arrJ[0]) == 1 && J.at<uint16_t>(0x68) == 64,
+           "outer slice: focus L's fields hold views of slice 1 at the game's size");
+    ctx->ClearRenderTargetView(J.at<ID3D11RenderTargetView*>(0x80), blue);
+    cl::EndGroup(ctx);
+    cl::WantTwin(arrJ3);
+    cl::WantTwin(arrK3);
+    cl::OnFrameStart(ctx, true);
+    cl::SetFocusEye(1);
+    cl::BeginGroup(ctx, cl::Focus);
+    expect(cl::HasTwin(arrJ3) && cl::FocusSlice(arrJ3, 1) == 2 && rtvSlice(J.at<void*>(0x80)) == 2,
+           "outer slice: focus R's twin is slice 2");
+    ctx->ClearRenderTargetView(J.at<ID3D11RenderTargetView*>(0x80), red);
+    cl::EndGroup(ctx);
+    cl::SetFocusEye(0);
+    expect(slicePixel(arrJ3, 0) == 0xFF00FF00u && slicePixel(arrJ3, 1) == 0xFFFF0000u &&
+               slicePixel(arrJ3, 2) == 0xFF0000FFu,
+           "outer slice: outer's clear in slice 0, focus L's in slice 1, focus R's in slice 2");
+    {
+        // B20 K5 resolve: K's array resolved as the game's single texture goes to the group's slice, outer's corner
+        // through a texture of the slice's size (D3D11 resolves equal sizes only).
+        ID3D11Texture2D *resO = tex(48, 36), *resF = tex(64, 48);
+        const uint64_t r0 = cl::TestGet().sliceResolves;
+        auto resolveIn = [&](cl::Set g, int eye, const float* color, ID3D11Texture2D* to) {
+            cl::SetFocusEye(eye);
+            cl::BeginGroup(ctx, g);
+            ctx->ClearRenderTargetView(K.at<ID3D11RenderTargetView*>(0x80), color);
+            ctx->ResolveSubresource(to, 0, K.at<ID3D11Texture2D*>(0x58), 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+            cl::EndGroup(ctx);
+            cl::SetFocusEye(0);
+            return pixel(to);
+        };
+        const uint32_t pxO = resolveIn(cl::Outer, 0, green, resO);
+        const uint32_t pxL = resolveIn(cl::Focus, 0, blue, resF);
+        const uint32_t pxR = resolveIn(cl::Focus, 1, red, resF);
+        expect(pxO == 0xFF00FF00u && pxL == 0xFFFF0000u && pxR == 0xFF0000FFu &&
+                   cl::TestGet().sliceResolves - r0 == 3 && cl::TestGet().sliceResolveFails == 0,
+               "outer slice: resolves of K's array in outer (corner 48 x 36), focus L (slice 1) and focus R (slice 2)");
+        resO->Release();
+        resF->Release();
+    }
+    ID3D11Resource* shotList[8] = {};
+    char shotLabels[8][64] = {};
+    expect(cl::ListForShot(cl::Outer, shotList, shotLabels, 8) == 0, "outer slice: no outer clone of its own to shoot");
+    cl::TestDestroy(true, &RJ);
+    cl::TestDestroy(false, &J);
+    cl::TestDestroy(false, &K);
+    expect(J.at<void*>(0x58) == texJ && J.at<void*>(0x80) == rtvJ, "outer slice: J's texture and views back at its destroy");
+    cl::OnFrameStart(ctx, true);
+    expect(cl::TestGet().arrays == 0 && !cl::IsArray(arrJ3), "outer slice: no array left");
+    cl::SetFocusIdentity(false);
+    cl::Shutdown();
     const int bad4 = bad;
 
     // Scenario 5 (DLSS SR in quad views, dlaa-plan S2): outer at the game size 64 x 48 (no post set), focus 32 x 24;

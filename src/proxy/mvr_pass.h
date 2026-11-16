@@ -41,7 +41,7 @@ bool Install();
 // in VS slot 3, mvr_vs.h) and view 1 (focus) in the top-left corner of slice 1, the whole slice when focus is at the
 // game's size. At the end slice 0's corner goes back into outer's clones and slice 1's into focus's targets: its clones,
 // or the engine's own textures when focus is at the game's size. B20 K3, K4: the early SSAO and lights and the forward
-// pass from outer (single-sample; multisampled is K5) run in that layout too, and so does what stands on them (B11,
+// pass from outer (B20 K5: multisampled on outer slice arrays) run in that layout too, and so does what stands on them (B11,
 // B13, B19). With focus at the game's size, outer smaller, mvr_corner and mvr_forward, the clones get an identity focus
 // set (clones::SetFocusIdentity) so that focus R has twins of the engine's textures outer R's group writes for it.
 void SetSizes(uint32_t gameW, uint32_t gameH, uint32_t outerW, uint32_t outerH, uint32_t focusW, uint32_t focusH);
@@ -173,6 +173,11 @@ bool GetMsColorSkip();
 // (clones.h). Outer L's live pass draws view 1 into slice 1, outer R's into slice 2 (renderTargetIndexOffset), each
 // clears only slice 0 and its own slice, and neither copies anything into or out of the slice: focus's group reads it
 // there.
+// B20 K5, the corner layout with MSAA (outer's multisampled forward targets are its own clones): their engine textures
+// become three-slice arrays at the game's size whose slice 0 is outer's clone too (clones::WantArray with outerSlice:
+// outer's views like the engine's, its sizes outer's, the corner at the top left), slices 1 and 2 focus's as above.
+// Until they are made the pass refuses (D3D11 copies no part of a multisampled texture); then it runs like B12 step 5
+// with view 0 in the corner of slice 0 (B20 K2) and copies nothing.
 // B11 (docs/mvr.md), [debug] mvr_velocity_skip (live, hotkey mvr_modifier + mvr_velocity_skip_key), mode 3 only: at the
 // first draw of the focus group's velocity pass (the bind above) the fill source writes the focus view's motion vectors
 // from outer (mvr_motion, B10) into the pass's target, and the pass's draws are skipped (the engine's object loop
@@ -277,10 +282,12 @@ void Shutdown();             // VR_Shutdown: textures released
 using CloneFn = ID3D11Texture2D* (*)(ID3D11Resource* original);
 // B17 in the smoke: stand-ins for clones::IsArray and clones::WantArray (null: the clones module).
 using NativeFn = bool (*)(ID3D11Resource* res);
-using WantArrayFn = void (*)(ID3D11Resource* res, UINT slices);
+using WantArrayFn = void (*)(ID3D11Resource* res, UINT slices, bool outerSlice);
 // B12 step 5: stand-in for clones::FocusSlice (null: no slice clones).
 using SliceFn = int (*)(ID3D11Resource* original, int eye, uint32_t* w, uint32_t* h);
-void TestNative(NativeFn isArray, WantArrayFn want, SliceFn slice = nullptr);
+// B20 K5: stand-in for clones::OuterSlice (null: no outer slice clones).
+using OuterSliceFn = bool (*)(ID3D11Resource* res, uint32_t* w, uint32_t* h);
+void TestNative(NativeFn isArray, WantArrayFn want, SliceFn slice = nullptr, OuterSliceFn outerSlice = nullptr);
 // B20 K2 in the smoke: stand-in for clones::Original (outer's fake clones to the game's targets; null: none).
 using OriginalFn = ID3D11Resource* (*)(ID3D11Resource* res);
 void TestOriginal(OriginalFn fn);

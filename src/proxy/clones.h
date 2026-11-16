@@ -130,9 +130,14 @@ bool IsClone(ID3D11Resource* res);
 // clone of a three-slice array is then the array itself: focus L's swapped fields and translated views see slice 1,
 // focus R's (its twin) slice 2, in the focus clones' size (the engine's size fields and the viewport check say focus's
 // size; the corner at the top left). No texture of its own, nothing copied when the twin is made.
-void WantArray(ID3D11Resource* original, UINT slices = 2);
+// B20 K5 (`outerSlice`, three slices): outer smaller than the game's size (the MVR corner layout), its clone of the
+// array is the array too: outer's swapped fields and views are like the engine's (slice 0), the size fields and the
+// viewport check say outer's size (the corner at the top left of slice 0). Focus's clones are slices 1 and 2 as above.
+void WantArray(ID3D11Resource* original, UINT slices = 2, bool outerSlice = false);
 // Any thread, lock-free: `res` is one of these arrays.
 bool IsArray(ID3D11Resource* res);
+// Render thread (B20 K5): `res` is an array whose outer clone is its own slice 0; w, h: outer's corner of it.
+bool OuterSlice(ID3D11Resource* res, uint32_t* w = nullptr, uint32_t* h = nullptr);
 // Render thread: the slice of `original`'s array that focus's work of `eye` uses as its clone (1 focus L, 2 focus R
 // with its twin, 1 for focus R before its twin is made), 0 when the focus clone is a texture of its own (or none).
 // w, h: focus's size of the slice clone (when not null and the result is not 0).
@@ -200,6 +205,7 @@ struct TestState {
     int twins = 0, twinViews = 0;
     int arrays = 0;  // B17
     uint64_t arrayFixes = 0, arrayLazy = 0, arrayCopies = 0;
+    uint64_t sliceResolves = 0, sliceResolveFails = 0;  // B20 K5
 };
 TestState TestGet();
 
