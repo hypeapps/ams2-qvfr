@@ -1,6 +1,7 @@
 #include <windows.h>
 
 #include "frame.h"
+#include "fps_hud.h"
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -1123,6 +1124,7 @@ void OnWaitGetPosesEnd(vr::IVRCompositor* real, vr::TrackedDevicePose_t* render,
         HandleHotkey(newest);
         PeriodicStats();
         ReloadConfig();
+        hud::PollHotkey();
         g_cur.frozen = g_frozen;
         // The gaze places this frame's focus window (DFR) and the overlay's gaze point; after the hotkeys, so a
         // benchmark that starts now already has the window at the center.

@@ -18,6 +18,7 @@
         </div>
         <div class="nav" data-class-active="page == 0" data-event-click="page = 0"><span class="icon"></span><span class="ntext">Settings</span></div>
         <div class="nav" data-class-active="page == 1" data-event-click="page = 1"><span class="icon"></span><span class="ntext">Resolution</span></div>
+        <div class="nav" data-class-active="page == 5" data-event-click="page = 5"><span class="icon"></span><span class="ntext">FPS counter</span></div>
         <div class="nav" data-class-active="page == 2" data-event-click="page = 2"><span class="icon"></span><span class="ntext">Status</span></div>
         <div class="nav" data-class-active="page == 3" data-event-click="page = 3"><span class="icon"></span><span class="ntext">Files</span></div>
         <div class="nav" data-class-active="page == 4" data-event-click="page = 4"><span class="icon"></span><span class="ntext">Log</span></div>
@@ -35,6 +36,48 @@
             <span class="banner-title">Restart the game to apply:</span> {{ restart }}
         </div>
         <div class="banner" data-if="save_error != ''">{{ save_error }}</div>
+
+        <div data-if="page == 5">
+            <div class="phead"><h1>FPS counter</h1><button class="ghost" data-event-click="fps_center()">Center in view</button></div>
+            <p class="lead">A small panel that follows your head, visible in both eyes. Changes apply while the game runs.
+                Works with OpenXR / D3D11, independently of quad views and DLAA.</p>
+            <div class="banner" data-if="!fps_available">Requires VR API = OpenXR and the QVFR OpenXR layer enabled (openxr_layer=1).</div>
+            <div class="card">
+                <div class="chead"><span class="ctitle">In-headset display</span></div>
+                <div class="cbody">
+                    <div class="row">
+                        <div class="label"><div class="name">Show FPS counter</div><div class="desc">Frames sent by AMS2, averaged over one second. The numbers refresh four times per second.</div></div>
+                        <div class="control"><div class="switch"><input type="checkbox" data-checked="fps_enabled"/><div class="knob"/></div></div>
+                    </div>
+                    <div class="row">
+                        <div class="label"><div class="name">Show frame time and runtime Hz</div><div class="desc">FRAME = average time between app frames. XR = cadence reported by the runtime. These are not CPU/GPU render costs.</div></div>
+                        <div class="control"><div class="switch"><input type="checkbox" data-checked="fps_details"/><div class="knob"/></div></div>
+                    </div>
+                    <div class="row">
+                        <div class="label"><div class="name">Right Ctrl + Insert shortcut</div><div class="desc">Show or hide the counter without opening this app. The shortcut does not change the saved setting.</div></div>
+                        <div class="control"><div class="switch"><input type="checkbox" data-checked="fps_hotkey"/><div class="knob"/></div></div>
+                    </div>
+                    <div class="row">
+                        <div class="label"><div class="name">Size</div><div class="desc">Make the panel easier to read or less intrusive.</div></div>
+                        <div class="control"><div class="slider"><div class="rail"><div class="fill" data-style-width="((fps_scale - 50) / 150 * 100) + '%'"/></div><input type="range" min="50" max="200" step="5" data-value="fps_scale"/></div><div class="value"><span class="num">{{ fps_scale }}</span><span class="unit">%</span></div></div>
+                    </div>
+                    <div class="row">
+                        <div class="label"><div class="name">Horizontal position</div><div class="desc">Negative = left. Positive = right. Zero = straight ahead.</div></div>
+                        <div class="control"><div class="slider"><div class="rail"><div class="fill" data-style-width="((fps_x + 30) / 60 * 100) + '%'"/></div><input type="range" min="-30" max="30" step="1" data-value="fps_x"/></div><div class="value"><span class="num">{{ fps_x }}</span><span class="unit">deg</span></div></div>
+                    </div>
+                    <div class="row">
+                        <div class="label"><div class="name">Vertical position</div><div class="desc">Negative = down. Positive = up. Center in view resets both positions.</div></div>
+                        <div class="control"><div class="slider"><div class="rail"><div class="fill" data-style-width="((fps_y + 30) / 60 * 100) + '%'"/></div><input type="range" min="-30" max="30" step="1" data-value="fps_y"/></div><div class="value"><span class="num">{{ fps_y }}</span><span class="unit">deg</span></div></div>
+                    </div>
+                </div>
+            </div>
+            <div class="card">
+                <div class="chead"><span class="ctitle">Reading the counter</span></div>
+                <div class="cbody"><p class="cintro">FPS counts the app's scene frames, once per frame for both eyes. Reprojected or synthesized display frames are not added. For example, 45 app FPS can coexist with a 90 Hz display.</p>
+                    <p class="cintro">Green: at least 95% of the runtime cadence. Amber: at least 75%. Red: below 75%. Color compares rates; it does not diagnose a CPU or GPU bottleneck. The initial reading is -- while samples accumulate.</p>
+                </div>
+            </div>
+        </div>
 
         <!-- ============================================================ Settings -->
         <div data-if="page == 0">

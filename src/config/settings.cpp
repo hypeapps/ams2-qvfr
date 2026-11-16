@@ -34,6 +34,14 @@ const char* const kPresetKeys[] = {"peripheral_multiplier", "horizontal_focus_se
 Settings Read(const IniFile& ini) {
     Settings s;
     s.openxr = ini.GetOr("runtime", "path", "openxr") != "openvr";  // openxr is the default
+    s.openxrLayer = ParseInt(ini.GetOr("runtime", "openxr_layer", ""), 1) != 0;
+    s.fpsHud.enabled = ParseInt(ini.GetOr("fps_hud", "enabled", ""), 0) != 0;
+    s.fpsHud.details = ParseInt(ini.GetOr("fps_hud", "details", ""), 1) != 0;
+    s.fpsHud.hotkey = ParseInt(ini.GetOr("fps_hud", "hotkey", ""), 1) != 0;
+    s.fpsHud.scale = ParseFloat(ini.GetOr("fps_hud", "scale", ""), 1);
+    s.fpsHud.xDegrees = ParseFloat(ini.GetOr("fps_hud", "horizontal", ""), -18);
+    s.fpsHud.yDegrees = ParseFloat(ini.GetOr("fps_hud", "vertical", ""), 12);
+    s.fpsHud = hud::Sanitize(s.fpsHud);
     s.modeText = ini.GetOr("quad", "mode", "off");
     s.quad = s.modeText == "quad";
     s.presetText = ini.GetOr("quad", "preset", "balanced");

@@ -161,6 +161,7 @@ add_library(qvfr_proxy SHARED
   nr.cpp
   nr_bridge.cpp
   xr_layer.cpp
+  fps_hud.cpp
   sysinfo.cpp
   sun_fx.cpp
   mvr_ps.cpp
@@ -176,7 +177,7 @@ add_library(qvfr_proxy SHARED
   ${QVFR_RML_BACKENDS}/RmlUi_Renderer_DX11.cpp
   panel.rc
 )
-target_link_libraries(qvfr_proxy PRIVATE qvfr_shaders qvfr_dxbc nvapi openvr_0912 openxr_headers minhook bcrypt version psapi shell32 ole32 windowscodecs
+target_link_libraries(qvfr_proxy PRIVATE qvfr_shaders qvfr_dxbc nvapi openvr_0912 openxr_headers minhook bcrypt version psapi shell32 ole32 windowscodecs gdi32
                       RmlUi::Core d3dcompiler delayimp dxguid)
 # The tuning panel's renderer compiles its shaders at run time; the system compiler loads only when the panel opens.
 target_link_options(qvfr_proxy PRIVATE /DELAYLOAD:d3dcompiler_47.dll)

@@ -44,6 +44,7 @@
 namespace fs = std::filesystem;
 using namespace qvfr::config;
 namespace presets = qvfr::presets;
+namespace hud = qvfr::hud;
 
 int RunSelfTest(const fs::path& dir);  // selftest.cpp
 
@@ -425,6 +426,25 @@ void BindModel(Rml::Context* ctx) {
         });
     };
     toggle("quad", [] { return g.s.quad; }, [](bool on) { Set("quad", "mode", on ? "quad" : "off"); });
+    c.BindFunc("fps_available", [](Rml::Variant& v) { v = g.s.openxr && g.s.openxrLayer; });
+    toggle("fps_enabled", [] { return g.s.fpsHud.enabled; }, [](bool on) { Set("fps_hud", "enabled", on ? "1" : "0"); });
+    toggle("fps_details", [] { return g.s.fpsHud.details; }, [](bool on) { Set("fps_hud", "details", on ? "1" : "0"); });
+    toggle("fps_hotkey", [] { return g.s.fpsHud.hotkey; }, [](bool on) { Set("fps_hud", "hotkey", on ? "1" : "0"); });
+    auto hudValue = [&](const char* name, float hud::Settings::* field, const char* key, float multiplier, int lo, int hi) {
+        c.BindFunc(name, [field, multiplier](Rml::Variant& v) { v = (int)std::lround(g.s.fpsHud.*field * multiplier); },
+                   [field, key, multiplier, lo, hi](const Rml::Variant& v) {
+                       const int n = std::clamp((int)std::lround(VarFloat(v)), lo, hi);
+                       if (n != (int)std::lround(g.s.fpsHud.*field * multiplier)) Set("fps_hud", key, Num(n / multiplier));
+                   });
+    };
+    hudValue("fps_scale", &hud::Settings::scale, "scale", 100, 50, 200);
+    hudValue("fps_x", &hud::Settings::xDegrees, "horizontal", 1, -30, 30);
+    hudValue("fps_y", &hud::Settings::yDegrees, "vertical", 1, -30, 30);
+    c.BindEventCallback("fps_center", [](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList&) {
+        g.ini.Set("fps_hud", "horizontal", "0");
+        g.ini.Set("fps_hud", "vertical", "0");
+        Changed();
+    });
     toggle("follow", [] { return g.s.followGaze; }, [](bool on) { Set("quad", "follow_gaze", on ? "1" : "0"); });
     toggle("gaze_hotkey", [] { return g.s.gazeKey != 0; }, [](bool on) { Set("debug", "gaze_key", on ? "0x75" : "0"); });
     toggle("gaze_overlay", [] { return g.s.overlay; }, [](bool on) { Set("debug", "overlay", on ? "1" : "0"); });
@@ -789,7 +809,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     Files files;
     for (int i = 1; i < argc; ++i) {
         if (!wcscmp(argv[i], L"--home") && i + 1 < argc) g.home = argv[++i];
-        else if (!wcscmp(argv[i], L"--tab") && i + 1 < argc) g.page = std::clamp(_wtoi(argv[++i]), 0, 4);
+        else if (!wcscmp(argv[i], L"--tab") && i + 1 < argc) g.page = std::clamp(_wtoi(argv[++i]), 0, 5);
         else if (!wcscmp(argv[i], L"--ui") && i + 1 < argc) files.uiDir = argv[++i];
         else if (!wcscmp(argv[i], L"--selftest") && i + 1 < argc) {
             // Redirected output (a pipe) is already stdout; a console window needs attaching.
@@ -842,7 +862,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     // The pages share one scrolling #main; each keeps its own position.
     Rml::Element* main = doc->GetElementById("main");
-    float pageScroll[5] = {};
+    float pageScroll[6] = {};
     int shownPage = g.page;
     for (bool running = true, onLog = false; running;) {
         running = Backend::ProcessEvents(ctx, nullptr, true);
