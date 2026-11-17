@@ -2138,6 +2138,56 @@ int RunClones() {
         cl::SetFocusEye(0);
         expect(cl::CloneOf(texT, cl::FocusScene) == sceneT0, "K4 SR eye 0: T's shared scene clone");
     }
+    // B20 K5b with DLSS SR: T's focus scene clone as a three-slice array of ours (WantSceneSlices; the clones are made
+    // again, learned stays). Focus L's field view draws into slice 1, focus R's twin (the same array) into slice 2;
+    // CarryList gives each eye's slice; a focus scene group's copy of T goes to its slice.
+    {
+        cl::WantSceneSlices(texT);
+        cl::OnFrameStart(ctx, true);
+        ID3D11Texture2D* arrT = cl::CloneOf(texT, cl::FocusScene);
+        D3D11_TEXTURE2D_DESC ad{};
+        if (arrT) arrT->GetDesc(&ad);
+        uint32_t fw = 0, fh = 0;
+        expect(arrT && ad.ArraySize == 3 && ad.Width == 20 && ad.Height == 15 && cl::TestGet().sceneSlices == 1 &&
+                   cl::FocusSlice(texT, 0, &fw, &fh) == 1 && fw == 20 && fh == 15 && cl::FocusSlice(texT, 1) == 1 &&
+                   cl::FocusSlice(texU, 0) == 0,
+               "K5b SR: T's focus scene clone a 20 x 15 three-slice array, focus slice 1 (focus R too before its twin), "
+               "U's a texture of its own");
+        UINT ss[4] = {}, ds[4] = {};
+        auto focusR = [&](int eye, const FLOAT* col) {
+            cl::SetFocusEye(eye);
+            cl::BeginGroup(ctx, cl::Focus);
+            const bool in = cl::SceneIn() && T.at<void*>(0x58) == arrT;
+            ctx->ClearRenderTargetView(T.at<ID3D11RenderTargetView*>(0x80), col);
+            nc = cl::CarryList(carryC, carryD, 4, ss, ds);
+            ID3D11Texture2D* cp = tex(20, 15);
+            ctx->CopyResource(cp, texT);
+            cl::SceneEnd(ctx);
+            cl::EndGroup(ctx);
+            cl::SetFocusEye(0);
+            const uint32_t px = pixel(cp);
+            cp->Release();
+            return in ? px : 0u;
+        };
+        const uint64_t c0 = cl::TestGet().sliceCopies;
+        const uint32_t cpL = focusR(0, red);
+        expect(cpL == 0xFF0000FFu && slicePixel(arrT, 1) == 0xFF0000FFu && slicePixel(arrT, 0) != 0xFF0000FFu &&
+                   nc == 1 && carryC[0] == arrT && ss[0] == 1 && ds[0] == 0,
+               "K5b SR focus L: T's field in slice 1 (red), its copy from slice 1, carried from slice 1");
+        cl::WantTwin(texT);
+        cl::OnFrameStart(ctx, true);
+        expect(cl::HasTwin(texT) && cl::FocusSlice(texT, 1) == 2 && cl::FocusSlice(texT, 0) == 1,
+               "K5b SR: focus R's twin of T is slice 2 of the array");
+        cl::SetFocusEye(1);
+        const bool sameArr = cl::CloneOf(texT, cl::FocusScene) == arrT;
+        cl::SetFocusEye(0);
+        const uint32_t cpR = focusR(1, green);
+        expect(sameArr && cpR == 0xFF00FF00u && slicePixel(arrT, 2) == 0xFF00FF00u &&
+                   slicePixel(arrT, 1) == 0xFF0000FFu && nc == 1 && carryC[0] == arrT && ss[0] == 2 && ds[0] == 0 &&
+                   cl::TestGet().sliceCopies - c0 == 2,
+               "K5b SR focus R: the twin is the array, T's field in slice 2 (green), focus L's slice 1 kept, copy and "
+               "carry from slice 2");
+    }
     // DLSS not running: the groups stay in their post sets.
     cl::SetSrActive(false);
     cl::OnFrameStart(ctx, true);

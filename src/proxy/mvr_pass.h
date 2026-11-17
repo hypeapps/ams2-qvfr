@@ -298,6 +298,9 @@ using SliceFn = int (*)(ID3D11Resource* original, int eye, uint32_t* w, uint32_t
 // B20 K5: stand-in for clones::OuterSlice (null: no outer slice clones).
 using OuterSliceFn = bool (*)(ID3D11Resource* res, uint32_t* w, uint32_t* h);
 void TestNative(NativeFn isArray, WantArrayFn want, SliceFn slice = nullptr, OuterSliceFn outerSlice = nullptr);
+// B20 K5b with DLSS SR: stand-in for clones::WantSceneSlices (null: the clones module).
+using WantSceneFn = void (*)(ID3D11Resource* original);
+void TestSceneSlices(WantSceneFn want);
 // B20 K2 in the smoke: stand-in for clones::Original (outer's fake clones to the game's targets; null: none).
 using OriginalFn = ID3D11Resource* (*)(ID3D11Resource* res);
 void TestOriginal(OriginalFn fn);

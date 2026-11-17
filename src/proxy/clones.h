@@ -64,7 +64,10 @@ void SetSrActive(bool on);
 void MarkTaa(ID3D11DeviceContext* imm);       // learning: the TAA draw comes now (its target bound)
 // While a scene set is in: the carried textures' scene clones and where they go (the post set's clone or the original;
 // not referenced; valid until frame start).
-int CarryList(ID3D11Texture2D** clone, ID3D11Resource** dest, int max);
+// B20 K5b: srcSlice / dstSlice (when not null) the array slice each is in (0: a texture of its own, or its slice 0): a
+// focus scene clone that is a three-slice array (WantSceneSlices), a focus clone that is slice 1 of an engine array.
+int CarryList(ID3D11Texture2D** clone, ID3D11Resource** dest, int max, UINT* srcSlice = nullptr,
+              UINT* dstSlice = nullptr);
 // A scene set is in now (the group's scene phase with clones).
 bool SceneIn();
 // The SR probe (sr_probe.h), render thread: an eye group with DLSS SR's scene sets runs now (its kind, the phase, its
@@ -134,13 +137,19 @@ bool IsClone(ID3D11Resource* res);
 // array is the array too: outer's swapped fields and views are like the engine's (slice 0), the size fields and the
 // viewport check say outer's size (the corner at the top left of slice 0). Focus's clones are slices 1 and 2 as above.
 void WantArray(ID3D11Resource* original, UINT slices = 2, bool outerSlice = false);
+// B20 K5b with DLSS SR (docs/mvr.md): `original`'s focus scene clone becomes a three-slice array of ours (single-sample,
+// one mip, focus's render size) when the clones are made again at the next frame start. Focus L's swapped fields and
+// translated views see slice 1, focus R's (its twin, no memory of its own) slice 2; slice 0 is the MVR pass's scratch
+// (view 0). A copy or resolve of the array in a focus scene group goes to the group's slice. Render thread.
+void WantSceneSlices(ID3D11Resource* original);
 // Any thread, lock-free: `res` is one of these arrays.
 bool IsArray(ID3D11Resource* res);
 // Render thread (B20 K5): `res` is an array whose outer clone is its own slice 0; w, h: outer's corner of it.
 bool OuterSlice(ID3D11Resource* res, uint32_t* w = nullptr, uint32_t* h = nullptr);
 // Render thread: the slice of `original`'s array that focus's work of `eye` uses as its clone (1 focus L, 2 focus R
 // with its twin, 1 for focus R before its twin is made), 0 when the focus clone is a texture of its own (or none).
-// w, h: focus's size of the slice clone (when not null and the result is not 0).
+// w, h: focus's size of the slice clone (when not null and the result is not 0). B20 K5b: with DLSS SR running (the
+// focus scene clone as WantTwin picks it) the slice of the focus scene clone's array (WantSceneSlices).
 int FocusSlice(ID3D11Resource* original, int eye, uint32_t* w = nullptr, uint32_t* h = nullptr);
 // Any thread: changes whenever the clones are dropped (views kept on old clones would keep them alive).
 uint32_t Generation();
@@ -206,6 +215,7 @@ struct TestState {
     int arrays = 0;  // B17
     uint64_t arrayFixes = 0, arrayLazy = 0, arrayCopies = 0;
     uint64_t sliceResolves = 0, sliceResolveFails = 0, sliceCopies = 0;  // B20 K5
+    int sceneSlices = 0;  // B20 K5b with DLSS SR: focus scene clones that are three-slice arrays
 };
 TestState TestGet();
 

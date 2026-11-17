@@ -99,6 +99,10 @@ struct Tex {
     // outer's size osw x osh, the corner at the top left (outer smaller than the game's size).
     bool oslice = false;
     uint32_t osw = 0, osh = 0;
+    // B20 K5b with DLSS SR (WantSceneSlices): clone[FocusScene] is a three-slice array of ours (focus L's views slice
+    // 1, twin[1] the same array with views of slice 2, slice 0 the MVR pass's scratch); sceneSlicesWanted: made so at
+    // the next build of the clones.
+    bool sslice = false, sceneSlicesWanted = false;
     // DLSS SR (SetStereoSr, SetSr): per kind, in the learning groups, written before the TAA resolve's draw (scene),
     // used after it (post), the target of that draw (taaOut: the TAA history, written in the output size).
     bool scene[2] = {}, post[2] = {}, taaOut[2] = {};
@@ -299,6 +303,23 @@ uint64_t g_sliceRes = 0, g_sliceResTot = 0;
 // size when smaller), and those without that texture (left to the driver as the game asked).
 uint64_t g_sliceResolves = 0, g_sliceResolvesTot = 0, g_sliceResolveFails = 0;
 uint64_t g_sliceCopies = 0, g_sliceCopiesTot = 0;  // B20 K5b: copies of such arrays sent to the group's slice
+// B20 K5b with DLSS SR: the focus scene clones that are three-slice arrays (lock-free checks of the copy hooks), and
+// arrays asked for since the last frame start (the clones are made again then).
+std::atomic<ID3D11Resource*> g_sceneArrList[kMaxArrays] = {};
+std::atomic<bool> g_sceneArrOn{false};
+bool g_sceneWantPending = false;
+void PublishSceneArrayLocked(ID3D11Resource* r) {
+    for (auto& p : g_sceneArrList)
+        if (!p.load(std::memory_order_relaxed)) {
+            p.store(r, std::memory_order_relaxed);
+            g_sceneArrOn = true;
+            return;
+        }
+}
+void UnpublishSceneArrayLocked(ID3D11Resource* r) {
+    for (auto& p : g_sceneArrList)
+        if (p.load(std::memory_order_relaxed) == r) p.store(nullptr, std::memory_order_relaxed);
+}
 std::vector<ID3D11Texture2D*> g_resolveTmp;  // textures of a slice's size for them (single-sample; dropped with the clones)
 int g_arrLogs = 0;
 uint64_t g_arrMade = 0;                            // arrays made in this process
@@ -578,6 +599,7 @@ void DestroyLocked(uint8_t* obj, bool rt) {
         for (ID3D11Texture2D*& c : it->second.clone) {
             if (!c) continue;
             g_byClone.erase(c);
+            UnpublishSceneArrayLocked(c);  // B20 K5b
             g_grave.push_back(c);
             c = nullptr;
         }
@@ -624,7 +646,10 @@ void DropClonesLocked() {
         t.sw = t.sh = 0;
         t.oslice = false;
         t.osw = t.osh = 0;
+        t.sslice = false;
     }
+    for (auto& p : g_sceneArrList) p.store(nullptr, std::memory_order_relaxed);  // B20 K5b
+    g_sceneArrOn = false;
     for (auto& [obj, r] : g_rt)
         for (int& v : r.views) v = 0;
     g_byClone.clear();
@@ -847,6 +872,8 @@ Set SetOf(const SetState& s) { return (Set)(&s - g_set); }
 // B12 step 5: the slice a view of set si's `clone` sees: t's slice for focus's clone, the next one for the twin, 0 for
 // a clone of its own (B20 K5: and for outer's slice clone, slice 0 like the engine's own views).
 UINT SliceOfLocked(const Tex& t, Set si, ID3D11Texture2D* clone, bool twin) {
+    // B20 K5b with DLSS SR: the focus scene clone's own array (the twin is the same array).
+    if (si == FocusScene && t.sslice && clone && clone == t.clone[FocusScene]) return twin ? 2u : 1u;
     if (KindOf(si) != Focus || !t.slice || (ID3D11Resource*)clone != t.res) return 0;
     return (UINT)(twin ? t.slice + 1 : t.slice);
 }
@@ -891,7 +918,7 @@ void* TwinViewLocked(ID3D11Device* dev, void* v, void* cv, const Tex& t, int k, 
     if (auto it = g_twin.find(cv); it != g_twin.end()) return it->second;
     if (k < 0 || !t.twin[k]) return nullptr;
     int mip = -1;
-    IUnknown* out = MakeViewLocked(dev, v, t.twin[k], t, mip, k == 0 ? SliceOfLocked(t, Focus, t.twin[k], true) : 0);
+    IUnknown* out = MakeViewLocked(dev, v, t.twin[k], t, mip, SliceOfLocked(t, k ? FocusScene : Focus, t.twin[k], true));
     if (!out) return nullptr;
     g_twin[cv] = out;
     NoteViewLocked(g_set[set], v, out, t.twin[k], t, mip);  // MapsChanged
@@ -973,7 +1000,7 @@ bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
     SetState& s = g_set[si];
     bool ok = true;
     Zeros zeros;
-    int zeroed = 0, notZeroed = 0, sliced = 0, identical = 0, outerSliced = 0;
+    int zeroed = 0, notZeroed = 0, sliced = 0, identical = 0, outerSliced = 0, sceneSliced = 0;
     int sharedN = 0;
     // B20 K4: focus at the game's size (wanted only for focus R's twins, UpdateWantedLocked): the identity set.
     const bool identity = si == Focus && s.w == g_gameW && s.h == g_gameH;
@@ -1033,6 +1060,14 @@ bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
         } else {
             if (si == Focus) t.slice = 0;
             if (si == Outer) t.oslice = false;
+            // B20 K5b with DLSS SR (WantSceneSlices): focus's scene clone as a three-slice array of ours.
+            if (si == FocusScene) t.sslice = false;
+            if (si == FocusScene && t.sceneSlicesWanted && d.MipLevels == 1 && d.SampleDesc.Count == 1 &&
+                d.ArraySize == 1 && !(d.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE)) {
+                d.ArraySize = 3;
+                t.sslice = true;
+                ++sceneSliced;
+            }
             const D3D11_SUBRESOURCE_DATA* init = zeros.For(d);
             hr = init ? dev->CreateTexture2D(&d, init, &c) : E_INVALIDARG;
             if (SUCCEEDED(hr) && c) {
@@ -1052,6 +1087,7 @@ bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
         if (!shared) {
             t.clone[si] = c;
             g_byClone[c] = obj;
+            if (si == FocusScene && t.sslice) PublishSceneArrayLocked(c);  // B20 K5b
             MapsChanged();
             mb += (ID3D11Resource*)c == t.res ? 0.0 : Megabytes(d);  // a slice or identity clone: none of its own
             ++clones;
@@ -1127,13 +1163,16 @@ bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
         Log("Clones: %s at the game's size: %d of its textures are their own clones (B20 K4: focus L draws into the "
             "engine's textures, focus R into twins of those outer's groups write for it)",
             kSetNames[si], identical);
-    Log("Clones: %s: %d clones start at zero, %d without initial data (multisampled, or refused with it)%s%s",
+    Log("Clones: %s: %d clones start at zero, %d without initial data (multisampled, or refused with it)%s%s%s",
         kSetNames[si], zeroed, notZeroed,
         sliced ? (", " + std::to_string(sliced) + " are slices of three-slice arrays (B12 step 5: no memory of "
                   "their own, focus L slice 1, focus R slice 2)").c_str()
                : "",
         outerSliced ? (", " + std::to_string(outerSliced) + " are slice 0 of three-slice arrays at the game's size "
                        "(B20 K5: no memory of their own, outer in the corner)").c_str()
+                    : "",
+        sceneSliced ? (", " + std::to_string(sceneSliced) + " are three-slice arrays (B20 K5b with DLSS SR: focus L "
+                       "slice 1, focus R's twin slice 2, the MVR pass's scratch slice 0)").c_str()
                     : "");
     return ok;
 }
@@ -1156,7 +1195,11 @@ void LogListLocked() {
             if (t->clone[s] && s == Focus && t->slice)
                 n += snprintf(clones + n, sizeof(clones) - n, " -> %s %u x %u, slice %d of the array", kSetNames[s],
                               t->sw, t->sh, t->slice);
-            else if (t->clone[s] && s == Outer && t->oslice)  // B20 K5
+            else if (t->clone[s] && s == FocusScene && t->sslice) {  // B20 K5b with DLSS SR
+                const D3D11_TEXTURE2D_DESC d = DescOf(t->clone[s]);
+                n += snprintf(clones + n, sizeof(clones) - n, " -> %s %u x %u, slice 1 of a three-slice array",
+                              kSetNames[s], d.Width, d.Height);
+            } else if (t->clone[s] && s == Outer && t->oslice)  // B20 K5
                 n += snprintf(clones + n, sizeof(clones) - n, " -> %s %u x %u, slice 0 of the array", kSetNames[s],
                               t->osw, t->osh);
             else if (t->clone[s] && (ID3D11Resource*)t->clone[s] == t->res)  // B20 K4: identity
@@ -1255,7 +1298,8 @@ void BuildTwinsLocked(ID3D11DeviceContext* imm) {
                                    D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_GDI_COMPATIBLE);
             ID3D11Texture2D* tw = nullptr;
             // B12 step 5: the twin is the next slice (focus's own clone only).
-            const bool slice = k == 0 && t.slice && (ID3D11Resource*)c == t.res;
+            // B20 K5b with DLSS SR: so is a focus scene clone's twin (slice 2 of its array).
+            const bool slice = (k == 0 && t.slice && (ID3D11Resource*)c == t.res) || (k == 1 && t.sslice);
             if (slice) {
                 tw = c;
                 tw->AddRef();
@@ -2489,13 +2533,23 @@ bool IsArrayFast(ID3D11Resource* r) {
         if (p.load(std::memory_order_relaxed) == r) return true;
     return false;
 }
+// B20 K5b with DLSS SR: a focus scene clone that is a three-slice array; or either kind of slice array.
+bool IsSceneArrayFast(ID3D11Resource* r) {
+    if (!g_sceneArrOn.load(std::memory_order_relaxed)) return false;
+    for (const auto& p : g_sceneArrList)
+        if (p.load(std::memory_order_relaxed) == r) return true;
+    return false;
+}
+bool SliceArrayFast(ID3D11Resource* r) { return IsArrayFast(r) || IsSceneArrayFast(r); }
+bool AnySliceArrays() {
+    return g_arrOn.load(std::memory_order_acquire) || g_sceneArrOn.load(std::memory_order_acquire);
+}
 
 // B17: CopyResource with a two-slice array on either side copies slice 0's subresources (a single texture and an array
 // cannot be copied as a whole; two arrays need only slice 0). B20 K5b: the slices `dsl` and `ssl` instead (a focus
 // group's slice clone, GroupSlices). False: not such a copy.
 bool CopySlice0(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src, UINT dsl = 0, UINT ssl = 0) {
-    if (!g_arrOn.load(std::memory_order_acquire) || !dst || !src || !o_copyRegion ||
-        (!IsArrayFast(dst) && !IsArrayFast(src)))
+    if (!AnySliceArrays() || !dst || !src || !o_copyRegion || (!SliceArrayFast(dst) && !SliceArrayFast(src)))
         return false;
     ID3D11Texture2D *d2 = nullptr, *s2 = nullptr;
     dst->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&d2);
@@ -2521,19 +2575,37 @@ bool CopySlice0(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src
 // B20 K5b: in a focus group whose clone of an array is one of its slices (focus L's slice 1, focus R's twin slice 2;
 // the G-buffer's colors without DLSS SR), the engine's copy of that texture goes to the slice (the call alone would see
 // slice 0, outer's scratch). 0: slice 0 (not such a texture, or outside the groups).
+// The texture whose clone in the set in now is `r` itself and one of the slice arrays: the engine's array (B12 step 5,
+// B20 K5), or (B20 K5b with DLSS SR) a focus scene clone of ours that is one. u: that clone. Null: neither.
+const Tex* SliceTexLocked(ID3D11Resource* r, ID3D11Texture2D*& u) {
+    u = nullptr;
+    if (auto it = g_byRes.find(r); it != g_byRes.end()) {
+        const Tex& t = g_tex[it->second];
+        u = UseOf(t, g_cur);
+        return (ID3D11Resource*)u == r ? &t : nullptr;
+    }
+    if (auto it = g_byClone.find(r); it != g_byClone.end()) {
+        const Tex& t = g_tex[it->second];
+        u = UseOf(t, g_cur);
+        return g_cur == FocusScene && t.sslice && (ID3D11Resource*)u == r ? &t : nullptr;
+    }
+    return nullptr;
+}
+// The swap in place is focus R's with a twin of clone u (its twin slot's).
+bool TwinNowLocked(const Tex& t, ID3D11Texture2D* u) {
+    const int k = TwinSlotOf(t, u);
+    return g_swapEye == 1 && k >= 0 && t.twin[k];
+}
 UINT GroupSliceLocked(ID3D11Resource* r) {
     if (!r || g_live.load(std::memory_order_relaxed) != LiveSwap || !g_swapped) return 0;
-    auto it = g_byRes.find(r);
-    if (it == g_byRes.end()) return 0;
-    const Tex& t = g_tex[it->second];
-    ID3D11Texture2D* u = UseOf(t, g_cur);
-    if ((ID3D11Resource*)u != r) return 0;
-    return SliceOfLocked(t, g_cur, u, g_swapEye == 1 && t.twin[0]);
+    ID3D11Texture2D* u = nullptr;
+    const Tex* t = SliceTexLocked(r, u);
+    return t ? SliceOfLocked(*t, g_cur, u, TwinNowLocked(*t, u)) : 0;
 }
 void GroupSlices(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src, UINT& dsl, UINT& ssl) {
     dsl = ssl = 0;
-    if (t_internal || c != g_imm || !g_arrOn.load(std::memory_order_acquire) ||
-        !((dst && IsArrayFast(dst)) || (src && IsArrayFast(src))))
+    if (t_internal || c != g_imm || !AnySliceArrays() ||
+        !((dst && SliceArrayFast(dst)) || (src && SliceArrayFast(src))))
         return;
     Protect("Copy (slice)", [&] {
         std::lock_guard lock(g_cm);
@@ -2562,21 +2634,25 @@ void STDMETHODCALLTYPE D_Copy(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D1
 // focus's slice 1, focus R's twin slice 2): that slice and its corner (w x h). False: not such a source.
 bool SliceResolveLocked(ID3D11Resource* src, UINT& slice, uint32_t& w, uint32_t& h) {
     if (g_live.load(std::memory_order_relaxed) != LiveSwap || !g_swapped) return false;
-    auto it = g_byRes.find(src);
-    if (it == g_byRes.end()) return false;
-    const Tex& t = g_tex[it->second];
-    ID3D11Texture2D* u = UseOf(t, g_cur);
-    if ((ID3D11Resource*)u != src) return false;
+    ID3D11Texture2D* u = nullptr;
+    const Tex* tp = SliceTexLocked(src, u);
+    if (!tp) return false;
+    const Tex& t = *tp;
     if (KindOf(g_cur) == Outer && t.oslice) {
         slice = 0;
         w = t.osw;
         h = t.osh;
         return true;
     }
-    if (const UINT s = SliceOfLocked(t, g_cur, u, g_swapEye == 1 && t.twin[0])) {
+    if (const UINT s = SliceOfLocked(t, g_cur, u, TwinNowLocked(t, u))) {
         slice = s;
         w = t.sw;
         h = t.sh;
+        if ((ID3D11Resource*)u != t.res) {  // B20 K5b with DLSS SR: the scene clone's array, whole slices
+            const D3D11_TEXTURE2D_DESC d = DescOf(u);
+            w = d.Width;
+            h = d.Height;
+        }
         return true;
     }
     return false;
@@ -2597,7 +2673,7 @@ void STDMETHODCALLTYPE D_Resolve(ID3D11DeviceContext* c, ID3D11Resource* dst, UI
     uint32_t w = 0, h = 0;
     ID3D11Texture2D* tmp = nullptr;
     bool sliced = false;
-    if (!t_internal && c == g_imm && src && dst && IsArrayFast(src))
+    if (!t_internal && c == g_imm && src && dst && SliceArrayFast(src))
         Protect("ResolveSubresource (slice)", [&] {
             std::lock_guard lock(g_cm);
             if (!SliceResolveLocked(src, slice, w, h)) return;
@@ -3069,6 +3145,16 @@ void OnFrameStart(ID3D11DeviceContext* imm, bool enabled) {
             g_phase = Learning;
             Log("Clones: B17: clones made again on the two-slice arrays' views");
         }
+        // B20 K5b with DLSS SR: focus scene clones asked for as three-slice arrays: the clones are made again (what was
+        // learned stays).
+        if (g_sceneWantPending && g_phase == Ready && !g_dirty) {
+            int n = 0;
+            for (auto& [obj, t] : g_tex) n += t.sceneSlicesWanted && !t.sslice ? 1 : 0;
+            DropClonesLocked();
+            g_phase = Learning;
+            Log("Clones: B20 K5b: clones made again with %d focus scene clones as three-slice arrays (DLSS SR)", n);
+        }
+        g_sceneWantPending = false;
         // S1 (stereo): no focus groups; the focus set is not wanted there.
         const bool focusDone = g_set[Focus].learned >= kLearnGroups || g_stereo;  // stereo: no focus groups
         if (g_phase == Learning && g_set[Outer].learned >= kLearnGroups && focusDone && g_enabled && imm)
@@ -3230,7 +3316,7 @@ void MarkTaa(ID3D11DeviceContext* imm) {
     });
 }
 
-int CarryList(ID3D11Texture2D** clone, ID3D11Resource** dest, int max) {
+int CarryList(ID3D11Texture2D** clone, ID3D11Resource** dest, int max, UINT* srcSlice, UINT* dstSlice) {
     int n = 0;
     Protect("CarryList", [&] {
         std::lock_guard lock(g_cm);
@@ -3241,6 +3327,12 @@ int CarryList(ID3D11Texture2D** clone, ID3D11Resource** dest, int max) {
                 // where it has one: a shared one holds what this eye's scene phase wrote too).
                 clone[n] = (ID3D11Texture2D*)ForEye(t.clone[g_cur], g_swapEye);
                 dest[n] = (ID3D11Resource*)ForEye(CarryDest(t, g_kind), g_swapEye);
+                // B20 K5b: a slice array's slice of this eye (the scene clone's own, or focus's of the engine's array).
+                if (srcSlice) srcSlice[n] = SliceOfLocked(t, g_cur, t.clone[g_cur], TwinNowLocked(t, t.clone[g_cur]));
+                if (dstSlice) {
+                    ID3D11Texture2D* pc = t.clone[g_kind];
+                    dstSlice[n] = pc ? SliceOfLocked(t, g_kind, pc, TwinNowLocked(t, pc)) : 0;
+                }
                 ++n;
             }
     });
@@ -3401,6 +3493,23 @@ void WantArray(ID3D11Resource* original, UINT slices, bool outerSlice) {
     });
 }
 
+void WantSceneSlices(ID3D11Resource* original) {
+    if (!original) return;
+    Protect("WantSceneSlices", [&] {
+        std::lock_guard lock(g_cm);
+        if (g_failed || g_phase != Ready || g_dirty) return;
+        auto it = g_byRes.find(original);
+        if (it == g_byRes.end()) return;
+        Tex& t = g_tex[it->second];
+        if (t.sceneSlicesWanted || t.sslice || !t.clone[FocusScene]) return;
+        int n = 0;
+        for (auto& [obj, x] : g_tex) n += x.sceneSlicesWanted ? 1 : 0;
+        if (n >= kMaxArrays) return;
+        t.sceneSlicesWanted = true;
+        g_sceneWantPending = true;
+    });
+}
+
 bool OuterSlice(ID3D11Resource* res, uint32_t* w, uint32_t* h) {
     bool out = false;
     if (!res || !IsArray(res)) return out;
@@ -3427,6 +3536,14 @@ int FocusSlice(ID3D11Resource* original, int eye, uint32_t* w, uint32_t* h) {
         auto it = g_byRes.find(original);
         if (it == g_byRes.end()) return;
         const Tex& t = g_tex[it->second];
+        if (FocusTwinSlotLocked(t) == 1) {  // B20 K5b: with DLSS SR the focus scene clone (its own array or none)
+            if (!t.sslice) return;
+            out = eye == 1 && t.twin[1] ? 2 : 1;
+            const D3D11_TEXTURE2D_DESC d = DescOf(t.clone[FocusScene]);
+            if (w) *w = d.Width;
+            if (h) *h = d.Height;
+            return;
+        }
         if (!t.slice || !t.clone[Focus]) return;
         out = eye == 1 && t.twin[0] ? t.slice + 1 : t.slice;
         if (w) *w = t.sw;
@@ -3505,7 +3622,9 @@ int ListForShot(Set set, ID3D11Resource** out, char (*labels)[64], int max) {
         std::vector<const Tex*> list;
         for (auto& [obj, t] : g_tex)
             // B12 step 5: a slice has no texture (B20 K5: outer's either)
-            if (t.clone[set] && !(set == Focus && t.slice) && !(set == Outer && t.oslice)) list.push_back(&t);
+            if (t.clone[set] && !(set == Focus && t.slice) && !(set == Outer && t.oslice) &&
+                !(set == FocusScene && t.sslice))  // B20 K5b
+                list.push_back(&t);
         std::sort(list.begin(), list.end(), [](const Tex* a, const Tex* b) {
             if (a->desc.Width != b->desc.Width) return a->desc.Width > b->desc.Width;
             if (a->desc.Format != b->desc.Format) return a->desc.Format < b->desc.Format;
@@ -3769,6 +3888,7 @@ TestState TestGet() {
     s.sliceResolves = g_sliceResolves + g_sliceResolvesTot;
     s.sliceCopies = g_sliceCopies + g_sliceCopiesTot;
     s.sliceResolveFails = g_sliceResolveFails;
+    for (auto& [obj, t] : g_tex) s.sceneSlices += t.sslice && t.clone[FocusScene] ? 1 : 0;
     return s;
 }
 

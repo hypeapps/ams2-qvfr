@@ -698,6 +698,7 @@ void ReleasePending() {
 struct CarryViews {
     ID3D11Resource* src = nullptr;  // clone (only compared)
     ID3D11Resource* dst = nullptr;  // original (only compared)
+    UINT srcSlice = 0, dstSlice = 0;  // B20 K5b: the slices of three-slice arrays (clones::CarryList)
     ID3D11ShaderResourceView* srv = nullptr;
     ID3D11RenderTargetView* rtv = nullptr;
     ID3D11DepthStencilView* dsv = nullptr;
@@ -854,14 +855,16 @@ bool IsLinearColor(DXGI_FORMAT f) {
     }
 }
 
-CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes) {
+CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes, UINT srcSlice, UINT dstSlice) {
     for (CarryViews& v : g_carry)
-        if (v.src == src && v.dst == dstRes) return &v;
+        if (v.src == src && v.dst == dstRes && v.srcSlice == srcSlice && v.dstSlice == dstSlice) return &v;
     if (g_carry.size() >= 64) return nullptr;
     g_carry.push_back(CarryViews{});
     CarryViews& v = g_carry.back();
     v.src = src;
     v.dst = dstRes;
+    v.srcSlice = srcSlice;
+    v.dstSlice = dstSlice;
     ID3D11Texture2D* dst = nullptr;
     D3D11_TEXTURE2D_DESC sd{}, dd{};
     src->GetDesc(&sd);
@@ -874,7 +877,9 @@ CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes) {
         const DXGI_FORMAT rf = ReadFormat(sd.Format);
         if (sd.SampleDesc.Count != 1 || dd.SampleDesc.Count != 1)
             why = "multisampled";
-        else if (sd.ArraySize != 1 || dd.ArraySize != 1)
+        // B20 K5b: a slice of a three-slice array (a focus scene clone of ours, focus's slice of an engine array)
+        else if ((sd.ArraySize != 1 && srcSlice >= sd.ArraySize) || (sd.ArraySize == 1 && srcSlice) ||
+                 (dd.ArraySize != 1 && dstSlice >= dd.ArraySize) || (dd.ArraySize == 1 && dstSlice))
             why = "a texture array";
         else if (!(sd.BindFlags & D3D11_BIND_SHADER_RESOURCE))
             why = "no shader view on the clone";
@@ -885,18 +890,33 @@ CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes) {
         if (!why) {
             D3D11_SHADER_RESOURCE_VIEW_DESC s{};
             s.Format = rf;
-            s.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-            s.Texture2D.MipLevels = 1;
+            if (sd.ArraySize != 1) {
+                s.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+                s.Texture2DArray = {0, 1, srcSlice, 1};
+            } else {
+                s.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                s.Texture2D.MipLevels = 1;
+            }
             HRESULT hr = g_dev->CreateShaderResourceView(src, &s, &v.srv);
             if (SUCCEEDED(hr) && depth) {
                 D3D11_DEPTH_STENCIL_VIEW_DESC d{};
                 d.Format = DepthFormat(dd.Format);
-                d.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+                if (dd.ArraySize != 1) {
+                    d.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+                    d.Texture2DArray = {0, dstSlice, 1};
+                } else {
+                    d.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+                }
                 hr = g_dev->CreateDepthStencilView(dst, &d, &v.dsv);
             } else if (SUCCEEDED(hr)) {
                 D3D11_RENDER_TARGET_VIEW_DESC r{};
                 r.Format = ReadFormat(dd.Format);
-                r.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                if (dd.ArraySize != 1) {
+                    r.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+                    r.Texture2DArray = {0, dstSlice, 1};
+                } else {
+                    r.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                }
                 hr = g_dev->CreateRenderTargetView(dst, &r, &v.rtv);
             }
             if (FAILED(hr)) why = "its views could not be made";
@@ -911,8 +931,10 @@ CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes) {
         SafeRelease(v.rtv);
         SafeRelease(v.dsv);
     }
-    Log("DLAA: DLSS SR: carry %ux%u fmt %d -> %ux%u fmt %d (%s): %s", sd.Width, sd.Height, (int)sd.Format, dd.Width,
-        dd.Height, (int)dd.Format, v.dsv ? "depth" : v.linear ? "linear" : "nearest", why ? why : "ok");
+    Log("DLAA: DLSS SR: carry %ux%u fmt %d%s -> %ux%u fmt %d%s (%s): %s", sd.Width, sd.Height, (int)sd.Format,
+        sd.ArraySize != 1 ? (" slice " + std::to_string(srcSlice)).c_str() : "", dd.Width, dd.Height, (int)dd.Format,
+        dd.ArraySize != 1 ? (" slice " + std::to_string(dstSlice)).c_str() : "",
+        v.dsv ? "depth" : v.linear ? "linear" : "nearest", why ? why : "ok");
     if (!why && dd.MipLevels > 1) Log("DLAA: DLSS SR: only mip 0 of that texture is carried (%u mips)", dd.MipLevels);
     SafeRelease(dst);
     return &v;
@@ -922,7 +944,8 @@ CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes) {
 void Carry(ID3D11DeviceContext* c) {
     ID3D11Texture2D* clone[24] = {};
     ID3D11Resource* orig[24] = {};
-    const int n = clones::CarryList(clone, orig, 24);
+    UINT srcSlice[24] = {}, dstSlice[24] = {};
+    const int n = clones::CarryList(clone, orig, 24, srcSlice, dstSlice);
     if (!n || !g_ctx1 || !EnsureCarry()) return;
     const uint32_t gen = clones::Generation() * 977u + gpu::Generation();
     if (gen != g_carryGen) {
@@ -940,7 +963,7 @@ void Carry(ID3D11DeviceContext* c) {
         c->RSSetState(g_carryRs);
         c->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
         for (int i = 0; i < n; ++i) {
-            CarryViews* v = CarryViewsFor(clone[i], orig[i]);
+            CarryViews* v = CarryViewsFor(clone[i], orig[i], srcSlice[i], dstSlice[i]);
             if (!v || v->skip) continue;
             D3D11_VIEWPORT vp{0, 0, (float)v->w, (float)v->h, 0, 1};
             c->RSSetViewports(1, &vp);

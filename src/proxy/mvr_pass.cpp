@@ -915,6 +915,15 @@ void WantNative(ID3D11Resource* r, UINT slices, bool outerSlice = false) {
     else if (!g_cloneFn)
         clones::WantArray(r, slices, outerSlice);
 }
+// B20 K5b with DLSS SR: the engine texture's focus scene clone as a three-slice array (clones::WantSceneSlices; the
+// smoke's stand-in).
+WantSceneFn g_wantSceneFn = nullptr;
+void WantScene(ID3D11Resource* e) {
+    if (g_wantSceneFn)
+        g_wantSceneFn(e);
+    else if (!g_cloneFn)
+        clones::WantSceneSlices(e);
+}
 // B20 K5: a multisampled forward target in the corner layout that is outer's own clone (outer's size): its engine
 // texture becomes a three-slice array at the next frame start, outer's clone its slice 0 (the corner), focus's clones
 // its slices 1 and 2 (clones::WantArray with outerSlice). Then the pass copies nothing in or out (as B12 step 5).
@@ -947,16 +956,27 @@ void WantCornerMs(UINT n, ID3D11RenderTargetView* const* rtv, ID3D11DepthStencil
 // own); the pass then draws view 1 into focus's slice (no extract copy). Its other copies (the depth: focus gets it
 // conservative; and the forward pass's, which bind that depth) get three slices too, so outer R draws view 1 into slice
 // 2 of all its targets (renderTargetIndexOffset is one per pass).
-bool GbufSlices() { return g_gbufSlices && FocusAtGame() && !SrScene(); }
-// The engine's array behind outer's clone `res` (described by d) when it is a three-slice array of aw x ah whose focus
-// clone is its slice 1 (the clones module's), else null. Not referenced (the engine holds it).
+// With DLSS SR (focus's targets its scene clones, smaller than the game's size) the same with focus's scene clones: they
+// become three-slice arrays of ours (clones::WantSceneSlices: focus L slice 1, focus R's twin slice 2, slice 0 the pass's
+// scratch), when focus's render size is not smaller than outer's in either axis (the slices are then the scene clones'
+// size). With DLSS SR on outer alone (focus at the game's size) as without SR.
+bool ScenePath() { return SrScene() && !FocusAtGame(); }
+bool GbufSlices() {
+    if (!g_gbufSlices) return false;
+    if (!ScenePath()) return FocusAtGame();
+    const Sizes s = Cur();
+    return s.fw >= s.ow && s.fh >= s.oh;
+}
+// The array behind outer's clone `res` (described by d) that is focus's target when it is a three-slice array of
+// aw x ah whose focus clone is its slice 1: the engine's (the clones module's B17 array) or, with DLSS SR, focus's scene
+// clone of ours. Else null. Not referenced (the engine or the clones module holds it).
 ID3D11Texture2D* FocusSliceArray(ID3D11Resource* res, const D3D11_TEXTURE2D_DESC& d, UINT aw, UINT ah) {
     if ((d.BindFlags & D3D11_BIND_DEPTH_STENCIL) || d.SampleDesc.Count != 1 || d.MipLevels != 1) return nullptr;
     ID3D11Resource* e = EngineOf(res);
-    if (!e || e == res || !IsNative(e) || FocusSliceOf(res, 0, nullptr, nullptr) != 1) return nullptr;
+    if (!e || e == res || FocusSliceOf(res, 0, nullptr, nullptr) != 1) return nullptr;
     ID3D11Texture2D* t = FocusTarget(res);
-    if (!t || (ID3D11Resource*)t != e) return nullptr;
-    const D3D11_TEXTURE2D_DESC ad = DescOf(e);
+    if (!t || ((ID3D11Resource*)t == e ? !IsNative(e) : !ScenePath())) return nullptr;
+    const D3D11_TEXTURE2D_DESC ad = DescOf(t);
     if (ad.ArraySize < 3 || ad.Width != aw || ad.Height != ah || ad.MipLevels != 1 || ad.Format != d.Format ||
         ad.SampleDesc.Count != 1)
         return nullptr;
@@ -1083,7 +1103,14 @@ int CopyFor(ID3D11DeviceContext* c, ID3D11Resource* res) {
     const UINT slices = native ? d.ArraySize : fsArr ? DescOf(fsArr).ArraySize : three ? 3 : 2;
     if (three && g_nativeOn && !fsArr && t_pass && !g_p.forward && !(d.BindFlags & D3D11_BIND_DEPTH_STENCIL) &&
         d.SampleDesc.Count == 1 && d.MipLevels == 1)
-        if (ID3D11Resource* e = EngineOf(res); e && e != res && !IsNative(e)) WantNative(e, 3);
+        if (ID3D11Resource* e = EngineOf(res); e && e != res) {
+            if (!ScenePath()) {
+                if (!IsNative(e)) WantNative(e, 3);
+            } else if (ID3D11Texture2D* ft = FocusTarget(res);  // DLSS SR: focus's scene clone, not yet an array
+                       ft && (ID3D11Resource*)ft != e && FocusSliceOf(res, 0, nullptr, nullptr) == 0) {
+                WantScene(e);
+            }
+        }
     int slot = -1;
     for (int k = 0; k < (int)g_copies.size(); ++k) {
         Copy& cp = g_copies[k];
@@ -5858,6 +5885,8 @@ void TestNative(NativeFn isArray, WantArrayFn want, SliceFn slice, OuterSliceFn 
     g_views.clear();
     for (Copy& cp : g_copies) cp = Copy{};
 }
+
+void TestSceneSlices(WantSceneFn want) { g_wantSceneFn = want; }
 
 TestState TestGet() { return g_test; }
 
