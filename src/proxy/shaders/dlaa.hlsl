@@ -44,8 +44,8 @@ void CSCockpit(uint3 id : SV_DispatchThreadID) {
     if ((s & bits) == bits) outColor[id.xy] = taaColor.Load(int3(id.xy, 0)).rgb;
 }
 
-// Displays with DLSS SR ([dlaa] cockpit_taa, S2.4): DLSS (preset K) ignores the bias-current-color mask and keeps old
-// digits in its history (trails). After DLSS every output pixel is copied from its result; the pixels whose stencil
+// Displays after DLSS ([dlaa] cockpit_taa; DLSS SR, and DLAA with display_pass; S2.4): DLSS (preset K) ignores the
+// bias-current-color mask and keeps old digits in its history (trails). After DLSS every output pixel is copied from its result; the pixels whose stencil
 // class (read at the render size, maskStencil) has all of `dispBits` instead take the current frame alone, bilinear at
 // the pixel's position without the jitter: no history, no trails (dlaa-plan S2.4 A2, run 2). Clamping DLSS's result to
 // the current 3 x 3 neighbourhood was not enough: on 2-3 px digit strokes it holds both colours.

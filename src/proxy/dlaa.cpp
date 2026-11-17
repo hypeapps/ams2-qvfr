@@ -74,8 +74,9 @@ bool g_keyDown = false;
 bool g_expKeyDown = false;
 bool g_presetKeyDown = false;
 bool g_sr = false;  // DLSS SR: [dlaa] mode=dlss (sr.h in stereo, S2 in quad views)
-// Displays/cockpit from the game's TAA (ini, read live); not with DLSS SR (the game's TAA would run at the render size).
-int CockpitTaaNow() { return g_sr ? 0 : Cfg().dlaaCockpitTaa; }
+// Displays/cockpit from the game's TAA (ini, read live); not with DLSS SR (the game's TAA would run at the render size)
+// and not with [dlaa] display_pass (the displays pass takes these pixels).
+int CockpitTaaNow() { return g_sr || Cfg().dlaaDisplayPass ? 0 : Cfg().dlaaCockpitTaa; }
 // DLSS's bias-current-color mask ([dlaa] bias_mask, diagnostic, shaders/dlaa.hlsl), 0 = none. DLSS 310.9 with preset K
 // ignores it, even on the whole image (dlaa-plan S2.4 A, run 2).
 float MaskValueNow() { return Cfg().dlaaBiasMask; }
@@ -85,9 +86,10 @@ uint32_t MaskBitsNow() { return Cfg().dlaaCockpitTaa >= 2 ? 0x80 : 0x88; }
 const char* MaskBitsText(uint32_t bits) {
     return bits == 0x80 ? "displays, mirrors and the player's car" : "displays and mirrors";
 }
-// Displays with DLSS SR (cockpit_taa > 0 instead of the game's TAA, shaders/dlaa.hlsl CSDisplays): after DLSS the
-// displays and mirrors take the current frame alone (DLSS leaves trails of changing digits there).
-bool DisplaysNow() { return g_sr && Cfg().dlaaCockpitTaa > 0; }
+// Displays pass (cockpit_taa > 0 instead of the game's TAA; with DLSS SR always, else with [dlaa] display_pass;
+// shaders/dlaa.hlsl CSDisplays): after DLSS the displays and mirrors take the current frame alone (DLSS leaves trails
+// of changing digits there).
+bool DisplaysNow() { return Cfg().dlaaCockpitTaa > 0 && (g_sr || Cfg().dlaaDisplayPass); }
 const char* CockpitText(int mode) {
     return mode == 0 ? "nothing" : mode == 1 ? "displays and mirrors" : "displays, mirrors and the player's car";
 }

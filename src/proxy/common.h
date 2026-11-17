@@ -295,10 +295,13 @@ struct Config {
     int dlaaKey = 0;                  // testers: VK_F1 (F4 is focus culling in quad mode)
     int dlaaExpKeyMod = VK_RCONTROL;  // DLSS exposure steps (testers, dlaa.cpp kExpSteps)
     int dlaaExpKey = 0;               // testers: VK_F12
-    // From the game's TAA instead of DLSS: 0 nothing, 1 displays and mirrors (stencil 0x88xx), 2 also the rest of the
-    // player's car (0x80xx). DLSS smears changing digits (dlaa-plan D4, tests 2-7). With DLSS SR the same pixels go
-    // through the displays pass after DLSS instead (dlaa.cpp DisplayModeNow).
+    // Pixels DLSS must not keep in its history (it smears changing digits, dlaa-plan D4 tests 2-7): 0 nothing, 1 displays
+    // and mirrors (stencil 0x88xx), 2 also the rest of the player's car (0x80xx). They take the current frame alone in
+    // the displays pass after DLSS (dlaa.cpp DisplaysNow); with DLAA and display_pass=0 the game's TAA instead.
     int dlaaCockpitTaa = 1;
+    // [dlaa] display_pass (live, not in the default ini): with DLAA too the displays pass instead of the game's TAA (no TAA
+    // draw, copy and composition; the locks pass is skipped). 0 = the game's TAA, the way before 2026-11-17.
+    bool dlaaDisplayPass = true;
     int dlaaPresetKeyMod = VK_RCONTROL;  // DLSS preset steps: ini, J, K, M, L (testers)
     int dlaaPresetKey = 0;               // testers: VK_HOME
     // [nr] (prototype NR-P1, dlaa-plan D7; not in the default ini): 0 off, 1 focus = after DLAA the focus views go
