@@ -288,14 +288,16 @@ struct Config {
     bool dlaaAutoExposure = false;    // DLSS auto exposure (0 = dlaaExposure)
     float dlaaExposure = 0.002f;      // with auto exposure off: fixed DLSS exposure (0 = DLSS default 1)
     float dlaaExposureScale = 1.0f;   // DLSS exposure scale (multiplies the auto or fixed exposure)
-    float dlaaBiasMask = 0.0f;        // DLSS bias-current-color mask value at stencil bit 0x200 pixels (0 = no mask)
+    float dlaaBiasMask = 0.0f;        // DLSS bias-current-color mask value on the displays (stencil 0x88; 0 = no mask;
+                                      // diagnostic: DLSS 310.9 preset K ignores it)
     bool dlaaSkipLocks = true;        // skip the engine's TAA locks pass while DLAA replaces the resolve
     int dlaaKeyMod = VK_RCONTROL;     // DLAA <-> the game's TAA (A/B comparison)
     int dlaaKey = 0;                  // testers: VK_F1 (F4 is focus culling in quad mode)
     int dlaaExpKeyMod = VK_RCONTROL;  // DLSS exposure steps (testers, dlaa.cpp kExpSteps)
     int dlaaExpKey = 0;               // testers: VK_F12
     // From the game's TAA instead of DLSS: 0 nothing, 1 displays and mirrors (stencil 0x88xx), 2 also the rest of the
-    // player's car (0x80xx). DLSS smears changing digits (dlaa-plan D4, tests 2-7).
+    // player's car (0x80xx). DLSS smears changing digits (dlaa-plan D4, tests 2-7). With DLSS SR the same pixels go
+    // through the displays pass after DLSS instead (dlaa.cpp DisplayModeNow).
     int dlaaCockpitTaa = 1;
     int dlaaPresetKeyMod = VK_RCONTROL;  // DLSS preset steps: ini, J, K, M, L (testers)
     int dlaaPresetKey = 0;               // testers: VK_HOME

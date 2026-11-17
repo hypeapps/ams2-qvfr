@@ -29,6 +29,7 @@
 #include <nvsdk_ngx_helpers_d3d.h>
 
 #include "dlaa_cockpit_cs.h"  // kDlaaCockpitCS (fxc from shaders/dlaa.hlsl)
+#include "dlaa_displays_cs.h"  // kDlaaDisplaysCS
 #include "dlaa_mask_cs.h"     // kDlaaMaskCS
 #include "sr_color_ps.h"       // kSrColorPS (fxc from shaders/sr.hlsl)
 #include "sr_depth_ps.h"       // kSrDepthPS
@@ -75,6 +76,18 @@ bool g_presetKeyDown = false;
 bool g_sr = false;  // DLSS SR: [dlaa] mode=dlss (sr.h in stereo, S2 in quad views)
 // Displays/cockpit from the game's TAA (ini, read live); not with DLSS SR (the game's TAA would run at the render size).
 int CockpitTaaNow() { return g_sr ? 0 : Cfg().dlaaCockpitTaa; }
+// DLSS's bias-current-color mask ([dlaa] bias_mask, diagnostic, shaders/dlaa.hlsl), 0 = none. DLSS 310.9 with preset K
+// ignores it, even on the whole image (dlaa-plan S2.4 A, run 2).
+float MaskValueNow() { return Cfg().dlaaBiasMask; }
+// Stencil high byte bits of the mask and the displays pass (as CSCockpit's): 0x88 displays and mirrors, 0x80 the whole
+// player's car.
+uint32_t MaskBitsNow() { return Cfg().dlaaCockpitTaa >= 2 ? 0x80 : 0x88; }
+const char* MaskBitsText(uint32_t bits) {
+    return bits == 0x80 ? "displays, mirrors and the player's car" : "displays and mirrors";
+}
+// Displays with DLSS SR (cockpit_taa > 0 instead of the game's TAA, shaders/dlaa.hlsl CSDisplays): after DLSS the
+// displays and mirrors take the current frame alone (DLSS leaves trails of changing digits there).
+bool DisplaysNow() { return g_sr && Cfg().dlaaCockpitTaa > 0; }
 const char* CockpitText(int mode) {
     return mode == 0 ? "nothing" : mode == 1 ? "displays and mirrors" : "displays, mirrors and the player's car";
 }
@@ -259,7 +272,24 @@ uint32_t g_cockpitCbBits = 0;
 uint64_t g_cockpitEvals = 0;
 ID3D11Buffer* g_maskCb = nullptr;
 float g_maskCbValue = -1;
+uint32_t g_maskCbBits = 0;
 bool g_maskFailed = false;
+bool g_maskSizeLogged = false;
+bool g_maskViewLogged[kViews] = {};
+// Displays pass (DisplaysNow): shader, constants (dispBits, jitter, scale, render size), evaluations.
+ID3D11ComputeShader* g_dispCs = nullptr;
+ID3D11Buffer* g_dispCb = nullptr;
+bool g_dispFailed = false;
+uint64_t g_dispEvals = 0;
+// The mask's and the displays pass's own view of the game's normal/stencil: one slice as a one-slice array (the game's
+// view may be a slice of an array: focus's scene clones with MVR, B20 K5b). Holds the texture; the oldest goes past 8.
+struct StencilView {
+    ID3D11Resource* res = nullptr;
+    UINT slice = 0;
+    DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+    ID3D11ShaderResourceView* srv = nullptr;
+};
+std::vector<StencilView> g_stencilViews;
 ID3D11Texture2D* g_expTex = nullptr;
 float g_expValue = -1;
 uint64_t g_maskEvals = 0, g_expEvals = 0;
@@ -299,6 +329,11 @@ void DropNgxLocked() {
     SafeRelease(g_maskCb);
     g_maskCbValue = -1;
     g_maskFailed = false;
+    for (StencilView& v : g_stencilViews) SafeRelease(v.srv);
+    g_stencilViews.clear();
+    SafeRelease(g_dispCs);
+    SafeRelease(g_dispCb);
+    g_dispFailed = false;
     SafeRelease(g_expTex);
     g_expValue = -1;
     DropCarry();
@@ -383,7 +418,9 @@ ID3D11Texture2D* ScratchFor(const D3D11_TEXTURE2D_DESC& like, DXGI_FORMAT fmt, U
         if (s.tex && s.w == like.Width && s.h == like.Height && s.mips == like.MipLevels && s.arr == 1 &&
             s.fmt == fmt && s.bind == bind)
             return s.tex;
-    if (g_scratch.size() >= 12) {
+    // 11 in a DLSS SR session with the mask (2026-11-17): 4 at the eye size from the learning frames, 3-4 per view size.
+    // The oldest goes; one still used in this evaluation must not, so the cap stays well above that.
+    if (g_scratch.size() >= 16) {
         SafeRelease(g_scratch.front().srv);
         SafeRelease(g_scratch.front().uav);
         SafeRelease(g_scratch.front().tex);
@@ -440,6 +477,35 @@ ID3D11ShaderResourceView* SrvFor(ID3D11Texture2D* tex) {
     return nullptr;
 }
 
+// Our one-slice array view of `slice` of the game's normal/stencil in format `fmt` (StencilView).
+ID3D11ShaderResourceView* StencilViewFor(ID3D11Resource* res, UINT slice, DXGI_FORMAT fmt) {
+    for (size_t i = 0; i < g_stencilViews.size(); ++i) {
+        StencilView& v = g_stencilViews[i];
+        if (v.res != res || v.slice != slice || v.fmt != fmt) continue;
+        if (i + 1 != g_stencilViews.size()) std::rotate(g_stencilViews.begin() + i, g_stencilViews.begin() + i + 1,
+                                                        g_stencilViews.end());  // most recent last
+        return g_stencilViews.back().srv;
+    }
+    D3D11_SHADER_RESOURCE_VIEW_DESC d{};
+    d.Format = fmt;
+    d.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+    d.Texture2DArray.MostDetailedMip = 0;
+    d.Texture2DArray.MipLevels = 1;
+    d.Texture2DArray.FirstArraySlice = slice;
+    d.Texture2DArray.ArraySize = 1;
+    StencilView v{res, slice, fmt, nullptr};
+    if (FAILED(g_dev->CreateShaderResourceView(res, &d, &v.srv)) || !v.srv) {
+        v.srv = nullptr;  // kept as a failed entry: not tried (and logged) again each frame
+        Log("DLAA: view of the stencil (slice %u, format %d) failed; no bias mask there", slice, (int)fmt);
+    }
+    if (g_stencilViews.size() >= 8) {
+        SafeRelease(g_stencilViews.front().srv);
+        g_stencilViews.erase(g_stencilViews.begin());
+    }
+    g_stencilViews.push_back(v);
+    return v.srv;
+}
+
 bool EnsureCockpitShader() {
     if (g_cockpitCs && g_cockpitCb) return true;
     D3D11_BUFFER_DESC bd{};
@@ -453,6 +519,24 @@ bool EnsureCockpitShader() {
         return false;
     }
     g_cockpitCbBits = 0;
+    return true;
+}
+
+bool EnsureDisplaysShader() {
+    if (g_dispCs && g_dispCb) return true;
+    if (g_dispFailed) return false;
+    D3D11_BUFFER_DESC bd{};
+    bd.ByteWidth = 32;
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    if (FAILED(g_dev->CreateComputeShader(kDlaaDisplaysCS, sizeof(kDlaaDisplaysCS), nullptr, &g_dispCs)) ||
+        FAILED(g_dev->CreateBuffer(&bd, nullptr, &g_dispCb))) {
+        Log("DLAA: the displays shader could not be made; the displays stay as DLSS made them");
+        g_dispFailed = true;
+        SafeRelease(g_dispCs);
+        SafeRelease(g_dispCb);
+        return false;
+    }
     return true;
 }
 
@@ -472,6 +556,7 @@ bool EnsureMaskShader() {
         return false;
     }
     g_maskCbValue = -1;
+    g_maskCbBits = 0;
     return true;
 }
 
@@ -687,6 +772,68 @@ void MeasureShot(ID3D11DeviceContext* c, int view, const char* mode, ID3D11Textu
         }
         Log("DLAA shot %s: %zu stencil values, the most common: %s", kViewName[view], order.size(), list.c_str());
     }
+}
+
+// Shot frame with DLSS SR (S2.4): the stencil classes (high byte) of the slice the displays pass and the mask read, at
+// the render size `w` x `h`, and how many pixels and where have all of `bits` (the displays). Stalls the frame.
+void MeasureDisplays(ID3D11DeviceContext* c, int view, ID3D11Texture2D* stencil, UINT slice, UINT w, UINT h,
+                     uint32_t bits, bool passOn) {
+    if (!stencil) return;
+    D3D11_TEXTURE2D_DESC ds;
+    stencil->GetDesc(&ds);
+    if (ds.Width < w || ds.Height < h || slice >= ds.ArraySize || ds.SampleDesc.Count != 1 ||
+        ds.Format < DXGI_FORMAT_R16G16B16A16_TYPELESS || ds.Format > DXGI_FORMAT_R16G16B16A16_SINT) {
+        Log("DLAA shot %s: stencil classes not measured (stencil %ux%u x%u format %d, slice %u, render size %ux%u)",
+            kViewName[view], ds.Width, ds.Height, ds.ArraySize, (int)ds.Format, slice, w, h);
+        return;
+    }
+    D3D11_TEXTURE2D_DESC sd = ds;  // one slice, mip 0
+    sd.ArraySize = 1;
+    sd.MipLevels = 1;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags = 0;
+    ID3D11Texture2D* ss = nullptr;
+    if (FAILED(g_dev->CreateTexture2D(&sd, nullptr, &ss))) ss = nullptr;
+    if (ss) c->CopySubresourceRegion(ss, 0, 0, 0, 0, stencil, D3D11CalcSubresource(0, slice, ds.MipLevels), nullptr);
+    D3D11_MAPPED_SUBRESOURCE ms{};
+    if (ss && SUCCEEDED(c->Map(ss, 0, D3D11_MAP_READ, 0, &ms))) {
+        uint64_t on = 0, cls[256] = {};
+        UINT x0 = w, y0 = h, x1 = 0, y1 = 0;
+        for (UINT y = 0; y < h; ++y) {
+            const uint16_t* rs = (const uint16_t*)((const uint8_t*)ms.pData + (size_t)y * ms.RowPitch);
+            for (UINT x = 0; x < w; ++x) {
+                const uint32_t k = rs[x * 4 + 3] >> 8;
+                ++cls[k];
+                if ((k & bits) != bits) continue;
+                ++on;
+                x0 = std::min(x0, x);
+                y0 = std::min(y0, y);
+                x1 = std::max(x1, x);
+                y1 = std::max(y1, y);
+            }
+        }
+        c->Unmap(ss, 0);
+        const double px = (double)w * h;
+        std::vector<int> order;
+        for (int k = 0; k < 256; ++k)
+            if (cls[k]) order.push_back(k);
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return cls[a] > cls[b]; });
+        std::string list;
+        for (size_t i = 0; i < order.size() && i < 12; ++i) {
+            char buf[48];
+            snprintf(buf, sizeof(buf), "%s0x%02X %.2f%%", i ? "; " : "", order[i], 100.0 * (double)cls[order[i]] / px);
+            list += buf;
+        }
+        Log("DLAA shot %s: displays pass %s on %s (0x%02X), render size %ux%u, stencil slice %u of %ux%u x%u: %.2f%% of "
+            "the pixels, in x %u..%u y %u..%u; stencil classes: %s",
+            kViewName[view], passOn ? "on" : "off", MaskBitsText(bits), bits, w, h, slice, ds.Width, ds.Height,
+            ds.ArraySize, 100.0 * (double)on / px, on ? x0 : 0, on ? x1 : 0, on ? y0 : 0, on ? y1 : 0, list.c_str());
+    } else {
+        Log("DLAA shot %s: stencil not read back", kViewName[view]);
+    }
+    SafeRelease(ss);
 }
 
 void ReleasePending() {
@@ -1232,23 +1379,75 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
         if (!out) return;
         stencil = TexOf(srv[4]);
 
-        // Bias-current-color mask where the game's TAA keeps a short history (stencil bit 0x200, shaders/dlaa.hlsl).
-        const Config& cfg = Cfg();
+        // Bias-current-color mask on the displays (stencil 0x88, MaskValueNow), at the render size like DLSS's color
+        // input: with DLSS SR the stencil is the scene's, at the render size (or larger: the corner of its slice).
+        const float maskValue = MaskValueNow();
+        const uint32_t maskBits = MaskBitsNow();
         ID3D11Texture2D* mask = nullptr;
         ID3D11UnorderedAccessView* maskUav = nullptr;
-        if (cfg.dlaaBiasMask > 0 && stencil && EnsureMaskShader()) {
+        ID3D11ShaderResourceView* maskStencil = nullptr;  // ours (StencilViewFor), not referenced
+        UINT stencilSlice = 0;
+        if (stencil) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+            srv[4]->GetDesc(&vd);
+            if (vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY) stencilSlice = vd.Texture2DArray.FirstArraySlice;
             D3D11_TEXTURE2D_DESC sd;
             stencil->GetDesc(&sd);
-            if (sd.Width == w && sd.Height == h && sd.SampleDesc.Count == 1) {
-                mask = ScratchFor(d[3], DXGI_FORMAT_R8_UNORM, D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);
+            if (!g_maskViewLogged[view]) {
+                g_maskViewLogged[view] = true;
+                Log("DLAA: %s: the game's normal/stencil %ux%u, %u slice(s), format %d; its view: dimension %d, format "
+                    "%d, slice %u (of %u); render size %ux%u",
+                    kViewName[view], sd.Width, sd.Height, sd.ArraySize, (int)sd.Format, (int)vd.ViewDimension,
+                    (int)vd.Format, stencilSlice,
+                    vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY ? vd.Texture2DArray.ArraySize : 1, iw, ih);
+            }
+            if ((maskValue > 0 || DisplaysNow()) && sd.SampleDesc.Count == 1 && sd.Width >= iw && sd.Height >= ih)
+                maskStencil = StencilViewFor(stencil, stencilSlice, vd.Format);
+        }
+        // Displays pass after DLSS (DisplaysNow): DLSS's result (out, read) into a second texture (dispTex), the
+        // displays from the current frame's color (curSrv) at the render size.
+        const bool dispOn = DisplaysNow();
+        bool dispDone = false;  // the pass ran: dispTex holds the result
+        ID3D11Texture2D* dispTex = nullptr;
+        ID3D11UnorderedAccessView* dispUav = nullptr;
+        ID3D11ShaderResourceView* dispIn[2] = {};  // DLSS's result, the current frame (not referenced)
+        if (dispOn && maskStencil && EnsureDisplaysShader()) {
+            dispTex = ScratchFor(d[3], d[3].Format, D3D11_BIND_UNORDERED_ACCESS);
+            dispUav = dispTex ? UavFor(dispTex) : nullptr;
+            dispIn[0] = SrvFor(out);
+            if (in[1] != tex[1]) {
+                dispIn[1] = SrvFor((ID3D11Texture2D*)in[1]);
+            } else {
+                D3D11_SHADER_RESOURCE_VIEW_DESC cd{};
+                srv[1]->GetDesc(&cd);
+                if (cd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D) dispIn[1] = srv[1];
+            }
+            if (!dispUav || !dispIn[0] || !dispIn[1]) dispTex = nullptr;
+        }
+        if (maskValue > 0 && maskStencil && EnsureMaskShader()) {
+            D3D11_TEXTURE2D_DESC sd;
+            stencil->GetDesc(&sd);
+            if (sd.Width >= iw && sd.Height >= ih && sd.SampleDesc.Count == 1) {
+                D3D11_TEXTURE2D_DESC md = d[3];
+                md.Width = iw;
+                md.Height = ih;
+                md.MipLevels = 1;
+                mask = ScratchFor(md, DXGI_FORMAT_R8_UNORM, D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);
                 maskUav = mask ? UavFor(mask) : nullptr;
+            } else if (!g_maskSizeLogged) {
+                g_maskSizeLogged = true;
+                Log("DLAA: no bias mask for %s: the stencil is %ux%u (%u samples), the render size %ux%u",
+                    kViewName[view], sd.Width, sd.Height, sd.SampleDesc.Count, iw, ih);
             }
             if (!maskUav) {
                 mask = nullptr;
-            } else if (cfg.dlaaBiasMask != g_maskCbValue) {
-                const float v[4] = {cfg.dlaaBiasMask, 0, 0, 0};
+            } else if (maskValue != g_maskCbValue || maskBits != g_maskCbBits) {
+                float v[4] = {maskValue, 0, 0, 0};
+                memcpy(&v[1], &maskBits, sizeof(maskBits));
                 c->UpdateSubresource(g_maskCb, 0, nullptr, v, 0, 0);
-                g_maskCbValue = cfg.dlaaBiasMask;
+                g_maskCbValue = maskValue;
+                g_maskCbBits = maskBits;
+                Log("DLAA: bias mask %.2f on stencil class 0x%02X (%s)", maskValue, maskBits, MaskBitsText(maskBits));
             }
         }
         ID3D11Texture2D* expTex =
@@ -1322,12 +1521,12 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             if (mask) {
                 c->CSSetShader(g_maskCs, nullptr, 0);
                 c->CSSetConstantBuffers(0, 1, &g_maskCb);
-                c->CSSetShaderResources(0, 1, &srv[4]);
+                c->CSSetShaderResources(2, 1, &maskStencil);
                 c->CSSetUnorderedAccessViews(0, 1, &maskUav, nullptr);
-                c->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+                c->Dispatch((iw + 7) / 8, (ih + 7) / 8, 1);
                 ID3D11ShaderResourceView* noSrv = nullptr;
                 ID3D11UnorderedAccessView* noUav = nullptr;
-                c->CSSetShaderResources(0, 1, &noSrv);
+                c->CSSetShaderResources(2, 1, &noSrv);
                 c->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
                 c->CSSetShader(nullptr, nullptr, 0);
                 ++g_maskEvals;
@@ -1369,6 +1568,30 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             // DLAA's own context state.
             if (NVSDK_NGX_SUCCEED(r) && nr::Wanted(view))
                 nr::Process(c, view, SrvFor(out), UavFor(out), mv, in[0], w, h, iw, ih, e.InReset != 0);
+            // Displays pass (S2.4): the result goes to dispTex, which then replaces out as the copy into the target.
+            if (NVSDK_NGX_SUCCEED(r) && dispTex) {
+                struct {
+                    uint32_t bits, pad;
+                    float jitter[2], toRender[2];
+                    uint32_t renderSize[2];
+                } cb{MaskBitsNow(), 0, {e.InJitterOffsetX, e.InJitterOffsetY},
+                     {(float)iw / (float)w, (float)ih / (float)h}, {iw, ih}};
+                static_assert(sizeof(cb) == 32, "DisplayParams in shaders/dlaa.hlsl");
+                c->UpdateSubresource(g_dispCb, 0, nullptr, &cb, 0, 0);
+                c->CSSetShader(g_dispCs, nullptr, 0);
+                c->CSSetConstantBuffers(2, 1, &g_dispCb);
+                c->CSSetShaderResources(2, 1, &maskStencil);
+                c->CSSetShaderResources(3, 2, dispIn);
+                c->CSSetUnorderedAccessViews(1, 1, &dispUav, nullptr);
+                c->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+                ID3D11ShaderResourceView* noSrv[3] = {};
+                ID3D11UnorderedAccessView* noUav = nullptr;
+                c->CSSetShaderResources(2, 3, noSrv);
+                c->CSSetUnorderedAccessViews(1, 1, &noUav, nullptr);
+                c->CSSetShader(nullptr, nullptr, 0);
+                ++g_dispEvals;
+                dispDone = true;
+            }
         });
         t_inside = false;
         g_ctx1->SwapDeviceContextState(prev, nullptr);
@@ -1398,14 +1621,17 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             ID3D11Texture2D* sSt = StagingCopy(c, stencil);
             ID3D11Texture2D* sOut = StagingCopy(c, out);
             char mode[192];
-            snprintf(mode, sizeof(mode), "DLAA, game's TAA for %s, %s, bias mask %.2f",
-                     CockpitText(afterDraw ? CockpitTaaNow() : 0), ExposureText().c_str(), mask ? cfg.dlaaBiasMask : 0.0f);
+            snprintf(mode, sizeof(mode), "%s, game's TAA for %s, %s, bias mask %.2f, displays pass: %s",
+                     iw != w ? "DLSS SR" : "DLAA", CockpitText(afterDraw ? CockpitTaaNow() : 0), ExposureText().c_str(),
+                     mask ? maskValue : 0.0f, dispDone ? "on" : "off");
             MeasureShot(c, view, mode, sIn, sSt, sOut);
             SafeRelease(sIn);
             SafeRelease(sSt);
             SafeRelease(sOut);
+            if (g_sr && view >= 1)
+                MeasureDisplays(c, view, stencil, stencilSlice, iw, ih, MaskBitsNow(), dispDone);
         }
-        c->CopyResource(tex[3], out);
+        c->CopyResource(tex[3], dispDone ? dispTex : out);
         if (g_sr) sr::ShotDlss(c, tex[1], tex[3]);  // shot frame only
         result = kDone;
     }();
@@ -1740,10 +1966,11 @@ void LogStats(bool totals) {
     g_lastSetCalls = sc;
     g_lastSetNonzero = sn;
 #ifdef QVFR_HAVE_DLSS
-    if (g_maskEvals || g_expEvals || g_cockpitEvals)
+    if (g_maskEvals || g_expEvals || g_cockpitEvals || g_dispEvals)
         Log("DLAA: evaluations with the bias mask %llu, with the fixed exposure %llu, with the cockpit from the game's "
-            "TAA %llu (session)",
-            (unsigned long long)g_maskEvals, (unsigned long long)g_expEvals, (unsigned long long)g_cockpitEvals);
+            "TAA %llu, with the displays pass %llu (session; the pass now %s)",
+            (unsigned long long)g_maskEvals, (unsigned long long)g_expEvals, (unsigned long long)g_cockpitEvals,
+            (unsigned long long)g_dispEvals, DisplaysNow() ? "on" : "off");
 #endif
     nr::LogStats(totals);
     if (Cfg().quadMode != QuadMode::Quad) return;
@@ -1780,6 +2007,7 @@ void SetShotFrame(bool shot) {
     (void)shot;
 #endif
 }
+
 
 void BeginGroup(int group) { g_group.store(group >= 0 && group < 4 ? group : -1, std::memory_order_relaxed); }
 

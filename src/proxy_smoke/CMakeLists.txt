@@ -2,7 +2,7 @@
 # --xr-layer and --openxr-path test the OpenXR path (xr_smoke.cpp).
 # --shots, --quad-compose, --focus-geometry, --focus-cull and --clones test the proxy's shot, composition, focus geometry,
 # focus culling and clones modules directly, so their sources are compiled in here as well.
-add_executable(qvfr_proxy_smoke main.cpp xr_smoke.cpp sun_fx_smoke.cpp mvr_vs_smoke.cpp mvr_ps_smoke.cpp mvr_pass_smoke.cpp mvr_forward_smoke.cpp mvr_motion_smoke.cpp taa_fix_smoke.cpp nr_bridge_smoke.cpp ../proxy/nr_bridge.cpp ../proxy/shots.cpp ../proxy/compose.cpp ../proxy/focus_geometry.cpp
+add_executable(qvfr_proxy_smoke main.cpp xr_smoke.cpp sun_fx_smoke.cpp mvr_vs_smoke.cpp mvr_ps_smoke.cpp mvr_pass_smoke.cpp mvr_forward_smoke.cpp mvr_motion_smoke.cpp dlaa_displays_smoke.cpp taa_fix_smoke.cpp nr_bridge_smoke.cpp ../proxy/nr_bridge.cpp ../proxy/shots.cpp ../proxy/compose.cpp ../proxy/focus_geometry.cpp
                ../proxy/focus_cull.cpp ../proxy/fwd_rec.cpp ../proxy/common.cpp ../proxy/clones.cpp ../proxy/hooks.cpp ../proxy/hook_prof.cpp ../proxy/sysinfo.cpp ../proxy/diag.cpp
                ../proxy/sun_fx.cpp ../proxy/sr_probe.cpp ../proxy/sr_cb.cpp ../proxy/mvr_vs.cpp ../proxy/mvr_ps.cpp ../proxy/mvr_pass.cpp ../proxy/mvr_motion.cpp ../proxy/taa_views.cpp ../proxy/gpu.cpp
                panel_smoke.cpp ../proxy/panel_ui.cpp ${PROJECT_SOURCE_DIR}/third_party/rmlui-6.3/Backends/RmlUi_Renderer_DX11.cpp

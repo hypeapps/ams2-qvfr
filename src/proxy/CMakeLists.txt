@@ -27,12 +27,14 @@ add_custom_command(
   VERBATIM)
 set(QVFR_DLAA_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/shaders/dlaa.hlsl)
 add_custom_command(
-  OUTPUT ${QVFR_SHADER_OUT}/dlaa_mask_cs.h ${QVFR_SHADER_OUT}/dlaa_cockpit_cs.h
+  OUTPUT ${QVFR_SHADER_OUT}/dlaa_mask_cs.h ${QVFR_SHADER_OUT}/dlaa_cockpit_cs.h ${QVFR_SHADER_OUT}/dlaa_displays_cs.h
   COMMAND ${CMAKE_COMMAND} -E make_directory ${QVFR_SHADER_OUT}
   COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSMask /Vn kDlaaMaskCS
           /Fh ${QVFR_SHADER_OUT}/dlaa_mask_cs.h ${QVFR_DLAA_HLSL}
   COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSCockpit /Vn kDlaaCockpitCS
           /Fh ${QVFR_SHADER_OUT}/dlaa_cockpit_cs.h ${QVFR_DLAA_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSDisplays /Vn kDlaaDisplaysCS
+          /Fh ${QVFR_SHADER_OUT}/dlaa_displays_cs.h ${QVFR_DLAA_HLSL}
   DEPENDS ${QVFR_DLAA_HLSL}
   COMMENT "fxc dlaa.hlsl"
   VERBATIM)
@@ -117,7 +119,8 @@ add_custom_command(
 # Linking this target gives the include directory and builds the headers first (proxy and smoke test).
 add_library(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT}/compose_vs.h ${QVFR_SHADER_OUT}/compose_ps.h
             ${QVFR_SHADER_OUT}/sun_fx_vs.h ${QVFR_SHADER_OUT}/sun_fx_ps.h ${QVFR_SHADER_OUT}/dlaa_mask_cs.h
-            ${QVFR_SHADER_OUT}/dlaa_cockpit_cs.h ${QVFR_SHADER_OUT}/mvr_pass_vs.h ${QVFR_SHADER_OUT}/mvr_pass_depth_ps.h
+            ${QVFR_SHADER_OUT}/dlaa_cockpit_cs.h ${QVFR_SHADER_OUT}/dlaa_displays_cs.h
+            ${QVFR_SHADER_OUT}/mvr_pass_vs.h ${QVFR_SHADER_OUT}/mvr_pass_depth_ps.h
             ${QVFR_SHADER_OUT}/mvr_pass_mask_ps.h ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ps.h
             ${QVFR_SHADER_OUT}/mvr_pass_blit_ps.h ${QVFR_SHADER_OUT}/mvr_pass_color_in_ms_ps.h
             ${QVFR_SHADER_OUT}/mvr_pass_color_out_ms_ps.h ${QVFR_SHADER_OUT}/mvr_pass_depth_in_ms_ps.h
