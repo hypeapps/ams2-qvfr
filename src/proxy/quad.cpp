@@ -712,6 +712,10 @@ void VelocityRecordLocked(int group) {
     if (!g_vrOn || g_fault.load(std::memory_order_relaxed)) return;
     const char* why = g_vrStopped ? "stopped: an armed group got no outer vectors" : mvrpass::FromOuterWhy(eye);
     if (!why && !mvrpass::VelocityFilled(eye, true)) why = "the velocity pass did not get outer's vectors last frame";
+    // The frame of a switch to the game's TAA (DLAA hotkey): no DLSS evaluation stores outer's vectors for the fill.
+    if (!why && !dlaa::DlssNow()) why = "DLSS does not run in this frame (no copy of outer's vectors)";
+    // A shot frame: FillFocusMotion leaves the velocity pass to the engine (the shot compares both).
+    if (!why && g_shotFrame) why = "shot frame (the velocity pass draws its own)";
     if (g_vrEye >= 0) {  // a group whose CEndEye did not end its arming
         fwdrec::Disarm();
         g_vrEye = -1;

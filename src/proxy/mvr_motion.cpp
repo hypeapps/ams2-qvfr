@@ -91,7 +91,7 @@ Tex g_out[2];  // the result per focus view
 DepthView g_depth[4];
 int g_depthNext = 0;
 Stats g_st, g_last;
-bool g_loggedUse[2] = {}, g_loggedFail = false;
+bool g_loggedUse[2] = {}, g_loggedFail = false, g_loggedSize = false;
 
 const char* kEye[2] = {"L", "R"};
 
@@ -226,6 +226,8 @@ ComPtr<ID3D11Texture2D> Staging(ID3D11DeviceContext* c, ID3D11Texture2D* src) {
 // focus's own geometry): the rounding of focus's matrices plus the resampling at silhouettes, in focus pixels.
 void Compare(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* ours, ID3D11Texture2D* game, UINT w, UINT h,
              bool fromOuter) {
+    UINT ah = 0, bh = 0;
+    if (TexW(ours, &ah) != w || ah != h || TexW(game, &bh) != w || bh != h) return;  // the loop reads w x h of both
     ComPtr<ID3D11Texture2D> a = Staging(c, ours), b = Staging(c, game);
     if (!a || !b) return;
     D3D11_MAPPED_SUBRESOURCE ma{}, mb{};
@@ -341,9 +343,21 @@ ID3D11Texture2D* ForFocus(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* dept
         ++g_st.noStore[eye];
         return nullptr;
     }
+    // The vectors go to DLSS with focus's depth: w x h is its size (DLSS SR: the render size, not the eye size).
+    UINT dh = 0;
+    if (!depth || TexW(depth, &dh) != w || dh != h) {
+        ++g_st.failed[eye];
+        if (!g_loggedSize) {
+            g_loggedSize = true;
+            UINT dw = depth ? TexW(depth, &dh) : 0;
+            Log("MVR motion: focus %s: asked for %ux%u, but focus's depth is %ux%u; the engine's motion vectors", kEye[eye],
+                w, h, dw, depth ? dh : 0);
+        }
+        return nullptr;
+    }
     ID3D11Texture2D* result = nullptr;
     [&] {
-        if (!depth || !EnsureDevice(c) || !EnsureTex(g_out[eye], w, h, true)) return;
+        if (!EnsureDevice(c) || !EnsureTex(g_out[eye], w, h, true)) return;
         ID3D11ShaderResourceView* ds = DepthSrv(depth);
         if (!ds) return;
         Run(c, g_store[eye].srv.Get(), g_storeDepth[eye].srv.Get(), g_store[eye].w, g_store[eye].h, ds,

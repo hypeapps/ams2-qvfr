@@ -33,6 +33,9 @@ bool FrameJitter(float out[2]);
 void TraceJitter(int calls);
 // DLSS SR (sr.h, [dlaa] mode=dlss in stereo): DLSS can run now, so the scene may render at the render size.
 bool SrWanted();
+// DLSS replaces the game's TAA in this frame (setting, hotkey, no failure); its evaluation stores outer's motion
+// vectors for focus (mvr_motion.h StoreOuter), so without it focus's velocity pass gets none from outer.
+bool DlssNow();
 void LogStats(bool totals);
 std::string Describe();  // one line for summary.txt
 void Shutdown();         // VR_Shutdown: DLSS features and NGX released

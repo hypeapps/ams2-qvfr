@@ -296,6 +296,23 @@ int RunMvrMotion() {
             same = 0;
             for (size_t i = 0; i < got.size() && i < ref.size(); ++i) same += got[i] == ref[i];
             forFocusOk = !qvfr::mvrmotion::ForFocus(ctx, 0, depthTex, nullptr, kFW, kFH, 7, false);
+            // A shot frame with DLSS SR (the 2026-11-14 exception): DLAA asked for the eye size while focus's depth and
+            // the engine's vectors are at the render size. Refused (no compute pass, no comparison past the
+            // textures); the render size still runs the comparison.
+            {
+                const std::vector<uint16_t> zeroMv((size_t)kFW * kFH * 2, 0);
+                ID3D11Texture2D* gameMv = make(kFW, kFH, DXGI_FORMAT_R16G16_FLOAT, zeroMv.data(), kFW * 4);
+                qvfr::mvrmotion::SetEnabled(false);  // the view's own vectors: only the shot's comparison runs
+                const bool bigRefused =
+                    gameMv && !qvfr::mvrmotion::ForFocus(ctx, 0, depthTex, gameMv, kFW * 3 / 2, kFH * 3 / 2, 7, true);
+                const bool sameRuns =
+                    gameMv && !qvfr::mvrmotion::ForFocus(ctx, 0, depthTex, gameMv, kFW, kFH, 7, true);
+                qvfr::mvrmotion::SetEnabled(true);
+                printf("MVR motion shot with DLSS SR: the eye size refused %s, the render size compared %s\n",
+                       bigRefused ? "ok" : "FAIL", sameRuns ? "ok" : "FAIL");
+                if (!bigRefused || !sameRuns) ++fails;
+                if (gameMv) gameMv->Release();
+            }
             // B20 K5b: the linear depth as slice 1 of a three-slice array (slices 0 and 2 hold another depth): the
             // same vectors.
             sliceSame = 0;

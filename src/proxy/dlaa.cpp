@@ -126,6 +126,9 @@ std::string ExposureText() {
 }
 std::atomic<uint64_t> g_frame{0};
 std::atomic<uint64_t> g_lastOkFrame{0};  // frame of the last DLSS evaluation (locks may be skipped)
+// A view's DLSS feature that a newer one of the same view replaced (another size: a transition frame, a changed
+// render scale) is released once it has not run for this many frames.
+constexpr uint64_t kFeatureIdleFrames = 300;
 std::atomic<uint32_t> g_lastCtx{0};      // render context of the last recorded TAA resolve (jitter index)
 int g_diagLogs = 0;
 
@@ -242,6 +245,7 @@ uint32_t g_gen = 0;
 bool g_ngxInit = false;
 NVSDK_NGX_Parameter* g_params = nullptr;
 std::vector<Feature> g_feat;
+std::atomic<size_t> g_featCount{0};  // g_feat.size() for the stats line (another thread)
 std::vector<Scratch> g_scratch;
 int g_evalFails = 0;
 int g_sizeLogs = 0;
@@ -280,6 +284,7 @@ void DropNgxLocked() {
     for (Feature& f : g_feat)
         if (f.handle) NVSDK_NGX_D3D11_ReleaseFeature(f.handle);
     g_feat.clear();
+    g_featCount = 0;
     for (Scratch& s : g_scratch) {
         SafeRelease(s.srv);
         SafeRelease(s.uav);
@@ -1024,6 +1029,22 @@ Feature* FeatureFor(ID3D11DeviceContext* c, int view, uintptr_t key, UINT w, UIN
     if (cfg.dlaaMvJittered) flags |= NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
     if (AutoExposureNow()) flags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     const int preset = PresetNow();
+    // Features of this view that another one replaced and that have not run for a while go (VRAM).
+    const uint64_t frame = g_frame.load();
+    for (auto it = g_feat.begin(); it != g_feat.end();) {
+        const bool same = it->key == key && it->w == w && it->h == h && it->ow == ow && it->oh == oh;
+        if (it->view != view || same || it->lastFrame + kFeatureIdleFrames >= frame) {
+            ++it;
+            continue;
+        }
+        Log("DLAA: DLSS feature for %s, motion vectors %p (%ux%u -> %ux%u) released: not run for %llu frames, the view "
+            "now runs %ux%u -> %ux%u",
+            kViewName[view], (void*)it->key, it->w, it->h, it->ow, it->oh,
+            (unsigned long long)(frame - it->lastFrame), w, h, ow, oh);
+        if (it->handle) NVSDK_NGX_D3D11_ReleaseFeature(it->handle);
+        it = g_feat.erase(it);
+        g_featCount = g_feat.size();
+    }
     Feature* f = nullptr;
     for (Feature& x : g_feat)
         if (x.view == view && x.key == key && x.w == w && x.h == h && x.ow == ow && x.oh == oh) f = &x;
@@ -1069,6 +1090,7 @@ Feature* FeatureFor(ID3D11DeviceContext* c, int view, uintptr_t key, UINT w, UIN
     f->fresh = true;
     Log("DLAA: DLSS feature for %s, motion vectors %p created (%ux%u -> %ux%u, %s, flags 0x%X, preset %d)",
         kViewName[view], (void*)key, w, h, ow, oh, QualityName(quality), flags, preset);
+    g_featCount = g_feat.size();
     return f;
 }
 
@@ -1294,7 +1316,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
                 if (view <= 2)
                     mvrmotion::StoreOuter(c, eye, (ID3D11Texture2D*)in[2], (ID3D11Texture2D*)in[0], frame, shot);
                 else if (ID3D11Texture2D* m = mvrmotion::ForFocus(c, eye, (ID3D11Texture2D*)in[0],
-                                                                  (ID3D11Texture2D*)in[2], w, h, frame, shot))
+                                                                  (ID3D11Texture2D*)in[2], iw, ih, frame, shot))
                     mv = m;
             }
             if (mask) {
@@ -1445,6 +1467,9 @@ bool Replace(ID3D11DeviceContext* c, UINT n) {
             g_fallbacks.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
+        // Learning keeps DLAA at the eye size, not the game's TAA: with the game's draw in the learning groups the
+        // clones learned fewer carried textures (5-7 instead of 10-12) and the windscreen flickered (2026-11-17).
+        // Its DLSS features go once the scene sets' ones run (kFeatureIdleFrames).
         clones::MarkTaa(c);
     }
     if (CockpitTaaNow()) {
@@ -1681,15 +1706,19 @@ void OnFrameStart() {
 
 bool SrWanted() { return g_sr && Wanted(); }
 
+bool DlssNow() { return g_installed && Wanted(); }
+
 void LogStats(bool totals) {
     if (!g_installed) return;
 #ifdef QVFR_HAVE_DLSS
     if (g_sr) {
         const uint64_t se = g_srEvals.load();
-        Log("DLAA%s: DLSS SR: %llu evaluations at the render size, %llu textures carried in %llu resolves",
+        Log("DLAA%s: DLSS SR: %llu evaluations at the render size, %llu textures carried in %llu resolves; DLSS "
+            "features %zu",
             totals ? " (session total)" : "", (unsigned long long)(totals ? se : se - g_lastSrEvals),
             (unsigned long long)(totals ? g_carried : g_carried - g_lastCarried),
-            (unsigned long long)(totals ? g_carryFrames : g_carryFrames - g_lastCarryFrames));
+            (unsigned long long)(totals ? g_carryFrames : g_carryFrames - g_lastCarryFrames),
+            g_featCount.load());
         g_lastSrEvals = se;
         g_lastCarried = g_carried;
         g_lastCarryFrames = g_carryFrames;
