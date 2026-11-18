@@ -141,6 +141,18 @@ struct LogLine {
     Rml::String cls, text;  // cls: warn (WARNING lines), note (Note: lines) or empty
 };
 
+// The DLSS options of the Rendering card: one row per kind of view, one tile per mode.
+struct DlssViewRow {
+    int id = 0;  // DlssView
+    Rml::String name, desc, size, preset, custom;
+    int mode = -1;  // index in kDlssModes, -1 = another scale
+    bool restart = false;
+};
+struct DlssModeRow {
+    Rml::String name, bar;  // bar: the share of the pixels rendered, as a width
+    int pct = 0;
+};
+
 constexpr size_t kLogLines = 400;  // the Log page shows the end of the log
 
 struct App {
@@ -176,14 +188,20 @@ struct App {
     bool askReset = false;
     // The preview shows the eye-tracking or the fixed size; it follows the setting until the person picks one there.
     bool previewDfr = true, lastFollow = true;
+    std::vector<DlssViewRow> dlssViews;
+    std::vector<DlssModeRow> dlssModes;
     int page = 0;
     Rml::DataModelHandle model;
 };
 
 App g;
 
+void RefreshDlss();
+
 void Dirty() {
-    if (g.model) g.model.DirtyAllVariables();
+    if (!g.model) return;
+    RefreshDlss();
+    g.model.DirtyAllVariables();
 }
 
 void FollowSetting() {
@@ -252,7 +270,7 @@ void LoadLog() {
 }
 
 void CheckNow() {
-    g.files = CheckFiles(g.home, g.s.openxr, g.s.dlaa, g.s.nr);
+    g.files = CheckFiles(g.home, g.s.openxr, g.s.dlss, g.s.nr);
     g.fileRows.clear();
     for (const Check& c : g.files.checks) {
         const char* cls = c.status == Status::Ok ? "ok" : c.status == Status::Info ? "info" : c.status == Status::Warning ? "warn" : "err";
@@ -310,9 +328,12 @@ struct Res {
     unsigned gw = 0, gh = 0;  // SteamVR resolution per eye (from the log, or typed in)
     bool dfr = true;
     float sx = 0, sy = 0, offX = 0, offY = 0, m = 0;
-    unsigned ow = 0, oh = 0, fw = 0, fh = 0;
+    unsigned ow = 0, oh = 0, fw = 0, fh = 0;      // the views' sizes
+    unsigned row = 0, roh = 0, rfw = 0, rfh = 0;  // what the game renders for them (smaller with DLSS upscaling)
     double total = 0, full = 0;
 };
+
+unsigned Scaled(unsigned size, float scale) { return (unsigned)std::lround((double)size * scale); }
 
 Res Compute() {
     const Settings& s = g.s;
@@ -329,9 +350,47 @@ Res Compute() {
     r.oh = (unsigned)std::lround(s.peripheral * r.gh);
     r.fw = (unsigned)std::lround(r.sx * s.focusMultiplier * r.gw);
     r.fh = (unsigned)std::lround(r.sy * s.focusMultiplier * r.gh);
-    r.total = (double)r.ow * r.oh + (double)r.fw * r.fh;
+    r.row = Scaled(r.ow, s.dlssOuterScale);
+    r.roh = Scaled(r.oh, s.dlssOuterScale);
+    r.rfw = Scaled(r.fw, s.dlssFocusScale);
+    r.rfh = Scaled(r.fh, s.dlssFocusScale);
+    r.total = (double)r.row * r.roh + (double)r.rfw * r.rfh;
     r.full = (double)r.gw * r.gh;
     return r;
+}
+
+// The rendered size and the view's when DLSS upscales, else the size alone. Barlow Condensed (the preview's labels) has
+// no arrow, so they pass their own separator.
+std::string SizeText(unsigned rw, unsigned rh, unsigned w, unsigned h, const char* same = "", const char* to = "\xE2\x86\x92") {
+    if (rw == w && rh == h) return Fmt("%u x %u%s", w, h, same);
+    return Fmt("%u x %u %s %u x %u", rw, rh, to, w, h);
+}
+
+void RefreshDlss() {
+    const Res r = Compute();
+    const Settings& s = g.s;
+    g.dlssViews.clear();
+    auto add = [&](DlssView id, const char* name, const char* desc, float Settings::* scale, const std::string& preset,
+                   unsigned w, unsigned h) {
+        DlssViewRow v;
+        v.id = (int)id;
+        v.name = name;
+        v.desc = desc;
+        v.size = SizeText(Scaled(w, s.*scale), Scaled(h, s.*scale), w, h, ", no upscaling");
+        v.preset = preset;
+        v.mode = DlssModeIndex(s.*scale);
+        if (v.mode < 0) v.custom = Fmt("Custom %d%%", (int)std::lround(s.*scale * 100));
+        // A game started with upscaling changes its modes while it runs; one started without needs a restart for them.
+        v.restart = g.game && g.haveStart && !g.start.dlssUpscale &&
+                    std::lround(g.start.*scale * 100) != std::lround(s.*scale * 100);
+        g.dlssViews.push_back(std::move(v));
+    };
+    if (s.quad) {
+        add(DlssView::Focus, "Focus", "The sharp area you look at.", &Settings::dlssFocusScale, s.dlssFocusPreset, r.fw, r.fh);
+        add(DlssView::Peripheral, "Peripheral", "The whole field of view.", &Settings::dlssOuterScale, s.dlssOuterPreset, r.ow, r.oh);
+    } else {
+        add(DlssView::Stereo, "Image", "The image of each eye.", &Settings::dlssScale, s.dlssPreset, r.gw, r.gh);
+    }
 }
 
 // Grid lines whose spacing shows the pixel density (denser = sharper), as a decorator for data-style-decorator.
@@ -371,6 +430,23 @@ void BindModel(Rml::Context* ctx) {
         h.RegisterMember("cls", &LogLine::cls);
         h.RegisterMember("text", &LogLine::text);
     }
+    if (auto h = c.RegisterStruct<DlssViewRow>()) {
+        h.RegisterMember("id", &DlssViewRow::id);
+        h.RegisterMember("name", &DlssViewRow::name);
+        h.RegisterMember("desc", &DlssViewRow::desc);
+        h.RegisterMember("size", &DlssViewRow::size);
+        h.RegisterMember("preset", &DlssViewRow::preset);
+        h.RegisterMember("custom", &DlssViewRow::custom);
+        h.RegisterMember("mode", &DlssViewRow::mode);
+        h.RegisterMember("restart", &DlssViewRow::restart);
+    }
+    if (auto h = c.RegisterStruct<DlssModeRow>()) {
+        h.RegisterMember("name", &DlssModeRow::name);
+        h.RegisterMember("bar", &DlssModeRow::bar);
+        h.RegisterMember("pct", &DlssModeRow::pct);
+    }
+    c.RegisterArray<std::vector<DlssViewRow>>();
+    c.RegisterArray<std::vector<DlssModeRow>>();
     c.RegisterArray<std::vector<Finding>>();
     c.RegisterArray<std::vector<KeyValue>>();
     c.RegisterArray<std::vector<FileRow>>();
@@ -424,7 +500,11 @@ void BindModel(Rml::Context* ctx) {
             if (v.Get<bool>() != get()) set(v.Get<bool>());
         });
     };
-    toggle("quad", [] { return g.s.quad; }, [](bool on) { Set("quad", "mode", on ? "quad" : "off"); });
+    toggle("quad", [] { return g.s.quad; }, [](bool on) {
+        g.ini.Set("quad", "mode", on ? "quad" : "off");
+        SyncDlssMode(g.ini);  // quad views and stereo have their own DLSS modes
+        Changed();
+    });
     toggle("follow", [] { return g.s.followGaze; }, [](bool on) { Set("quad", "follow_gaze", on ? "1" : "0"); });
     toggle("gaze_hotkey", [] { return g.s.gazeKey != 0; }, [](bool on) { Set("debug", "gaze_key", on ? "0x75" : "0"); });
     toggle("gaze_overlay", [] { return g.s.overlay; }, [](bool on) { Set("debug", "overlay", on ? "1" : "0"); });
@@ -465,17 +545,46 @@ void BindModel(Rml::Context* ctx) {
     // --- Rendering: NVIDIA Multi-View Rendering ([mvr], docs/mvr.md).
     toggle("mvr", [] { return g.s.mvr; }, [](bool on) { Set("mvr", "mode", on ? "mvr" : "off"); });
     rs("rs_mvr", [](const Settings& a, const Settings& b) { return a.mvr != b.mvr; });
-    // --- Rendering: NVIDIA DLAA ([dlaa], docs/dlaa.md). The DLL row on the Files page depends on the mode.
-    // DLSS 5 runs on DLAA's result, so with DLSS 5 on the DLAA switch stays on and is greyed out.
-    toggle("dlaa", [] { return g.s.dlaa; }, [](bool on) {
-        if (!on && g.s.nr) return;
-        Set("dlaa", "mode", on ? "dlaa" : "off");
+    // --- Rendering: NVIDIA DLSS ([dlaa], docs/dlaa.md). The DLL row on the Files page depends on it. DLSS 5 runs on
+    // DLSS's motion vectors and depth, so DLSS off turns it off too and DLSS 5 on turns DLSS on.
+    toggle("dlss", [] { return g.s.dlss; }, [](bool on) {
+        WriteDlss(g.ini, on);
+        Changed();
         CheckNow();
     });
-    c.BindFunc("dlaa_locked", [](Rml::Variant& v) { v = g.s.nr && g.s.dlaa; });
-    rs("rs_dlaa", [](const Settings& a, const Settings& b) { return a.dlaa != b.dlaa; });
-    // DLSS 5 itself is live, but the DLAA it turned on starts with the game.
-    rs("rs_nr", [](const Settings& a, const Settings& b) { return b.nr && a.dlaa != b.dlaa; });
+    rs("rs_dlss", [](const Settings& a, const Settings& b) { return a.dlss != b.dlss; });
+    // DLSS 5 itself is live, but the DLSS it turned on starts with the game.
+    rs("rs_nr", [](const Settings& a, const Settings& b) { return b.nr && a.dlss != b.dlss; });
+    // One row per kind of view (RefreshDlss), each with the same tiles.
+    for (const DlssMode& m : kDlssModes)
+        g.dlssModes.push_back({m.name, Fmt("%.0f%%", m.scale * m.scale * 100), (int)std::lround(m.scale * 100)});
+    RefreshDlss();
+    c.Bind("dlss_views", &g.dlssViews);
+    c.Bind("dlss_modes", &g.dlssModes);
+    c.BindEventCallback("dlss_mode", [](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) {
+        if (args.size() < 2) return;
+        const int view = args[0].Get<int>(), mode = args[1].Get<int>();
+        if (view < 0 || view > (int)DlssView::Stereo || mode < 0 || mode >= (int)std::size(kDlssModes)) return;
+        WriteDlssScale(g.ini, (DlssView)view, kDlssModes[mode].scale);
+        Changed();
+    });
+    c.BindEventCallback("dlss_preset", [](Rml::DataModelHandle, Rml::Event&, const Rml::VariantList& args) {
+        if (args.size() < 2) return;
+        const int view = args[0].Get<int>();
+        if (view < 0 || view > (int)DlssView::Stereo) return;
+        WriteDlssPreset(g.ini, (DlssView)view, args[1].Get<Rml::String>());
+        Changed();
+    });
+    // What the game renders per eye with these modes, and without upscaling.
+    c.BindFunc("dlss_mpx", [](Rml::Variant& v) {
+        const Res r = Compute();
+        const double stereo = (double)Scaled(r.gw, g.s.dlssScale) * Scaled(r.gh, g.s.dlssScale);
+        v = Fmt("%.1f", (g.s.quad ? r.total : stereo) / 1e6);
+    });
+    c.BindFunc("dlss_full_mpx", [](Rml::Variant& v) {
+        const Res r = Compute();
+        v = Fmt("%.1f", (g.s.quad ? (double)r.ow * r.oh + (double)r.fw * r.fh : r.full) / 1e6);
+    });
     // --- Rendering: DLSS 5 ([nr], dlaa-plan D7): the options of the tuning panel in the headset (proxy panel.cpp),
     // with its ranges and value formats. All live.
     toggle("nr", [] { return g.s.nr; }, [](bool on) {
@@ -524,14 +633,9 @@ void BindModel(Rml::Context* ctx) {
     c.BindFunc("nr_outer_separate", [](Rml::Variant& v) { v = g.s.nrOuterSeparate; }, [](const Rml::Variant& v) {
         if (v.Get<bool>() != g.s.nrOuterSeparate) Set("nr", "outer_atlas", v.Get<bool>() ? "separate" : "shared");
     });
-    c.BindFunc("dlaa_preset", [](Rml::Variant& v) { v = Rml::String(g.s.dlaaPreset); },
-               [](const Rml::Variant& v) {
-                   const Rml::String p = v.Get<Rml::String>();
-                   if (p != g.s.dlaaPreset) Set("dlaa", "preset", p);
-               });
     // The DLSS exposure ([dlaa] auto_exposure, exposure) is not in the GUI (decision 2026-11-11): only the ini.
     c.BindFunc("dlss_dll", [](Rml::Variant& v) { v = g.files.dlss; });
-    // From the newest log's Detected block: the game's anti-aliasing options and the DLAA state at that start.
+    // From the newest log's Detected block: the game's anti-aliasing options at that start.
     auto detected = [](const char* key) -> std::string {
         for (const KeyValue& kv : g.detected)
             if (kv.key == key) return kv.value;
@@ -632,17 +736,18 @@ void BindModel(Rml::Context* ctx) {
         Dirty();
     });
     c.BindFunc("canvas_h", [](Rml::Variant& v) { const Res r = Compute(); v = Fmt("%.0fdp", 400.0 * r.gh / r.gw); });
-    // The pixel bar: outer and focus over a full render at the render resolution (the focus part capped at the bar).
-    c.BindFunc("outer_mpx", [](Rml::Variant& v) { const Res r = Compute(); v = Fmt("%.1f", (double)r.ow * r.oh / 1e6); });
-    c.BindFunc("focus_mpx", [](Rml::Variant& v) { const Res r = Compute(); v = Fmt("%.1f", (double)r.fw * r.fh / 1e6); });
+    // The pixel bar: outer and focus as rendered, over a full render at the render resolution (the focus part capped at
+    // the bar).
+    c.BindFunc("outer_mpx", [](Rml::Variant& v) { const Res r = Compute(); v = Fmt("%.1f", (double)r.row * r.roh / 1e6); });
+    c.BindFunc("focus_mpx", [](Rml::Variant& v) { const Res r = Compute(); v = Fmt("%.1f", (double)r.rfw * r.rfh / 1e6); });
     c.BindFunc("bar_outer", [](Rml::Variant& v) {
         const Res r = Compute();
-        v = Fmt("%.2f%%", (std::min)(100.0, 100.0 * r.ow * r.oh / r.full));
+        v = Fmt("%.2f%%", (std::min)(100.0, 100.0 * r.row * r.roh / r.full));
     });
     c.BindFunc("bar_focus", [](Rml::Variant& v) {
         const Res r = Compute();
-        const double o = (std::min)(100.0, 100.0 * r.ow * r.oh / r.full);
-        v = Fmt("%.2f%%", (std::min)(100.0 - o, 100.0 * r.fw * r.fh / r.full));
+        const double o = (std::min)(100.0, 100.0 * r.row * r.roh / r.full);
+        v = Fmt("%.2f%%", (std::min)(100.0 - o, 100.0 * r.rfw * r.rfh / r.full));
     });
     c.BindFunc("fewer", [](Rml::Variant& v) { const Res r = Compute(); v = Fmt("%.1f", r.total > 0 ? r.full / r.total : 0.0); });
     c.BindFunc("saves", [](Rml::Variant& v) { const Res r = Compute(); v = r.total < r.full; });
@@ -666,9 +771,9 @@ void BindModel(Rml::Context* ctx) {
     c.BindFunc("mpx", [](Rml::Variant& v) { v = Fmt("%.1f", Compute().total / 1e6); });
     c.BindFunc("share", [](Rml::Variant& v) { const Res r = Compute(); v = Fmt("%.0f", 100 * r.total / r.full); });
     c.BindFunc("full_mpx", [](Rml::Variant& v) { v = Fmt("%.1f", Compute().full / 1e6); });
-    c.BindFunc("outer_size", [](Rml::Variant& v) { const Res r = Compute(); v = Fmt("%u x %u", r.ow, r.oh); });
+    c.BindFunc("outer_size", [](Rml::Variant& v) { const Res r = Compute(); v = SizeText(r.row, r.roh, r.ow, r.oh, "", "to"); });
     c.BindFunc("outer_density", [](Rml::Variant& v) { v = Fmt("%.0f%%", g.s.peripheral * 100); });
-    c.BindFunc("focus_size", [](Rml::Variant& v) { const Res r = Compute(); v = Fmt("%u x %u", r.fw, r.fh); });
+    c.BindFunc("focus_size", [](Rml::Variant& v) { const Res r = Compute(); v = SizeText(r.rfw, r.rfh, r.fw, r.fh, "", "to"); });
 
     // --- Status.
     c.BindFunc("log_found", [](Rml::Variant& v) { v = g.log.found; });

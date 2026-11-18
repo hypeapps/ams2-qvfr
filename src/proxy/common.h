@@ -230,8 +230,9 @@ struct Config {
     // toggles it.
     bool mvrVelocitySkip = true;
     // Live ([debug] mvr_outlier_px, shaders/mvr_motion.hlsl): an outer texel whose motion is more than this many outer
-    // pixels off the shortest depth-matching one around it counts as an outlier; 0 = off.
-    float mvrOutlierPx = 16.0f;
+    // pixels off the shortest depth-matching one around it counts as an outlier; 0 = off. High enough to leave the road
+    // at a nearby car's tyres alone (same depth, tens of pixels more motion) and still catch vectors hundreds of pixels off.
+    float mvrOutlierPx = 128.0f;
     // Live ([debug] mvr_outer_vel_cons, mvr_pass.h mvr_forward_depth): in mode 3 and the corner layout (B20) outer's
     // velocity pass draws on a conservative copy of outer's forward depth (off: the night artefacts of 2026-11-17).
     bool mvrOuterVelCons = true;
@@ -285,12 +286,15 @@ struct Config {
     bool dlaa = false;                // mode=dlaa or dlss (a change needs a restart)
     // mode=dlss (dlaa-plan S1 in stereo, S2 in quad views): the scene renders at a render scale of each view's size into
     // the clones (sr.h, clones.h scene sets) and DLSS Super Resolution scales it to the view's size at the TAA resolve.
-    // Quad views: outer_render_scale and focus_render_scale, each render_scale when absent. Restart for all.
+    // Quad views: outer_render_scale and focus_render_scale, each render_scale when absent. mode needs a restart; the
+    // scales are live in a game started with mode=dlss (mode=dlaa then means 1, the SR passes stay).
     bool dlaaSr = false;
     float dlaaRenderScale = 0.67f;
     float dlaaOuterRenderScale = 0.67f;
     float dlaaFocusRenderScale = 0.67f;
     int dlaaPreset = 0;               // DLSS render preset hint for DLAA: 0 = DLSS default, 10 = J, 11 = K, ...
+    int dlaaOuterPreset = 0;          // quad views: outer_preset and focus_preset, each preset when absent (live)
+    int dlaaFocusPreset = 0;
     float dlaaJitterScaleX = 0.5f;    // DLSS jitter in pixels = the engine's projection offset * scale
     float dlaaJitterScaleY = -0.5f;
     bool dlaaMvJittered = false;      // the engine's motion vectors include the jitter

@@ -55,9 +55,9 @@ int RunSelfTest(const fs::path& dir) {
     Expect(Near(s.peripheral, 0.5f) && Near(s.focusX, 0.35f) && Near(s.fixedY, 0.45f) && Near(s.focusMultiplier, 1.0f),
           "default ini: balanced values");
     Expect(s.gazeKey == 0x75 && s.benchKey == 0 && s.outerKey == 0 && s.warningBox, "default ini: player hotkeys");
-    Expect(!s.dlaa && s.dlaaPreset == "m" && !s.dlaaAutoExposure && Near(s.dlaaExposure, 0.002f) && s.dlaaKey == 0 &&
-               s.dlaaPresetKey == 0,
-           "default ini: DLAA off, preset M, fixed exposure 0.002, no DLAA hotkeys");
+    Expect(!s.dlss && !s.dlssUpscale && s.dlssPreset == "m" && s.dlssOuterPreset == "m" && s.dlssFocusPreset == "m" &&
+               !s.dlaaAutoExposure && Near(s.dlaaExposure, 0.002f) && s.dlaaKey == 0 && s.dlaaPresetKey == 0,
+           "default ini: DLSS off, preset M, fixed exposure 0.002, no DLSS hotkeys");
     Expect(s.mvr, "default ini: NVIDIA Multi-View Rendering on");
     {
         IniFile d = ini;
@@ -70,7 +70,74 @@ int RunSelfTest(const fs::path& dir) {
         IniFile d = ini;
         d.Set("dlaa", "mode", "dlaa");
         const auto ch = ChangedRestartKeys(ini, d);
-        Expect(Read(d).dlaa && ch.size() == 1 && ch[0] == "NVIDIA DLAA on/off", "DLAA on needs a restart");
+        Expect(Read(d).dlss && !Read(d).dlssUpscale && ch.size() == 1 && ch[0] == "NVIDIA DLSS", "DLAA on needs a restart");
+    }
+    {
+        // The DLSS options of the Rendering card, in quad views.
+        IniFile d = ini;
+        WriteDlss(d, true);
+        Settings n = Read(d);
+        Expect(d.GetOr("dlaa", "mode", "") == "dlaa" && DlssModeIndex(n.dlssOuterScale) == 0 && DlssModeIndex(n.dlssFocusScale) == 0,
+               "DLSS on: DLAA in both views");
+        WriteDlssScale(d, DlssView::Peripheral, kDlssModes[1].scale);
+        n = Read(d);
+        Expect(d.GetOr("dlaa", "mode", "") == "dlss" && DlssModeIndex(n.dlssOuterScale) == 1 && DlssModeIndex(n.dlssFocusScale) == 0,
+               "peripheral Quality: mode=dlss, the focus stays DLAA");
+        auto ch = ChangedRestartKeys(ini, d);
+        Expect(ch.size() == 2 && ch[0] == "NVIDIA DLSS" && ch[1] == "DLSS mode of the periphery", "a DLSS mode needs a restart");
+        WriteDlss(d, false);
+        Expect(!Read(d).dlss && !Read(d).dlssUpscale, "DLSS off");
+        WriteDlss(d, true);
+        n = Read(d);
+        Expect(n.dlssUpscale && DlssModeIndex(n.dlssOuterScale) == 1, "DLSS on again: the chosen modes are back");
+        WriteDlssScale(d, DlssView::Peripheral, kDlssModes[0].scale);
+        Expect(d.GetOr("dlaa", "mode", "") == "dlaa", "both views DLAA: mode=dlaa");
+        WriteDlssPreset(d, DlssView::Focus, "k");
+        n = Read(d);
+        Expect(n.dlssFocusPreset == "k" && n.dlssOuterPreset == "m" && n.dlssPreset == "m", "a preset for the focus only");
+        IniFile e = d;
+        WriteDlssPreset(e, DlssView::Peripheral, "j");
+        Expect(Read(e).dlssOuterPreset == "j" && ChangedRestartKeys(d, e).empty(), "a preset needs no restart");
+        // A game started with upscaling: its modes change live, also to DLAA in both views.
+        WriteDlssScale(d, DlssView::Focus, kDlssModes[1].scale);
+        e = d;
+        WriteDlssScale(e, DlssView::Peripheral, kDlssModes[3].scale);
+        Expect(ChangedRestartKeys(d, e).empty(), "started with upscaling: another mode needs no restart");
+        WriteDlssScale(e, DlssView::Peripheral, kDlssModes[0].scale);
+        WriteDlssScale(e, DlssView::Focus, kDlssModes[0].scale);
+        Expect(e.GetOr("dlaa", "mode", "") == "dlaa" && ChangedRestartKeys(d, e).empty(),
+               "started with upscaling: DLAA in both views needs no restart");
+        WriteDlss(e, false);
+        Expect(ChangedRestartKeys(d, e) == std::vector<std::string>{"NVIDIA DLSS"}, "started with upscaling: DLSS off needs a restart");
+    }
+    {
+        // An ini made by hand: scales without their own keys, stale scales with mode=dlaa, a scale of no mode.
+        IniFile d;
+        d.LoadText("[quad]\nmode=quad\n[dlaa]\nmode=dlss\n");
+        Settings n = Read(d);
+        Expect(n.dlssUpscale && Near(n.dlssOuterScale, 0.67f) && Near(n.dlssFocusScale, 0.67f), "mode=dlss without scales: the proxy's 0.67");
+        d.LoadText("[quad]\nmode=quad\n[dlaa]\nmode=dlss\nrender_scale=0.5\nfocus_render_scale=0.75\npreset=default\n");
+        n = Read(d);
+        Expect(DlssModeIndex(n.dlssOuterScale) == 3 && DlssModeIndex(n.dlssFocusScale) == -1 && n.dlssFocusPreset == "k",
+               "render_scale as the fallback, a custom scale, preset default as K");
+        d.LoadText("[quad]\nmode=quad\n[dlaa]\nmode=dlaa\nouter_render_scale=0.67\nfocus_render_scale=0.67\n");
+        n = Read(d);
+        Expect(n.dlss && !n.dlssUpscale && Near(n.dlssOuterScale, 1) && Near(n.dlssFocusScale, 1), "mode=dlaa shows DLAA whatever the scales");
+        WriteDlssScale(d, DlssView::Focus, 0.5f);
+        n = Read(d);
+        Expect(n.dlssUpscale && Near(n.dlssFocusScale, 0.5f) && Near(n.dlssOuterScale, 1), "from mode=dlaa: the other view stays as shown");
+        WriteDlss(d, false);
+        d.Set("nr", "mode", "final");
+        d.Set("dlaa", "mode", "dlaa");
+        WriteDlss(d, false);
+        WriteDlss(d, true);
+        Expect(d.GetOr("dlaa", "mode", "") == "dlaa", "DLSS off from mode=dlaa: on again gives DLAA, not the old scales");
+        d.LoadText("[quad]\nmode=off\n[dlaa]\nmode=dlss\nrender_scale=0.58\nouter_render_scale=1.0\nfocus_render_scale=1.0\n");
+        n = Read(d);
+        Expect(DlssModeIndex(n.dlssScale) == 2, "stereo: render_scale");
+        d.Set("quad", "mode", "quad");
+        SyncDlssMode(d);
+        Expect(d.GetOr("dlaa", "mode", "") == "dlaa", "quad views on with nothing to upscale: mode=dlaa");
     }
     Expect(!s.nr && Near(s.nrIntensity, 1) && Near(s.nrStrength, 1) && s.nrStyle == 0 && s.nrPreset == 0 &&
                s.nrAutoMask && s.nrOuter && s.nrOuterStep == 2 && Near(s.nrOuterArea, 1) && !s.nrOuterSeparate,
@@ -80,11 +147,18 @@ int RunSelfTest(const fs::path& dir) {
         WriteNr(d, true);
         Settings n = Read(d);
         const auto ch = ChangedRestartKeys(ini, d);
-        Expect(n.nr && n.dlaa && d.GetOr("nr", "mode", "") == "final" && ch.size() == 1 && ch[0] == "NVIDIA DLAA on/off",
-               "DLSS 5 on: [nr] mode=final and DLAA on (only DLAA needs a restart)");
+        Expect(n.nr && n.dlss && d.GetOr("nr", "mode", "") == "final" && ch.size() == 1 && ch[0] == "NVIDIA DLSS",
+               "DLSS 5 on: [nr] mode=final and DLSS on (only DLSS needs a restart)");
         WriteNr(d, false);
         n = Read(d);
-        Expect(!n.nr && n.dlaa, "DLSS 5 off: DLAA stays on");
+        Expect(!n.nr && n.dlss, "DLSS 5 off: DLSS stays on");
+        WriteDlssScale(d, DlssView::Focus, kDlssModes[2].scale);
+        WriteNr(d, true);
+        Expect(d.GetOr("dlaa", "mode", "") == "dlss" && DlssModeIndex(Read(d).dlssFocusScale) == 2,
+               "DLSS 5 on keeps the chosen DLSS mode");
+        WriteDlss(d, false);
+        n = Read(d);
+        Expect(!n.dlss && !n.nr, "DLSS off turns DLSS 5 off too");
         d.Set("nr", "outer_resolution", "0.333");
         d.Set("nr", "outer_atlas", "separate");
         d.Set("nr", "intensity", "1.5");
@@ -132,12 +206,16 @@ int RunSelfTest(const fs::path& dir) {
           "[   27527.9] Detected (20 s after the first frame):\n"
           "[   27527.9]   Game: AMS2AVX.exe, supported build\n"
           "[   27527.9]   Gaze: SteamVR, valid in 100.0% of 968 frames\n"
-          "[   27527.9]   Findings: 1 warning(s), 0 note(s)\n"
-          "[   27600.0] Note: something.\n");
+          "[   27527.9]   DLAA: on (waiting for the first TAA frame)\n"
+          "[   27528.0]   Findings: 1 warning(s), 0 note(s)\n"
+          "[   27600.0] Note: something.\n"
+          "[   27700.0] Detected update: DLAA: on in quad views (DLSS Super Resolution: focus 67%, peripheral 50%)\n");
     const LogInfo log = ReadNewestLog(mod / L"logs");
     Expect(log.found && log.file.filename() == L"qvfr_20261102_201721_AMS2AVX.log" && log.when == "2026-11-02 20:17:21", "newest log");
     Expect(log.gridW == 8192 && log.gridH == 6864 && log.openxr, "SteamVR resolution and path from the log");
-    Expect(log.detectedWritten && log.detected.size() == 3 && log.detected[1].rfind("Gaze: ", 0) == 0, "Detected block");
+    Expect(log.detectedWritten && log.detected.size() == 4 && log.detected[1].rfind("Gaze: ", 0) == 0, "Detected block");
+    Expect(log.detected[2] == "DLAA: on in quad views (DLSS Super Resolution: focus 67%, peripheral 50%)",
+           "Detected update replaces its line");
     Expect(log.findings.size() == 2 && log.findings[0] == "WARNING: The game runs as X." && log.findings[1] == "Note: something.",
           "findings");
 

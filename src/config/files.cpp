@@ -134,8 +134,8 @@ FileState CheckFiles(const fs::path& modDir, bool openxrPath, bool dlaa, bool nr
                  : openxrPath ? "missing: no eye tracking on path=openxr" : "missing (needed only for path=openxr)");
     st.dlss = fs::exists(modDir / L"nvngx_dlss.dll", ec);
     add(st.dlss ? Status::Ok : dlaa ? Status::Error : Status::Info, "x64\\qvfr\\nvngx_dlss.dll",
-        st.dlss ? "NVIDIA DLSS (NVIDIA DLAA)" : dlaa ? "missing: NVIDIA DLAA cannot start, the game's TAA stays"
-                                                    : "missing (needed only for NVIDIA DLAA)");
+        st.dlss ? "NVIDIA DLSS" : dlaa ? "missing: NVIDIA DLSS cannot start, the game's TAA stays"
+                                       : "missing (needed only for NVIDIA DLSS)");
     st.nrModel = fs::exists(modDir / L"nvngx_dlssnr.dll", ec);
     st.nrForwarder = fs::exists(modDir / L"nvngx.dll_qvfr_nr.dll", ec);
     if (nr) {

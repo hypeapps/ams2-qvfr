@@ -121,16 +121,26 @@ float ExposureScaleNow() {
 constexpr int kPresetSteps[] = {-1, 10, 11, 13, 12};
 constexpr int kPresetStepCount = (int)(sizeof(kPresetSteps) / sizeof(kPresetSteps[0]));
 std::atomic<int> g_presetStep{0};
-int PresetNow() {
+// The preset of a view (kViewName): the hotkey's step for all of them, else the ini's for that kind of view.
+int PresetFor(int view) {
     const int s = g_presetStep.load();
-    return s == 0 ? Cfg().dlaaPreset : kPresetSteps[s];
+    if (s != 0) return kPresetSteps[s];
+    const Config& c = Cfg();
+    return view == 0 ? c.dlaaPreset : view <= 2 ? c.dlaaOuterPreset : c.dlaaFocusPreset;
+}
+std::string PresetName(int p) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), p > 0 ? "%c" : "default", 'a' + p - 1);
+    return buf;
 }
 std::string ExposureText() {
-    char buf[96];
+    char buf[128];
     const float e = ExposureNow(), k = ExposureScaleNow();
-    const int p = PresetNow();
-    char preset[16];
-    snprintf(preset, sizeof(preset), p > 0 ? "%c" : "default", 'a' + p - 1);
+    const int outer = PresetFor(1), focus = PresetFor(3);
+    const std::string names = Cfg().quadMode == QuadMode::Off ? PresetName(PresetFor(0))
+                              : outer == focus               ? PresetName(outer)
+                                                             : "outer " + PresetName(outer) + ", focus " + PresetName(focus);
+    const char* preset = names.c_str();
     if (AutoExposureNow())
         snprintf(buf, sizeof(buf), "exposure auto x %g, preset %s", k, preset);
     else if (e > 0)
@@ -171,6 +181,23 @@ void SetState(const std::string& s) {
     std::lock_guard lock(g_sm);
     g_state = s;
     diag::Set("DLAA", s);
+}
+
+// The state while DLSS runs; with DLSS SR it names the render scales in use.
+bool g_ran = false, g_ranQuad = false;
+void SetRunningState(bool quad) {
+    g_ran = true;
+    g_ranQuad = quad;
+    char state[128];
+    const Config& cfg = Cfg();
+    if (!g_sr)
+        snprintf(state, sizeof(state), "%s (DLSS replaces the game's TAA)", quad ? "on in quad views" : "on");
+    else if (quad)
+        snprintf(state, sizeof(state), "on in quad views (DLSS Super Resolution: focus %.0f%%, peripheral %.0f%%)",
+                 cfg.dlaaFocusRenderScale * 100, cfg.dlaaOuterRenderScale * 100);
+    else
+        snprintf(state, sizeof(state), "on (DLSS Super Resolution: %.0f%%)", cfg.dlaaRenderScale * 100);
+    SetState(state);
 }
 
 template <class F>
@@ -1177,7 +1204,7 @@ Feature* FeatureFor(ID3D11DeviceContext* c, int view, uintptr_t key, UINT w, UIN
     int flags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
     if (cfg.dlaaMvJittered) flags |= NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
     if (AutoExposureNow()) flags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
-    const int preset = PresetNow();
+    const int preset = PresetFor(view);
     // Features of this view that another one replaced and that have not run for a while go (VRAM).
     const uint64_t frame = g_frame.load();
     for (auto it = g_feat.begin(); it != g_feat.end();) {
@@ -1611,7 +1638,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
         if (g_evalFails || !g_viewLogged[view]) {
             g_viewLogged[view] = true;
             Log("DLAA: DLSS replaces the game's TAA resolve (%s, %ux%u -> %ux%u)", kViewName[view], iw, ih, w, h);
-            SetState(view ? "on in quad views (DLSS replaces the game's TAA)" : "on (DLSS replaces the game's TAA)");
+            SetRunningState(view != 0);
         }
         g_viewEvals[view].fetch_add(1, std::memory_order_relaxed);
         g_evalFails = 0;
@@ -1933,6 +1960,13 @@ void OnFrameStart() {
 }
 
 bool SrWanted() { return g_sr && Wanted(); }
+
+void OnSrScalesChanged() {
+    Protect("render scales", [] {
+        ResetAllLocked();  // a feature of an earlier size that comes back has an old history
+        if (g_ran) SetRunningState(g_ranQuad);
+    });
+}
 
 bool DlssNow() { return g_installed && Wanted(); }
 

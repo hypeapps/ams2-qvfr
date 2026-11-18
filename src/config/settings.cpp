@@ -29,6 +29,38 @@ float Clamp(float v, float lo, float hi) { return !(v >= lo) ? lo : v > hi ? hi 
 const char* const kPresetKeys[] = {"peripheral_multiplier", "horizontal_focus_section", "vertical_focus_section",
                                    "horizontal_fixed_section", "vertical_fixed_section"};
 
+constexpr float kFullScale = 0.995f;  // a render scale from here up upscales nothing
+
+// A render scale in the ini: its key, then render_scale. Without either the proxy takes 0.67 with mode=dlss; for a mode
+// not chosen yet nothing was picked, which is DLAA.
+float StoredScale(const IniFile& ini, const char* key, bool upscale) {
+    std::string v;
+    const float s = Given(ini, "dlaa", key, v) || Given(ini, "dlaa", "render_scale", v) ? ParseFloat(v, 1.0f)
+                    : upscale                                                          ? 0.67f
+                                                                                       : 1.0f;
+    return Clamp(s, 0.33f, 1.0f);
+}
+
+bool QuadOn(const IniFile& ini) { return ini.GetOr("quad", "mode", "off") == "quad"; }
+
+bool Upscales(const IniFile& ini, bool upscale) {
+    if (!QuadOn(ini)) return StoredScale(ini, "render_scale", upscale) < kFullScale;
+    return StoredScale(ini, "outer_render_scale", upscale) < kFullScale ||
+           StoredScale(ini, "focus_render_scale", upscale) < kFullScale;
+}
+
+// Stores a scale shown to the player when the ini would not give it back with DLSS off.
+void KeepScale(IniFile& ini, const char* key, float shown) {
+    const float stored = StoredScale(ini, key, false);
+    if (stored < shown - 0.001f || stored > shown + 0.001f) ini.Set("dlaa", key, Num(shown));
+}
+
+// A preset key as the GUI shows it; "default" is NVIDIA's choice for DLAA, which is K.
+std::string PresetOf(const IniFile& ini, const char* key, const std::string& fallback) {
+    const std::string p = ini.GetOr("dlaa", key, "");
+    return p.empty() ? fallback : p == "default" ? "k" : p;
+}
+
 }  // namespace
 
 Settings Read(const IniFile& ini) {
@@ -67,11 +99,18 @@ Settings Read(const IniFile& ini) {
     s.warningBox = ParseInt(ini.GetOr("log", "warning_box", ""), 1) != 0;
     s.overlay = ParseInt(ini.GetOr("debug", "overlay", ""), 0) != 0;
     s.mvr = ini.GetOr("mvr", "mode", "mvr") != "off";
-    s.dlaa = ini.GetOr("dlaa", "mode", "off") == "dlaa";
-    // The GUI offers j, k, l and m; without the key the proxy takes M; "default" (or empty) is NVIDIA's choice for DLAA,
-    // which is K.
-    s.dlaaPreset = ini.GetOr("dlaa", "preset", "m");
-    if (s.dlaaPreset.empty() || s.dlaaPreset == "default") s.dlaaPreset = "k";
+    const std::string dlss = ini.GetOr("dlaa", "mode", "off");
+    s.dlss = dlss == "dlaa" || dlss == "dlss";
+    s.dlssUpscale = dlss == "dlss";
+    if (s.dlssUpscale) {
+        s.dlssScale = StoredScale(ini, "render_scale", true);
+        s.dlssOuterScale = StoredScale(ini, "outer_render_scale", true);
+        s.dlssFocusScale = StoredScale(ini, "focus_render_scale", true);
+    }
+    // The GUI offers j, k, l and m; without the key the proxy takes M; an empty key reads as "default".
+    s.dlssPreset = PresetOf(ini, "preset", ini.GetOr("dlaa", "preset", "m").empty() ? "k" : "m");
+    s.dlssOuterPreset = PresetOf(ini, "outer_preset", s.dlssPreset);
+    s.dlssFocusPreset = PresetOf(ini, "focus_preset", s.dlssPreset);
     s.dlaaAutoExposure = ParseInt(ini.GetOr("dlaa", "auto_exposure", ""), 0) != 0;
     s.dlaaExposure = ParseFloat(ini.GetOr("dlaa", "exposure", ""), 0.002f);
     // [nr], with the proxy's defaults and ranges (common.cpp).
@@ -119,9 +158,56 @@ void ClearPresetOverrides(IniFile& ini) {
     for (const char* k : kPresetKeys) ini.Set("quad", k, "");
 }
 
+int DlssModeIndex(float scale) {
+    for (int i = 0; i < (int)std::size(kDlssModes); ++i)
+        if (scale > kDlssModes[i].scale - 0.005f && scale < kDlssModes[i].scale + 0.005f) return i;
+    return -1;
+}
+
+void WriteDlss(IniFile& ini, bool on) {
+    if (on) {
+        ini.Set("dlaa", "mode", Upscales(ini, false) ? "dlss" : "dlaa");
+        return;
+    }
+    const Settings s = Read(ini);
+    if (s.dlss) {
+        if (s.quad) {
+            KeepScale(ini, "outer_render_scale", s.dlssOuterScale);
+            KeepScale(ini, "focus_render_scale", s.dlssFocusScale);
+        } else {
+            KeepScale(ini, "render_scale", s.dlssScale);
+        }
+    }
+    ini.Set("dlaa", "mode", "off");
+    ini.Set("nr", "mode", "off");
+}
+
+void WriteDlssScale(IniFile& ini, DlssView view, float scale) {
+    const Settings s = Read(ini);
+    bool upscale = scale < kFullScale;
+    if (view == DlssView::Stereo) {
+        ini.Set("dlaa", "render_scale", Num(scale));
+    } else {
+        // The other view keeps what is shown for it (with mode=dlaa that is 1, whatever the ini still holds).
+        const float other = view == DlssView::Focus ? s.dlssOuterScale : s.dlssFocusScale;
+        upscale = upscale || other < kFullScale;
+        ini.Set("dlaa", "outer_render_scale", Num(view == DlssView::Focus ? other : scale));
+        ini.Set("dlaa", "focus_render_scale", Num(view == DlssView::Focus ? scale : other));
+    }
+    ini.Set("dlaa", "mode", upscale ? "dlss" : "dlaa");
+}
+
+void WriteDlssPreset(IniFile& ini, DlssView view, const std::string& preset) {
+    ini.Set("dlaa", view == DlssView::Stereo ? "preset" : view == DlssView::Focus ? "focus_preset" : "outer_preset", preset);
+}
+
+void SyncDlssMode(IniFile& ini) {
+    if (Read(ini).dlssUpscale && !Upscales(ini, true)) ini.Set("dlaa", "mode", "dlaa");
+}
+
 void WriteNr(IniFile& ini, bool on) {
     ini.Set("nr", "mode", on ? "final" : "off");
-    if (on) ini.Set("dlaa", "mode", "dlaa");
+    if (on && !Read(ini).dlss) WriteDlss(ini, true);
 }
 
 void WritePreset(IniFile& ini, int preset) {
@@ -145,7 +231,10 @@ const std::vector<KeyRef>& RestartKeys() {
         {"quad", "horizontal_fixed_section", "focus width without eye tracking"},
         {"quad", "vertical_fixed_section", "focus height without eye tracking"},
         {"mvr", "mode", "NVIDIA Multi-View Rendering on/off"},
-        {"dlaa", "mode", "NVIDIA DLAA on/off"},
+        {"dlaa", "mode", "NVIDIA DLSS"},
+        {"dlaa", "render_scale", "DLSS mode"},
+        {"dlaa", "outer_render_scale", "DLSS mode of the periphery"},
+        {"dlaa", "focus_render_scale", "DLSS mode of the focus"},
         {"timing", "csv_always", "CSV for the whole session"},
         {"timing", "gpu", "GPU timestamps"},
         {"benchmark", "auto_start_s", "benchmark auto start"},
@@ -155,7 +244,11 @@ const std::vector<KeyRef>& RestartKeys() {
 
 std::vector<std::string> ChangedRestartKeys(const IniFile& before, const IniFile& now) {
     std::vector<std::string> out;
+    // A game started with mode=dlss changes its DLSS modes while it runs; only turning DLSS off waits for a restart.
+    const bool liveModes = Read(before).dlssUpscale;
+    const bool dlssOn = Read(now).dlss;
     for (const KeyRef& k : RestartKeys()) {
+        if (liveModes && !strcmp(k.section, "dlaa") && (strcmp(k.key, "mode") || dlssOn)) continue;
         std::string a, b;
         before.Get(k.section, k.key, a);
         now.Get(k.section, k.key, b);

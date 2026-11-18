@@ -29,13 +29,18 @@ struct Settings {
     bool overlay = false;  // [debug] overlay: the gaze and the blend edges drawn in the game
     // [mvr] (docs/mvr.md): NVIDIA Multi-View Rendering of the focus views in outer's passes
     bool mvr = true;                 // mode=mvr, anything but off (restart)
-    // [dlaa] (docs/dlaa.md): NVIDIA DLAA instead of the game's TAA
-    bool dlaa = false;               // mode=dlaa (restart)
-    std::string dlaaPreset = "m";    // j, k, l, m (no key: m as the proxy; "default" reads as k, NVIDIA's DLAA default)
+    // [dlaa] (docs/dlaa.md): NVIDIA DLSS instead of the game's TAA
+    bool dlss = false;               // mode=dlaa or dlss (restart)
+    bool dlssUpscale = false;        // mode=dlss
+    // The share of each axis the game renders, as the proxy uses it: 1 unless mode=dlss (restart).
+    float dlssScale = 1.0f, dlssOuterScale = 1.0f, dlssFocusScale = 1.0f;
+    // j, k, l, m (no key: m as the proxy; "default" reads as k, NVIDIA's DLAA default). Live. The outer and focus ones
+    // follow dlssPreset when they have no key.
+    std::string dlssPreset = "m", dlssOuterPreset = "m", dlssFocusPreset = "m";
     bool dlaaAutoExposure = false;
     float dlaaExposure = 0.002f;     // fixed DLSS exposure with auto off
-    // [nr] (dlaa-plan D7): DLSS 5 neural rendering on the finished image; runs on DLAA's motion vectors and depth, so
-    // it needs [dlaa] mode=dlaa. All live. The same options as the tuning panel in the headset (proxy panel.cpp).
+    // [nr] (dlaa-plan D7): DLSS 5 neural rendering on the finished image; runs on DLSS's motion vectors and depth, so
+    // it needs DLSS on. All live. The same options as the tuning panel in the headset (proxy panel.cpp).
     bool nr = false;                 // mode=final (or the older focus)
     float nrIntensity = 1.0f, nrStrength = 1.0f, nrLocalTone = 1.0f, nrLocalStructure = 1.0f;
     int nrStyle = 0, nrPreset = 0;   // 0..3
@@ -55,11 +60,32 @@ struct Settings {
 
 Settings Read(const IniFile& ini);
 
+// The DLSS modes the GUI offers, with the proxy's render scale of each.
+struct DlssMode {
+    const char* name;
+    float scale;
+};
+inline constexpr DlssMode kDlssModes[] = {
+    {"DLAA", 1.0f}, {"Quality", 0.67f}, {"Balanced", 0.58f}, {"Performance", 0.5f}, {"Ultra Performance", 0.33f}};
+// The mode of a render scale, -1 for another scale (typed into the ini).
+int DlssModeIndex(float scale);
+
+// What a row of DLSS options sets: the two kinds of views in quad views, or the eye image in stereo.
+enum class DlssView { Focus, Peripheral, Stereo };
+
 // Writers: each changes the document (the caller saves). Values are written the way a person would type them.
 std::string Num(float v);
 void WritePreset(IniFile& ini, int preset);        // preset=<name> and the five preset keys emptied
 void ClearPresetOverrides(IniFile& ini);
-// DLSS 5 on ([nr] mode=final, and [dlaa] mode=dlaa, which it runs on) or off ([nr] mode=off; DLAA stays as it is).
+// DLSS on: mode=dlss when the stored scales upscale anything, else mode=dlaa. Off: mode=off and DLSS 5 off, which cannot
+// run without it; the scales shown until then stay stored for the next time.
+void WriteDlss(IniFile& ini, bool on);
+// One view's mode. The mode key follows: dlaa when nothing is upscaled any more, else dlss.
+void WriteDlssScale(IniFile& ini, DlssView view, float scale);
+void WriteDlssPreset(IniFile& ini, DlssView view, const std::string& preset);
+// After [quad] mode changed: other scales apply now; dlss becomes dlaa when they upscale nothing.
+void SyncDlssMode(IniFile& ini);
+// DLSS 5 on ([nr] mode=final, and DLSS on when it was off; a DLSS mode already chosen stays) or off ([nr] mode=off).
 void WriteNr(IniFile& ini, bool on);
 
 // Keys that only take effect at the next game start (the rest work while the game runs, about 1 s after saving).

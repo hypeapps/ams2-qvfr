@@ -2743,6 +2743,27 @@ void ShotRectsLocked(const focus::Eye* eye) {
     }
 }
 
+uint32_t SizePx(double v) { return (uint32_t)std::clamp(std::lround(v), 16L, 16384L); }
+
+// DLSS SR (S2): the scene phase of each view at its render scale of the view's size. At the start, and at a frame start
+// after the scales changed in qvfr.ini (a DLSS mode picked while the game runs).
+uint32_t g_srSizes[4] = {};
+void ApplySrScalesLocked() {
+    const Config& c = Cfg();
+    const uint32_t r[4] = {SizePx(g_focus.outerW * (double)c.dlaaOuterRenderScale),
+                           SizePx(g_focus.outerH * (double)c.dlaaOuterRenderScale),
+                           SizePx(g_focus.focusTexW * (double)c.dlaaFocusRenderScale),
+                           SizePx(g_focus.focusTexH * (double)c.dlaaFocusRenderScale)};
+    if (std::equal(r, r + 4, g_srSizes)) return;
+    const bool live = g_srSizes[0] != 0;
+    std::copy(r, r + 4, g_srSizes);
+    clones::SetSceneSizes(r[0], r[1], r[2], r[3]);
+    mvrpass::SetSceneSizes(r[0], r[1], r[2], r[3]);
+    if (live) dlaa::OnSrScalesChanged();
+    Log("Quad: DLSS SR%s: outer's scene at %u x %u -> %u x %u, focus's at %u x %u -> %u x %u", live ? " (changed live)" : "",
+        r[0], r[1], g_focus.outerW, g_focus.outerH, r[2], r[3], g_focus.focusTexW, g_focus.focusTexH);
+}
+
 // First size query of a VR session: the focus window. Only with the engine hooks and the builder patch in place, so a
 // game without focus groups keeps its full size.
 void SetupLocked(vr::IVRSystem* real) {
@@ -2768,11 +2789,10 @@ void SetupLocked(vr::IVRSystem* real) {
     }
     // Texture sizes as in mbucchia: multiplier x SteamVR size (focus: x section too). The game renders all four views
     // at its one size, so it gets the larger per axis.
-    auto px = [](double v) { return (uint32_t)std::clamp(std::lround(v), 16L, 16384L); };
-    g_focus.outerW = px(c.peripheralMultiplier * g.gridW);
-    g_focus.outerH = px(c.peripheralMultiplier * g.gridH);
-    g_focus.focusTexW = px((double)c.focusMultiplier * secX * g.gridW);
-    g_focus.focusTexH = px((double)c.focusMultiplier * secY * g.gridH);
+    g_focus.outerW = SizePx(c.peripheralMultiplier * g.gridW);
+    g_focus.outerH = SizePx(c.peripheralMultiplier * g.gridH);
+    g_focus.focusTexW = SizePx((double)c.focusMultiplier * secX * g.gridW);
+    g_focus.focusTexH = SizePx((double)c.focusMultiplier * secY * g.gridH);
     g_focus.gameW = std::max(g_focus.outerW, g_focus.focusTexW);
     g_focus.gameH = std::max(g_focus.outerH, g_focus.focusTexH);
     g_focus.on = true;
@@ -2780,17 +2800,7 @@ void SetupLocked(vr::IVRSystem* real) {
                      g_focus.focusTexH);
     mvrpass::SetSizes(g_focus.gameW, g_focus.gameH, g_focus.outerW, g_focus.outerH, g_focus.focusTexW,
                       g_focus.focusTexH);
-    if (SrConfigured()) {
-        // DLSS SR (S2): the scene phase of each view at its render scale of the view's size.
-        const uint32_t row = px(g_focus.outerW * (double)c.dlaaOuterRenderScale);
-        const uint32_t roh = px(g_focus.outerH * (double)c.dlaaOuterRenderScale);
-        const uint32_t rfw = px(g_focus.focusTexW * (double)c.dlaaFocusRenderScale);
-        const uint32_t rfh = px(g_focus.focusTexH * (double)c.dlaaFocusRenderScale);
-        clones::SetSceneSizes(row, roh, rfw, rfh);
-        mvrpass::SetSceneSizes(row, roh, rfw, rfh);
-        Log("Quad: DLSS SR: outer's scene at %u x %u -> %u x %u, focus's at %u x %u -> %u x %u", row, roh,
-            g_focus.outerW, g_focus.outerH, rfw, rfh, g_focus.focusTexW, g_focus.focusTexH);
-    }
+    if (SrConfigured()) ApplySrScalesLocked();
     g_focus.engaged = true;
     for (int i = 0; i < 2; ++i) {
         float cx = 0, cy = 0;
@@ -2999,6 +3009,7 @@ void OnFrameStart() {
         // DLSS SR: the scene sets only while DLSS runs (setting, hotkey, no failure), else the views' own sizes.
         srprobe::OnFrameStart(gpu::Context());  // S2.1: the probed frame's report, the hotkey
         srcb::OnFrameStart();
+        if (g_focus.engaged && SrConfigured()) ApplySrScalesLocked();
         const bool srNow = SrConfigured() && dlaa::SrWanted();
         clones::SetSrActive(srNow);
         mvrpass::SetSrActive(srNow);

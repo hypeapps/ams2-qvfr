@@ -39,6 +39,12 @@ void ProcessFinal(ID3D11DeviceContext* c, int eye, ID3D11Texture2D*& focus, ID3D
 // Live on/off ([nr] key, benchmark switch `nr`).
 bool Active();
 void SetActive(bool on);
+// The tuning panel's switch: NR on the final images now. On also works with [nr] mode=off in the ini, for this session
+// (SessionOn) until the panel saves it to the ini (then ClearSession) or the settings turn NR off.
+bool FinalOn();
+void SetFinal(bool on);
+bool SessionOn();
+void ClearSession();
 // Live settings over the ini: the benchmark sequence switches (quad.cpp) and the tuning panel (panel.cpp).
 // nr_outer 0/1, nr_batch 0/1, nr_outer_res (source pixels per outer pixel in the atlas, 1..4), nr_outer_area (the outer images'
 // centre part through the model, percent 50..100), nr_preset 0..3, nr_style 0..3, nr_strength (percent 0..300),

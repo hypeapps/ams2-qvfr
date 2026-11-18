@@ -198,7 +198,11 @@ std::string IniText(K k, int v) {
     return b;
 }
 
+// Neural Rendering on from this panel while the ini has it off.
+bool NrToSave() { return nr::SessionOn() && nr::FinalOn(); }
+
 bool AnyToSave() {
+    if (NrToSave()) return true;
     for (const IniKey& k : kIniKeys)
         if (nr::KnobSet(k.knob)) return true;
     return false;
@@ -215,7 +219,8 @@ void Save() {
     std::vector<const IniKey*> keys;
     for (const IniKey& k : kIniKeys)
         if (nr::KnobSet(k.knob)) keys.push_back(&k);
-    if (keys.empty()) {
+    const bool saveNr = NrToSave();
+    if (keys.empty() && !saveNr) {
         SetStatus("Nothing to save");
         return;
     }
@@ -227,6 +232,10 @@ void Save() {
         return;
     }
     std::string list;
+    if (saveNr) {
+        ini.Set("nr", "mode", "final");
+        list = "[nr] mode=final";
+    }
     for (const IniKey* k : keys) {
         const std::string v = IniText(k->knob, nr::GetKnob(k->knob));
         ini.Set(k->section, k->key, v);
@@ -239,7 +248,8 @@ void Save() {
     }
     ReloadConfig(true);
     for (const IniKey* k : keys) nr::ClearKnob(k->knob);
-    SetStatus("Saved " + std::to_string(keys.size()));
+    if (saveNr) nr::ClearSession();
+    SetStatus("Saved " + std::to_string(keys.size() + (saveNr ? 1 : 0)));
     Log("Panel: saved to qvfr.ini: %s", list.c_str());
 }
 
@@ -287,9 +297,9 @@ void UpdateStats() {
         const uint64_t d11 = n.d11Frames - pn.d11Frames, frames = n.frames - pn.frames;
         if (!d11 || !frames) {
             s[3].value = "-";
-            g.statsNote = Cfg().nrMode != 2 ? "NR is off in qvfr.ini ([nr] mode=final)"
-                          : !nr::Active()   ? "Neural Rendering is switched off"
-                                            : "No images went through NR in the last second";
+            g.statsNote = !Cfg().dlaa    ? "NVIDIA DLSS is off: turn it on in the settings and restart the game"
+                          : !nr::FinalOn() ? "Neural Rendering is switched off"
+                                           : "No images went through NR in the last second";
         } else {
             const double k = 1.0 / (double)d11;
             const double guides = (n.d11Guides - pn.d11Guides) * k, pack = (n.d11Pack - pn.d11Pack) * k,
@@ -312,8 +322,7 @@ void UpdateStats() {
 }
 
 int ValueOf(const Item& it) {
-    // ON only while NR can run: [nr] mode=final in qvfr.ini and the live switch on (the note says which one is off).
-    if (it.special == Special::NrOn) return Cfg().nrMode == 2 && nr::Active() ? 1 : 0;
+    if (it.special == Special::NrOn) return nr::FinalOn() ? 1 : 0;
     if (it.knob == K::Count) return 0;
     const int v = nr::GetKnob(it.knob);
     return it.knob == K::SkinStructure && v < 0 ? it.min : v;  // the model's own: left of 0
@@ -332,8 +341,14 @@ std::string TextOf(const Item& it, int v) {
 
 void Change(const Item& it, int dir) {
     if (it.special == Special::NrOn) {
-        nr::SetActive(!nr::Active());
-        Log("Panel: Neural Rendering %s", nr::Active() ? "on" : "off");
+        // NR takes DLSS's motion vectors and depth, and DLSS starts with the game.
+        if (!Cfg().dlaa) {
+            Log("Panel: Neural Rendering needs NVIDIA DLSS, which is off in this game session");
+            return;
+        }
+        nr::SetFinal(!nr::FinalOn());
+        Log("Panel: Neural Rendering %s%s", nr::FinalOn() ? "on" : "off",
+            nr::SessionOn() ? " (for this session: not in qvfr.ini until saved)" : "");
         return;
     }
     if (it.special == Special::Save) {
@@ -389,7 +404,8 @@ std::vector<R> Rows() {
         R r;
         r.kind = it.kind;
         r.label = it.label;
-        if (it.knob != K::Count && nr::KnobSet(it.knob)) r.label += "  *";  // changed in this session
+        if ((it.knob != K::Count && nr::KnobSet(it.knob)) || (it.special == Special::NrOn && NrToSave()))
+            r.label += "  *";  // changed in this session
         if (it.kind != R::Head) {
             const int v = ValueOf(it);
             r.value = TextOf(it, v);
@@ -474,7 +490,7 @@ void Tick() {
             return;
         }
     }
-    const char* title = c.nrMode == 2 ? "DLSS 5 tuning" : "DLSS 5 tuning (NR off in qvfr.ini)";
+    const char* title = c.dlaa ? "DLSS 5 tuning" : "DLSS 5 tuning (NVIDIA DLSS is off)";
     UpdateStats();
     g.ui.Set(Rows(), g.sel, title, kFooter, g.stats, "Measured, last second", g.details, "NR cost parts",
              g.statsNote);

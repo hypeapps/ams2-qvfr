@@ -127,42 +127,27 @@
                             <div class="switch"><input type="checkbox" data-checked="mvr"/><div class="knob"/></div>
                         </div>
                     </div>
-                    <div class="banner gaze-warn" data-if="dlaa &amp;&amp; !dlss_dll">
+                    <div class="banner gaze-warn" data-if="dlss &amp;&amp; !dlss_dll">
                         <span class="banner-title">nvngx_dlss.dll is missing in x64\qvfr.</span>
-                        NVIDIA DLAA cannot start without it, so the game's own TAA stays. Unpack the mod's zip again.
+                        NVIDIA DLSS cannot start without it, so the game's own TAA stays. Unpack the mod's zip again.
                     </div>
-                    <div class="banner gaze-warn" data-if="dlaa &amp;&amp; (game_taa_off || game_msaa_on)">
+                    <div class="banner gaze-warn" data-if="dlss &amp;&amp; (game_taa_off || game_msaa_on)">
                         <span class="banner-title">TAA was off or MSAA on in the game at its last start ({{ log_when }}).</span>
-                        NVIDIA DLAA replaces the game's TAA: in the game's graphics options turn TAA on and MSAA off.
+                        NVIDIA DLSS replaces the game's TAA: in the game's graphics options turn TAA on and MSAA off.
                     </div>
-                    <div class="row" data-class-locked="dlaa_locked">
+                    <div class="row">
                         <div class="label">
-                            <div class="name">NVIDIA DLAA <span class="tag" data-if="rs_dlaa">Game restart needed</span></div>
-                            <div class="desc" data-if="!dlaa_locked">NVIDIA DLSS without upscaling replaces the game's TAA. NVIDIA RTX graphics cards only. Needs TAA on in the game.</div>
-                            <div class="desc" data-if="dlaa_locked">On for DLSS 5, which works on the DLAA image. Turn DLSS 5 off to turn DLAA off.</div>
+                            <div class="name">NVIDIA DLSS <span class="tag" data-if="rs_dlss">Game restart needed</span></div>
+                            <div class="desc">Replaces the game's TAA. NVIDIA RTX graphics cards only. Needs TAA on in the game.</div>
                         </div>
                         <div class="control">
-                            <div class="switch"><input type="checkbox" data-checked="dlaa" data-attrif-disabled="dlaa_locked"/><div class="knob"/></div>
-                        </div>
-                    </div>
-                    <div class="row" data-if="dlaa">
-                        <div class="label">
-                            <div class="name">DLSS preset</div>
-                            <div class="desc">The DLSS model. M (default) shows the least ghosting on thin parts of cars; on RTX 20 and 30 series cards K costs about half as much. With Debug hotkeys on, right Ctrl + Home cycles through the presets during the game.</div>
-                        </div>
-                        <div class="control">
-                            <div class="seg">
-                                <button data-class-on="dlaa_preset == 'j'" data-event-click="dlaa_preset = 'j'">J</button>
-                                <button data-class-on="dlaa_preset == 'k'" data-event-click="dlaa_preset = 'k'">K</button>
-                                <button data-class-on="dlaa_preset == 'l'" data-event-click="dlaa_preset = 'l'">L</button>
-                                <button data-class-on="dlaa_preset == 'm'" data-event-click="dlaa_preset = 'm'">M</button>
-                            </div>
+                            <div class="switch"><input type="checkbox" data-checked="dlss"/><div class="knob"/></div>
                         </div>
                     </div>
                     <div class="row">
                         <div class="label">
                             <div class="name">NVIDIA DLSS 5 <span class="tag" data-if="rs_nr">Game restart needed</span></div>
-                            <div class="desc">Neural rendering: NVIDIA's model reworks the light and materials of the finished image. Works on the NVIDIA DLAA image and turns DLAA on. NVIDIA RTX only. Right Ctrl + F2 opens the tuning panel in the game.</div>
+                            <div class="desc">Neural rendering: NVIDIA's model reworks the light and materials of the finished image. Turns NVIDIA DLSS on. NVIDIA RTX only. Right Ctrl + F2 opens the tuning panel in the game.</div>
                         </div>
                         <div class="control">
                             <div class="switch"><input type="checkbox" data-checked="nr"/><div class="knob"/></div>
@@ -171,6 +156,32 @@
                     <div class="banner gaze-warn withbtn" data-if="nr &amp;&amp; !nr_files">
                         <span class="btext"><span class="banner-title">{{ nr_missing }} missing in x64\qvfr.</span>DLSS 5 cannot start. <span data-if="!nr_model">The mod does not include NVIDIA's DLSS 5 model: download nvngx_dlssnr.dll and put it in x64\qvfr.</span><span data-if="nr_model">Install the mod again.</span></span>
                         <button class="primary" data-if="!nr_model" data-event-click="open_url('dlssnr')">Download</button>
+                    </div>
+                    <div class="dlss" data-if="dlss">
+                        <div class="dintro">Preset is the DLSS model. M (default) shows the least ghosting on thin parts of cars.</div>
+                        <div class="dview" data-for="v : dlss_views">
+                            <div class="dhead">
+                                <div class="dtitle">
+                                    <span class="dname">{{ v.name }}</span><span class="ddesc">{{ v.desc }}</span><span class="tag" data-if="v.restart">Game restart needed</span>
+                                </div>
+                                <span class="dlabel">Preset</span>
+                                <div class="seg small">
+                                    <button data-class-on="v.preset == 'j'" data-event-click="dlss_preset(v.id, 'j')">J</button>
+                                    <button data-class-on="v.preset == 'k'" data-event-click="dlss_preset(v.id, 'k')">K</button>
+                                    <button data-class-on="v.preset == 'l'" data-event-click="dlss_preset(v.id, 'l')">L</button>
+                                    <button data-class-on="v.preset == 'm'" data-event-click="dlss_preset(v.id, 'm')">M</button>
+                                </div>
+                            </div>
+                            <div class="tiles">
+                                <div class="tile" data-for="m, i : dlss_modes" data-class-on="v.mode == i" data-event-click="dlss_mode(v.id, i)">
+                                    <div class="tname">{{ m.name }}</div>
+                                    <div class="tvalue"><span class="num">{{ m.pct }}</span><span class="unit">%</span></div>
+                                    <div class="tbar"><div class="tfill" data-style-width="m.bar"/></div>
+                                </div>
+                            </div>
+                            <div class="dsize"><span class="dcustom" data-if="v.mode &lt; 0">{{ v.custom }}</span><span class="dpx">{{ v.size }}</span></div>
+                        </div>
+                        <div class="dtotal"><span class="num">{{ dlss_mpx }}</span><span class="unit">Mpx</span><span class="dnote">rendered per eye, {{ dlss_full_mpx }} Mpx without upscaling</span></div>
                     </div>
                 </div>
             </div>
@@ -391,7 +402,7 @@
                     <div class="row">
                         <div class="label">
                             <div class="name">Debug hotkeys</div>
-                            <div class="desc">Right Ctrl + F3 sun effects, F4 focus culling, F5 clones, F7 freeze the gaze, F8 overlay, F10 screenshot, F11 outer only, F1 DLAA or the game's TAA, F12 DLSS exposure steps, Home DLSS preset steps. The DLSS 5 tuning panel (right Ctrl + F2) works without them.</div>
+                            <div class="desc">Right Ctrl + F3 sun effects, F4 focus culling, F5 clones, F7 freeze the gaze, F8 overlay, F10 screenshot, F11 outer only, F1 DLSS or the game's TAA, F12 DLSS exposure steps, Home DLSS preset steps. The DLSS 5 tuning panel (right Ctrl + F2) works without them.</div>
                         </div>
                         <div class="control">
                             <div class="switch"><input type="checkbox" data-checked="debug_keys"/><div class="knob"/></div>

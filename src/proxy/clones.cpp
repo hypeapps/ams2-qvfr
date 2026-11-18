@@ -164,6 +164,7 @@ uintptr_t g_d3dLo = 0, g_d3dHi = 0;    // module of the D3D11 runtime's object v
 bool g_d3dHooked = false;
 bool g_enabled = false;
 bool g_dirty = false;    // the list of objects or the sizes changed
+bool g_quietBuild = false;  // the next build follows a live size change: its list is the one already logged
 bool g_swapped = false;  // clones in the engine objects now (set g_cur)
 bool g_inGroup = false;
 Set g_cur = Focus;
@@ -1259,7 +1260,8 @@ bool BuildLocked(ID3D11DeviceContext* imm) {
         }
     }
     dev->Release();
-    LogListLocked();
+    if (!g_quietBuild) LogListLocked();
+    g_quietBuild = false;
     bool any = false;
     for (const SetState& s : g_set) any |= !s.entries.empty();
     g_phase = any ? Ready : Failed;
@@ -3289,13 +3291,24 @@ void SetSceneSizes(uint32_t outerW, uint32_t outerH, uint32_t focusW, uint32_t f
             changed |= sc.w != sizes[k][0] || sc.h != sizes[k][1];
         }
         if (!changed) return;
+        // A DLSS mode changed while the game runs: what the groups were seen doing does not depend on the size, so the
+        // clones are made again at the next frame start without watching the groups first.
+        const bool live = g_phase == Ready && !g_dirty && !g_failed;
+        if (g_swapped) RestoreLocked(g_imm);
         DropClonesLocked();
         for (int k = 0; k < 2; ++k) {
             g_set[SceneOf((Set)k)].w = sizes[k][0];
             g_set[SceneOf((Set)k)].h = sizes[k][1];
         }
         UpdateWantedLocked();
-        g_dirty = true;
+        if (live && AnyWanted()) {
+            g_phase = Learning;
+            g_quietBuild = true;
+            Log("Clones: DLSS SR: scene sets now outer %u x %u, focus %u x %u; clones made again (what was learned stays)",
+                outerW, outerH, focusW, focusH);
+        } else {
+            g_dirty = true;
+        }
     });
 }
 

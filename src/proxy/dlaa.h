@@ -33,6 +33,8 @@ bool FrameJitter(float out[2]);
 void TraceJitter(int calls);
 // DLSS SR (sr.h, [dlaa] mode=dlss in stereo): DLSS can run now, so the scene may render at the render size.
 bool SrWanted();
+// Render thread: DLSS SR's render sizes changed while the game runs: the histories start over, the state names the scales.
+void OnSrScalesChanged();
 // DLSS replaces the game's TAA in this frame (setting, hotkey, no failure); its evaluation stores outer's motion
 // vectors for focus (mvr_motion.h StoreOuter), so without it focus's velocity pass gets none from outer.
 bool DlssNow();

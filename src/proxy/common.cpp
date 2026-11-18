@@ -491,14 +491,19 @@ Config ReadConfig(const fs::path& ini) {
         std::clamp(IniFloat(ini, L"dlaa", L"focus_render_scale", c.dlaaRenderScale), 0.33f, 1.0f);
     // M (2026-11-18): the least ghosting on thin parts (the rivals' diffuser strakes, dlaa-plan ghosting runs 2-5) at
     // about K's cost on RTX 40 / 50; it takes no fixed exposure (DLSS Programming Guide 3.9: only J and K do).
+    const auto presetValue = [](const char* key, const std::string& v, int fallback) {
+        if (v == "default") return 0;
+        if (v.size() == 1 && v[0] >= 'a' && v[0] <= 'o') return v[0] - 'a' + 1;  // NVSDK_NGX_DLSS_Hint_Render_Preset: A = 1 ... K = 11
+        Log("Settings: unknown [dlaa] %s=\"%s\", ignored", key, v.c_str());
+        return fallback;
+    };
     const std::string preset = IniString(ini, L"dlaa", L"preset", L"m");
-    if (preset == "default") {
-        c.dlaaPreset = 0;
-    } else if (preset.size() == 1 && preset[0] >= 'a' && preset[0] <= 'o') {
-        c.dlaaPreset = preset[0] - 'a' + 1;  // NVSDK_NGX_DLSS_Hint_Render_Preset: A = 1 ... K = 11
-    } else {
-        Log("Settings: unknown [dlaa] preset=\"%s\", using default", preset.c_str());
-    }
+    c.dlaaPreset = presetValue("preset", preset, c.dlaaPreset);
+    // Quad views: each kind of view can have its own model; an absent or empty key follows preset.
+    const std::string outerPreset = IniString(ini, L"dlaa", L"outer_preset", L"");
+    const std::string focusPreset = IniString(ini, L"dlaa", L"focus_preset", L"");
+    c.dlaaOuterPreset = outerPreset.empty() ? c.dlaaPreset : presetValue("outer_preset", outerPreset, c.dlaaPreset);
+    c.dlaaFocusPreset = focusPreset.empty() ? c.dlaaPreset : presetValue("focus_preset", focusPreset, c.dlaaPreset);
     c.dlaaJitterScaleX = IniFloat(ini, L"dlaa", L"jitter_scale_x", c.dlaaJitterScaleX);
     c.dlaaJitterScaleY = IniFloat(ini, L"dlaa", L"jitter_scale_y", c.dlaaJitterScaleY);
     c.dlaaMvJittered = IniInt(ini, L"dlaa", L"mv_jittered", 0) != 0;
@@ -518,11 +523,13 @@ Config ReadConfig(const fs::path& ini) {
     c.dlaaPresetKey = IniInt(ini, L"dlaa", L"preset_key", c.dlaaPresetKey);
     if (c.dlaa)
         Log("Settings: [dlaa] mode=%s render_scale=%.3f outer_render_scale=%.3f focus_render_scale=%.3f preset=%s "
-            "jitter_scale=(%.3f, %.3f) mv_jittered=%d "
+            "outer_preset=%s focus_preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d "
             "auto_exposure=%d exposure=%.4f exposure_scale=%.4f bias_mask=%.2f skip_locks=%d modifier=0x%X key=0x%X "
             "exposure_key=0x%X preset_key=0x%X cockpit_taa=%d display_pass=%d",
             c.dlaaSr ? "dlss" : "dlaa", c.dlaaRenderScale, c.dlaaOuterRenderScale, c.dlaaFocusRenderScale,
-            preset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY, c.dlaaMvJittered, c.dlaaAutoExposure,
+            preset.c_str(), outerPreset.empty() ? preset.c_str() : outerPreset.c_str(),
+            focusPreset.empty() ? preset.c_str() : focusPreset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY,
+            c.dlaaMvJittered, c.dlaaAutoExposure,
             c.dlaaExposure, c.dlaaExposureScale, c.dlaaBiasMask, c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey,
             c.dlaaExpKey, c.dlaaPresetKey, c.dlaaCockpitTaa, c.dlaaDisplayPass ? 1 : 0);
     const std::string nr = IniString(ini, L"nr", L"mode", L"off");
@@ -696,16 +703,26 @@ bool ReloadConfig(bool force) {
              n.fixedSectionX != c.fixedSectionX || n.fixedSectionY != c.fixedSectionY,
          "[quad] *_section");
     need(n.probeFrames != c.probeFrames || n.probeEngine != c.probeEngine || n.probeD3D != c.probeD3D, "[quad] probe_*");
-    need(n.dlaa != c.dlaa || n.dlaaSr != c.dlaaSr, "[dlaa] mode");
-    need(n.dlaaRenderScale != c.dlaaRenderScale || n.dlaaOuterRenderScale != c.dlaaOuterRenderScale ||
-             n.dlaaFocusRenderScale != c.dlaaFocusRenderScale,
-         "[dlaa] *render_scale");
+    // A game started with mode=dlss has DLSS SR's hooks: its render scales are live (quad.cpp, sr.cpp), and mode=dlaa
+    // there is a scale of 1. A game started without them needs a restart for SR.
+    need(n.dlaa != c.dlaa || (n.dlaaSr && !c.dlaaSr), "[dlaa] mode");
+    if (!c.dlaaSr) {
+        need(n.dlaaRenderScale != c.dlaaRenderScale || n.dlaaOuterRenderScale != c.dlaaOuterRenderScale ||
+                 n.dlaaFocusRenderScale != c.dlaaFocusRenderScale,
+             "[dlaa] *render_scale");
+    } else if (n.dlaa) {
+        c.dlaaRenderScale = n.dlaaSr ? n.dlaaRenderScale : 1.0f;
+        c.dlaaOuterRenderScale = n.dlaaSr ? n.dlaaOuterRenderScale : 1.0f;
+        c.dlaaFocusRenderScale = n.dlaaSr ? n.dlaaFocusRenderScale : 1.0f;
+    }
     need(n.mvr != c.mvr, "[mvr] mode");
     need(n.mvrVsPatch != c.mvrVsPatch, "[debug] mvr_vs_patch");
     need(n.mvrVsView0 != c.mvrVsView0, "[debug] mvr_vs_view0");
     need(n.mvrPsPatch != c.mvrPsPatch, "[debug] mvr_ps_patch");
     need(n.mvrGbuffer != c.mvrGbuffer, "[debug] mvr_gbuffer");
     c.dlaaPreset = n.dlaaPreset;
+    c.dlaaOuterPreset = n.dlaaOuterPreset;
+    c.dlaaFocusPreset = n.dlaaFocusPreset;
     c.srCbFix = n.srCbFix;  // live (sr_cb.h)
     c.dlaaJitterScaleX = n.dlaaJitterScaleX;
     c.dlaaJitterScaleY = n.dlaaJitterScaleY;

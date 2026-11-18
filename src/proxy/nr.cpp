@@ -85,9 +85,13 @@ constexpr int kStepCount = (int)(sizeof(kSteps) / sizeof(kSteps[0]));
 std::atomic<int> g_step{0};
 bool g_testKeyDown = false;
 
-// The mode now: the ini's (0 off, 1 after DLAA, 2 the final image), or the test step's while the ini has NR on.
+// Switched on in the tuning panel while the ini has NR off: the final image for this session.
+std::atomic<bool> g_session{false};
+int BaseMode() { return g_session.load() ? 2 : Cfg().nrMode; }
+
+// The mode now: the ini's or the panel's (0 off, 1 after DLAA, 2 the final image), or the test step's while NR is on.
 int ModeNow() {
-    const int ini = Cfg().nrMode;
+    const int ini = BaseMode();
     const int step = kSteps[g_step.load()].mode;
     return ini && step ? step : ini;
 }
@@ -869,6 +873,12 @@ void Process(ID3D11DeviceContext* c, int view, ID3D11ShaderResourceView* srv, ID
 
 bool Active() { return g_active.load(); }
 
+bool FinalOn() { return ModeNow() == 2 && g_active.load(); }
+
+bool SessionOn() { return g_session.load(); }
+
+void ClearSession() { g_session = false; }
+
 int GetKnob(Knob k) {
     const Config& c = Cfg();
     switch (k) {
@@ -914,9 +924,18 @@ void SetActive(bool on) {
     g_active = on;
 }
 
+void SetFinal(bool on) {
+    if (on && Cfg().nrMode != 2) g_session = true;
+    SetActive(on);
+}
+
 void OnFrameStart() {
     const Config& c = Cfg();
-    if (c.nrMode == 0) return;
+    // Turned off in the settings GUI (the ini had it on): the panel's session switch goes too.
+    static int iniWas = 0;
+    if (iniWas && !c.nrMode) g_session = false;
+    iniWas = c.nrMode;
+    if (BaseMode() == 0) return;
     if (c.nrTestKey && Pressed(c.nrKeyMod, c.nrTestKey, g_testKeyDown)) {
         const int step = (g_step.load() + 1) % kStepCount;
         g_step = step;
@@ -937,7 +956,7 @@ void OnFrameStart() {
 }
 
 void LogStats(bool totals) {
-    if (Cfg().nrMode == 0 && !g_bridge) return;
+    if (BaseMode() == 0 && !g_bridge) return;
     const nrbridge::Stats s = g_bridge ? g_bridge->stats() : nrbridge::Stats{};
     nrbridge::Stats d = s;
     if (!totals) {
@@ -1027,7 +1046,7 @@ Totals LiveTotals() {
 }
 
 std::string Describe() {
-    if (Cfg().nrMode == 0) return "NR: off";
+    if (BaseMode() == 0) return "NR: off";
     if (g_failed) return "NR: off (" + g_why + ")";
     if (!g_bridge) return "NR: waiting for the first focus DLAA";
     std::string s = std::string(ModeNow() != 2  ? "NR: focus views through "

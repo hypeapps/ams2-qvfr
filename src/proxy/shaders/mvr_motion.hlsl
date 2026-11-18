@@ -17,7 +17,8 @@
 // history through such patches. The shortest motion among
 // the depth-matching texels of the 4 x 4 around the point is the reference, and a 2 x 2 texel more than opt.z outer
 // pixels off it gives the reference instead. A moving object keeps its motion: all its texels share it, and at its
-// silhouette the depth tells it from the background.
+// silhouette the depth tells it from the background. Where a car touches the road the depths do match and the road moves
+// tens of pixels more than the car, so the limit (128 by default) stays above that.
 // The window maps are uv = scale * outer uv + offset per axis (mvr_motion.h).
 
 cbuffer Params : register(b0) {

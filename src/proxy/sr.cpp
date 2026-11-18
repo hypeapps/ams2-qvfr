@@ -10,6 +10,7 @@
 
 #include "clones.h"
 #include "common.h"
+#include "dlaa.h"
 #include "gpu.h"
 #include "hook_prof.h"
 #include "hooks.h"
@@ -29,6 +30,7 @@ std::mutex g_m;
 std::vector<void*> g_begin, g_end;  // the VR graph's CBeginEye and CEndEye tasks (last build)
 thread_local bool t_inBuilder = false;
 uint32_t g_gameW = 0, g_gameH = 0;
+uint32_t g_sceneW = 0, g_sceneH = 0;  // the render size given to the clones
 uint64_t g_groups = 0, g_groupsTot = 0, g_other = 0;
 // Render thread: the VR eye group being executed (its index among the graph's CBeginEye tasks), -1 outside one.
 int g_eye = -1;
@@ -242,17 +244,33 @@ void Install() {
 
 bool On() { return g_on.load(std::memory_order_relaxed); }
 
+namespace {
+
+// The scene phase at the render scale of the eye size, in the outer scene set.
+void ApplyScale() {
+    const float s = Cfg().dlaaRenderScale;
+    const uint32_t rw = std::max(16u, (uint32_t)(g_gameW * s + 0.5f)), rh = std::max(16u, (uint32_t)(g_gameH * s + 0.5f));
+    if (rw == g_sceneW && rh == g_sceneH) return;
+    const bool live = g_sceneW != 0;
+    g_sceneW = rw;
+    g_sceneH = rh;
+    clones::SetSceneSizes(rw, rh, 0, 0);
+    if (live) dlaa::OnSrScalesChanged();
+    Log("DLSS SR%s: eye size %u x %u, scene at %u x %u (render scale %.3f)", live ? " (changed live)" : "", g_gameW,
+        g_gameH, rw, rh, s);
+}
+
+}  // namespace
+
 void NoteGameSize(uint32_t w, uint32_t h) {
     if (!g_installed || !w || !h) return;
     Guard("size", [&] {
         if (w == g_gameW && h == g_gameH) return;
         g_gameW = w;
         g_gameH = h;
-        const float s = Cfg().dlaaRenderScale;
-        const uint32_t rw = std::max(16u, (uint32_t)(w * s + 0.5f)), rh = std::max(16u, (uint32_t)(h * s + 0.5f));
-        Log("DLSS SR: eye size %u x %u, scene at %u x %u (render scale %.3f)", w, h, rw, rh, s);
-        clones::SetSizes(w, h, w, h, w, h);    // the view size is the game's: no post set
-        clones::SetSceneSizes(rw, rh, 0, 0);  // the scene phase in the outer scene set
+        clones::SetSizes(w, h, w, h, w, h);  // the view size is the game's: no post set
+        g_sceneW = g_sceneH = 0;
+        ApplyScale();
     });
 }
 
@@ -260,6 +278,7 @@ void OnFrameStart(bool wanted) {
     if (!g_installed) return;
     Guard("frame", [&] {
         EnsureD3DHooks();
+        if (g_gameW) ApplyScale();  // a DLSS mode picked while the game runs
         clones::OnFrameStart(gpu::Context(), wanted && g_on.load(std::memory_order_relaxed));
     });
     ShotGuard("frame", [] { HandleShot(); });

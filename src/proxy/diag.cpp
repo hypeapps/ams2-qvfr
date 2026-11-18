@@ -39,6 +39,7 @@ uint64_t g_frames = 0, g_gazeFrames = 0, g_gazeOk = 0;
 uint64_t g_src[4] = {};  // quad::SrcLive, SrcHeld, SrcFixed, SrcFrozen
 const char* g_gazeSource = nullptr;
 std::atomic<bool> g_detected{false};
+std::atomic<bool> g_blockWritten{false};  // the Detected block is in the log: later changes go in as updates
 std::string (*g_quadDescribe)() = nullptr;
 
 std::string Percent(uint64_t part, uint64_t whole) {
@@ -107,6 +108,7 @@ void WriteDetected(const char* when) {
         Log("  Findings: %d warning(s), %d note(s); see the WARNING and Note lines", warnings, notes);
     else
         Log("  Findings: none");
+    g_blockWritten = true;
     ShowPendingBox();
 }
 
@@ -132,14 +134,20 @@ void Report(Level level, const char* id, const char* fmt, ...) {
 }
 
 void Set(const char* key, const std::string& value) {
-    std::lock_guard lock(g_m);
-    for (auto& f : g_facts) {
-        if (f.first == key) {
+    {
+        std::lock_guard lock(g_m);
+        bool found = false;
+        for (auto& f : g_facts) {
+            if (f.first != key) continue;
+            found = true;
+            if (f.second == value) return;
             f.second = value;
-            return;
+            break;
         }
+        if (!found) g_facts.emplace_back(key, value);
     }
-    g_facts.emplace_back(key, value);
+    // The settings GUI's Status page takes these over the block (DLSS usually starts after it, on the track).
+    if (g_blockWritten.load()) Log("Detected update: %s: %s", key, value.c_str());
 }
 
 void ShowPendingBox() {

@@ -62,6 +62,20 @@ LogInfo ReadNewestLog(const std::filesystem::path& logDir) {
             inBlock = true;
             continue;
         }
+        // A value that changed after the block: "Detected update: Key: value" replaces its line.
+        if (t.rfind("Detected update: ", 0) == 0) {
+            const std::string fact = t.substr(17);
+            const size_t colon = fact.find(": ");
+            bool replaced = false;
+            if (colon != std::string::npos)
+                for (std::string& d : info.detected)
+                    if (d.compare(0, colon + 2, fact, 0, colon + 2) == 0) {
+                        d = fact;
+                        replaced = true;
+                    }
+            if (!replaced) info.detected.push_back(fact);
+            continue;
+        }
         if (t.rfind("WARNING: ", 0) == 0 || t.rfind("Note: ", 0) == 0) info.findings.push_back(t);
         if (t.find("[runtime] path=openxr") != std::string::npos) info.openxr = true;
         // Quad mode: "... (quad focus size; SteamVR 8192 x 6864)"; otherwise the plain SteamVR answer.

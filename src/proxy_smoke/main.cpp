@@ -2201,6 +2201,30 @@ int RunClones() {
     cl::BeginGroup(ctx, cl::Outer);
     expect(!cl::TestGet().swapped, "SR inactive: outer at the game size");
     cl::EndGroup(ctx);
+    // A DLSS mode picked while the game runs: the clones are made again at the next frame start, without learning.
+    cl::SetSrActive(true);
+    cl::SetSceneSizes(24, 18, 32, 24);  // focus at its view size: no focus scene set
+    cl::OnFrameStart(ctx, true);
+    st = cl::TestGet();
+    expect(st.phase == 2 && st.clones[cl::OuterScene] == 2 && st.clones[cl::FocusScene] == 0 && st.clones[cl::Focus] == 3,
+           "SR live: ready in the same frame start, outer scene clones again, no focus scene set");
+    cl::BeginGroup(ctx, cl::Outer);
+    expect(cl::SceneIn() && size(T.at<ID3D11Texture2D*>(0x58)) == std::make_pair(24u, 18u) && devSize(0)[0] == 24,
+           "SR live: outer's scene at the new 24 x 18");
+    cl::EndGroup(ctx);
+    cl::BeginGroup(ctx, cl::Focus);
+    expect(!cl::SceneIn() && size(T.at<ID3D11Texture2D*>(0x58)) == std::make_pair(32u, 24u),
+           "SR live: focus in its 32 x 24 clones");
+    cl::EndGroup(ctx);
+    cl::SetSceneSizes(20, 15, 16, 12);  // and a focus scene set again
+    cl::OnFrameStart(ctx, true);
+    st = cl::TestGet();
+    expect(st.phase == 2 && st.clones[cl::FocusScene] == 2, "SR live: the focus scene set is back");
+    cl::BeginGroup(ctx, cl::Focus);
+    expect(cl::SceneIn() && size(U.at<ID3D11Texture2D*>(0x58)) == std::make_pair(16u, 12u),
+           "SR live: focus's scene at the new 16 x 12");
+    cl::EndGroup(ctx);
+    expect(T.at<void*>(0x58) == texT && U.at<void*>(0x58) == texU, "SR live: the originals back after the groups");
     cl::Shutdown();
     cl::SetSrActive(true);
     cl::SetSceneSizes(0, 0, 0, 0);

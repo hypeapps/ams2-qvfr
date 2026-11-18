@@ -56,7 +56,8 @@ void EndGroup(ID3D11DeviceContext* imm);             // eye group CEndEye, after
 // its kind's post set (Outer or Focus) when that has clones, else with the originals.
 void SetStereoSr(bool on);                    // before the first frame (stereo: no focus groups)
 void SetSr(bool on);                          // quad views, before the first frame
-// The scene sets' sizes (0 = no scene set for that kind): BeginGroup(kind) puts the kind's scene set in.
+// The scene sets' sizes (0 = no scene set for that kind): BeginGroup(kind) puts the kind's scene set in. Render thread,
+// before OnFrameStart; with clones ready a change makes them again at that frame start, without learning.
 void SetSceneSizes(uint32_t outerW, uint32_t outerH, uint32_t focusW, uint32_t focusH);
 // Quad views, render thread, before OnFrameStart: DLSS runs in this frame, so the groups use the scene sets (else
 // each group stays in its post set, as without DLSS SR). Stereo (SetStereoSr): always on.
