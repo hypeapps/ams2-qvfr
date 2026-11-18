@@ -94,8 +94,8 @@ mod in `x64\qvfr\`.
   highlights.
 - Dashboard displays and mirrors keep the game's TAA, because DLSS leaves trails behind changing digits
   (`[dlaa] cockpit_taa` in `qvfr.ini`: 0 = DLSS everywhere, 2 = also the rest of your car).
-- With **Debug hotkeys** on: right Ctrl + F1 switches between DLAA and the game's TAA, F12 steps through exposures and
-  Home through the presets while you drive.
+- With **Debug hotkeys** on: right Ctrl + F1 switches between DLAA and the game's TAA and F12 steps through exposures
+  while you drive.
 - The **Status** page shows whether DLAA ran at the last game start, and if not, why.
 
 ## NVIDIA DLSS 5 (alpha)
@@ -158,7 +158,7 @@ Turn these on in the GUI (**Settings → Debug**):
 - **Frame timing CSV for the whole session:** the same timings for the whole drive in `x64\qvfr\bench\`.
 - **Show the gaze in the game** (Eye tracking): a white ring where you look, the focus edges in red (blend starts) and
   green (fully sharp).
-- **Debug hotkeys:** right Ctrl + F3 sun effects from outer (crepuscular rays and lens flares), F4 focus culling, F5 clones, F7 freeze the gaze, F8 overlay, F10 screenshot of the views, F11 outer only, F1 NVIDIA DLSS or the game's TAA, F12 DLSS exposure steps, Home DLSS preset steps.
+- **Debug hotkeys:** right Ctrl + F3 sun effects from outer (crepuscular rays and lens flares), F4 focus culling, F5 clones, F7 freeze the gaze, F8 overlay, F10 screenshot of the views, F11 outer only, F1 NVIDIA DLSS or the game's TAA, F12 DLSS exposure steps.
 
 ### Issue reporting
 

@@ -514,12 +514,11 @@ void BindModel(Rml::Context* ctx) {
     toggle("debug_keys",
            [] {
                return g.s.overlayKey || g.s.freezeKey || g.s.outerKey || g.s.clonesKey || g.s.shotKey || g.s.cullKey ||
-                      g.s.sunKey || g.s.taaKey || g.s.dlaaKey || g.s.dlaaExpKey || g.s.dlaaPresetKey;
+                      g.s.sunKey || g.s.taaKey || g.s.dlaaKey || g.s.dlaaExpKey;
            },
            [](bool on) {
                g.ini.Set("dlaa", "key", on ? "0x70" : "0");
                g.ini.Set("dlaa", "exposure_key", on ? "0x7B" : "0");
-               g.ini.Set("dlaa", "preset_key", on ? "0x24" : "0");
                // Right Ctrl + F2 is the DLSS 5 tuning panel ([panel] key, always on): focus TAA history only in the ini.
                g.ini.Set("debug", "taa_views_key", "0");
                g.ini.Set("debug", "sun_effects_key", on ? "0x72" : "0");

@@ -56,7 +56,7 @@ int RunSelfTest(const fs::path& dir) {
           "default ini: balanced values");
     Expect(s.gazeKey == 0x75 && s.benchKey == 0 && s.outerKey == 0 && s.warningBox, "default ini: player hotkeys");
     Expect(!s.dlss && !s.dlssUpscale && s.dlssPreset == "k" && s.dlssOuterPreset == "k" && s.dlssFocusPreset == "k" &&
-               !s.dlaaAutoExposure && Near(s.dlaaExposure, 0.002f) && s.dlaaKey == 0 && s.dlaaPresetKey == 0,
+               !s.dlaaAutoExposure && Near(s.dlaaExposure, 0.002f) && s.dlaaKey == 0 && s.dlaaExpKey == 0,
            "default ini: DLSS off, preset K, fixed exposure 0.002, no DLSS hotkeys");
     Expect(s.mvr, "default ini: NVIDIA Multi-View Rendering on");
     {

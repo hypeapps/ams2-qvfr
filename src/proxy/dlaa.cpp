@@ -72,7 +72,6 @@ uint64_t g_lastViewEvals[kViews] = {};
 bool g_viewLogged[kViews] = {};  // first DLSS evaluation of the view logged
 bool g_keyDown = false;
 bool g_expKeyDown = false;
-bool g_presetKeyDown = false;
 bool g_sr = false;  // DLSS SR: [dlaa] mode=dlss (sr.h in stereo, S2 in quad views)
 // Displays/cockpit from the game's TAA (ini, read live); not with DLSS SR (the game's TAA would run at the render size)
 // and not with [dlaa] display_pass (the displays pass takes these pixels).
@@ -117,17 +116,10 @@ float ExposureScaleNow() {
     if (s == 0) return Cfg().dlaaExposureScale;
     return kExpSteps[s].autoExp ? kExpSteps[s].value : 1.0f;
 }
-// Preset hotkey ([dlaa] preset_key): step 0 = the ini preset, then J, K, M, L.
-constexpr int kPresetSteps[] = {-1, 10, 11, 13, 12};
-constexpr int kPresetStepCount = (int)(sizeof(kPresetSteps) / sizeof(kPresetSteps[0]));
-std::atomic<int> g_presetStep{0};
 // Benchmark sequence switches: the preset of all views, of outer's, of focus's; -1 = not set.
 std::atomic<int> g_presetSwitch[3] = {-1, -1, -1};
-// The preset of a view (kViewName): the hotkey's step for all of them, a benchmark switch, else the ini's for that kind
-// of view.
+// The preset of a view (kViewName): a benchmark switch, else the ini's for that kind of view.
 int PresetFor(int view) {
-    const int s = g_presetStep.load();
-    if (s != 0) return kPresetSteps[s];
     const int kind = view == 0 ? g_presetSwitch[0].load() : g_presetSwitch[view <= 2 ? 1 : 2].load();
     if (kind >= 0) return kind;
     if (g_presetSwitch[0].load() >= 0) return g_presetSwitch[0].load();
@@ -1981,10 +1973,6 @@ void OnFrameStart() {
         if (Pressed(c.dlaaExpKeyMod, c.dlaaExpKey, g_expKeyDown)) {
             g_expStep = (g_expStep.load() + 1) % kExpStepCount;
             Log("DLAA: exposure hotkey: %s%s", ExposureText().c_str(), g_expStep.load() == 0 ? " (the ini settings)" : "");
-        }
-        if (Pressed(c.dlaaPresetKeyMod, c.dlaaPresetKey, g_presetKeyDown)) {
-            g_presetStep = (g_presetStep.load() + 1) % kPresetStepCount;
-            Log("DLAA: preset hotkey: %s%s", ExposureText().c_str(), g_presetStep.load() == 0 ? " (the ini preset)" : "");
         }
     });
     nr::OnFrameStart();

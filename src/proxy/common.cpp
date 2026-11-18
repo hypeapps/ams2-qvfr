@@ -520,19 +520,17 @@ Config ReadConfig(const fs::path& ini) {
     c.dlaaExpKey = IniInt(ini, L"dlaa", L"exposure_key", c.dlaaExpKey);
     c.dlaaCockpitTaa = std::clamp(IniInt(ini, L"dlaa", L"cockpit_taa", c.dlaaCockpitTaa), 0, 2);
     c.dlaaDisplayPass = IniInt(ini, L"dlaa", L"display_pass", c.dlaaDisplayPass ? 1 : 0) != 0;
-    c.dlaaPresetKeyMod = IniInt(ini, L"dlaa", L"preset_modifier", c.dlaaPresetKeyMod);
-    c.dlaaPresetKey = IniInt(ini, L"dlaa", L"preset_key", c.dlaaPresetKey);
     if (c.dlaa)
         Log("Settings: [dlaa] mode=%s render_scale=%.3f outer_render_scale=%.3f focus_render_scale=%.3f preset=%s "
             "outer_preset=%s focus_preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d "
             "auto_exposure=%d exposure=%.4f exposure_scale=%.4f bias_mask=%.2f skip_locks=%d modifier=0x%X key=0x%X "
-            "exposure_key=0x%X preset_key=0x%X cockpit_taa=%d display_pass=%d",
+            "exposure_key=0x%X cockpit_taa=%d display_pass=%d",
             c.dlaaSr ? "dlss" : "dlaa", c.dlaaRenderScale, c.dlaaOuterRenderScale, c.dlaaFocusRenderScale,
             preset.c_str(), outerPreset.empty() ? preset.c_str() : outerPreset.c_str(),
             focusPreset.empty() ? preset.c_str() : focusPreset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY,
             c.dlaaMvJittered, c.dlaaAutoExposure,
             c.dlaaExposure, c.dlaaExposureScale, c.dlaaBiasMask, c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey,
-            c.dlaaExpKey, c.dlaaPresetKey, c.dlaaCockpitTaa, c.dlaaDisplayPass ? 1 : 0);
+            c.dlaaExpKey, c.dlaaCockpitTaa, c.dlaaDisplayPass ? 1 : 0);
     const std::string nr = IniString(ini, L"nr", L"mode", L"off");
     c.nrMode = nr == "focus" ? 1 : nr == "final" ? 2 : 0;
     if (nr != "off" && nr != "focus" && nr != "final") Log("Settings: unknown [nr] mode=\"%s\", using off", nr.c_str());
@@ -729,8 +727,6 @@ bool ReloadConfig(bool force) {
     c.dlaaExposureScale = n.dlaaExposureScale;
     c.dlaaCockpitTaa = n.dlaaCockpitTaa;
     c.dlaaDisplayPass = n.dlaaDisplayPass;
-    c.dlaaPresetKeyMod = n.dlaaPresetKeyMod;
-    c.dlaaPresetKey = n.dlaaPresetKey;
     c.nrMode = n.nrMode;
     c.nrKeyMod = n.nrKeyMod;
     c.nrKey = n.nrKey;

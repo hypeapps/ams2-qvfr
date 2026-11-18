@@ -140,7 +140,6 @@ Settings Read(const IniFile& ini) {
     s.shotKey = ParseInt(ini.GetOr("quad", "shot_key", ""), 0);
     s.dlaaKey = ParseInt(ini.GetOr("dlaa", "key", ""), 0);
     s.dlaaExpKey = ParseInt(ini.GetOr("dlaa", "exposure_key", ""), 0);
-    s.dlaaPresetKey = ParseInt(ini.GetOr("dlaa", "preset_key", ""), 0);
     return s;
 }
 
