@@ -5,6 +5,9 @@
 // every texture and render target in the game's render size or its 1/2, 1/4, 1/8; the destructor hooks drop them. In
 // the first eye groups of a list (learning) the D3D11 hooks note which of them outer and focus write: a set gets clones
 // of the targets it writes. Outer keeps a target focus reads but does not write (focus needs outer's data).
+// Issue #10: a learning group counts only when its kind writes a listed texture in the game's size (the groups of
+// loading frames draw almost nothing); a set with no clone in the game's size gets none. A listed texture neither kind
+// wrote while learning, bound as a target while clones are in, starts the learning again (what was seen stays).
 //
 // While a group of that set runs, the engine objects hold the clone's D3D11 texture, views and size instead of their
 // own (texture +0x58, its views, size +0x68; render target view arrays and size +0x24), the device's render target size
@@ -217,6 +220,10 @@ struct TestState {
     uint64_t arrayFixes = 0, arrayLazy = 0, arrayCopies = 0;
     uint64_t sliceResolves = 0, sliceResolveFails = 0, sliceCopies = 0;  // B20 K5
     int sceneSlices = 0;  // B20 K5b with DLSS SR: focus scene clones that are three-slice arrays
+    // Issue #10: learning groups counted per kind (outer, focus), not counted, lists watched again, sets off.
+    int learned[2] = {};
+    uint64_t learnSkipped = 0, relearns = 0;
+    bool setFailed[2] = {};
 };
 TestState TestGet();
 

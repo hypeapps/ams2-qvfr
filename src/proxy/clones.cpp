@@ -150,6 +150,8 @@ struct Counters {
     uint64_t fixFwd = 0, fixBack = 0, lazy = 0, sizeMismatch = 0;
     uint64_t twinSwaps = 0;  // focus swaps for eye 1 (with focus R's twins when there are any)
     uint64_t arrFix = 0, arrLazy = 0;  // B17: binds and copies of a replaced texture's own views (made on the array)
+    uint64_t learnSkipped = 0;  // learning groups not counted: no listed texture in the game's size written (issue #10)
+    uint64_t relearns = 0;      // lists watched again: a target the learning missed was bound (issue #10)
 };
 
 std::mutex g_cm;
@@ -214,6 +216,15 @@ std::vector<std::string> g_otherLines;
 int g_otherCount[2] = {};
 std::vector<void*> g_outsideCallers, g_mismatchCallers;
 Counters g_c, g_ctot;
+// Issue #10 (the image broken from the second session on): the eye groups of loading frames draw little or nothing, so a
+// list learned on them gave outer clones of 3 small textures while its size went to the engine. A learning group counts
+// only when its kind writes a listed texture in the game's size (g_groupFull); the others are counted apart, per kind.
+bool g_groupFull = false;
+int g_learnSkipped[2] = {};
+// Issue #10: while clones are in, a listed texture neither kind wrote while learning was bound as a target (the learning
+// missed it): it counts as written by that kind, and the groups are watched again at the next frame start.
+int g_missed = 0;
+char g_missedWhat[192] = "";
 
 // Viewport while clones are in: what the engine asked for, what is set, the bound target.
 std::atomic<bool> g_vpActive{false};
@@ -696,6 +707,8 @@ void ResetLocked(const char* why) {
         s.learned = 0;
         s.changedLogged = false;
     }
+    g_learnSkipped[0] = g_learnSkipped[1] = 0;
+    g_missed = 0;
     g_otherWritten.clear();
     g_otherLines.clear();
     g_otherCount[0] = g_otherCount[1] = 0;
@@ -715,6 +728,30 @@ void ResetLocked(const char* why) {
             why, g_tex.size(), g_rt.size(), g_gameW, g_gameH, kLearnGroups, WantedSetsText().c_str(),
             g_resetLogs == kMaxResetLogs ? " (further list changes only counted)" : "");
     }
+}
+
+// Issue #10: the same list watched again after a group with clones bound a target the learning missed. What was seen
+// stays (the missed textures count as written), so each time at least one more texture is known and this ends.
+void RelearnLocked() {
+    DropClonesLocked();
+    for (SetState& s : g_set) {
+        s.failed = false;
+        s.learned = 0;
+        s.changedLogged = false;
+    }
+    g_learnSkipped[0] = g_learnSkipped[1] = 0;
+    g_phase = Learning;
+    ++g_c.lists;
+    ++g_c.relearns;
+    if (g_resetLogs < kMaxResetLogs) {
+        ++g_resetLogs;
+        Log("Clones: %d listed textures that neither outer nor focus wrote while learning were bound as targets in "
+            "groups with clones (first: %s); clones dropped, watching the groups again (%d groups each, what was seen "
+            "stays)%s",
+            g_missed, g_missedWhat, kLearnGroups,
+            g_resetLogs == kMaxResetLogs ? " (further list changes only counted)" : "");
+    }
+    g_missed = 0;
 }
 
 uint32_t MipSize(uint32_t s, UINT mip) { return std::max(1u, s >> std::min(mip, 31u)); }
@@ -1005,6 +1042,18 @@ bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
     int sharedN = 0;
     // B20 K4: focus at the game's size (wanted only for focus R's twins, UpdateWantedLocked): the identity set.
     const bool identity = si == Focus && s.w == g_gameW && s.h == g_gameH;
+    // Issue #10: without a clone in the game's size the set's size would go to the engine while it draws into the
+    // engine's full-size targets (the image offset and scaled, the old contents around it): no clones for it then.
+    if (!identity) {
+        bool full = false;
+        for (auto& [obj, t] : g_tex) full |= t.fr.d == 1 && CloneWanted(t, si);
+        if (!full) {
+            Log("Clones: %s writes none of the listed textures in the game's size %u x %u (learning saw only smaller "
+                "ones written)",
+                kSetNames[si], g_gameW, g_gameH);
+            return false;
+        }
+    }
     for (auto& [obj, t] : g_tex) {
         // A scene set also holds the kind's post clones of the textures it does not clone (UseOf); the post sets are
         // built first.
@@ -1179,8 +1228,9 @@ bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
 }
 
 void LogListLocked() {
-    Log("Clones: outer watched in %d groups, focus in %d; %zu listed textures (O outer, F focus; r read, w written):",
-        g_set[Outer].learned, g_set[Focus].learned, g_tex.size());
+    Log("Clones: outer watched in %d groups, focus in %d (not counted, nothing written in the game's size: outer %d, "
+        "focus %d); %zu listed textures (O outer, F focus; r read, w written):",
+        g_set[Outer].learned, g_set[Focus].learned, g_learnSkipped[Outer], g_learnSkipped[Focus], g_tex.size());
     std::vector<const Tex*> list;
     for (auto& [obj, t] : g_tex) list.push_back(&t);
     std::sort(list.begin(), list.end(), [](const Tex* a, const Tex* b) {
@@ -1896,9 +1946,29 @@ void ApplyViewportsLocked(void* caller, bool force) {
     g_vpSetN = g_vpN;
 }
 
+// Issue #10: a target bound while clones are in (only when the bound target changes) that is a listed texture neither
+// kind wrote while learning: the learning missed it. It counts as written by the group's kind; the groups are watched
+// again at the next frame start (RelearnLocked).
+void NoteMissedLocked(void* bound, void* caller) {
+    if (!bound || g_set[g_cur].targets.count(bound)) return;  // a view of a clone
+    ID3D11Resource* r = nullptr;
+    static_cast<ID3D11View*>(bound)->GetResource(&r);
+    if (!r) return;
+    auto it = g_byRes.find(r);
+    r->Release();
+    if (it == g_byRes.end()) return;
+    Tex& t = g_tex[it->second];
+    if (t.written[Outer] || t.written[Focus]) return;
+    t.written[g_kind] = true;
+    if (g_missed++ == 0)
+        snprintf(g_missedWhat, sizeof(g_missedWhat), "%s %u x %u fmt %d in a %s group, from %s", TexName(t),
+                 t.desc.Width, t.desc.Height, (int)t.desc.Format, kSetNames[g_cur], Where(caller).c_str());
+}
+
 void OnBindLocked(void* bound, void* caller) {
     if (!g_swapped || bound == g_bound) return;
     g_bound = bound;
+    NoteMissedLocked(bound, caller);
     ApplyViewportsLocked(caller, false);
 }
 
@@ -2222,6 +2292,7 @@ void NoteLocked(ID3D11Resource* r, Use use, const char* method, void* caller) {
         if (auto it = g_byRes.find(r); it != g_byRes.end()) {
             Tex& t = g_tex[it->second];
             (use == Write ? t.written : t.read)[g_kind] = true;
+            if (use == Write && t.fr.d == 1) g_groupFull = true;  // issue #10: the group counts
             if (g_sr && g_post)
                 t.post[g_kind] = true;
             else if (g_sr && use == Write)
@@ -3140,6 +3211,11 @@ void OnFrameStart(ID3D11DeviceContext* imm, bool enabled) {
             if (g_dirty || !wasFailed) ResetLocked(g_phase == Waiting ? "first list" : "list changed");
             g_dirty = false;
         }
+        // Issue #10: a target the learning missed was bound in a group with clones.
+        if (g_missed) {
+            if (g_phase == Ready) RelearnLocked();
+            g_missed = 0;
+        }
         // B17: arrays asked for go into the engine objects; clones made from the old views are made again from the new
         // ones (what was learned stays, so they are made below in this frame start).
         if (!g_arrWant.empty() && imm && BuildArraysLocked(imm) && g_phase == Ready) {
@@ -3222,6 +3298,7 @@ void BeginGroup(ID3D11DeviceContext* imm, Set set) {
         std::lock_guard lock(g_cm);
         if (g_failed || g_swapped) return;
         g_inGroup = true;
+        g_groupFull = false;
         g_post = false;
         g_postVp = false;
         g_srGroup = false;
@@ -3255,7 +3332,17 @@ void EndGroup(ID3D11DeviceContext* imm) {
         g_postVp = false;
         if (!g_inGroup) return;
         g_inGroup = false;
-        if (g_phase == Learning) ++g_set[g_kind].learned;
+        // Issue #10: a watched group counts only when its kind wrote a listed texture in the game's size (not a loading
+        // frame's group).
+        if (g_phase == Learning && g_set[g_kind].learned < kLearnGroups) {
+            if (g_groupFull) {
+                ++g_set[g_kind].learned;
+            } else {
+                ++g_learnSkipped[g_kind];
+                ++g_c.learnSkipped;
+            }
+        }
+        g_groupFull = false;
         if (!g_swapped) return;
         const Set was = g_cur;
         RestoreLocked(imm);
@@ -3735,6 +3822,8 @@ void LogStats(bool totals) {
         g_ctot.twinSwaps += g_c.twinSwaps;
         g_ctot.arrFix += g_c.arrFix;
         g_ctot.arrLazy += g_c.arrLazy;
+        g_ctot.learnSkipped += g_c.learnSkipped;
+        g_ctot.relearns += g_c.relearns;
         const uint64_t copies = g_arrCopies.exchange(0);
         g_arrCopiesTot += copies;
         const Counters& c = totals ? g_ctot : g_c;
@@ -3765,14 +3854,16 @@ void LogStats(bool totals) {
         if (c.swaps[0] || c.swaps[1] || c.lists || c.changed)
             Log("Clones stats%s: %s, groups with clones outer %llu focus %llu (with focus R's twins %llu, %zu views and "
                 "textures twinned), %llu with bound views translated, %llu "
-                "late restores, %llu lists watched, %llu changed fields, %llu device sizes and %llu postprocess sizes "
-                "swapped; viewports for an original on its clone %llu (scaled %llu), larger than the original %llu; "
-                "bind fix: originals to clones %llu (views made on clones %llu), clones to originals %llu; target size "
-                "mismatches in proof groups %llu",
+                "late restores, %llu lists watched (%llu again after a missed target), %llu learning groups not "
+                "counted (nothing written in the game's size), %llu changed fields, %llu device sizes and %llu "
+                "postprocess sizes swapped; viewports for an original on its clone %llu (scaled %llu), larger than the "
+                "original %llu; bind fix: originals to clones %llu (views made on clones %llu), clones to originals "
+                "%llu; target size mismatches in proof groups %llu",
                 totals ? " (session total)" : "", kPhaseNames[g_phase], (unsigned long long)c.swaps[0],
                 (unsigned long long)c.swaps[1], (unsigned long long)c.twinSwaps, g_twin.size(),
                 (unsigned long long)c.translated, (unsigned long long)c.lateRestores,
-                (unsigned long long)c.lists, (unsigned long long)c.changed, (unsigned long long)c.devSizes,
+                (unsigned long long)c.lists, (unsigned long long)c.relearns, (unsigned long long)c.learnSkipped,
+                (unsigned long long)c.changed, (unsigned long long)c.devSizes,
                 (unsigned long long)c.postSizes,
                 (unsigned long long)c.vpMismatch, (unsigned long long)c.vpFixed, (unsigned long long)c.vpOutside,
                 (unsigned long long)c.fixFwd, (unsigned long long)c.lazy, (unsigned long long)c.fixBack,
@@ -3836,6 +3927,9 @@ void Shutdown() {
         for (SetState& s : g_set) s = SetState{};
         g_enabled = false;
         g_dirty = false;
+        g_groupFull = false;
+        g_learnSkipped[0] = g_learnSkipped[1] = 0;
+        g_missed = 0;
         if (!g_failed) g_phase = Waiting;
         g_c = g_ctot = Counters{};
         g_resetLogs = 0;
@@ -3901,6 +3995,12 @@ TestState TestGet() {
     s.sliceResolves = g_sliceResolves + g_sliceResolvesTot;
     s.sliceCopies = g_sliceCopies + g_sliceCopiesTot;
     s.sliceResolveFails = g_sliceResolveFails;
+    s.learned[0] = g_set[Outer].learned;
+    s.learned[1] = g_set[Focus].learned;
+    s.learnSkipped = g_c.learnSkipped + g_ctot.learnSkipped;
+    s.relearns = g_c.relearns + g_ctot.relearns;
+    s.setFailed[0] = g_set[Outer].failed;
+    s.setFailed[1] = g_set[Focus].failed;
     for (auto& [obj, t] : g_tex) s.sceneSlices += t.sslice && t.clone[FocusScene] ? 1 : 0;
     return s;
 }
