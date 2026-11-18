@@ -2077,13 +2077,102 @@ int RunClones() {
         const float want[8] = {32.0f, 24.0f, 32.0f, 24.0f, 1.0f / 32.0f, 1.0f / 24.0f, 7.25f, 20.0f};
         bool same = true;
         for (int i = 0; i < 8; ++i) same &= fabsf(got[i] - want[i]) <= fabsf(want[i]) * 1e-6f;
-        expect(fixBound && fixBound != cbFocus && qvfr::srcb::TestWindowsFixed() == 1 && same,
+        expect(fixBound && fixBound != cbFocus && qvfr::srcb::TestBlocksFixed() == 1 && same,
                "SR constants fix: the window fixBound in its place has focus's view size (32, 24, 32, 24, 1/32, 1/24), the "
                "pair that is no size stays (7.25, 20)");
         if (!same)
             printf("SR constants fix: got %g %g %g %g %g %g %g %g\n", got[0], got[1], got[2], got[3], got[4], got[5],
                    got[6], got[7]);
         if (fixBound) fixBound->Release();
+    }
+    // Windows of a dynamic buffer share a block: two neighbours take one, a far one its own, and a Map of the buffer
+    // drops them, so the next draw sees the new data.
+    {
+        D3D11_BUFFER_DESC dd{};
+        dd.ByteWidth = 1 << 20;
+        dd.Usage = D3D11_USAGE_DYNAMIC;
+        dd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        dd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        ID3D11Buffer* dyn = nullptr;
+        dev->CreateBuffer(&dd, nullptr, &dyn);
+        ID3D11DeviceContext1* c1 = nullptr;
+        ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&c1);
+        const UINT firstA = 4096, firstB = 4112, firstFar = 32768, numW = 16;
+        auto fill = [&](float tail) {
+            D3D11_MAPPED_SUBRESOURCE m{};
+            if (FAILED(ctx->Map(dyn, 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
+            memset(m.pData, 0, dd.ByteWidth);
+            auto put = [&](UINT first, float x, float y, float z, float w) {
+                float* f = (float*)m.pData + first * 4;
+                f[0] = x, f[1] = y, f[2] = z, f[3] = w;
+            };
+            put(firstA, 20.0f, 15.0f, tail, 20.0f);
+            put(firstB, 1.0f / 20.0f, 1.0f / 15.0f, 20.0f, 15.0f);
+            put(firstFar, 20.0f, 15.0f, 7.25f, 20.0f);
+            ctx->Unmap(dyn, 0);
+        };
+        // What PS slot `slot` shows at its window's start, and the buffer behind it (compared only, not kept).
+        auto boundAt = [&](UINT slot, float* out) {
+            ID3D11Buffer* b = nullptr;
+            UINT first = 0, num = 0;
+            c1->PSGetConstantBuffers1(slot, 1, &b, &first, &num);
+            if (!b) return b;
+            D3D11_BUFFER_DESC sd{};
+            b->GetDesc(&sd);
+            sd.Usage = D3D11_USAGE_STAGING;
+            sd.BindFlags = 0;
+            sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            ID3D11Buffer* st = nullptr;
+            dev->CreateBuffer(&sd, nullptr, &st);
+            if (st) {
+                ctx->CopyResource(st, b);
+                D3D11_MAPPED_SUBRESOURCE m{};
+                if (SUCCEEDED(ctx->Map(st, 0, D3D11_MAP_READ, 0, &m))) {
+                    memcpy(out, (const char*)m.pData + first * 16, 16);
+                    ctx->Unmap(st, 0);
+                }
+                st->Release();
+            }
+            b->Release();
+            return b;
+        };
+        auto close4 = [](const float* g, float x, float y, float z, float w) {
+            const float want[4] = {x, y, z, w};
+            for (int i = 0; i < 4; ++i)
+                if (fabsf(g[i] - want[i]) > fabsf(want[i]) * 1e-6f) return false;
+            return true;
+        };
+        if (dyn && c1) {
+            fill(9.5f);
+            qvfr::srcb::TestInit(ctx);
+            float a[4] = {}, b[4] = {}, far4[4] = {}, again[4] = {};
+            c1->PSSetConstantBuffers1(12, 1, &dyn, &firstA, &numW);
+            c1->PSSetConstantBuffers1(11, 1, &dyn, &firstB, &numW);
+            qvfr::srcb::OnDraw(ctx);
+            ID3D11Buffer* ba = boundAt(12, a);
+            ID3D11Buffer* bb = boundAt(11, b);
+            expect(ba && ba == bb && ba != dyn && qvfr::srcb::TestBlocksFixed() == 1 && close4(a, 32, 24, 9.5f, 20) &&
+                       close4(b, 1.0f / 32.0f, 1.0f / 24.0f, 32, 24),
+                   "SR constants fix: two neighbouring windows of a dynamic buffer come from one fixed block");
+            c1->PSSetConstantBuffers1(12, 1, &dyn, &firstFar, &numW);
+            qvfr::srcb::OnDraw(ctx);
+            ID3D11Buffer* bf = boundAt(12, far4);
+            expect(bf && bf != ba && qvfr::srcb::TestBlocksFixed() == 2 && close4(far4, 32, 24, 7.25f, 20),
+                   "SR constants fix: a window far away gets its own block");
+            qvfr::srcb::OnBufferWrite(ctx, dyn);
+            fill(3.5f);
+            c1->PSSetConstantBuffers1(12, 1, &dyn, &firstA, &numW);
+            qvfr::srcb::OnDraw(ctx);
+            boundAt(12, again);
+            expect(qvfr::srcb::TestBlocksFixed() == 3 && close4(again, 32, 24, 3.5f, 20),
+                   "SR constants fix: a Map of the buffer drops its blocks, the next draw reads the new data");
+            c1->PSSetConstantBuffers(12, 1, &noCb);
+            c1->PSSetConstantBuffers(11, 1, &noCb);
+        } else {
+            expect(false, "SR constants fix: a dynamic constant buffer and ID3D11DeviceContext1");
+        }
+        if (c1) c1->Release();
+        if (dyn) dyn->Release();
     }
     cbOuter->Release();
     cbFocus->Release();
