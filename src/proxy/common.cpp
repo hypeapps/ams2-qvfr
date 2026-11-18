@@ -489,15 +489,16 @@ Config ReadConfig(const fs::path& ini) {
         std::clamp(IniFloat(ini, L"dlaa", L"outer_render_scale", c.dlaaRenderScale), 0.33f, 1.0f);
     c.dlaaFocusRenderScale =
         std::clamp(IniFloat(ini, L"dlaa", L"focus_render_scale", c.dlaaRenderScale), 0.33f, 1.0f);
-    // M (2026-11-18): the least ghosting on thin parts (the rivals' diffuser strakes, dlaa-plan ghosting runs 2-5) at
-    // about K's cost on RTX 40 / 50; it takes no fixed exposure (DLSS Programming Guide 3.9: only J and K do).
+    // K: NVIDIA's DLAA default and far cheaper than M in quad views (benchmark 2026-11-18: 9.7 against 17.1 ms of GPU
+    // time per frame). M has the least ghosting on thin parts but takes no fixed exposure (DLSS Programming Guide 3.9:
+    // only J and K do).
     const auto presetValue = [](const char* key, const std::string& v, int fallback) {
         if (v == "default") return 0;
         if (v.size() == 1 && v[0] >= 'a' && v[0] <= 'o') return v[0] - 'a' + 1;  // NVSDK_NGX_DLSS_Hint_Render_Preset: A = 1 ... K = 11
         Log("Settings: unknown [dlaa] %s=\"%s\", ignored", key, v.c_str());
         return fallback;
     };
-    const std::string preset = IniString(ini, L"dlaa", L"preset", L"m");
+    const std::string preset = IniString(ini, L"dlaa", L"preset", L"k");
     c.dlaaPreset = presetValue("preset", preset, c.dlaaPreset);
     // Quad views: each kind of view can have its own model; an absent or empty key follows preset.
     const std::string outerPreset = IniString(ini, L"dlaa", L"outer_preset", L"");

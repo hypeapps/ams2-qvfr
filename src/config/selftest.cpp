@@ -55,9 +55,9 @@ int RunSelfTest(const fs::path& dir) {
     Expect(Near(s.peripheral, 0.5f) && Near(s.focusX, 0.35f) && Near(s.fixedY, 0.45f) && Near(s.focusMultiplier, 1.0f),
           "default ini: balanced values");
     Expect(s.gazeKey == 0x75 && s.benchKey == 0 && s.outerKey == 0 && s.warningBox, "default ini: player hotkeys");
-    Expect(!s.dlss && !s.dlssUpscale && s.dlssPreset == "m" && s.dlssOuterPreset == "m" && s.dlssFocusPreset == "m" &&
+    Expect(!s.dlss && !s.dlssUpscale && s.dlssPreset == "k" && s.dlssOuterPreset == "k" && s.dlssFocusPreset == "k" &&
                !s.dlaaAutoExposure && Near(s.dlaaExposure, 0.002f) && s.dlaaKey == 0 && s.dlaaPresetKey == 0,
-           "default ini: DLSS off, preset M, fixed exposure 0.002, no DLSS hotkeys");
+           "default ini: DLSS off, preset K, fixed exposure 0.002, no DLSS hotkeys");
     Expect(s.mvr, "default ini: NVIDIA Multi-View Rendering on");
     {
         IniFile d = ini;
@@ -92,9 +92,9 @@ int RunSelfTest(const fs::path& dir) {
         Expect(n.dlssUpscale && DlssModeIndex(n.dlssOuterScale) == 1, "DLSS on again: the chosen modes are back");
         WriteDlssScale(d, DlssView::Peripheral, kDlssModes[0].scale);
         Expect(d.GetOr("dlaa", "mode", "") == "dlaa", "both views DLAA: mode=dlaa");
-        WriteDlssPreset(d, DlssView::Focus, "k");
+        WriteDlssPreset(d, DlssView::Focus, "m");
         n = Read(d);
-        Expect(n.dlssFocusPreset == "k" && n.dlssOuterPreset == "m" && n.dlssPreset == "m", "a preset for the focus only");
+        Expect(n.dlssFocusPreset == "m" && n.dlssOuterPreset == "k" && n.dlssPreset == "k", "a preset for the focus only");
         IniFile e = d;
         WriteDlssPreset(e, DlssView::Peripheral, "j");
         Expect(Read(e).dlssOuterPreset == "j" && ChangedRestartKeys(d, e).empty(), "a preset needs no restart");

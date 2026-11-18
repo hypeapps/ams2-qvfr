@@ -158,7 +158,7 @@
                         <button class="primary" data-if="!nr_model" data-event-click="open_url('dlssnr')">Download</button>
                     </div>
                     <div class="dlss" data-if="dlss">
-                        <div class="dintro">Preset is the DLSS model. M (default) shows the least ghosting on thin parts of cars.</div>
+                        <div class="dintro">Preset is the DLSS model. K (default) is light on the GPU. M shows less ghosting behind mirrors and cars, but costs much more.</div>
                         <div class="dview" data-for="v : dlss_views">
                             <div class="dhead">
                                 <div class="dtitle">
