@@ -1,13 +1,16 @@
 # AMS2 QVFR
 
-Experimental quad views foveated rendering for Automobilista 2 in VR.
+**Experimental** quad views foveated rendering for Automobilista 2 in VR.
 
-The game renders each eye in two parts. The *outer* view covers the whole field of view at a lower pixel density, and
-the *focus* view covers a smaller area at full density. With eye tracking, the focus follows your gaze. Without it, the
-focus stays in the middle of the view. The mod puts both parts together for each eye before the image goes to the
-headset. You get a sharp image where you look, and the game renders far fewer pixels. You can spend the saved GPU time
-on higher settings or a steadier frame rate. MSAA and the game's TAA keep working. On NVIDIA RTX graphics cards, the mod
-can also replace the game's TAA with NVIDIA DLSS, as DLAA or as Super Resolution.
+The game renders each eye in two parts: the whole field of view at a lower pixel density (the *outer* view) and a smaller area at full density (the *focus* view). 
+
+With eye tracking the focus view follows your gaze. Without eye tracking the focus view stays in the middle of the view. 
+
+The mod puts both together for each eye before the image goes to the headset. 
+
+You get a sharp image where you look and render far fewer pixels, so you have headroom for higher settings or a steadier frame rate.
+
+On NVIDIA RTX graphics cards the mod can also replace the game's TAA with NVIDIA DLSS (DLAA or Super Resolution).
 
 ## Install
 
