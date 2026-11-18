@@ -71,6 +71,7 @@ std::atomic<uint64_t> g_viewEvals[kViews];
 uint64_t g_lastViewEvals[kViews] = {};
 bool g_viewLogged[kViews] = {};  // first DLSS evaluation of the view logged
 bool g_keyDown = false;
+bool g_gameTaaCfg = false;  // [dlaa] game_taa as last applied (a change sets the hotkey's state)
 bool g_expKeyDown = false;
 bool g_presetKeyDown = false;
 bool g_sr = false;  // DLSS SR: [dlaa] mode=dlss (sr.h in stereo, S2 in quad views)
@@ -1919,6 +1920,18 @@ void OnFrameStart() {
 #ifdef QVFR_HAVE_DLSS
             if (on) ResetAllLocked();
 #endif
+        }
+        // [dlaa] game_taa (ini or a test scenario): the same switch as the hotkey, on a change of the setting.
+        if (c.dlaaGameTaa != g_gameTaaCfg) {
+            g_gameTaaCfg = c.dlaaGameTaa;
+            const bool on = !c.dlaaGameTaa;
+            if (g_active.load() != on) {
+                g_active = on;
+                Log("DLAA: game_taa=%d: %s", c.dlaaGameTaa ? 1 : 0, on ? "DLAA" : "the game's TAA");
+#ifdef QVFR_HAVE_DLSS
+                if (on) ResetAllLocked();
+#endif
+            }
         }
         if (Pressed(c.dlaaExpKeyMod, c.dlaaExpKey, g_expKeyDown)) {
             g_expStep = (g_expStep.load() + 1) % kExpStepCount;

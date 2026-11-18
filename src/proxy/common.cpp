@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <ctime>
 #include <mutex>
+#include <thread>
 
 namespace qvfr {
 
@@ -488,7 +489,9 @@ Config ReadConfig(const fs::path& ini) {
         std::clamp(IniFloat(ini, L"dlaa", L"outer_render_scale", c.dlaaRenderScale), 0.33f, 1.0f);
     c.dlaaFocusRenderScale =
         std::clamp(IniFloat(ini, L"dlaa", L"focus_render_scale", c.dlaaRenderScale), 0.33f, 1.0f);
-    const std::string preset = IniString(ini, L"dlaa", L"preset", L"k");  // K: NVIDIA's DLAA default, set explicitly
+    // M (2026-11-18): the least ghosting on thin parts (the rivals' diffuser strakes, dlaa-plan ghosting runs 2-5) at
+    // about K's cost on RTX 40 / 50; it takes no fixed exposure (DLSS Programming Guide 3.9: only J and K do).
+    const std::string preset = IniString(ini, L"dlaa", L"preset", L"m");
     if (preset == "default") {
         c.dlaaPreset = 0;
     } else if (preset.size() == 1 && preset[0] >= 'a' && preset[0] <= 'o') {
@@ -511,17 +514,18 @@ Config ReadConfig(const fs::path& ini) {
     c.dlaaExpKey = IniInt(ini, L"dlaa", L"exposure_key", c.dlaaExpKey);
     c.dlaaCockpitTaa = std::clamp(IniInt(ini, L"dlaa", L"cockpit_taa", c.dlaaCockpitTaa), 0, 2);
     c.dlaaDisplayPass = IniInt(ini, L"dlaa", L"display_pass", c.dlaaDisplayPass ? 1 : 0) != 0;
+    c.dlaaGameTaa = IniInt(ini, L"dlaa", L"game_taa", c.dlaaGameTaa ? 1 : 0) != 0;
     c.dlaaPresetKeyMod = IniInt(ini, L"dlaa", L"preset_modifier", c.dlaaPresetKeyMod);
     c.dlaaPresetKey = IniInt(ini, L"dlaa", L"preset_key", c.dlaaPresetKey);
     if (c.dlaa)
         Log("Settings: [dlaa] mode=%s render_scale=%.3f outer_render_scale=%.3f focus_render_scale=%.3f preset=%s "
             "jitter_scale=(%.3f, %.3f) mv_jittered=%d "
             "auto_exposure=%d exposure=%.4f exposure_scale=%.4f bias_mask=%.2f skip_locks=%d modifier=0x%X key=0x%X "
-            "exposure_key=0x%X preset_key=0x%X cockpit_taa=%d display_pass=%d",
+            "exposure_key=0x%X preset_key=0x%X cockpit_taa=%d display_pass=%d game_taa=%d",
             c.dlaaSr ? "dlss" : "dlaa", c.dlaaRenderScale, c.dlaaOuterRenderScale, c.dlaaFocusRenderScale,
             preset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY, c.dlaaMvJittered, c.dlaaAutoExposure,
             c.dlaaExposure, c.dlaaExposureScale, c.dlaaBiasMask, c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey,
-            c.dlaaExpKey, c.dlaaPresetKey, c.dlaaCockpitTaa, c.dlaaDisplayPass ? 1 : 0);
+            c.dlaaExpKey, c.dlaaPresetKey, c.dlaaCockpitTaa, c.dlaaDisplayPass ? 1 : 0, c.dlaaGameTaa ? 1 : 0);
     const std::string nr = IniString(ini, L"nr", L"mode", L"off");
     c.nrMode = nr == "focus" ? 1 : nr == "final" ? 2 : 0;
     if (nr != "off" && nr != "focus" && nr != "final") Log("Settings: unknown [nr] mode=\"%s\", using off", nr.c_str());
@@ -611,12 +615,9 @@ struct TestScenario {
 };
 const TestScenario kTestScenarios[] = {
     {"as in the ini", [](Config&) {}},
-    // O2 step 3 across live switches: each one leaves the focus velocity pass to the engine from its first frame, so
-    // the forward recording must not arm there (and arms again back in the ini's state).
-    {"MVR live forward depth 2 (the velocity pass draws its own vectors)", [](Config& c) { c.mvrForwardDepth = 2; }},
-    {"MVR focus motion vectors from outer off (B10, mvr_velocity 0)", [](Config& c) { c.mvrVelocity = false; }},
-    {"MVR focus velocity pass draws its own vectors (B11, mvr_velocity_skip 0)",
-     [](Config& c) { c.mvrVelocitySkip = false; }},
+    // A/B of the DLSS model (dlaa-plan, ghosting runs 2-5: M the default since 2026-11-18) and of DLSS itself.
+    {"DLSS preset K (the default before 2026-11-18)", [](Config& c) { c.dlaaPreset = 11; }},
+    {"the game's TAA instead of DLSS (dlaa game_taa 1)", [](Config& c) { c.dlaaGameTaa = true; }},
 };
 constexpr int kTestScenarioCount = (int)(sizeof(kTestScenarios) / sizeof(kTestScenarios[0]));
 // The settings any scenario sets, back to the ini's before the next one applies.
@@ -629,6 +630,8 @@ void RestoreTestFields(Config& c, const Config& ini) {
     c.mvrGbufferPs = ini.mvrGbufferPs;
     c.mvrEarly = ini.mvrEarly;
     c.mvrForward = ini.mvrForward;
+    c.dlaaPreset = ini.dlaaPreset;
+    c.dlaaGameTaa = ini.dlaaGameTaa;
 }
 
 void NoteIniTime() {
@@ -724,6 +727,7 @@ bool ReloadConfig(bool force) {
     c.dlaaExposureScale = n.dlaaExposureScale;
     c.dlaaCockpitTaa = n.dlaaCockpitTaa;
     c.dlaaDisplayPass = n.dlaaDisplayPass;
+    c.dlaaGameTaa = n.dlaaGameTaa;
     c.dlaaPresetKeyMod = n.dlaaPresetKeyMod;
     c.dlaaPresetKey = n.dlaaPresetKey;
     c.nrMode = n.nrMode;
@@ -890,6 +894,18 @@ void TestScenarioFrame() {
     RestoreTestFields(g_cfg, g_iniCfg);
     kTestScenarios[g_testStep].apply(g_cfg);
     Log("Test scenario %d of %d (hotkey): %s", g_testStep, kTestScenarioCount - 1, kTestScenarios[g_testStep].name);
+    // The tester hears which one it is ([benchmark] beep): scenario 0 one low tone, scenario n n short high ones. A tap
+    // shorter than a frame is not seen (2026-11-18, ghosting run 2: the count went one ahead of the log).
+    if (c.benchBeep) {
+        const int n = g_testStep;
+        std::thread([n] {
+            if (n == 0) Beep(440, 400);
+            for (int i = 0; i < n; ++i) {
+                Beep(1100, 110);
+                Sleep(90);
+            }
+        }).detach();
+    }
 }
 
 const char* ExpModeName(ExpMode m) {

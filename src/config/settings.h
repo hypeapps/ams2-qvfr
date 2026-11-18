@@ -31,7 +31,7 @@ struct Settings {
     bool mvr = true;                 // mode=mvr, anything but off (restart)
     // [dlaa] (docs/dlaa.md): NVIDIA DLAA instead of the game's TAA
     bool dlaa = false;               // mode=dlaa (restart)
-    std::string dlaaPreset = "k";    // j, k, l, m ("default" reads as k, NVIDIA's DLAA default)
+    std::string dlaaPreset = "m";    // j, k, l, m (no key: m as the proxy; "default" reads as k, NVIDIA's DLAA default)
     bool dlaaAutoExposure = false;
     float dlaaExposure = 0.002f;     // fixed DLSS exposure with auto off
     // [nr] (dlaa-plan D7): DLSS 5 neural rendering on the finished image; runs on DLAA's motion vectors and depth, so

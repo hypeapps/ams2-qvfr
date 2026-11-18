@@ -148,7 +148,7 @@
                     <div class="row" data-if="dlaa">
                         <div class="label">
                             <div class="name">DLSS preset</div>
-                            <div class="desc">The DLSS model. With Debug hotkeys on, right Ctrl + Home cycles through the presets during the game.</div>
+                            <div class="desc">The DLSS model. M (default) shows the least ghosting on thin parts of cars; on RTX 20 and 30 series cards K costs about half as much. With Debug hotkeys on, right Ctrl + Home cycles through the presets during the game.</div>
                         </div>
                         <div class="control">
                             <div class="seg">

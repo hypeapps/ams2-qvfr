@@ -68,8 +68,9 @@ Settings Read(const IniFile& ini) {
     s.overlay = ParseInt(ini.GetOr("debug", "overlay", ""), 0) != 0;
     s.mvr = ini.GetOr("mvr", "mode", "mvr") != "off";
     s.dlaa = ini.GetOr("dlaa", "mode", "off") == "dlaa";
-    // The GUI offers j, k, l and m; "default" (or empty) is NVIDIA's choice for DLAA, which is K.
-    s.dlaaPreset = ini.GetOr("dlaa", "preset", "k");
+    // The GUI offers j, k, l and m; without the key the proxy takes M; "default" (or empty) is NVIDIA's choice for DLAA,
+    // which is K.
+    s.dlaaPreset = ini.GetOr("dlaa", "preset", "m");
     if (s.dlaaPreset.empty() || s.dlaaPreset == "default") s.dlaaPreset = "k";
     s.dlaaAutoExposure = ParseInt(ini.GetOr("dlaa", "auto_exposure", ""), 0) != 0;
     s.dlaaExposure = ParseFloat(ini.GetOr("dlaa", "exposure", ""), 0.002f);
