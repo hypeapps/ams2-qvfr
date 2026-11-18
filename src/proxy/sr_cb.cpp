@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cmath>
 #include <map>
 #include <tuple>
 #include <unordered_set>
@@ -13,7 +12,6 @@
 
 #include "clones.h"
 #include "common.h"
-#include "gpu.h"
 #include "hooks.h"
 #include "sr_fix_cs.h"  // kSrFixCS (fxc from shaders/sr.hlsl)
 #include "sr_probe.h"
@@ -58,7 +56,6 @@ ID3D11Buffer* g_pairsCb = nullptr;
 bool g_shareBlocks = false;  // the Map hook is in, so a block can never outlive the data it was copied from
 bool g_pairsSet = false;
 Sizes g_pairsFor{};  // the sizes in g_pairsCb
-uint64_t g_frameSeen = 0;
 std::map<BlockKey, Fixed> g_cache;         // this frame's fixed blocks
 std::vector<ID3D11Buffer*> g_sources;      // the dynamic buffers with shared blocks in g_cache (see OnBufferWrite)
 std::unordered_set<ID3D11Buffer*> g_ours;  // our fixed constant buffers (bound by us)
@@ -390,7 +387,6 @@ void OnFrameStart() {
         const bool on = c.srCbFix && !g_hotkeyOff && g_ctx1;
         if (on != g_on.load()) g_on = on;
         DropCache();  // a new frame: the game's buffers hold new data
-        ++g_frameSeen;
     });
 }
 

@@ -611,8 +611,6 @@ double g_iniCheckMs = 0;
 // One hotkey for an in-game test: each press goes to the next scenario, which sets live settings over the ini's (the
 // modules pick the change up as from a live reload); after the last one it is the ini again. The table is the current
 // test's and changes with it.
-// Current test (2026-11-17, dlaa-plan "S2.4: głębia outer po forwardzie w układzie rogu"): the fix (outer's velocity
-// pass on a conservative copy) against the state before it, by eye and in the benchmark (A/B).
 Config g_iniCfg;  // g_cfg as the ini has it (LoadConfig, ReloadConfig), before the scenario
 int g_testStep = 0;
 bool g_testKeyDown = false;
@@ -624,17 +622,9 @@ const TestScenario kTestScenarios[] = {
     {"as in the ini", [](Config&) {}},
 };
 constexpr int kTestScenarioCount = (int)(sizeof(kTestScenarios) / sizeof(kTestScenarios[0]));
-// The settings any scenario sets, back to the ini's before the next one applies.
-void RestoreTestFields(Config& c, const Config& ini) {
-    c.mvrForwardDepth = ini.mvrForwardDepth;
-    c.mvrVelocity = ini.mvrVelocity;
-    c.mvrVelocitySkip = ini.mvrVelocitySkip;
-    c.mvrOutlierPx = ini.mvrOutlierPx;
-    c.mvrOuterVelCons = ini.mvrOuterVelCons;
-    c.mvrGbufferPs = ini.mvrGbufferPs;
-    c.mvrEarly = ini.mvrEarly;
-    c.mvrForward = ini.mvrForward;
-}
+// The settings any scenario sets, back to the ini's before the next one applies (c.field = ini.field for each; none
+// while the table holds only step 0).
+void RestoreTestFields(Config& /*c*/, const Config& /*ini*/) {}
 
 void NoteIniTime() {
     WIN32_FILE_ATTRIBUTE_DATA a{};
