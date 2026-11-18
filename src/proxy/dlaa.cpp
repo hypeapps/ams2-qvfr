@@ -121,10 +121,16 @@ float ExposureScaleNow() {
 constexpr int kPresetSteps[] = {-1, 10, 11, 13, 12};
 constexpr int kPresetStepCount = (int)(sizeof(kPresetSteps) / sizeof(kPresetSteps[0]));
 std::atomic<int> g_presetStep{0};
-// The preset of a view (kViewName): the hotkey's step for all of them, else the ini's for that kind of view.
+// Benchmark sequence switches: the preset of all views, of outer's, of focus's; -1 = not set.
+std::atomic<int> g_presetSwitch[3] = {-1, -1, -1};
+// The preset of a view (kViewName): the hotkey's step for all of them, a benchmark switch, else the ini's for that kind
+// of view.
 int PresetFor(int view) {
     const int s = g_presetStep.load();
     if (s != 0) return kPresetSteps[s];
+    const int kind = view == 0 ? g_presetSwitch[0].load() : g_presetSwitch[view <= 2 ? 1 : 2].load();
+    if (kind >= 0) return kind;
+    if (g_presetSwitch[0].load() >= 0) return g_presetSwitch[0].load();
     const Config& c = Cfg();
     return view == 0 ? c.dlaaPreset : view <= 2 ? c.dlaaOuterPreset : c.dlaaFocusPreset;
 }
@@ -185,18 +191,21 @@ void SetState(const std::string& s) {
 
 // The state while DLSS runs; with DLSS SR it names the render scales in use.
 bool g_ran = false, g_ranQuad = false;
+float g_scaleNow[2] = {-1, -1};  // focus (stereo: the eye) and outer after a live change; -1: the ini's at the start
 void SetRunningState(bool quad) {
     g_ran = true;
     g_ranQuad = quad;
     char state[128];
     const Config& cfg = Cfg();
+    const float focus = g_scaleNow[0] >= 0 ? g_scaleNow[0] : quad ? cfg.dlaaFocusRenderScale : cfg.dlaaRenderScale;
+    const float outer = g_scaleNow[1] >= 0 ? g_scaleNow[1] : cfg.dlaaOuterRenderScale;
     if (!g_sr)
         snprintf(state, sizeof(state), "%s (DLSS replaces the game's TAA)", quad ? "on in quad views" : "on");
     else if (quad)
         snprintf(state, sizeof(state), "on in quad views (DLSS Super Resolution: focus %.0f%%, peripheral %.0f%%)",
-                 cfg.dlaaFocusRenderScale * 100, cfg.dlaaOuterRenderScale * 100);
+                 focus * 100, outer * 100);
     else
-        snprintf(state, sizeof(state), "on (DLSS Super Resolution: %.0f%%)", cfg.dlaaRenderScale * 100);
+        snprintf(state, sizeof(state), "on (DLSS Super Resolution: %.0f%%)", focus * 100);
     SetState(state);
 }
 
@@ -1321,6 +1330,14 @@ void FinishTaaShot(ID3D11DeviceContext* c) {
     ReleasePending();
 }
 
+// GPU spans of a quad view's DLSS step (kViewName 1..4; `first`: the kind's outer L entry); stereo has none.
+void ViewSpanBegin(gpu::Span first, int view) {
+    if (view >= 1) gpu::SpanBegin((gpu::Span)(first + view - 1));
+}
+void ViewSpanEnd(gpu::Span first, int view) {
+    if (view >= 1) gpu::SpanEnd((gpu::Span)(first + view - 1));
+}
+
 // A DrawIndexed(6) on the immediate context. The engine records its TAA resolve into a command buffer and replays it
 // later, so the draw is recognized by what is bound (docs/ams2-renderer.md): target and history R11G11B10_FLOAT,
 // t3 motion vectors R16G16_FLOAT, t5 locks R8_UNORM. Returns kNotTaa, kDone (DLSS ran, skip the draw) or kFailed.
@@ -1339,6 +1356,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
         if (!IsTaaResolve(rtv, srv)) return;
         result = kFailed;  // from here on it is the TAA resolve
         if (g_failed) return;
+        ViewSpanBegin(gpu::DlssOuterL, view);
         if (g_dev && g_gen != gpu::Generation()) {
             Log("DLAA: the device changed; NGX starts again");
             DropNgxLocked();
@@ -1539,6 +1557,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             // MVR (mvr_motion.h): outer's motion vectors kept per eye, the focus views' made from them.
             ID3D11Resource* mv = in[2];
             if (view >= 1) {
+                ViewSpanBegin(gpu::DlssMvOuterL, view);
                 const int eye = (view - 1) & 1;
                 const bool shot = g_shot.load(std::memory_order_relaxed);
                 if (view <= 2)
@@ -1546,6 +1565,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
                 else if (ID3D11Texture2D* m = mvrmotion::ForFocus(c, eye, (ID3D11Texture2D*)in[0],
                                                                   (ID3D11Texture2D*)in[2], iw, ih, frame, shot))
                     mv = m;
+                ViewSpanEnd(gpu::DlssMvOuterL, view);
             }
             if (mask) {
                 c->CSSetShader(g_maskCs, nullptr, 0);
@@ -1578,7 +1598,9 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             e.InExposureScale = ExposureScaleNow();
             e.pInBiasCurrentColorMask = mask;
             e.pInExposureTexture = expTex;
+            ViewSpanBegin(gpu::DlssEvalOuterL, view);
             r = NGX_D3D11_EVALUATE_DLSS_EXT(c, f->handle, g_params, &e);
+            ViewSpanEnd(gpu::DlssEvalOuterL, view);
             if (afterDraw && NVSDK_NGX_SUCCEED(r)) {
                 ID3D11ShaderResourceView* in2[2] = {srv[4], taaSrv};
                 c->CSSetShader(g_cockpitCs, nullptr, 0);
@@ -1599,6 +1621,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
                 nr::Process(c, view, SrvFor(out), UavFor(out), mv, in[0], w, h, iw, ih, e.InReset != 0);
             // Displays pass (S2.4): the result goes to dispTex, which then replaces out as the copy into the target.
             if (NVSDK_NGX_SUCCEED(r) && dispTex) {
+                ViewSpanBegin(gpu::DlssDispOuterL, view);
                 struct {
                     uint32_t bits, pad;
                     float jitter[2], toRender[2];
@@ -1620,6 +1643,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
                 c->CSSetShader(nullptr, nullptr, 0);
                 ++g_dispEvals;
                 dispDone = true;
+                ViewSpanEnd(gpu::DlssDispOuterL, view);
             }
         });
         t_inside = false;
@@ -1661,6 +1685,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
                 MeasureDisplays(c, view, stencil, stencilSlice, iw, ih, MaskBitsNow(), dispDone);
         }
         c->CopyResource(tex[3], dispDone ? dispTex : out);
+        ViewSpanEnd(gpu::DlssOuterL, view);
         if (g_sr) sr::ShotDlss(c, tex[1], tex[3]);  // shot frame only
         result = kDone;
     }();
@@ -1710,7 +1735,13 @@ bool Replace(ID3D11DeviceContext* c, UINT n) {
             {
                 clones::RawScope raw;  // our calls pass the clones' hooks as they are
                 Protect("draw", [&] { r = Evaluate(c, false); });
-                if (r == kDone) Protect("carry", [&] { Carry(c); });
+                if (r == kDone)
+                    Protect("carry", [&] {
+                        const int view = g_group.load(std::memory_order_relaxed) + 1;
+                        ViewSpanBegin(gpu::CarryOuterL, view);
+                        Carry(c);
+                        ViewSpanEnd(gpu::CarryOuterL, view);
+                    });
             }
             clones::SceneEnd(c);
             if (r == kDone) {
@@ -1961,12 +1992,18 @@ void OnFrameStart() {
 
 bool SrWanted() { return g_sr && Wanted(); }
 
-void OnSrScalesChanged() {
-    Protect("render scales", [] {
+void OnSrScalesChanged(float focus, float outer) {
+    Protect("render scales", [&] {
         ResetAllLocked();  // a feature of an earlier size that comes back has an old history
+        g_scaleNow[0] = focus;
+        g_scaleNow[1] = outer;
         if (g_ran) SetRunningState(g_ranQuad);
     });
 }
+
+int GetPresetSwitch(int which) { return g_presetSwitch[which].load(); }
+
+void SetPresetSwitch(int which, int preset) { g_presetSwitch[which] = preset; }
 
 bool DlssNow() { return g_installed && Wanted(); }
 

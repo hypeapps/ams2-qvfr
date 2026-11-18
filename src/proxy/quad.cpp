@@ -2748,18 +2748,21 @@ uint32_t SizePx(double v) { return (uint32_t)std::clamp(std::lround(v), 16L, 163
 // DLSS SR (S2): the scene phase of each view at its render scale of the view's size. At the start, and at a frame start
 // after the scales changed in qvfr.ini (a DLSS mode picked while the game runs).
 uint32_t g_srSizes[4] = {};
+int g_srScaleSwitch[2] = {-1, -1};  // benchmark sequence: outer's and focus's scale in percent over the ini's; -1 = not set
+float SrScale(int which, float ini) {
+    return g_srScaleSwitch[which] > 0 ? std::clamp(g_srScaleSwitch[which], 33, 100) / 100.0f : ini;
+}
 void ApplySrScalesLocked() {
     const Config& c = Cfg();
-    const uint32_t r[4] = {SizePx(g_focus.outerW * (double)c.dlaaOuterRenderScale),
-                           SizePx(g_focus.outerH * (double)c.dlaaOuterRenderScale),
-                           SizePx(g_focus.focusTexW * (double)c.dlaaFocusRenderScale),
-                           SizePx(g_focus.focusTexH * (double)c.dlaaFocusRenderScale)};
+    const float so = SrScale(0, c.dlaaOuterRenderScale), sf = SrScale(1, c.dlaaFocusRenderScale);
+    const uint32_t r[4] = {SizePx(g_focus.outerW * (double)so), SizePx(g_focus.outerH * (double)so),
+                           SizePx(g_focus.focusTexW * (double)sf), SizePx(g_focus.focusTexH * (double)sf)};
     if (std::equal(r, r + 4, g_srSizes)) return;
     const bool live = g_srSizes[0] != 0;
     std::copy(r, r + 4, g_srSizes);
     clones::SetSceneSizes(r[0], r[1], r[2], r[3]);
     mvrpass::SetSceneSizes(r[0], r[1], r[2], r[3]);
-    if (live) dlaa::OnSrScalesChanged();
+    if (live) dlaa::OnSrScalesChanged(sf, so);
     Log("Quad: DLSS SR%s: outer's scene at %u x %u -> %u x %u, focus's at %u x %u -> %u x %u", live ? " (changed live)" : "",
         r[0], r[1], g_focus.outerW, g_focus.outerH, r[2], r[3], g_focus.focusTexW, g_focus.focusTexH);
 }
@@ -3337,6 +3340,14 @@ const Switch kSwitches[] = {
          g_qbOn = v != 0;
          g_qbWant = g_qbOn ? (1u << OuterL) | (1u << FocusL) : 0;
      }},
+    // DLSS, over the ini (-1 = the ini's): presets as NVIDIA numbers them (10 J, 11 K, 12 L, 13 M), scales in percent.
+    {"dlss_preset", false, -1, 15, [] { return dlaa::GetPresetSwitch(0); }, [](int v) { dlaa::SetPresetSwitch(0, v); }},
+    {"dlss_preset_outer", false, -1, 15, [] { return dlaa::GetPresetSwitch(1); },
+     [](int v) { dlaa::SetPresetSwitch(1, v); }},
+    {"dlss_preset_focus", false, -1, 15, [] { return dlaa::GetPresetSwitch(2); },
+     [](int v) { dlaa::SetPresetSwitch(2, v); }},
+    {"dlss_scale_outer", false, -1, 100, [] { return g_srScaleSwitch[0]; }, [](int v) { g_srScaleSwitch[0] = v; }},
+    {"dlss_scale_focus", false, -1, 100, [] { return g_srScaleSwitch[1]; }, [](int v) { g_srScaleSwitch[1] = v; }},
 };
 
 const Switch* FindSwitch(const std::string& name, std::string* why) {
@@ -3344,6 +3355,15 @@ const Switch* FindSwitch(const std::string& name, std::string* why) {
         if (name != s.name) continue;
         if (s.mvr && !mvrpass::On()) {
             if (why) *why = name + ": MVR is not installed ([debug] mvr_gbuffer=1)";
+            return nullptr;
+        }
+        // A step that could not take effect would measure the wrong thing under its label.
+        if (name.rfind("dlss_", 0) == 0 && !Cfg().dlaa) {
+            if (why) *why = name + ": NVIDIA DLSS is off ([dlaa] mode)";
+            return nullptr;
+        }
+        if (name.rfind("dlss_scale", 0) == 0 && !SrConfigured()) {
+            if (why) *why = name + ": needs a game started with [dlaa] mode=dlss";
             return nullptr;
         }
         return &s;

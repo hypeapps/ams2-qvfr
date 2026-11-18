@@ -61,8 +61,8 @@ float IniFloat(const fs::path& ini, const wchar_t* sec, const wchar_t* key, floa
 }
 
 std::wstring IniPathValue(const fs::path& ini, const wchar_t* sec, const wchar_t* key) {
-    wchar_t buf[1024];
-    GetPrivateProfileStringW(sec, key, L"", buf, 1024, ini.c_str());
+    wchar_t buf[4096];  // also [benchmark] sequence, which can be long
+    GetPrivateProfileStringW(sec, key, L"", buf, 4096, ini.c_str());
     return buf;
 }
 

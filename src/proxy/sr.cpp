@@ -255,7 +255,7 @@ void ApplyScale() {
     g_sceneW = rw;
     g_sceneH = rh;
     clones::SetSceneSizes(rw, rh, 0, 0);
-    if (live) dlaa::OnSrScalesChanged();
+    if (live) dlaa::OnSrScalesChanged(s, s);
     Log("DLSS SR%s: eye size %u x %u, scene at %u x %u (render scale %.3f)", live ? " (changed live)" : "", g_gameW,
         g_gameH, rw, rh, s);
 }
