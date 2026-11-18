@@ -7,7 +7,7 @@ smaller area at full density (the *focus* view). With eye tracking the focus fol
 the middle of the view. The mod puts both together for each eye before the image goes to the headset. You get a sharp
 image where you look and render far fewer pixels, so you have headroom for higher settings or a steadier frame rate.
 MSAA keeps working, and so does the game's TAA. On NVIDIA RTX graphics cards the mod can also replace the game's TAA with
-NVIDIA DLAA (experimental).
+NVIDIA DLSS (DLAA or Super Resolution).
 
 ## Install
 
@@ -42,7 +42,7 @@ let Steam verify the game files and delete `x64\qvfr`.
 You can customize settings using the GUI: `x64\qvfr\qvfr_config.exe`
 
 - **Settings:** quad views on/off, VR API, eye tracking (with the time the focus waits when the tracker loses your eyes,
-  and a switch that shows your gaze and the focus edges in the game), anti-aliasing ([NVIDIA DLAA](#nvidia-dlaa-experimental)),
+  and a switch that shows your gaze and the focus edges in the game), anti-aliasing ([NVIDIA DLSS](#nvidia-dlss-dlaa-and-super-resolution)),
   focus position, debug options.
 - **Resolution:** a to-scale preview of the left eye with the pixels the game renders, the presets and every size.
 - **Status:** problems found at the last game start and what the mod detected (headset, runtime, eye tracking…).
@@ -77,17 +77,21 @@ the next game start.
 - **OpenVR:** the game talks to SteamVR through the Valve DLL in `x64\qvfr\openvr\`. Eye tracking: what SteamVR
   gives games (tested with the Pimax Dream Air).
 
-## NVIDIA DLAA (experimental)
+## NVIDIA DLSS: DLAA and Super Resolution
 
-NVIDIA DLSS without upscaling (DLAA) replaces the game's temporal anti-aliasing (TAA): calmer edges and a sharper image
-than the game's TAA. The mod gives DLSS the game's own motion vectors (including the cars and
-wheels), depth and camera jitter, and runs it for each of the four views. NVIDIA DLSS (`nvngx_dlss.dll`) comes with the
-mod in `x64\qvfr\`.
+NVIDIA DLSS replaces the game's temporal anti-aliasing (TAA). The mod gives DLSS the game's own motion vectors (including
+the cars and wheels), depth and camera jitter, and runs it for each of the four views. NVIDIA DLSS (`nvngx_dlss.dll`) comes
+with the mod in `x64\qvfr\`.
 
 - **Requirements:** an NVIDIA RTX graphics card, and in the game's graphics options **TAA on and MSAA off**. Without them
   the game's own anti-aliasing stays.
 - **Turn it on:** `qvfr_config.exe` → **Settings** → **Rendering** → **NVIDIA DLSS**, then restart the game. Off by
   default; it starts in the **DLAA** mode.
+- **Mode:** DLAA (100%, no upscaling) gives calmer edges and a sharper image than the game's TAA. With Super Resolution
+  the game renders fewer pixels and DLSS upscales them to the size of each view: Quality (67%), Balanced (58%),
+  Performance (50%) or Ultra Performance (33%). Choose the mode separately for the focus and the periphery, or once for
+  the whole image with quad views off. If the game started with upscaling on, a new mode applies while you drive, with a
+  short hitch; from plain DLAA the first upscaling mode needs a game restart.
 - **Preset:** the DLSS model (J, K, L, M), chosen separately for the focus and the periphery.
 - **DLSS exposure** (`[dlaa] auto_exposure` and `exposure` in `qvfr.ini`): fixed (default 0.002) keeps the brightness of
   lights and reflections; auto lets DLSS measure it, which dims them, most at night. Lower fixed values keep brighter
@@ -95,9 +99,9 @@ mod in `x64\qvfr\`.
 - Dashboard displays and mirrors take the current frame instead of DLSS, because DLSS leaves trails behind changing
   digits (`[dlaa] cockpit_taa` in `qvfr.ini`: 0 = DLSS everywhere, 2 = also the rest of your car; `[dlaa]
   display_pass=0` gives them the game's TAA instead).
-- With **Debug hotkeys** on: right Ctrl + F1 switches between DLAA and the game's TAA and F12 steps through exposures
+- With **Debug hotkeys** on: right Ctrl + F1 switches between NVIDIA DLSS and the game's TAA and F12 steps through exposures
   while you drive.
-- The **Status** page shows whether DLAA ran at the last game start, and if not, why.
+- The **Status** page shows whether NVIDIA DLSS ran at the last game start, and if not, why.
 
 ## NVIDIA DLSS 5 (alpha)
 
@@ -105,7 +109,7 @@ NVIDIA's DLSS 5 neural rendering model reworks the light and materials of the fi
 the periphery. It works on the DLSS image (its motion vectors and depth), so turning it on also turns NVIDIA DLSS on,
 and turning NVIDIA DLSS off turns it off.
 
-- **Requirements:** everything DLAA needs, and NVIDIA's model `nvngx_dlssnr.dll` in `x64\qvfr\`. The mod does not include
+- **Requirements:** everything NVIDIA DLSS needs, and NVIDIA's model `nvngx_dlssnr.dll` in `x64\qvfr\`. The mod does not include
   the model: when it is missing, the settings app shows a **Download** button under the DLSS 5 switch.
   You can download it here: https://github.com/RankFTW/rhi-repo/releases/tag/dlssnr-310.9.16
 - **Turn it on:** `qvfr_config.exe` → **Settings** → **Rendering** → **NVIDIA DLSS 5**. Off by default. The **DLSS 5**
@@ -116,14 +120,6 @@ and turning NVIDIA DLSS off turns it off.
   **Neural Rendering** switch works whenever NVIDIA DLSS is running. Changes show at once, **Save to qvfr.ini** keeps them. The panel also shows the frame rate, the CPU and GPU frame time and
   the cost of DLSS 5.
 - **Cost:** about 4 ms of GPU time per frame on an RTX 5090 with the periphery at half resolution (the default).
-
-## NVIDIA DLSS Super Resolution (prototype)
-
-The game renders fewer pixels and DLSS upscales them to the size of each view. With **NVIDIA DLSS** on, choose a mode under
-it: DLAA (100%, no upscaling), Quality (67%), Balanced (58%), Performance (50%) or Ultra Performance (33%), separately for
-the focus and the periphery, or once for the whole image with quad views off. If the game started with upscaling on, a new
-mode applies while you drive, with a short hitch; from plain DLAA the first upscaling mode needs a game restart. The same
-requirements as DLAA.
 
 ## Requirements
 
