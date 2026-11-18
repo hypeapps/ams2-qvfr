@@ -1540,6 +1540,11 @@ int RunMvrForward() {
     std::vector<uint64_t> crefC, crefD, ccC, ccD, cfC, cfD, cfH, cfHD;
     qvfr::mvrpass::TestLiveState clv{};
     unsigned cTwins = 0;
+    // Mode 3 in the corner layout: outer's velocity pass (an R16G16 target of outer's size with outer's depth, outside
+    // the focus groups) gets a conservative copy of outer's forward depth (the 2026-11-17 night artefacts); with the
+    // zero depth bias here the copy equals the exact depth that went back. Another target with that depth: as it is.
+    bool ovSwap = false, ovPlain = false;
+    int ovDiff = -1;
     if (cornerMade) {
         auto startOc = [&] {
             ctx->ClearRenderTargetView(s_oc.rtv.Get(), kOuterColor);
@@ -1582,6 +1587,34 @@ int RunMvrForward() {
         cfD = Read(g_s.focus.depth.Get());
         cfH = Read(g_s.focus.half.Get());
         cfHD = Read(g_s.focus.halfDepth.Get());
+        ComPtr<ID3D11Texture2D> ovTex = Tex(kOW, kOH, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_RENDER_TARGET);
+        ComPtr<ID3D11RenderTargetView> ovRtv;
+        if (ovTex) dev->CreateRenderTargetView(ovTex.Get(), nullptr, &ovRtv);
+        if (ovRtv) {
+            ID3D11RenderTargetView* vr = ovRtv.Get();
+            ctx->OMSetRenderTargets(1, &vr, s_oc.dsv.Get());
+            ComPtr<ID3D11DepthStencilView> got;
+            ctx->OMGetRenderTargets(0, nullptr, &got);
+            ComPtr<ID3D11Resource> gr;
+            if (got) got->GetResource(&gr);
+            ComPtr<ID3D11Texture2D> gt;
+            if (gr) gr.As(&gt);
+            ovSwap = gt && gt.Get() != s_oc.depth.Get();
+            if (ovSwap) {
+                ctx->OMSetRenderTargets(0, nullptr, nullptr);
+                const std::vector<uint64_t> cp = Read(gt.Get());
+                ovDiff = cp.size() == ccD.size() ? 0 : -2;
+                for (size_t i = 0; ovDiff >= 0 && i < cp.size(); ++i) ovDiff += cp[i] != ccD[i];
+            }
+            ID3D11RenderTargetView* orv = s_oc.rtv.Get();
+            ctx->OMSetRenderTargets(1, &orv, s_oc.dsv.Get());
+            got.Reset();
+            gr.Reset();
+            ctx->OMGetRenderTargets(0, nullptr, &got);
+            if (got) got->GetResource(&gr);
+            ovPlain = gr.Get() == (ID3D11Resource*)s_oc.depth.Get();
+            ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        }
         qvfr::mvrpass::TestEnd();
         qvfr::mvrpass::SetSizes(0, 0, 0, 0, 0, 0);
         qvfr::mvrpass::TestOriginal(nullptr);
@@ -1706,7 +1739,8 @@ int RunMvrForward() {
                           ccC.size() == (size_t)opx && cfC.size() == (size_t)fpx && cOuterC * 100 <= opx &&
                           cOuterD * 100 <= opx && cCovered > fpx / 3 && cFC * 100 <= fpx && cFD * 100 <= fpx &&
                           cfH.size() == (size_t)(kFW / 2) * (kFH / 2) && cHalf == 0 && cHalfD == 0 &&
-                          clv.otherClears == 2 && clv.otherClearMisses == 0 && cTwins == 4;
+                          clv.otherClears == 2 && clv.otherClearMisses == 0 && cTwins == 4 && ovSwap && ovDiff == 0 &&
+                          ovPlain;
     const MsCheck msaa = RunMsaa(sx, ox, sy, oy, cornerMade ? &s_oc : nullptr);  // B12, B20 K5
     qvfr::mvrpass::SetForward(false);
     qvfr::mvrpass::TestDepthBias(-1, 0.0f, false);
@@ -1842,10 +1876,11 @@ int RunMvrForward() {
     printf("  B20 K4: live pass in the corner layout (outer %ux%u, focus at the game's size %ux%u): passes %u, ok %u "
            "(%s); outer vs its own pass: color %d px by > 2/255 (max %.4f), depth %d px off (max %.2g); focus vs its own "
            "pass: %d px covered, color %d px by > 0.02, depth %d px off; 1/2 clears %u (missed %u), left %d / %d px; "
-           "noted for focus R's twins %u (%s)\n",
+           "noted for focus R's twins %u; outer's velocity pass on a copy %s (vs the depth that went back %d px "
+           "differ), another target on outer's depth %s (%s)\n",
            kOW, kOH, kFW, kFH, clv.passes, clv.ok, clv.why.empty() ? "-" : clv.why.c_str(), cOuterC, cOuterMax,
            cOuterD, cOuterDMax, cCovered, cFC, cFD, clv.otherClears, clv.otherClearMisses, cHalf, cHalfD, cTwins,
-           cornerOk ? "OK" : "WRONG");
+           ovSwap ? "yes" : "NO", ovDiff, ovPlain ? "as it is" : "SWAPPED", cornerOk ? "OK" : "WRONG");
     printf("  O1 step 3: MVR draws with the PS state from the hooks, checked against PS*Get*: %llu, mismatches %llu; "
            "PS read back %llu times (%s)\n",
            trkChecks, trkMis, psReads, trackOk ? "OK" : "WRONG");

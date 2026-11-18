@@ -1123,6 +1123,7 @@ void OnWaitGetPosesEnd(vr::IVRCompositor* real, vr::TrackedDevicePose_t* render,
         HandleHotkey(newest);
         PeriodicStats();
         ReloadConfig();
+        TestScenarioFrame();
         g_cur.frozen = g_frozen;
         // The gaze places this frame's focus window (DFR) and the overlay's gaze point; after the hotkeys, so a
         // benchmark that starts now already has the window at the center.

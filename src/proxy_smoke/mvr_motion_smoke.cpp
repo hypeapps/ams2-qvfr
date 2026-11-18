@@ -235,6 +235,50 @@ int RunMvrMotion() {
                diskPx, maxWindow, ok ? "ok" : "FAIL");
     }
 
+    // Outliers (2026-11-17, the night glows): a single background texel and a 2 x 2 block get 200 outer px of motion at
+    // the background's depth. Focus pixels around them must still get the background's motion (within 0.5 focus px),
+    // not a patch of the outlier's.
+    {
+        std::vector<uint16_t> mvBad = mv;
+        const int bad[5][2] = {{30, 26}, {56, 48}, {57, 48}, {56, 49}, {57, 49}};
+        for (const auto& t : bad) {
+            mvBad[(t[1] * kOW + t[0]) * 2] = ToHalf((float)(200.0 / kOW));
+            mvBad[(t[1] * kOW + t[0]) * 2 + 1] = ToHalf((float)(-150.0 / kOH));
+        }
+        ID3D11Texture2D* badTex = make(kOW, kOH, DXGI_FORMAT_R16G16_FLOAT, mvBad.data(), kOW * 4);
+        ID3D11Texture2D* out =
+            badTex ? qvfr::mvrmotion::TestRun(ctx, badTex, outerDepthTex, depthTex, mc, mp, kFW, kFH, false) : nullptr;
+        double maxNear = 0;
+        int nearPx = 0;
+        if (out) {
+            const std::vector<uint32_t> got = ReadTexels(dev, ctx, out);
+            for (UINT y = 0; y < kFH && !got.empty(); ++y)
+                for (UINT x = 0; x < kFW; ++x) {
+                    const double uf = (x + 0.5) / kFW, vf = (y + 0.5) / kFH;
+                    double uo, vo;
+                    focusToOuter(cur, uf, vf, uo, vo);
+                    const double tx = uo * kOW - 0.5, ty = vo * kOH - 0.5;
+                    bool close = false;
+                    for (const auto& t : bad) close |= std::fabs(tx - t[0]) <= 2.0 && std::fabs(ty - t[1]) <= 2.0;
+                    if (!close || InDisk(uo, vo)) continue;
+                    double e[2];
+                    BackV(uo, vo, e);
+                    double pu, pv;
+                    outerToFocus(prev, uo - e[0], vo - e[1], pu, pv);
+                    const uint32_t v = got[y * kFW + x];
+                    const double gx = FromHalf((uint16_t)(v & 0xFFFF)), gy = FromHalf((uint16_t)(v >> 16));
+                    maxNear = std::max(maxNear, std::hypot((gx - (uf - pu)) * kFW, (gy - (vf - pv)) * kFH));
+                    ++nearPx;
+                }
+        }
+        if (badTex) badTex->Release();
+        const bool ok = out && nearPx > 20 && maxNear <= 0.5;
+        if (!ok) ++fails;
+        printf("MVR motion outliers (200 px at the background's depth): %d focus px around them, max error %.4f px "
+               "(limit 0.5): %s\n",
+               nearPx, maxNear, ok ? "ok" : "FAIL");
+    }
+
     // B11: FillFocus writes the same vectors into the game's (typeless) velocity target from outer's copy of the window
     // (StoreOuter), puts back the CS state it changes, and ForFocus then leaves the view as it is.
     {

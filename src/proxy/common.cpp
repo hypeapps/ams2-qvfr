@@ -429,9 +429,13 @@ Config ReadConfig(const fs::path& ini) {
     c.mvrForwardKey = IniInt(ini, L"debug", L"mvr_forward_key", c.mvrForwardKey);
     c.mvrForwardDepth = std::clamp(IniInt(ini, L"debug", L"mvr_forward_depth", 3), 0, 3);
     c.mvrForwardDepthKey = IniInt(ini, L"debug", L"mvr_forward_depth_key", c.mvrForwardDepthKey);
+    c.testKeyMod = IniInt(ini, L"debug", L"test_modifier", c.testKeyMod);
+    c.testKey = IniInt(ini, L"debug", L"test_key", c.testKey);
     c.mvrVelocity = IniInt(ini, L"debug", L"mvr_velocity", 1) != 0;
     c.mvrVelocityKey = IniInt(ini, L"debug", L"mvr_velocity_key", c.mvrVelocityKey);
     c.mvrVelocitySkip = IniInt(ini, L"debug", L"mvr_velocity_skip", 1) != 0;
+    c.mvrOutlierPx = std::max(0.0f, IniFloat(ini, L"debug", L"mvr_outlier_px", c.mvrOutlierPx));
+    c.mvrOuterVelCons = IniInt(ini, L"debug", L"mvr_outer_vel_cons", 1) != 0;
     c.mvrVelocitySkipKey = IniInt(ini, L"debug", L"mvr_velocity_skip_key", c.mvrVelocitySkipKey);
     c.mvrGbufferPs = IniInt(ini, L"debug", L"mvr_gbuffer_ps", 1) != 0;
     c.mvrGbufferPsKey = IniInt(ini, L"debug", L"mvr_gbuffer_ps_key", c.mvrGbufferPsKey);
@@ -592,6 +596,36 @@ Config ReadConfig(const fs::path& ini) {
 FILETIME g_iniTime{};
 double g_iniCheckMs = 0;
 
+// ---------------------------------------------------------------- test scenarios ([debug] test_key)
+// One hotkey for an in-game test: each press goes to the next scenario, which sets live settings over the ini's (the
+// modules pick the change up as from a live reload); after the last one it is the ini again. The table is the current
+// test's and changes with it.
+// Current test (2026-11-17, dlaa-plan "S2.4: głębia outer po forwardzie w układzie rogu"): the fix (outer's velocity
+// pass on a conservative copy) against the state before it, by eye and in the benchmark (A/B).
+Config g_iniCfg;  // g_cfg as the ini has it (LoadConfig, ReloadConfig), before the scenario
+int g_testStep = 0;
+bool g_testKeyDown = false;
+struct TestScenario {
+    const char* name;
+    void (*apply)(Config&);
+};
+const TestScenario kTestScenarios[] = {
+    {"as in the ini", [](Config&) {}},
+    {"outer's velocity pass on outer's exact forward depth, as before the fix (mvr_outer_vel_cons 0)",
+     [](Config& c) { c.mvrOuterVelCons = false; }},
+};
+constexpr int kTestScenarioCount = (int)(sizeof(kTestScenarios) / sizeof(kTestScenarios[0]));
+// The settings any scenario sets, back to the ini's before the next one applies.
+void RestoreTestFields(Config& c, const Config& ini) {
+    c.mvrForwardDepth = ini.mvrForwardDepth;
+    c.mvrVelocity = ini.mvrVelocity;
+    c.mvrOutlierPx = ini.mvrOutlierPx;
+    c.mvrOuterVelCons = ini.mvrOuterVelCons;
+    c.mvrGbufferPs = ini.mvrGbufferPs;
+    c.mvrEarly = ini.mvrEarly;
+    c.mvrForward = ini.mvrForward;
+}
+
 void NoteIniTime() {
     WIN32_FILE_ATTRIBUTE_DATA a{};
     if (GetFileAttributesExW(IniFile().c_str(), GetFileExInfoStandard, &a)) g_iniTime = a.ftLastWriteTime;
@@ -613,6 +647,7 @@ void LoadConfig() {
     NoteIniTime();
     Config c = ReadConfig(ini);
     g_cfg = c;
+    g_iniCfg = c;
     Log("Settings %s: [runtime] path=%s opencomposite=\"%s\" openxr_layer=%d", Narrow(ini.wstring()).c_str(),
         c.pathOpenXr ? "openxr" : "openvr", Narrow(c.openComposite).c_str(), c.openxrLayer);
     Log("Settings %s: wrap=%d first_calls=%d stats_interval_s=%d csv_always=%d gpu=%d | benchmark: modifier=0x%X key=0x%X "
@@ -794,9 +829,13 @@ bool ReloadConfig(bool force) {
     c.mvrForwardKey = n.mvrForwardKey;
     c.mvrForwardDepth = n.mvrForwardDepth;
     c.mvrForwardDepthKey = n.mvrForwardDepthKey;
+    c.testKeyMod = n.testKeyMod;
+    c.testKey = n.testKey;
     c.mvrVelocity = n.mvrVelocity;
     c.mvrVelocityKey = n.mvrVelocityKey;
     c.mvrVelocitySkip = n.mvrVelocitySkip;
+    c.mvrOutlierPx = n.mvrOutlierPx;
+    c.mvrOuterVelCons = n.mvrOuterVelCons;
     c.mvrVelocitySkipKey = n.mvrVelocitySkipKey;
     c.mvrGbufferPs = n.mvrGbufferPs;
     c.mvrGbufferPsKey = n.mvrGbufferPsKey;
@@ -826,7 +865,26 @@ bool ReloadConfig(bool force) {
         c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey, c.gazeKeyMod, c.gazeKey, c.clonesKeyMod, c.clonesKey,
         c.cullKeyMod, c.cullKey, c.sunKeyMod, c.sunKey, c.taaViewsKeyMod, c.taaViewsKey, c.mvrKeyMod, c.mvrKey,
         restart.empty() ? "" : "; CHANGED BUT NEEDS A GAME RESTART: ", restart.c_str());
+    g_iniCfg = c;
+    if (g_testStep) {
+        kTestScenarios[g_testStep].apply(c);
+        Log("Test scenario %d of %d stays over the reloaded ini: %s", g_testStep, kTestScenarioCount - 1,
+            kTestScenarios[g_testStep].name);
+    }
     return true;
+}
+
+void TestScenarioFrame() {
+    const Config& c = g_cfg;
+    const bool down = c.testKey && (GetAsyncKeyState(c.testKey) & 0x8000) &&
+                      (!c.testKeyMod || (GetAsyncKeyState(c.testKeyMod) & 0x8000));
+    const bool pressed = down && !g_testKeyDown;
+    g_testKeyDown = down;
+    if (!pressed) return;
+    g_testStep = (g_testStep + 1) % kTestScenarioCount;
+    RestoreTestFields(g_cfg, g_iniCfg);
+    kTestScenarios[g_testStep].apply(g_cfg);
+    Log("Test scenario %d of %d (hotkey): %s", g_testStep, kTestScenarioCount - 1, kTestScenarios[g_testStep].name);
 }
 
 const char* ExpModeName(ExpMode m) {

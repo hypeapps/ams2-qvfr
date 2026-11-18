@@ -155,7 +155,9 @@ void SetForward(bool on);
 bool GetForward();
 // The depth the live pass leaves in focus's clone ([debug] mvr_forward_depth): 0 as MVR drew it, 1 plus mvr_depth_bias
 // float steps, 2 conservative like the G-buffer stash, 3 (default) as drawn, and while the focus group's velocity pass
-// draws (an R16G16 target with the depth clone bound) a conservative copy (dilate, slope, bias) in its place. 1 and 2
+// draws (an R16G16 target with the depth clone bound) a conservative copy (dilate, slope, bias) in its place; in the
+// corner layout (B20) outer's velocity pass gets the same for outer's forward depth ([debug] mvr_outer_vel_cons, on by
+// default; without it the night artefacts of 2026-11-17: wrong motion on outer's cockpit for DLSS and B10). 1 and 2
 // thin out the crowd in the stands (a later pass tests the crowd against this depth); with 0 focus's own geometry in
 // the velocity pass misses the nearer MVR depth and the cockpit smears after DLAA while driving (docs/mvr.md B9d runs 3,
 // 4).

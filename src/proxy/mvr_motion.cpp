@@ -181,10 +181,12 @@ UINT TexW(ID3D11Texture2D* t, UINT* h) {
 
 void Run(ID3D11DeviceContext* c, ID3D11ShaderResourceView* outer, ID3D11ShaderResourceView* outerDepth, UINT ow,
          UINT oh, ID3D11ShaderResourceView* depth, ID3D11UnorderedAccessView* out, UINT w, UINT h, const Map& cur, const Map& prev, bool nearest) {
+    // [debug] mvr_outlier_px: the outlier limit of the shader (the engine's night glows), 0 = no check.
+    const float outlier = Cfg().mvrOutlierPx > 0 ? Cfg().mvrOutlierPx : 1e30f;
     const Params p = {{cur.su, cur.ou, cur.sv, cur.ov},
                       {prev.su, prev.ou, prev.sv, prev.ov},
                       {(float)w, (float)h, (float)ow, (float)oh},
-                      {kDepthTolerance, nearest ? 1.0f : 0.0f, 0, 0}};
+                      {kDepthTolerance, nearest ? 1.0f : 0.0f, outlier, 0}};
     c->UpdateSubresource(g_cb.Get(), 0, nullptr, &p, 0, 0);
     ID3D11ShaderResourceView* srv[3] = {outer, depth, outerDepth};
     c->CSSetShader(g_cs.Get(), nullptr, 0);

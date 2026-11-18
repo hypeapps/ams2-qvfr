@@ -211,10 +211,15 @@ struct Config {
     int mvrForwardKey = 0;
     // Live: the depth the live forward pass leaves in focus's clone (the game's later passes test against it): 0 as MVR
     // drew it, 1 plus mvr_depth_bias float steps, 2 conservative like the G-buffer stash (dilate, slope, bias), 3 as
-    // drawn with the velocity pass on a conservative copy (mvr_pass.h). The hotkey (mvr_modifier +
+    // drawn with the velocity passes (focus's, and outer's in the corner layout) on a conservative copy (mvr_pass.h).
+    // The hotkey (mvr_modifier +
     // mvr_forward_depth_key; testers: VK_PRIOR) cycles them.
     int mvrForwardDepth = 3;
     int mvrForwardDepthKey = 0;
+    // [debug] test_modifier + test_key (testers, live): one hotkey steps through the scenarios of the current in-game
+    // test (common.cpp kTestScenarios: each sets live settings over the ini's; step 0 is the ini as it is).
+    int testKeyMod = VK_RCONTROL;
+    int testKey = 0;
     // Live (docs/mvr.md B10, mvr_motion.h): with the live forward, DLSS gets the focus views' motion vectors made from
     // outer's (the geometry the focus image shows) in place of the focus velocity pass's. The hotkey (mvr_modifier +
     // mvr_velocity_key; testers: VK_PAUSE) toggles it.
@@ -224,6 +229,12 @@ struct Config {
     // into its target at its first draw and skips its draws (CPU). The hotkey (mvr_modifier + mvr_velocity_skip_key)
     // toggles it.
     bool mvrVelocitySkip = true;
+    // Live ([debug] mvr_outlier_px, shaders/mvr_motion.hlsl): an outer texel whose motion is more than this many outer
+    // pixels off the shortest depth-matching one around it counts as an outlier; 0 = off.
+    float mvrOutlierPx = 16.0f;
+    // Live ([debug] mvr_outer_vel_cons, mvr_pass.h mvr_forward_depth): in mode 3 and the corner layout (B20) outer's
+    // velocity pass draws on a conservative copy of outer's forward depth (off: the night artefacts of 2026-11-17).
+    bool mvrOuterVelCons = true;
     int mvrVelocitySkipKey = 0;
     // Live (docs/mvr.md B13, mvr_pass.h): the G-buffer pass's patched pixel shaders get view 1's rows and the live track
     // map read in the focus window, as in the forward pass. The hotkey (mvr_modifier + mvr_gbuffer_ps_key) toggles it.
@@ -370,6 +381,8 @@ void LoadConfig();                    // creates a default qvfr.ini if it does n
 // (listed at the end of the default ini) and logs the ones that need a restart. True when it reloaded. now: check at
 // once (the tuning panel after it saved).
 bool ReloadConfig(bool now = false);
+// Render thread, every frame after ReloadConfig: the test hotkey ([debug] test_key) steps the test scenario.
+void TestScenarioFrame();
 
 fs::path ModuleDir();                 // folder of the proxy DLL (the game's x64\)
 fs::path BaseDir();                   // %QVFR_HOME% (tests) or x64\qvfr; %TEMP%\ams2-qvfr when x64\qvfr is not writable

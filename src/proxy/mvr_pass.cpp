@@ -820,6 +820,14 @@ struct VelDepth {
     uint64_t frame = 0;
 };
 VelDepth g_vel[2];
+// Mode 3 in the corner layout (B20): outer's forward depth goes back into outer's clone as view 0 drew it through M_0
+// (exact, for the crowd, K4), so outer's velocity pass (outer's own geometry, LESS_EQUAL) would miss it where M_0 rounds
+// nearer, as focus's did in mode 0: those pixels keep the camera motion of their linear depth (hundreds of pixels on the
+// cockpit while driving), which DLSS and B10 take (the night artefacts of 2026-11-17, docs/dlaa-plan.md). Outer's
+// velocity pass gets this conservative copy instead (OuterVelocityDsv), as focus's gets g_vel. The outer groups run one
+// after the other, so one copy serves both eyes.
+VelDepth g_velOut;
+bool g_velOutLogged = false;
 int g_curFocus = -1;  // the focus group whose clones are in (FocusGroupIn)
 uintptr_t g_phase3BuildVt = 0;  // focus's CPhase3BuildCommandThread (quad, by class name)
 uint64_t g_fwdOk[2] = {};       // the frame whose forward pass of the eye put view 1 into focus's clones
@@ -871,6 +879,7 @@ struct FwdStats {
     uint64_t passes[2] = {}, ok[2] = {}, skipped[2] = {}, buildSkipped[2] = {}, own[2] = {};
     uint64_t draws = 0, otherClears = 0, otherClearMisses = 0;
     uint64_t velBinds = 0;  // mode 3: velocity pass binds given the conservative depth
+    uint64_t outerVelCopies = 0, outerVelBinds = 0;  // mode 3 in the corner layout: outer's (g_velOut)
     // B11: velocity passes that got outer's vectors and skipped their draws, passes that drew (with reasons).
     uint64_t velFilled[2] = {}, velDrawn[2] = {}, velSkippedDraws = 0;
     std::vector<Reason> velReasons;
@@ -1061,6 +1070,7 @@ void ReleaseAll() {
     g_otherClears.clear();
     g_cloneViews.clear();
     for (VelDepth& v : g_vel) v = VelDepth{};
+    g_velOut = VelDepth{};
     ResetLiveTrack();
     g_g = Gpu{};
 }
@@ -2479,6 +2489,38 @@ void RestorePsSlots(ID3D11DeviceContext* c) {
     c->PSSetShaderResources(mvrps::kTexBase, mvrps::kTextures, none);
 }
 
+// Mode 3 in the corner layout: the conservative copy of slice 0's corner (outer's forward depth) for outer's velocity
+// pass (g_velOut, OuterVelocityDsv). On failure that pass tests against the exact depth (no copy this frame).
+void OuterVelocityDepth(ID3D11DeviceContext* c, const Copy& cp) {
+    VelDepth& v = g_velOut;
+    v.frame = 0;
+    D3D11_TEXTURE2D_DESC d = cp.desc, have{};
+    d.ArraySize = 1;
+    d.MipLevels = 1;
+    d.MiscFlags &= ~(D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX |
+                     D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_GDI_COMPATIBLE |
+                     D3D11_RESOURCE_MISC_TEXTURECUBE);
+    if (v.tex) v.tex->GetDesc(&have);
+    if (!v.tex || !SameLayout(have, d)) {
+        v.tex.Reset();
+        if (FAILED(g_g.dev->CreateTexture2D(&d, nullptr, &v.tex))) return;
+    }
+    DXGI_FORMAT dsvF, srvF;
+    DepthFormats(d.Format, dsvF, srvF);
+    D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+    dv.Format = dsvF;
+    dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+    auto* dsv = dsvF == DXGI_FORMAT_UNKNOWN ? nullptr
+                                            : (ID3D11DepthStencilView*)CloneViewOf(v.tex.Get(), 1, &dv, sizeof(dv));
+    if (!dsv) return;
+    DepthPass(c, cp.depthSrv.Get(), dsv, cp.desc.Width, cp.desc.Height, DepthBias(), DepthSlope(), DepthDilate(),
+              nullptr, 0);
+    v.orig = cp.orig;
+    v.frame = g_frame;
+    ++g_fs.outerVelCopies;
+    ++g_ftot.outerVelCopies;
+}
+
 // End of the MVR part: MVR off, slot 3 back, the game's views bound again (rebind; at a tail bind the game binds its
 // own next), slice 0 into the game's targets, slice 1's corners into the stash. The rest of the task runs plain.
 void SetPassViewport(ID3D11DeviceContext* c, bool slices);
@@ -2530,10 +2572,12 @@ void EndMvr(ID3D11DeviceContext* c, bool rebind) {
                     // passes test their own geometry against it, so it is made conservative as focus's stash
                     // (mvr_depth_*). B20 K4: after the forward pass as focus's forward depth (mvr_forward_depth: as
                     // drawn by default; a farther depth thins out the crowd in the stands, B9d run 3, and in the game
-                    // outer's stands changed with K4's conservative copy).
+                    // outer's stands changed with K4's conservative copy). Mode 3: outer's velocity pass gets a
+                    // conservative copy (g_velOut).
                     const bool fwd = p.forward, stash = !fwd || g_fwdDepth == 2, bias = stash || g_fwdDepth == 1;
                     DepthPass(c, cp.depthSrv.Get(), cp.backDsv.Get(), cp.desc.Width, cp.desc.Height,
                               bias ? DepthBias() : 0u, stash ? DepthSlope() : 0.0f, stash && DepthDilate(), nullptr, 0);
+                    if (fwd && g_fwdDepth == 3 && Cfg().mvrOuterVelCons) OuterVelocityDepth(c, cp);
                 } else {
                     for (UINT m = 0; m < cp.desc.MipLevels; ++m) {
                         const D3D11_BOX box{0, 0, 0, std::max(1u, cp.desc.Width >> m), std::max(1u, cp.desc.Height >> m),
@@ -3144,6 +3188,33 @@ ID3D11DepthStencilView* VelocityDsv(ID3D11RenderTargetView* rt, ID3D11DepthStenc
     D3D11_DEPTH_STENCIL_VIEW_DESC dd{};
     ds->GetDesc(&dd);
     return (ID3D11DepthStencilView*)CloneViewOf(v.tex.Get(), 1, &dd, sizeof(dd));
+}
+
+// Mode 3 in the corner layout, a bind outside the focus groups: outer's velocity pass (an R16G16 target of the copy's
+// size with outer's forward depth from this frame's pass) gets the conservative copy g_velOut. Null: as is.
+ID3D11DepthStencilView* OuterVelocityDsv(ID3D11RenderTargetView* rt, ID3D11DepthStencilView* ds) {
+    const VelDepth& v = g_velOut;
+    if (!v.tex || !v.orig || v.frame != g_frame) return nullptr;
+    ComPtr<ID3D11Resource> dr, rr;
+    ds->GetResource(&dr);
+    if (!dr || dr.Get() != v.orig) return nullptr;
+    rt->GetResource(&rr);
+    bool ok = false;
+    const D3D11_TEXTURE2D_DESC rd = DescOf(rr.Get(), &ok);
+    D3D11_TEXTURE2D_DESC vd{};
+    v.tex->GetDesc(&vd);
+    if (!ok || !IsRg16(rd.Format) || rd.Width != vd.Width || rd.Height != vd.Height) return nullptr;
+    D3D11_DEPTH_STENCIL_VIEW_DESC dd{};
+    ds->GetDesc(&dd);
+    if (dd.ViewDimension != D3D11_DSV_DIMENSION_TEXTURE2D) return nullptr;
+    auto* out = (ID3D11DepthStencilView*)CloneViewOf(v.tex.Get(), 1, &dd, sizeof(dd));
+    if (out && !g_velOutLogged) {
+        g_velOutLogged = true;
+        Log("MVR forward: outer's velocity pass (%ux%u) draws on a conservative copy of outer's forward depth (mode 3 in "
+            "the corner layout)",
+            rd.Width, rd.Height);
+    }
+    return out;
 }
 
 // B9d: the corners of slice 1 of the live forward pass into focus's clones (colors by copy, the depth by
@@ -5205,6 +5276,17 @@ bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* r
             g_velBound.store(g_curFocus, std::memory_order_relaxed);  // B11: its draws go through VelocityDraw
             return true;
         }
+        // In the corner layout outer's velocity pass draws on outer's conservative copy (its draws as they are).
+        if (g_curFocus < 0 && g_velOut.frame == g_frame && Cfg().mvrOuterVelCons) {
+            Protect("MapTargets (outer velocity)", [&] { vel = OuterVelocityDsv(rtv[0], dsv); });
+            if (vel) {
+                for (UINT i = 0; i < n && i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) rtvOut[i] = rtv[i];
+                *dsvOut = vel;
+                ++g_fs.outerVelBinds;
+                ++g_ftot.outerVelBinds;
+                return true;
+            }
+        }
     }
     if (t_internal || g_p.part == PartNone || c != Imm()) return false;
     bool ok = false;
@@ -5739,7 +5821,8 @@ void LogStats(bool totals) {
             "task CPU per pass L %.3f / R %.3f ms, draws per pass %.0f; focus forward skipped L %llu / R %llu (builds "
             "%llu / %llu), own L %llu / R %llu; focus clones written from outer %zu, with focus R's twin %zu; "
             "other-size clears repeated %llu (shared "
-            "%llu); velocity pass binds on the conservative depth %llu; velocity passes with outer's vectors and no draws "
+            "%llu); velocity pass binds on the conservative depth %llu (outer's in the corner layout: copies %llu, binds "
+            "%llu, mvr_outer_vel_cons %s); velocity passes with outer's vectors and no draws "
             "(mvr_velocity_skip %s) L %llu / R %llu, draws skipped %llu, passes drawn L %llu / R %llu%s%s; live track "
             "maps from outer %llu (failed %llu); targets: copied in from focus's clones %llu, cleared first (no copy-in) "
             "%llu, multisampled (per-sample copies) %llu, multisampled colors without copy-in after a depth clear "
@@ -5752,7 +5835,9 @@ void LogStats(bool totals) {
             (unsigned long long)f.skipped[0], (unsigned long long)f.skipped[1], (unsigned long long)f.buildSkipped[0],
             (unsigned long long)f.buildSkipped[1], (unsigned long long)f.own[0], (unsigned long long)f.own[1],
             g_twinOrigs.size(), twins, (unsigned long long)f.otherClears,
-            (unsigned long long)f.otherClearMisses, (unsigned long long)f.velBinds, g_velSkipOn ? "on" : "off",
+            (unsigned long long)f.otherClearMisses, (unsigned long long)f.velBinds,
+            (unsigned long long)f.outerVelCopies, (unsigned long long)f.outerVelBinds,
+            Cfg().mvrOuterVelCons ? "on" : "off", g_velSkipOn ? "on" : "off",
             (unsigned long long)f.velFilled[0], (unsigned long long)f.velFilled[1],
             (unsigned long long)f.velSkippedDraws, (unsigned long long)f.velDrawn[0], (unsigned long long)f.velDrawn[1],
             vr.empty() ? "" : " (", vr.empty() ? "" : (vr + ")").c_str(), (unsigned long long)f.liveTracks,
