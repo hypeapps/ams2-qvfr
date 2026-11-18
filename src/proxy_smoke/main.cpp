@@ -1410,6 +1410,103 @@ int RunClones() {
     expect(!cl::TestGet().swapped && P.at<void*>(0x58) == texP, "focus group at the game size: no swap");
     cl::EndGroup(ctx);
     cl::Shutdown();
+    // Scenario 2c (issue #10): outer smaller again, with H (1/2). Loading frames write only H: their groups do not count.
+    // Then the learning misses Q (nobody writes it); outer binding Q with clones in starts the learning again, after which
+    // Q has its clone. Last, a list whose only texture outer writes in the game's size is kept for focus gets no outer
+    // clones (outer stays at the game's size).
+    {
+        auto resetDev = [&] {
+            for (int k = 0; k < 4; ++k) {
+                devSize(k)[0] = devInit[k][0];
+                devSize(k)[1] = devInit[k][1];
+                devDirty(k) = 0;
+            }
+        };
+        ID3D11Texture2D* texH = tex(32, 24);
+        ID3D11RenderTargetView* rtvH = rtv(texH);
+        FakeObj H;
+        H.at<void*>(0x58) = texH;
+        H.at<void*>(0x80) = rtvH;
+        H.at<const char*>(0xf0) = "Fake H";
+        H.at<uint16_t>(0x68) = 32;
+        H.at<uint16_t>(0x6a) = 24;
+        FakeObj* objs2c[] = {&P, &Q, &S, &H};
+        auto frames = [&](int n, std::initializer_list<ID3D11RenderTargetView*> outerW,
+                          std::initializer_list<ID3D11RenderTargetView*> focusW, bool focusReadsQ) {
+            for (int f = 0; f < n; ++f) {
+                cl::OnFrameStart(ctx, true);
+                cl::BeginGroup(ctx, cl::Outer);
+                for (ID3D11RenderTargetView* v : outerW) ctx->ClearRenderTargetView(v, green);
+                cl::EndGroup(ctx);
+                cl::BeginGroup(ctx, cl::Focus);
+                for (ID3D11RenderTargetView* v : focusW) ctx->ClearRenderTargetView(v, blue);
+                if (focusReadsQ) ctx->PSSetShaderResources(0, 1, &srvQ);
+                cl::EndGroup(ctx);
+            }
+            cl::OnFrameStart(ctx, true);
+        };
+        resetDev();
+        cl::SetSizes(64, 48, 32, 24, 64, 48);
+        for (FakeObj* o : objs2c) cl::TestRegister(false, o);
+        frames(20, {rtvH}, {rtvH}, false);
+        st = cl::TestGet();
+        expect(st.phase == 1 && st.learned[0] == 0 && st.learned[1] == 0 && st.learnSkipped == 40,
+               "issue #10: loading groups (only H, 1/2, written) not counted, still learning");
+        frames(16, {rtvP, rtvS, rtvH}, {rtvP}, false);
+        st = cl::TestGet();
+        expect(st.phase == 2 && st.clones[0] == 3 && st.relearns == 0,
+               "issue #10: learned on drawing groups: outer clones P, S and H (Q missed)");
+        // A group with clones binding a clone's view: nothing missed.
+        cl::BeginGroup(ctx, cl::Outer);
+        ID3D11RenderTargetView* cloneRtvP = P.at<ID3D11RenderTargetView*>(0x80);
+        ctx->OMSetRenderTargets(1, &cloneRtvP, nullptr);
+        cl::OnOMSetRenderTargets(ctx, 1, &cloneRtvP, nullptr, nullptr);
+        cl::EndGroup(ctx);
+        cl::OnFrameStart(ctx, true);
+        st = cl::TestGet();
+        expect(st.phase == 2 && st.relearns == 0, "issue #10: a clone's view bound: no new learning");
+        // Q (neither kind wrote it while learning) bound in a group with clones: learning again.
+        cl::BeginGroup(ctx, cl::Outer);
+        expect(cl::TestGet().swapped && Q.at<void*>(0x58) == texQ, "issue #10: outer swapped in, Q the original");
+        ctx->OMSetRenderTargets(1, &rtvQ, nullptr);
+        cl::OnOMSetRenderTargets(ctx, 1, &rtvQ, nullptr, nullptr);
+        cl::EndGroup(ctx);
+        ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        cl::OnFrameStart(ctx, true);
+        st = cl::TestGet();
+        expect(st.phase == 1 && st.relearns == 1 && st.clones[0] == 0 && P.at<void*>(0x58) == texP,
+               "issue #10: missed Q starts the learning again, clones dropped");
+        frames(16, {rtvP, rtvS, rtvH}, {rtvP}, false);
+        st = cl::TestGet();
+        expect(st.phase == 2 && st.clones[0] == 4 && st.relearns == 1,
+               "issue #10: learned again: outer clones P, Q, S and H (Q counts as written)");
+        cl::BeginGroup(ctx, cl::Outer);
+        expect(size(Q.at<ID3D11Texture2D*>(0x58)) == std::make_pair(32u, 24u), "issue #10: Q in its 32 x 24 clone");
+        ctx->OMSetRenderTargets(1, &rtvQ, nullptr);
+        cl::OnOMSetRenderTargets(ctx, 1, &rtvQ, nullptr, nullptr);
+        cl::EndGroup(ctx);
+        ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        cl::OnFrameStart(ctx, true);
+        expect(cl::TestGet().phase == 2 && cl::TestGet().relearns == 1,
+               "issue #10: Q's original bound after it was learned: no new learning");
+        cl::Shutdown();
+        // Only Q (kept for focus) in the game's size written by outer, and H: no outer clones. Focus writes P (its
+        // groups count too).
+        resetDev();
+        cl::SetSizes(64, 48, 32, 24, 64, 48);
+        for (FakeObj* o : objs2c) cl::TestRegister(false, o);
+        frames(16, {rtvQ, rtvH}, {rtvP}, true);
+        st = cl::TestGet();
+        expect(st.phase == 3 && st.setFailed[0] && st.clones[0] == 0,
+               "issue #10: no outer clone in the game's size: outer off for this list");
+        cl::BeginGroup(ctx, cl::Outer);
+        expect(!cl::TestGet().swapped && devSize(0)[0] == 64 && H.at<void*>(0x58) == texH,
+               "issue #10: outer group without clones keeps the game's size");
+        cl::EndGroup(ctx);
+        cl::Shutdown();
+        rtvH->Release();
+        texH->Release();
+    }
     // Scenario 2b (MVR B20 K4): the same with the identity focus set (SetFocusIdentity): P, which focus writes, is its
     // own focus clone (no memory), so focus R gets a twin of the engine's texture; eye 0 keeps the engine's texture.
     for (int k = 0; k < 4; ++k) {
