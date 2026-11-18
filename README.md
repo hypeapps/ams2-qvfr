@@ -92,8 +92,9 @@ mod in `x64\qvfr\`.
 - **DLSS exposure** (`[dlaa] auto_exposure` and `exposure` in `qvfr.ini`): fixed (default 0.002) keeps the brightness of
   lights and reflections; auto lets DLSS measure it, which dims them, most at night. Lower fixed values keep brighter
   highlights.
-- Dashboard displays and mirrors keep the game's TAA, because DLSS leaves trails behind changing digits
-  (`[dlaa] cockpit_taa` in `qvfr.ini`: 0 = DLSS everywhere, 2 = also the rest of your car).
+- Dashboard displays and mirrors take the current frame instead of DLSS, because DLSS leaves trails behind changing
+  digits (`[dlaa] cockpit_taa` in `qvfr.ini`: 0 = DLSS everywhere, 2 = also the rest of your car; `[dlaa]
+  display_pass=0` gives them the game's TAA instead).
 - With **Debug hotkeys** on: right Ctrl + F1 switches between DLAA and the game's TAA and F12 steps through exposures
   while you drive.
 - The **Status** page shows whether DLAA ran at the last game start, and if not, why.
