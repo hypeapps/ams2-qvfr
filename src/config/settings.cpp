@@ -228,6 +228,7 @@ const std::vector<KeyRef>& RestartKeys() {
         {"runtime", "path", "VR API (OpenVR / OpenXR)"},
         {"runtime", "opencomposite", "OpenComposite DLL"},
         {"runtime", "openxr_layer", "OpenXR layer"},
+        {"runtime", "openxr_gaze_layers", "OpenXR gaze layers"},
         {"proxy", "wrap", "proxy wrap"},
         {"quad", "mode", "quad views on/off"},
         {"quad", "preset", "preset"},

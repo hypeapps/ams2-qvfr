@@ -3,6 +3,7 @@
 #include "common.h"
 #include "diag.h"
 #include "xr_layer.h"
+#include "xr_layer_order.h"
 
 namespace qvfr::runtime {
 
@@ -122,6 +123,52 @@ void LogImplicitLayers(HKEY root, const char* rootName) {
     RegCloseKey(key);
 }
 
+// The enabled implicit layers under one registry root, in the order the loader reads them.
+void AddImplicitManifests(HKEY root, std::vector<std::wstring>& out) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(root, L"SOFTWARE\\Khronos\\OpenXR\\1\\ApiLayers\\Implicit", 0, KEY_READ, &key) != ERROR_SUCCESS)
+        return;
+    for (DWORD i = 0;; ++i) {
+        wchar_t name[1024];
+        DWORD nameLen = 1024, type = 0, data = 0, dataLen = sizeof(data);
+        LONG r = RegEnumValueW(key, i, name, &nameLen, nullptr, &type, (BYTE*)&data, &dataLen);
+        if (r == ERROR_NO_MORE_ITEMS) break;
+        if (r == ERROR_SUCCESS && type == REG_DWORD && data == 0) out.push_back(name);
+    }
+    RegCloseKey(key);
+}
+
+bool g_movedLayerHasGaze = false;
+
+// Implicit layers that provide the gaze sit above our layer, so our gaze calls would miss them (xr_layer_order.h). For
+// this process only they are turned off as implicit layers and enabled again after ours. Nothing outside the process
+// changes: other OpenXR applications keep their layers as they are.
+void AddGazeLayers(std::wstring& layerPath, std::wstring& enable) {
+    xrorder::Input in;
+    AddImplicitManifests(HKEY_LOCAL_MACHINE, in.enabledManifests);
+    AddImplicitManifests(HKEY_CURRENT_USER, in.enabledManifests);
+    in.setting = Cfg().openxrGazeLayers;
+    in.layerPath = GetEnv(L"XR_API_LAYER_PATH");
+    in.ownLayer = xrlayer::kLayerName;
+    in.envSet = [](const std::string& name) {
+        wchar_t buf[2];
+        return GetEnvironmentVariableW(Widen(name).c_str(), buf, 2) != 0;
+    };
+    const xrorder::Plan plan = xrorder::MakePlan(in);
+    for (const std::string& note : plan.notes) Log("Runtime: OpenXR gaze layers: %s", note.c_str());
+    std::string moved;
+    for (const xrorder::Layer& l : plan.move) {
+        SetEnvironmentVariableW(Widen(l.disableEnv).c_str(), L"1");
+        if (!l.folder.empty()) layerPath += L";" + l.folder;
+        enable += L";" + Widen(l.name);
+        g_movedLayerHasGaze |= l.declaresGaze;
+        moved += (moved.empty() ? "" : ", ") + l.name;
+        Log("Runtime: OpenXR layer %s moved below the mod's layer for this process (%s; %s=1, manifest %s)", l.name.c_str(),
+            l.reason.c_str(), l.disableEnv.c_str(), Narrow(l.manifest).c_str());
+    }
+    if (!moved.empty()) diag::Set("OpenXR gaze layers", "moved below the mod's layer in this game: " + moved);
+}
+
 void LogActiveRuntime() {
     wchar_t buf[1024] = {};
     DWORD len = sizeof(buf);
@@ -177,12 +224,16 @@ std::wstring Prepare(HMODULE self) {
                      Narrow(manifest.wstring()).c_str());
         return g_backend;
     }
-    if (Elevated())
+    std::wstring layerPath = qvfr.wstring(), enable = Widen(xrlayer::kLayerName);
+    const bool elevated = Elevated();
+    // Elevated, the loader ignores XR_API_LAYER_PATH: a moved layer would be lost, so everything stays where it is.
+    if (!elevated) Guarded("runtime gaze layers", [&] { AddGazeLayers(layerPath, enable); });
+    if (elevated)
         diag::Report(diag::Level::Warning, "elevated",
                      "The game runs as administrator. The OpenXR loader then ignores the mod's environment, so the mod's "
                      "OpenXR layer does not load and there is no eye tracking on path=openxr. Start the game normally.");
-    PrependEnv(L"XR_API_LAYER_PATH", qvfr.wstring());
-    PrependEnv(L"XR_ENABLE_API_LAYERS", Widen(xrlayer::kLayerName));
+    PrependEnv(L"XR_API_LAYER_PATH", layerPath);
+    PrependEnv(L"XR_ENABLE_API_LAYERS", enable);
     diag::Set("OpenXR mod layer", "set up for the OpenXR loader, not loaded yet");
     return g_backend;
 }
@@ -201,5 +252,6 @@ void LogStartup() {
 }
 
 bool OpenXrPath() { return g_openxr; }
+bool MovedLayerHasGaze() { return g_movedLayerHasGaze; }
 
 }  // namespace qvfr::runtime

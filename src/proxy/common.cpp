@@ -285,6 +285,7 @@ Config ReadConfig(const fs::path& ini) {
     if (path != "openvr" && path != "openxr") Log("Settings: unknown [runtime] path=\"%s\", using openxr", path.c_str());
     c.openComposite = IniPathValue(ini, L"runtime", L"opencomposite");
     c.openxrLayer = IniInt(ini, L"runtime", L"openxr_layer", 1) != 0;
+    c.openxrGazeLayers = IniPathValue(ini, L"runtime", L"openxr_gaze_layers");
     c.fpsHud.enabled = IniInt(ini, L"fps_hud", L"enabled", 0) != 0;
     c.fpsHud.details = IniInt(ini, L"fps_hud", L"details", 1) != 0;
     c.fpsHud.hotkey = IniInt(ini, L"fps_hud", L"hotkey", 1) != 0;
@@ -684,7 +685,8 @@ bool ReloadConfig(bool force) {
     auto need = [&](bool changed, const char* name) {
         if (changed) restart += restart.empty() ? name : std::string(", ") + name;
     };
-    need(n.pathOpenXr != c.pathOpenXr || n.openComposite != c.openComposite || n.openxrLayer != c.openxrLayer,
+    need(n.pathOpenXr != c.pathOpenXr || n.openComposite != c.openComposite || n.openxrLayer != c.openxrLayer ||
+             n.openxrGazeLayers != c.openxrGazeLayers,
          "[runtime]");
     need(n.wrap != c.wrap, "[proxy] wrap");
     need(n.firstCalls != c.firstCalls, "[log] first_calls");

@@ -9,3 +9,4 @@ namespace fs = std::filesystem;
 
 int RunXrLayer(const fs::path& dll, const fs::path& home);
 int RunOpenXrPath(const fs::path& dll, const fs::path& home);
+int RunXrGazeLayers(const fs::path& home);  // xr_order_smoke.cpp
