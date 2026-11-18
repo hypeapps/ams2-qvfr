@@ -611,14 +611,19 @@ struct TestScenario {
 };
 const TestScenario kTestScenarios[] = {
     {"as in the ini", [](Config&) {}},
-    {"outer's velocity pass on outer's exact forward depth, as before the fix (mvr_outer_vel_cons 0)",
-     [](Config& c) { c.mvrOuterVelCons = false; }},
+    // O2 step 3 across live switches: each one leaves the focus velocity pass to the engine from its first frame, so
+    // the forward recording must not arm there (and arms again back in the ini's state).
+    {"MVR live forward depth 2 (the velocity pass draws its own vectors)", [](Config& c) { c.mvrForwardDepth = 2; }},
+    {"MVR focus motion vectors from outer off (B10, mvr_velocity 0)", [](Config& c) { c.mvrVelocity = false; }},
+    {"MVR focus velocity pass draws its own vectors (B11, mvr_velocity_skip 0)",
+     [](Config& c) { c.mvrVelocitySkip = false; }},
 };
 constexpr int kTestScenarioCount = (int)(sizeof(kTestScenarios) / sizeof(kTestScenarios[0]));
 // The settings any scenario sets, back to the ini's before the next one applies.
 void RestoreTestFields(Config& c, const Config& ini) {
     c.mvrForwardDepth = ini.mvrForwardDepth;
     c.mvrVelocity = ini.mvrVelocity;
+    c.mvrVelocitySkip = ini.mvrVelocitySkip;
     c.mvrOutlierPx = ini.mvrOutlierPx;
     c.mvrOuterVelCons = ini.mvrOuterVelCons;
     c.mvrGbufferPs = ini.mvrGbufferPs;

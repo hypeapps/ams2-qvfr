@@ -1376,10 +1376,23 @@ int RunMvrForward() {
     // both draws are dropped; after a bind without the depth clone the next draw goes into the target (top left
     // quarter, the PS gives 0 there).
     int velQuarter = 0, velMarked = 0, velOther = 0;
+    bool fillWhyOn = false, fillWhyDepth = false, fillWhySkip = false;
     if (velRtv) {
         g_fill = FillCall{};
         g_fill.rtv = velRtv.Get();
         qvfr::mvrpass::SetVelocityFill(&FakeFill);
+        // O2 step 3 arms on this: null in mode 3 with the skip on, a reason after a live switch away from either.
+        {
+            const int depthMode = qvfr::mvrpass::GetForwardDepth();
+            const bool skipOn = qvfr::mvrpass::GetVelocitySkip();
+            fillWhyOn = qvfr::mvrpass::VelocityFillWhy() == nullptr;
+            qvfr::mvrpass::SetForwardDepth(2);
+            fillWhyDepth = qvfr::mvrpass::VelocityFillWhy() != nullptr;
+            qvfr::mvrpass::SetForwardDepth(depthMode);
+            qvfr::mvrpass::SetVelocitySkip(false);
+            fillWhySkip = qvfr::mvrpass::VelocityFillWhy() != nullptr;
+            qvfr::mvrpass::SetVelocitySkip(skipOn);
+        }
         const float zero[4] = {0, 0, 0, 0};
         ctx->ClearRenderTargetView(velRtv.Get(), zero);
         ID3D11RenderTargetView* vr = velRtv.Get();
@@ -1767,7 +1780,7 @@ int RunMvrForward() {
     const bool velSkipOk = g_fill.calls == 1 && g_fill.eye == 0 && g_fill.depth == g_s.focus.gt2.Get() &&
                            g_fill.target == velTex.Get() && lv.velFilled == 1 && lv.velSkippedDraws == 2 &&
                            lv.velDrawn == 0 && velQuarter == velPx / 4 && velMarked == velPx - velPx / 4 &&
-                           velOther == 0;
+                           velOther == 0 && fillWhyOn && fillWhyDepth && fillWhySkip;
 
     // B13: outer L's G-buffer pass (CPhase1Render) with a PS that reads the live track map like the game's: view 1 (the
     // corner of slice 1 of the color copy) must read outer's map in the focus window (texel = outer UV of the focus
@@ -1922,10 +1935,11 @@ int RunMvrForward() {
            velOk ? "yes" : "NO", lv.velBinds, plainOk ? "yes" : "NO", liveOk ? "OK" : "WRONG");
     printf("  velocity pass with outer's vectors (B11): fill calls %d (eye %d, linear depth %s, target %s), passes "
            "filled %u, draws skipped %u, passes drawn %u; target: drawn quarter %d / %d px, marker %d / %d px, other "
-           "%d px (%s)\n",
+           "%d px; fill refused up front in mode 2 %s, with the skip off %s, none in mode 3 %s (%s)\n",
            g_fill.calls, g_fill.eye, g_fill.depth == g_s.focus.gt2.Get() ? "ok" : "WRONG",
            g_fill.target == velTex.Get() ? "ok" : "WRONG", lv.velFilled, lv.velSkippedDraws, lv.velDrawn, velQuarter,
-           velPx / 4, velMarked, velPx - velPx / 4, velOther, velSkipOk ? "OK" : "WRONG");
+           velPx / 4, velMarked, velPx - velPx / 4, velOther, fillWhyDepth ? "yes" : "NO", fillWhySkip ? "yes" : "NO",
+           fillWhyOn ? "yes" : "NO", velSkipOk ? "OK" : "WRONG");
     printf("  G-buffer PS with the live track map (B13): PS %s (map in t%u); on: pass %s, stash %s, draws with view 1's "
            "rows %u, kept %u, map read %s, misses %u, view 1 %d px covered, %d off (max %.5f), slice 0 %d px off; off: "
            "draws %u, view 1 %d px covered, %d off (max %.3f), slice 0 %d px off (%s)\n",

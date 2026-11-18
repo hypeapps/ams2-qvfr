@@ -704,13 +704,18 @@ void QueueBreakdownLocked(uint8_t* ctx, int group) {
 }
 
 // O2 step 3, [debug] mvr_velocity_record_skip (live): a focus group whose G-buffer, forward and velocity come from
-// outer in this frame (B11 filled the velocity pass from outer in the previous frame too) has its forward recording
-// armed: its velocity sub-passes submit only until the first draw (fwd_rec.h). Checked at the group's CEndEye.
+// outer in this frame (B11 filled the velocity pass from outer in the previous frame too, and this frame's settings
+// still let it fill) has its forward recording armed: its velocity sub-passes submit only until the first draw
+// (fwd_rec.h). Checked at the group's CEndEye.
 void VelocityRecordLocked(int group) {
     if (group < FocusL || group > FocusR) return;
     const int eye = group - FocusL;
     if (!g_vrOn || g_fault.load(std::memory_order_relaxed)) return;
     const char* why = g_vrStopped ? "stopped: an armed group got no outer vectors" : mvrpass::FromOuterWhy(eye);
+    // A live switch at this frame's start (forward depth mode, B10, B11) leaves this frame's velocity pass without
+    // outer's vectors although the previous one had them.
+    if (!why) why = mvrpass::VelocityFillWhy();
+    if (!why && !mvrmotion::Enabled()) why = "mvr_velocity off";
     if (!why && !mvrpass::VelocityFilled(eye, true)) why = "the velocity pass did not get outer's vectors last frame";
     // The frame of a switch to the game's TAA (DLAA hotkey): no DLSS evaluation stores outer's vectors for the fill.
     if (!why && !dlaa::DlssNow()) why = "DLSS does not run in this frame (no copy of outer's vectors)";

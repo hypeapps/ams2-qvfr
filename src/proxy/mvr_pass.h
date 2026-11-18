@@ -203,6 +203,10 @@ void SetVelocitySkip(bool on);
 // B11: focus eye `eye`'s velocity pass got outer's vectors (and dropped its draws) in this frame, or in the previous
 // one (`previous`, for a decision before this frame's pass ran).
 bool VelocityFilled(int eye, bool previous);
+// B11: why the velocity passes of this frame will draw their own vectors whatever the fill source says (the settings as
+// they are now: mvr_velocity_skip off, no fill source, a forward depth mode other than 3); null when the fill can run.
+// The settings change at the frame start, so a decision before this frame's pass sees the frame's state.
+const char* VelocityFillWhy();
 bool GetVelocitySkip();
 // From every draw detour before the real draw: true = drop the draw (a velocity pass whose target got the vectors).
 bool SkipDraw(ID3D11DeviceContext* c);

@@ -5699,6 +5699,14 @@ bool VelocityFilled(int eye, bool previous) {
     return v.state == VelFilled && v.frame == (previous ? g_frame - 1 : g_frame);
 }
 
+const char* VelocityFillWhy() {
+    if (!g_velSkipOn) return "mvr_velocity_skip off";
+    if (!g_velFill) return "no fill source";
+    if (!g_forwardOn) return "MVR live forward off";
+    if (g_fwdDepth != 3) return "forward depth mode not 3 (the velocity pass is not bound for the fill)";
+    return nullptr;
+}
+
 void SetGbufferPs(bool on) { g_gbufPsOn = on; }
 void SetBindSkip(bool on) { g_texSkipOn = on; }
 bool GetBindSkip() { return g_texSkipOn; }
