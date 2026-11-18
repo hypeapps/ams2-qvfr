@@ -438,29 +438,30 @@ input.range sliderbar {
 input.range sliderbar:hover, input.range sliderbar:active { background-color: #ffffff; }
 input.range sliderarrowdec, input.range sliderarrowinc { width: 0; height: 0; }
 
-/* Switch: a square frame with a square knob; red when on. */
-.switch { position: relative; width: 48dp; height: 24dp; }
+/* Switch: the frame of a segmented control (.seg) with one part as the knob; the part is red when on. */
+.switch { position: relative; width: 48dp; height: 26dp; }
 .switch input.checkbox {
     display: block;
     width: 46dp;
-    height: 22dp;
+    height: 24dp;
     background-color: #141414;
-    border: 1dp #444444;
+    border: 1dp #3a3a3a;
+    border-radius: 4dp;
     cursor: pointer;
-    transition: background-color border-color 0.12s;
 }
-.switch input.checkbox:checked { background-color: #e2231a; border-color: #e2231a; }
 .switch .knob {
     position: absolute;
-    top: 4dp;
-    left: 4dp;
-    width: 16dp;
-    height: 16dp;
-    background-color: #8a8e9a;
+    top: 3dp;
+    left: 3dp;
+    width: 21dp;
+    height: 20dp;
+    border-radius: 3dp;
+    background-color: #4c505b;
     pointer-events: none;
-    transition: left 0.12s cubic-out;
+    transition: left background-color 0.12s cubic-out;
 }
-.switch input.checkbox:checked + .knob { left: 28dp; background-color: #ffffff; }
+.switch input.checkbox:hover + .knob { background-color: #9da1ad; }
+.switch input.checkbox:checked + .knob { left: 24dp; background-color: #e2231a; }
 
 /* Segmented control: one framed group, the chosen part filled. */
 .seg { display: flex; flex-direction: row; border: 1dp #3a3a3a; border-radius: 4dp; background-color: #141414; padding: 2dp; }
