@@ -313,9 +313,6 @@ struct Config {
     // [dlaa] display_pass (live, not in the default ini): with DLAA too the displays pass instead of the game's TAA (no TAA
     // draw, copy and composition; the locks pass is skipped). 0 = the game's TAA, the way before 2026-11-17.
     bool dlaaDisplayPass = true;
-    // [dlaa] game_taa (live, not in the default ini; test scenarios): 1 = the game's TAA instead of DLSS, as the
-    // modifier + key hotkey gives it. A change of the setting sets the hotkey's state.
-    bool dlaaGameTaa = false;
     int dlaaPresetKeyMod = VK_RCONTROL;  // DLSS preset steps: ini, J, K, M, L (testers)
     int dlaaPresetKey = 0;               // testers: VK_HOME
     // [nr] (prototype NR-P1, dlaa-plan D7; not in the default ini): 0 off, 1 focus = after DLAA the focus views go
