@@ -35,9 +35,35 @@ using JitterFn = bool (*)(float out[2]);
 void SetJitterSource(JitterFn fn);
 // VR_Init in quad mode, once per process, with the VS patch installed and the executor patched. False: off.
 bool Install();
+// B20 K2 (docs/mvr.md): the sizes of this VR session, as given to clones::SetSizes. With outer smaller than the game's
+// size (it draws into its own clones) outer's G-buffer pass runs in the corner layout ([debug] mvr_corner): the copies
+// are at the slices' size, the game's size, view 0 (outer) lies in the top-left corner of slice 0 (its gated transform
+// in VS slot 3, mvr_vs.h) and view 1 (focus) in the top-left corner of slice 1, the whole slice when focus is at the
+// game's size. At the end slice 0's corner goes back into outer's clones and slice 1's into focus's targets: its clones,
+// or the engine's own textures when focus is at the game's size. B20 K3, K4: the early SSAO and lights and the forward
+// pass from outer (B20 K5: multisampled on outer slice arrays) run in that layout too, and so does what stands on them (B11,
+// B13, B19). With focus at the game's size, outer smaller, mvr_corner and mvr_forward, the clones get an identity focus
+// set (clones::SetFocusIdentity) so that focus R has twins of the engine's textures outer R's group writes for it.
+void SetSizes(uint32_t gameW, uint32_t gameH, uint32_t outerW, uint32_t outerH, uint32_t focusW, uint32_t focusH);
+// DLSS SR in quad views (docs/dlaa-plan.md S2.2): the render sizes of outer's and focus's scene phases, as given to
+// clones::SetSceneSizes (0 = no SR). While SetSrActive says DLSS runs in this frame, the G-buffer pass takes them in
+// place of the view sizes: outer draws into its scene clones (the corner layout whenever they are smaller than the
+// game's size, the slices at the larger of the two render sizes per axis), focus's targets are its scene clones (else
+// its view-size clones, else the engine's textures), and focus's jitter is over its render size. The early SSAO and
+// lights and the forward pass from outer run then too (B20 K3, K4): the opaque forward lies before the TAA resolve, so
+// it writes focus's scene clones (focus R twins of them, clones::WantTwin).
+void SetSceneSizes(uint32_t outerW, uint32_t outerH, uint32_t focusW, uint32_t focusH);
+// Render thread, at the frame start: the groups use the scene sets in this frame (clones::SetSrActive).
+void SetSrActive(bool on);
+// B20 K2, from the clones' RSSetViewports hook before the real call (render thread): in the corner layout, while a
+// patched VS draws, viewports at outer's size (top left 0, 0) become the slices'. True: `vps` changed.
+bool MapViewports(ID3D11DeviceContext* c, UINT n, D3D11_VIEWPORT* vps);
 // First Submit: the module's D3D11 hooks on the immediate context (VSSetShader, VSSetConstantBuffers(1), the
 // instanced and indirect draws; the plain draws come from sun_fx).
 void InstallD3DHooks(ID3D11DeviceContext* imm);
+// S2.2: InstallD3DHooks hooked DrawIndexedInstanced and DrawInstanced; their detours also call srcb::OnDraw and the SR
+// probe, so sr_cb does not hook them again (a second hook on a function fails).
+bool InstancedDrawHooks();
 bool On();  // installed and not stopped (cheap)
 
 // Render thread, every frame start before the shot is prepared: `enabled` = the setting and the hotkey. Reports the
@@ -76,6 +102,9 @@ void AfterTask(uint8_t* task);  // after the engine's Execute (not after a skipp
 // before its CPhase3Render (the forward pass that a later step draws with MVR), and the focus group skips them. Only
 // focus L: the focus clones are shared, and outer R's group (which would run focus R's) comes before focus L's group.
 // With mvr_forward (step 3, below) focus R's run in outer R's group as well, into focus R's own clones.
+// B20 K3: focus L's run also in the corner layout and with DLSS SR's scene sets (focus's targets: its clones, its scene
+// clones or the engine's textures, as the focus group's swap puts them in). B20 K4: focus R's too, into the twins of
+// those targets (refused at the game's size without the identity focus set, SetSizes).
 // The run order of quad's RunTask:
 //   EarlyWanted(eye) -> quad swaps focus's view in and puts focus's clones in -> EarlyBegin(eye, projected) -> the
 //   engine's CBeginEye, CSSAORender, CPhase2Render of the focus group without their Finish -> clones out, view back,
@@ -118,11 +147,17 @@ void EarlyWaited(double ms);                  // time quad waited for the engine
 // and the forward passes write (noted as they are bound, cleared or filled) gets focus R's own copy from the clones
 // module (clones::WantTwin, made at the next frame start), which focus R's work then uses (clones::SetFocusEye). Focus
 // R's early run (and with it its live pass) waits until every noted clone has one.
+// B20 K4: in the corner layout (outer smaller) the pass binds outer's clones; their copies are at the slices' size,
+// slice 0 gets outer's clone in its top-left corner (the depth by a pass), view 0 draws there through its gated
+// transform, and a pause at targets of another size keeps the game's viewports. Focus's targets are its clones, its
+// scene clones with DLSS SR or, at the game's size, the engine's textures (focus R's: their twins).
 void SetForward(bool on);
 bool GetForward();
 // The depth the live pass leaves in focus's clone ([debug] mvr_forward_depth): 0 as MVR drew it, 1 plus mvr_depth_bias
 // float steps, 2 conservative like the G-buffer stash, 3 (default) as drawn, and while the focus group's velocity pass
-// draws (an R16G16 target with the depth clone bound) a conservative copy (dilate, slope, bias) in its place. 1 and 2
+// draws (an R16G16 target with the depth clone bound) a conservative copy (dilate, slope, bias) in its place; in the
+// corner layout (B20) outer's velocity pass gets the same for outer's forward depth ([debug] mvr_outer_vel_cons, on by
+// default; without it the night artefacts of 2026-11-17: wrong motion on outer's cockpit for DLSS and B10). 1 and 2
 // thin out the crowd in the stands (a later pass tests the crowd against this depth); with 0 focus's own geometry in
 // the velocity pass misses the nearer MVR depth and the cockpit smears after DLAA while driving (docs/mvr.md B9d runs 3,
 // 4).
@@ -140,19 +175,38 @@ bool GetMsColorSkip();
 // (clones.h). Outer L's live pass draws view 1 into slice 1, outer R's into slice 2 (renderTargetIndexOffset), each
 // clears only slice 0 and its own slice, and neither copies anything into or out of the slice: focus's group reads it
 // there.
+// B20 K5, the corner layout with MSAA (outer's multisampled forward targets are its own clones): their engine textures
+// become three-slice arrays at the game's size whose slice 0 is outer's clone too (clones::WantArray with outerSlice:
+// outer's views like the engine's, its sizes outer's, the corner at the top left), slices 1 and 2 focus's as above.
+// Until they are made the pass refuses (D3D11 copies no part of a multisampled texture); then it runs like B12 step 5
+// with view 0 in the corner of slice 0 (B20 K2) and copies nothing.
+// B20 K5b (docs/mvr.md), [debug] mvr_gbuffer_slices (restart only, default on): in the corner layout without DLSS SR
+// (focus at the game's size) the G-buffer pass's colors ask for their engine textures as three-slice arrays at the
+// game's size (clones::WantArray: focus L's clone slice 1, focus R's twin slice 2, the engine's views slice 0; outer's
+// clone stays a texture of its own). The pass then draws into the array: view 0 into slice 0's corner (copied back into
+// outer's clone as before), view 1 straight into focus's slice (no extract copy, counted "read in their slice"; a shot
+// frame, a diagnosis mode or focus R before its twin go through the stash, and Fill copies it into focus's slice). The
+// corner layout's other copies (the G-buffer's depth: focus gets it conservative; the forward pass's, bound with that
+// depth) get three slices, so outer R's G-buffer pass draws view 1 into slice 2 of all its targets; each clear of a
+// slice array covers slice 0 and the eye's slice only.
 // B11 (docs/mvr.md), [debug] mvr_velocity_skip (live, hotkey mvr_modifier + mvr_velocity_skip_key), mode 3 only: at the
 // first draw of the focus group's velocity pass (the bind above) the fill source writes the focus view's motion vectors
 // from outer (mvr_motion, B10) into the pass's target, and the pass's draws are skipped (the engine's object loop
 // stays, its draw calls go). The camera motion pass at its start reads the linear depth: the fill gets it from the PS
 // shader resources of that draw (R32 at the target's size). When the source refuses (shot frame, DLAA off, the forward
 // not from outer, ...) the pass draws as before.
-using VelocityFillFn = bool (*)(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Texture2D* target,
-                                const char** why);
+// `slice`: the linear depth's slice (B20 K5b: a G-buffer color as focus's slice of the engine's three-slice array).
+using VelocityFillFn = bool (*)(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, UINT slice,
+                                ID3D11Texture2D* target, const char** why);
 void SetVelocityFill(VelocityFillFn fn);
 void SetVelocitySkip(bool on);
 // B11: focus eye `eye`'s velocity pass got outer's vectors (and dropped its draws) in this frame, or in the previous
 // one (`previous`, for a decision before this frame's pass ran).
 bool VelocityFilled(int eye, bool previous);
+// B11: why the velocity passes of this frame will draw their own vectors whatever the fill source says (the settings as
+// they are now: mvr_velocity_skip off, no fill source, a forward depth mode other than 3); null when the fill can run.
+// The settings change at the frame start, so a decision before this frame's pass sees the frame's state.
+const char* VelocityFillWhy();
 bool GetVelocitySkip();
 // From every draw detour before the real draw: true = drop the draw (a velocity pass whose target got the vectors).
 bool SkipDraw(ID3D11DeviceContext* c);
@@ -244,10 +298,18 @@ void Shutdown();             // VR_Shutdown: textures released
 using CloneFn = ID3D11Texture2D* (*)(ID3D11Resource* original);
 // B17 in the smoke: stand-ins for clones::IsArray and clones::WantArray (null: the clones module).
 using NativeFn = bool (*)(ID3D11Resource* res);
-using WantArrayFn = void (*)(ID3D11Resource* res, UINT slices);
+using WantArrayFn = void (*)(ID3D11Resource* res, UINT slices, bool outerSlice);
 // B12 step 5: stand-in for clones::FocusSlice (null: no slice clones).
 using SliceFn = int (*)(ID3D11Resource* original, int eye, uint32_t* w, uint32_t* h);
-void TestNative(NativeFn isArray, WantArrayFn want, SliceFn slice = nullptr);
+// B20 K5: stand-in for clones::OuterSlice (null: no outer slice clones).
+using OuterSliceFn = bool (*)(ID3D11Resource* res, uint32_t* w, uint32_t* h);
+void TestNative(NativeFn isArray, WantArrayFn want, SliceFn slice = nullptr, OuterSliceFn outerSlice = nullptr);
+// B20 K5b with DLSS SR: stand-in for clones::WantSceneSlices (null: the clones module).
+using WantSceneFn = void (*)(ID3D11Resource* original);
+void TestSceneSlices(WantSceneFn want);
+// B20 K2 in the smoke: stand-in for clones::Original (outer's fake clones to the game's targets; null: none).
+using OriginalFn = ID3D11Resource* (*)(ID3D11Resource* res);
+void TestOriginal(OriginalFn fn);
 void TestSetup(ID3D11DeviceContext* ctx, const void* phase1Vtable, const void* buildVtable, CloneFn clone,
                JitterFn jitter);
 struct TestState {
@@ -259,9 +321,18 @@ struct TestState {
     unsigned gbufPsDraws = 0, gbufPsKept = 0, srvMisses = 0;
     bool liveTrack = false;
     unsigned direct = 0;  // B15: targets written straight into focus's clones (in the frame)
+    unsigned sliceDirect = 0;  // B20 K5b: of them, colors focus reads in their slice (nothing written)
     unsigned native = 0;  // B17: the last pass's targets that were the game's own arrays
+    bool corner = false;  // B20 K2: the last pass ran in the corner layout (its slices sw x sh)
+    bool sr = false;      // S2.2: ... at DLSS SR's render sizes (SetSceneSizes, SetSrActive)
+    unsigned oddViewports = 0;
+    uint32_t sw = 0, sh = 0;
+    const char* earlyWhy = nullptr;  // B20 K3: the latest reason an early run did not go (static text)
 };
 TestState TestGet();
+// B11 in the smoke: the linear depth B11 finds among the bound PS shader resources for a w x h target (null: none) and
+// its slice.
+ID3D11Texture2D* TestLinearDepth(ID3D11DeviceContext* c, UINT w, UINT h, UINT* slice);
 ID3D11Texture2D* TestArray(int k);
 // Overrides mvr_depth_bias, mvr_depth_slope and mvr_depth_dilate (steps < 0: the settings).
 void TestDepthBias(int steps, float slope, bool dilate);  // the two-slice copy of target k (not referenced), null when none
@@ -284,6 +355,9 @@ ID3D11Texture2D* TestForwardStash(int k);  // the corner of slice 1 of forward t
 void TestForwardLive(const void* phase3Vtable);
 // As if the eye's early run began now.
 void TestEarlyMark(int eye);
+// B20 K3 in the smoke --mvr-pass: stand-ins for CSSAORender's, CPhase2Render's and CPhase3Render's vtables and
+// mvr_early = 1, so quad's calls of the early run (EarlyWanted, EarlyBegin, EarlyEnd) can be made by hand; null: off.
+void TestEarly(const void* ssaoVtable, const void* phase2Vtable, const void* phase3Vtable);
 struct TestLiveState {
     unsigned passes = 0, ok = 0, focusSkipped = 0, buildSkipped = 0, otherClears = 0, otherClearMisses = 0;
     unsigned twinEntries = 0, velBinds = 0;  // focus clones noted for focus R's twins

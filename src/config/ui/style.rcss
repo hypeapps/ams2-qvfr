@@ -438,32 +438,30 @@ input.range sliderbar {
 input.range sliderbar:hover, input.range sliderbar:active { background-color: #ffffff; }
 input.range sliderarrowdec, input.range sliderarrowinc { width: 0; height: 0; }
 
-/* Switch: a square frame with a square knob; red when on. */
-.switch { position: relative; width: 48dp; height: 24dp; }
+/* Switch: the frame of a segmented control (.seg) with one part as the knob; the part is red when on. */
+.switch { position: relative; width: 48dp; height: 26dp; }
 .switch input.checkbox {
     display: block;
     width: 46dp;
-    height: 22dp;
+    height: 24dp;
     background-color: #141414;
-    border: 1dp #444444;
+    border: 1dp #3a3a3a;
+    border-radius: 4dp;
     cursor: pointer;
-    transition: background-color border-color 0.12s;
 }
-.switch input.checkbox:checked { background-color: #e2231a; border-color: #e2231a; }
 .switch .knob {
     position: absolute;
-    top: 4dp;
-    left: 4dp;
-    width: 16dp;
-    height: 16dp;
-    background-color: #8a8e9a;
+    top: 3dp;
+    left: 3dp;
+    width: 21dp;
+    height: 20dp;
+    border-radius: 3dp;
+    background-color: #4c505b;
     pointer-events: none;
-    transition: left 0.12s cubic-out;
+    transition: left background-color 0.12s cubic-out;
 }
-.switch input.checkbox:checked + .knob { left: 28dp; background-color: #ffffff; }
-/* Held by another setting (DLAA while DLSS 5 is on): greyed out, no click. */
-.row.locked .switch { opacity: 0.35; }
-.row.locked .switch input.checkbox { cursor: default; }
+.switch input.checkbox:hover + .knob { background-color: #9da1ad; }
+.switch input.checkbox:checked + .knob { left: 24dp; background-color: #e2231a; }
 
 /* Segmented control: one framed group, the chosen part filled. */
 .seg { display: flex; flex-direction: row; border: 1dp #3a3a3a; border-radius: 4dp; background-color: #141414; padding: 2dp; }
@@ -481,6 +479,52 @@ input.range sliderarrowdec, input.range sliderarrowinc { width: 0; height: 0; }
 }
 .seg button:hover { color: #ffffff; }
 .seg button.on { background-color: #e2231a; color: #ffffff; }
+
+/* DLSS options of the Rendering card: a row of tiles per kind of view, the mode's pixel share as a bar on each tile. */
+.dlss { border-top: 1dp #303030; padding: 12dp 0 4dp 0; }
+.dintro { font-size: 13dp; color: #a3a7b0; }
+.dview { padding-top: 14dp; }
+.dhead { display: flex; flex-direction: row; align-items: center; margin-bottom: 8dp; }
+.dtitle { display: flex; flex: 1; flex-direction: row; align-items: center; }
+.dname { display: block; font-size: 14.5dp; font-weight: 600; color: #f4f5f7; margin-right: 8dp; }
+.ddesc { display: block; font-size: 13dp; color: #a3a7b0; }
+.dlabel { display: block; font-size: 12.5dp; color: #8d919b; margin-right: 8dp; }
+.tiles { display: flex; flex-direction: row; margin: 0 -3dp; }
+.tile {
+    flex: 1 1 0;
+    margin: 0 3dp;
+    padding: 7dp 9dp 8dp 9dp;
+    border: 1dp #3a3a3a;
+    border-radius: 4dp;
+    background-color: #141414;
+    cursor: pointer;
+    transition: background-color border-color 0.1s;
+}
+.tile:hover { border-color: #6a6a6a; }
+.tname {
+    font-family: "Barlow Condensed";
+    font-weight: 600;
+    font-size: 14dp;
+    letter-spacing: 0.6dp;
+    text-transform: uppercase;
+    white-space: nowrap;
+    color: #c9ccd4;
+}
+.tvalue .num { font-family: "Barlow Condensed"; font-weight: 700; font-size: 22dp; color: #ffffff; }
+.tvalue .unit { font-family: "Barlow Condensed"; font-weight: 600; font-size: 14dp; color: #8d919b; margin-left: 2dp; }
+.tbar { height: 3dp; margin-top: 5dp; background-color: #333333; }
+.tfill { height: 3dp; background-color: #8a8e9a; }
+.tile.on { background-color: #e2231a; border-color: #e2231a; }
+.tile.on .tname, .tile.on .tvalue .unit { color: #ffe3e0; }
+.tile.on .tbar { background-color: #a51710; }
+.tile.on .tfill { background-color: #ffffff; }
+.dsize { display: flex; flex-direction: row; justify-content: flex-end; margin-top: 6dp; font-size: 13dp; color: #c4c7ce; }
+.dcustom { display: block; color: #f0a39d; margin-right: 12dp; }
+.dpx { display: block; }
+.dtotal { display: flex; flex-direction: row; align-items: baseline; padding: 14dp 0 8dp 0; }
+.dtotal .num { display: block; font-family: "Barlow Condensed"; font-weight: 700; font-size: 26dp; color: #ffffff; }
+.dtotal .unit { display: block; font-family: "Barlow Condensed"; font-weight: 600; font-size: 15dp; color: #a3a7b0; margin: 0 8dp 0 3dp; }
+.dnote { display: block; font-size: 13dp; color: #a3a7b0; }
 
 /* Scrollbar like the game's lists: a dark rectangular track with a red rectangular thumb of the same width. */
 scrollbarvertical { width: 10dp; margin: 4dp 4dp 4dp 0; }

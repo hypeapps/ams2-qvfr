@@ -16,7 +16,9 @@
 //   focus projection, focus's jitter and its screen textures (edge pixels may round differently): the copy-in of the
 //   clones (color and depth), the screen inputs' map, the screen textures in t21..t25 and their UV scale;
 // - the clones are not changed by outer's pass; the comparison after focus's own pass runs;
-// - the module's counters and the debug layer (its linkage report for SV_RenderTargetArrayIndex is expected).
+// - the module's counters and the debug layer (its linkage report for SV_RenderTargetArrayIndex is expected);
+// - B20 K4: the live pass in the corner layout (outer's clones smaller than focus at the game's size): outer's clones
+//   equal its own pass, focus's engine textures equal focus's own pass (view 1's screen UV in outer's units).
 #include <windows.h>
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
@@ -65,6 +67,8 @@ SamplerState pointSampler : register(s0);
 cbuffer Tint : register(b0) { float4 tint; };
 float4 Fwd(VsOut i) : SV_Target {
     float2 uv = i.scr.xy / i.scr.w;
+    // Clamped to vpd - 1 as the game's forward PS do (467 of 599 in the dump of 2026-11-14): in the corner layout
+    // (B20 K4) view 1 needs focus's size there (the patch's screen constants), not outer's.
     int2 p = int2(min(uv * viewportPixelDimensions.zw, viewportPixelDimensions.zw - 1));
     float4 a = globalTexture0.Load(int3(p, 0));
     float4 g = globalTexture2.GatherRed(pointSampler, i.pos.xy * screenSpaceDimensions.zw);
@@ -174,6 +178,8 @@ using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT
                                                       ID3D11DepthStencilView*);
 using ClearRtvFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11RenderTargetView*, const FLOAT[4]);
 using ClearDsvFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, ID3D11DepthStencilView*, UINT, FLOAT, UINT8);
+using RSSetViewportsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, const D3D11_VIEWPORT*);
+RSSetViewportsFn o_vp = nullptr;  // B20 K4: the corner layout's viewports (as the clones' hook in the game)
 OMSetRenderTargetsFn o_om = nullptr;
 ClearRtvFn o_clearRtv = nullptr;
 ClearDsvFn o_clearDsv = nullptr;
@@ -194,11 +200,20 @@ void STDMETHODCALLTYPE D_ClearRtv(ID3D11DeviceContext* c, ID3D11RenderTargetView
 void STDMETHODCALLTYPE D_ClearDsv(ID3D11DeviceContext* c, ID3D11DepthStencilView* v, UINT f, FLOAT d, UINT8 st) {
     o_clearDsv(c, qvfr::mvrpass::MapClear(c, v, f, d, st), f, d, st);
 }
+void STDMETHODCALLTYPE D_Vp(ID3D11DeviceContext* c, UINT n, const D3D11_VIEWPORT* vps) {
+    D3D11_VIEWPORT m[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+    if (vps && n && n <= D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE) {
+        memcpy(m, vps, n * sizeof(D3D11_VIEWPORT));
+        if (qvfr::mvrpass::MapViewports(c, n, m)) vps = m;
+    }
+    o_vp(c, n, vps);
+}
 bool HookContext(ID3D11DeviceContext* c) {
     void** vt = *(void***)c;
     return qvfr::hooks::CreateAt(vt[33], (void*)D_OM, (void**)&o_om, "OMSetRenderTargets") &&
            qvfr::hooks::CreateAt(vt[50], (void*)D_ClearRtv, (void**)&o_clearRtv, "ClearRenderTargetView") &&
-           qvfr::hooks::CreateAt(vt[53], (void*)D_ClearDsv, (void**)&o_clearDsv, "ClearDepthStencilView");
+           qvfr::hooks::CreateAt(vt[53], (void*)D_ClearDsv, (void**)&o_clearDsv, "ClearDepthStencilView") &&
+           qvfr::hooks::CreateAt(vt[44], (void*)D_Vp, (void**)&o_vp, "RSSetViewports");
 }
 
 ComPtr<ID3D11Texture2D> Tex(UINT w, UINT h, DXGI_FORMAT f, UINT bind, const void* data = nullptr, UINT pitch = 0) {
@@ -269,7 +284,7 @@ struct FillCall {
     ID3D11RenderTargetView* rtv = nullptr;
 };
 FillCall g_fill;
-bool FakeFill(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Texture2D* target, const char** why) {
+bool FakeFill(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, UINT, ID3D11Texture2D* target, const char** why) {
     ++g_fill.calls;
     g_fill.eye = eye;
     g_fill.depth = depth;
@@ -469,8 +484,9 @@ struct FakeTask {
 };
 int g_finish = 0;
 void __fastcall FakeFinish(void*) { ++g_finish; }
+const Set* g_outerSet = nullptr;  // B20 K4: outer's clones in the corner run (null: g_s.game)
 void __fastcall OuterExecute(void* task) {
-    DrawForward(g_s.game);
+    DrawForward(g_outerSet ? *g_outerSet : g_s.game);
     (*(TaskFn**)task)[0x38 / 8](task);
 }
 void __fastcall FocusExecute(void* task) {
@@ -532,6 +548,10 @@ void BindTint(ID3D11DeviceContext* c) {
 // (as a game's forward pass may), 2 clears only its depth and first draws an opaque full-screen background without depth
 // writes (AMS2's forward pass with MSAA: the sky dome; mvr_ms_color_skip).
 int g_msMode = 0;
+// B20 K5a: added to the multisampled pass's viewport width (the clones' viewport fix in the game scales 2117 to
+// 1996.0001: the module must still take it for outer's size).
+float g_msVpExtra = 0;
+bool g_msVpRaw = false;  // B20 K5a: the viewport set past the hooks (the module never sees it before the draws)
 const float kMsClearColor[4] = {0.05f, 0.15f, 0.25f, 1.0f};
 ComPtr<ID3D11DepthStencilState> g_msBgDs;  // depth test LESS_EQUAL, no writes (the sky dome's)
 ComPtr<ID3D11PixelShader> g_msBgPs;
@@ -543,8 +563,11 @@ void DrawForwardMs(const Set& s, const MsSet& m) {
     c->OMSetRenderTargets(1, &rtv, m.dsv.Get());
     if (g_msMode == 1) c->ClearRenderTargetView(rtv, kMsClearColor);
     if (g_msMode != 0) c->ClearDepthStencilView(m.dsv.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
-    D3D11_VIEWPORT vp{0, 0, (float)s.w, (float)s.h, 0, 1};
-    c->RSSetViewports(1, &vp);
+    D3D11_VIEWPORT vp{0, 0, (float)s.w + g_msVpExtra, (float)s.h, 0, 1};
+    if (g_msVpRaw && o_vp)
+        o_vp(c, 1, &vp);
+    else
+        c->RSSetViewports(1, &vp);
     c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     c->IASetInputLayout(nullptr);
     if (g_msMode == 2) {  // the background over every sample (its old color must not matter)
@@ -580,8 +603,9 @@ void DrawForwardMs(const Set& s, const MsSet& m) {
     c->PSSetShaderResources(0, 8, none);
     c->OMSetRenderTargets(0, nullptr, nullptr);
 }
+const Set* g_msOuter = nullptr;  // B20 K5: outer's own Set in the corner run (null: g_s.game)
 void __fastcall OuterExecuteMs(void* task) {
-    DrawForwardMs(g_s.game, g_msGame);
+    DrawForwardMs(g_msOuter ? *g_msOuter : g_s.game, g_msGame);
     (*(TaskFn**)task)[0x38 / 8](task);
 }
 void* g_vtPhase3Ms[32];
@@ -669,7 +693,9 @@ struct MsCheck {
 // copies and a pass that clears only its depth and draws a full-screen background first (the color gets no copy-in,
 // mvr_ms_color_skip). Each: outer's samples bit for bit as the pass without the module, focus's clones per sample as
 // focus's own pass (edges may round).
-MsCheck RunMsaa(double sx, double ox, double sy, double oy) {
+// B20 K5 (`oc`: outer's Set of the corner run, null: none): the corner layout with outer's multisampled targets as slice
+// 0 of three-slice arrays at the game's size.
+MsCheck RunMsaa(double sx, double ox, double sy, double oy, const Set* oc) {
     MsCheck r;
     ID3D11Device* dev = g_s.dev;
     ID3D11DeviceContext* ctx = g_s.ctx;
@@ -836,6 +862,117 @@ MsCheck RunMsaa(double sx, double ox, double sy, double oy) {
             qvfr::mvrpass::TestNative(nullptr, nullptr);
         }
     }
+    // B20 K5: the corner layout with MSAA. Outer (oc's size) draws into slice 0 of three-slice arrays at the game's
+    // size (focus's, kFW x kFH) through views like the engine's (slice 0); the stand-in for clones::OuterSlice gives
+    // outer's corner, the one for clones::FocusSlice slice 1 for focus L and 2 for focus R. Outer L's live pass, then
+    // outer R's in the same frame, for the two passes that clear: slice 0's corner as outer's own pass (view 0 through
+    // its gated transform rounds like view 1), slices 1 and 2 as focus's own pass, nothing copied in or out.
+    struct CornerRun {
+        qvfr::mvrpass::TestLiveState l, r;
+        bool ran[2] = {};
+        std::vector<uint64_t> refC, refD, s0C, s0D, s1C, s1D, s2C, s2D;
+    };
+    CornerRun crun[kSliceRuns];
+    static ID3D11Resource* s_carr[2] = {};
+    static UINT s_cw = 0, s_ch = 0;
+    MsSet cornerArr, plainOc;
+    const bool cornerMade = oc && MakeMsSet(cornerArr, kFW, kFH, D3D11_BIND_SHADER_RESOURCE, 3) &&
+                            MakeMsSet(plainOc, oc->w, oc->h, 0, 1);
+    // A w x h corner of a slice read by ReadMs from a texture `width` wide.
+    auto cornerOf = [](const std::vector<uint64_t>& v, UINT width, UINT w, UINT h) {
+        std::vector<uint64_t> out;
+        if (v.size() < (size_t)width * kMs * h) return out;
+        for (UINT y = 0; y < h; ++y)
+            out.insert(out.end(), v.begin() + (size_t)y * width * kMs, v.begin() + (size_t)y * width * kMs + w * kMs);
+        return out;
+    };
+    if (cornerMade) {
+        s_carr[0] = cornerArr.color.Get();
+        s_carr[1] = cornerArr.depth.Get();
+        s_cw = oc->w;
+        s_ch = oc->h;
+        D3D11_RENDER_TARGET_VIEW_DESC rv{};
+        rv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY;
+        rv.Texture2DMSArray = {0, 3};
+        D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+        dv.Format = DXGI_FORMAT_D32_FLOAT;
+        dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY;
+        dv.Texture2DMSArray = {0, 3};
+        ComPtr<ID3D11RenderTargetView> allR;
+        ComPtr<ID3D11DepthStencilView> allD;
+        dev->CreateRenderTargetView(cornerArr.color.Get(), &rv, &allR);
+        dev->CreateDepthStencilView(cornerArr.depth.Get(), &dv, &allD);
+        auto startOc = [&](MsSet& m) {  // outer's targets as its earlier tasks left them
+            ctx->ClearRenderTargetView(m.rtv.Get(), kOuterColor);
+            ctx->ClearDepthStencilView(m.dsv.Get(), D3D11_CLEAR_DEPTH, kDepthLeft, 0);
+        };
+        for (int k = 0; k < kSliceRuns; ++k) {
+            CornerRun& m = crun[k];
+            g_msMode = k + 1;
+            startOc(plainOc);
+            DrawForwardMs(*oc, plainOc);  // outer's reference: its own pass (no pass of the module runs)
+            m.refC = ReadMs(plainOc.color.Get());
+            m.refD = ReadMs(plainOc.depth.Get());
+            if (allR) ctx->ClearRenderTargetView(allR.Get(), kFocusColor);  // slices 1 and 2 start stale
+            if (allD) ctx->ClearDepthStencilView(allD.Get(), D3D11_CLEAR_DEPTH, 0.5f, 0);
+            startOc(cornerArr);  // the engine's kind of view: slice 0
+            const qvfr::mvrpass::NativeFn isArr = [](ID3D11Resource* x) {
+                return x && (x == s_carr[0] || x == s_carr[1]);
+            };
+            const qvfr::mvrpass::SliceFn slice = [](ID3D11Resource* o, int eye, uint32_t* w, uint32_t* h) -> int {
+                if (!o || (o != s_carr[0] && o != s_carr[1])) return 0;
+                if (w) *w = kFW;
+                if (h) *h = kFH;
+                return eye == 1 ? 2 : 1;
+            };
+            const qvfr::mvrpass::OuterSliceFn outerSlice = [](ID3D11Resource* o, uint32_t* w, uint32_t* h) {
+                if (!o || (o != s_carr[0] && o != s_carr[1])) return false;
+                if (w) *w = s_cw;
+                if (h) *h = s_ch;
+                return true;
+            };
+            qvfr::mvrpass::TestNative(isArr, nullptr, slice, outerSlice);
+            static const Set* s_ocp = nullptr;  // outer's screen textures are clones of focus's (the engine's)
+            s_ocp = oc;
+            qvfr::mvrpass::TestOriginal([](ID3D11Resource* r) -> ID3D11Resource* {
+                if (r == s_ocp->gt0.Get()) return g_s.focus.gt0.Get();
+                if (r == s_ocp->gt2.Get()) return g_s.focus.gt2.Get();
+                return r;
+            });
+            qvfr::mvrpass::SetSizes(kFW, kFH, oc->w, oc->h, kFW, kFH);
+            qvfr::mvrpass::OnFrameStart(true);
+            qvfr::mvrpass::SetWindow(0, true, sx, ox, sy, oy, kFW, kFH);
+            qvfr::mvrpass::SetWindow(1, true, sx, ox, sy, oy, kFW, kFH);
+            qvfr::mvrpass::TestForwardLive(g_vtPhase3Ms);
+            qvfr::mvrpass::TestEarlyMark(1);
+            g_msGame = cornerArr;
+            g_msOuter = oc;
+            g_msVpExtra = k == 0 ? 0.0001f : 0.0f;  // run 1 through the hook (scaled), run 2 past it
+            g_msVpRaw = k == 1;
+            for (int eye = 0; eye < 2; ++eye) {
+                if (eye == 1) startOc(cornerArr);  // outer R starts from what its earlier tasks left in slice 0
+                FakeTask t{g_vtPhase3Ms};
+                m.ran[eye] = !qvfr::mvrpass::BeforeTask((uint8_t*)&t, eye);
+                if (m.ran[eye]) RunTask(t);
+                qvfr::mvrpass::AfterTask((uint8_t*)&t);
+                (eye ? m.r : m.l) = qvfr::mvrpass::TestLiveGet();
+            }
+            g_msOuter = nullptr;
+            g_msVpExtra = 0;
+            g_msVpRaw = false;
+            m.s0C = cornerOf(ReadMs(cornerArr.color.Get(), 0), kFW, oc->w, oc->h);
+            m.s0D = cornerOf(ReadMs(cornerArr.depth.Get(), 0), kFW, oc->w, oc->h);
+            m.s1C = ReadMs(cornerArr.color.Get(), 1);
+            m.s1D = ReadMs(cornerArr.depth.Get(), 1);
+            m.s2C = ReadMs(cornerArr.color.Get(), 2);
+            m.s2D = ReadMs(cornerArr.depth.Get(), 2);
+            qvfr::mvrpass::TestEnd();
+            qvfr::mvrpass::TestNative(nullptr, nullptr);
+            qvfr::mvrpass::TestOriginal(nullptr);
+            qvfr::mvrpass::SetSizes(0, 0, 0, 0, 0, 0);
+        }
+    }
     g_msMode = 0;
     g_msGame = MsSet{};
     const int samples = (int)(kFW * kFH * kMs);
@@ -925,6 +1062,59 @@ MsCheck RunMsaa(double sx, double ox, double sy, double oy) {
                  m.r.passes - m.l.passes, m.r.ok - m.l.ok, m.r.why.empty() ? "" : ": ", m.r.why.c_str(),
                  m.l.sliceTargets, m.r.sliceTargets, m.l.copyIns, m.r.copyIns, m.l.sliceClears, m.r.sliceClears, outer,
                  samples, covered, cBig[0], cMax[0], dOff[0], cBig[1], cMax[1], dOff[1], runOk ? "OK" : "WRONG");
+        text += line;
+    }
+    for (int k = 0; oc && k < kSliceRuns; ++k) {
+        const CornerRun& m = crun[k];
+        const int ref = k + 1;
+        const int osamples = (int)(oc->w * oc->h * kMs);
+        int oC = 0, oD = 0, covered = 0;
+        float oMax = 0, oDMax = 0;
+        int cBig[2] = {}, dOff[2] = {};
+        float cMax[2] = {};
+        const std::vector<uint64_t>* sc[2] = {&m.s1C, &m.s2C};
+        const std::vector<uint64_t>* sd[2] = {&m.s1D, &m.s2D};
+        bool sizes = cornerMade && m.refC.size() == (size_t)osamples && m.refD.size() == (size_t)osamples &&
+                     m.s0C.size() == (size_t)osamples && m.s0D.size() == (size_t)osamples &&
+                     refFC[ref].size() == (size_t)samples && refFD[ref].size() == (size_t)samples;
+        for (int i = 0; i < 2; ++i) sizes = sizes && sc[i]->size() == (size_t)samples && sd[i]->size() == (size_t)samples;
+        if (sizes) {
+            for (int i = 0; i < osamples; ++i) {
+                const float d = MaxHalfDiff(m.s0C[i], m.refC[i]);
+                oMax = std::max(oMax, d);
+                oC += d > 2.0f / 255;
+                const float dd = std::fabs(AsFloat(m.s0D[i]) - AsFloat(m.refD[i]));
+                oDMax = std::max(oDMax, dd);
+                oD += dd > 1e-5f;
+            }
+            for (int j = 0; j < samples; ++j) covered += AsFloat(refFD[ref][j]) != 1.0f;
+            for (int i = 0; i < 2; ++i)
+                for (int j = 0; j < samples; ++j) {
+                    const float d = MaxHalfDiff((*sc[i])[j], refFC[ref][j]);
+                    cBig[i] += d > 0.02f;
+                    cMax[i] = std::max(cMax[i], d);
+                    dOff[i] += std::fabs(AsFloat((*sd[i])[j]) - AsFloat(refFD[ref][j])) > 1e-5f;
+                }
+        }
+        const unsigned clears = k == 0 ? 2 : 1;
+        const bool counts = m.ran[0] && m.ran[1] && m.l.passes == 1 && m.l.ok == 1 && m.r.passes == 2 && m.r.ok == 2 &&
+                            m.l.sliceTargets == 2 && m.r.sliceTargets == 2 && m.l.copyIns == 0 && m.r.copyIns == 0 &&
+                            m.l.sliceClears == clears && m.r.sliceClears == clears && m.l.native == 2 &&
+                            m.r.native == 2 && m.l.copiedBack == 0 && m.r.copiedBack == 0;
+        bool runOk = sizes && counts && oC * 100 <= osamples && oD * 100 <= osamples && covered > samples / 3;
+        for (int i = 0; i < 2; ++i) runOk = runOk && cBig[i] * 100 <= samples && dOff[i] * 100 <= samples;
+        ok = ok && runOk;
+        snprintf(line, sizeof(line),
+                 "  B20 K5: MSAA %ux in the corner layout (outer %ux%u as slice 0 of three-slice arrays %ux%u) %s: "
+                 "passes L %u ok %u, then R %u ok %u%s%s; read in their slice L %u / R %u, copied in %u / %u, back %u / "
+                 "%u, clears of their own slices %u / %u; slice 0's corner vs outer's own pass: color %d samples by > "
+                 "2/255 (max %.4f), depth %d off (max %.2g); vs focus's own pass (%d covered): slice 1 color %d by > "
+                 "0.02 (max %.4f), depth %d off; slice 2 color %d (max %.4f), depth %d (%s)\n",
+                 kMs, oc->w, oc->h, kFW, kFH, k == 0 ? "cleared first" : "depth cleared and a background first",
+                 m.l.passes, m.l.ok, m.r.passes - m.l.passes, m.r.ok - m.l.ok, m.r.why.empty() ? "" : ": ",
+                 m.r.why.c_str(), m.l.sliceTargets, m.r.sliceTargets, m.l.copyIns, m.r.copyIns, m.l.copiedBack,
+                 m.r.copiedBack, m.l.sliceClears, m.r.sliceClears, oC, oMax, oD, oDMax, covered, cBig[0], cMax[0],
+                 dOff[0], cBig[1], cMax[1], dOff[1], runOk ? "OK" : "WRONG");
         text += line;
     }
     r.ok = ok;
@@ -1186,10 +1376,23 @@ int RunMvrForward() {
     // both draws are dropped; after a bind without the depth clone the next draw goes into the target (top left
     // quarter, the PS gives 0 there).
     int velQuarter = 0, velMarked = 0, velOther = 0;
+    bool fillWhyOn = false, fillWhyDepth = false, fillWhySkip = false;
     if (velRtv) {
         g_fill = FillCall{};
         g_fill.rtv = velRtv.Get();
         qvfr::mvrpass::SetVelocityFill(&FakeFill);
+        // O2 step 3 arms on this: null in mode 3 with the skip on, a reason after a live switch away from either.
+        {
+            const int depthMode = qvfr::mvrpass::GetForwardDepth();
+            const bool skipOn = qvfr::mvrpass::GetVelocitySkip();
+            fillWhyOn = qvfr::mvrpass::VelocityFillWhy() == nullptr;
+            qvfr::mvrpass::SetForwardDepth(2);
+            fillWhyDepth = qvfr::mvrpass::VelocityFillWhy() != nullptr;
+            qvfr::mvrpass::SetForwardDepth(depthMode);
+            qvfr::mvrpass::SetVelocitySkip(false);
+            fillWhySkip = qvfr::mvrpass::VelocityFillWhy() != nullptr;
+            qvfr::mvrpass::SetVelocitySkip(skipOn);
+        }
         const float zero[4] = {0, 0, 0, 0};
         ctx->ClearRenderTargetView(velRtv.Get(), zero);
         ID3D11RenderTargetView* vr = velRtv.Get();
@@ -1333,7 +1536,225 @@ int RunMvrForward() {
     const int nOuter = differ(ngC, lgC) + differ(ngD, lgD), nFocus = differ(nC, lC) + differ(nD, lD);
     const bool nativeOk = arrDsv && nlv.passes == 1 && nlv.ok == 1 && nlv.native == 1 && nlv.copiedBack == 1 &&
                           lv.native == 0 && lv.copiedBack == 2 && nOuter == 0 && nFocus == 0;
-    const MsCheck msaa = RunMsaa(sx, ox, sy, oy);  // B12
+
+    // B20 K4: the live pass in the corner layout. Outer 56 x 40 draws into its clones (oc: its own projection and
+    // jitter), focus at the game's size 64 x 48 into the engine's textures (g_s.focus: the fake clones give none for
+    // them; TestOriginal maps oc's textures to them). The slices are 64 x 48: slice 0 gets oc in its top-left corner
+    // (the depth by a pass), view 0 draws there through its gated transform, the viewports at outer's size become the
+    // slices' (D_Vp) and the pause at the 1/2 size targets keeps the game's. The PS reads its Load at uv * vpd and its
+    // GatherRed at SV_Position * ssd.zw from outer's cbuffer (56 x 40): view 1 must read focus's screen textures at its
+    // own pixels (the UV fix of K4 in PsRows).
+    constexpr UINT kOW = 56, kOH = 40;
+    static Set s_oc;
+    float poC[16];
+    OuterProj(poC);
+    Jitter(poC, kJitter[0] / kOW, kJitter[1] / kOH);
+    const bool cornerMade = MakeSet(s_oc, kOW, kOH, 0, poC);
+    std::vector<uint64_t> crefC, crefD, ccC, ccD, cfC, cfD, cfH, cfHD;
+    qvfr::mvrpass::TestLiveState clv{};
+    unsigned cTwins = 0;
+    // Mode 3 in the corner layout: outer's velocity pass (an R16G16 target of outer's size with outer's depth, outside
+    // the focus groups) gets a conservative copy of outer's forward depth (the 2026-11-17 night artefacts); with the
+    // zero depth bias here the copy equals the exact depth that went back. Another target with that depth: as it is.
+    bool ovSwap = false, ovPlain = false;
+    int ovDiff = -1;
+    if (cornerMade) {
+        auto startOc = [&] {
+            ctx->ClearRenderTargetView(s_oc.rtv.Get(), kOuterColor);
+            ctx->ClearDepthStencilView(s_oc.dsv.Get(), D3D11_CLEAR_DEPTH, kDepthLeft, 0);
+        };
+        startOc();
+        DrawForward(s_oc);  // outer's reference: its own pass without MVR (no pass of the module runs)
+        crefC = Read(s_oc.color.Get());
+        crefD = Read(s_oc.depth.Get());
+        startOc();
+        Restore();  // focus's engine textures at the start (its color, the occluder's depth)
+        ctx->ClearRenderTargetView(g_s.focus.halfRtv.Get(), mark);
+        ctx->ClearDepthStencilView(g_s.focus.halfDsv.Get(), D3D11_CLEAR_DEPTH, 0.25f, 0);
+        qvfr::mvrpass::TestOriginal([](ID3D11Resource* r) -> ID3D11Resource* {
+            const Set& o = s_oc;
+            const Set& f = g_s.focus;
+            if (r == o.color.Get()) return f.color.Get();
+            if (r == o.depth.Get()) return f.depth.Get();
+            if (r == o.gt0.Get()) return f.gt0.Get();
+            if (r == o.gt2.Get()) return f.gt2.Get();
+            if (r == o.half.Get()) return f.half.Get();
+            if (r == o.halfDepth.Get()) return f.halfDepth.Get();
+            return r;
+        });
+        qvfr::mvrpass::SetSizes(kFW, kFH, kOW, kOH, kFW, kFH);
+        const unsigned twinsBefore = qvfr::mvrpass::TestLiveGet().twinEntries;
+        qvfr::mvrpass::OnFrameStart(true);
+        qvfr::mvrpass::SetWindow(0, true, sx, ox, sy, oy, kFW, kFH);
+        qvfr::mvrpass::TestForwardLive(g_vtPhase3);
+        g_outerSet = &s_oc;
+        FakeTask outerK{g_vtPhase3};
+        if (!qvfr::mvrpass::BeforeTask((uint8_t*)&outerK, 0)) RunTask(outerK);
+        qvfr::mvrpass::AfterTask((uint8_t*)&outerK);
+        g_outerSet = nullptr;
+        clv = qvfr::mvrpass::TestLiveGet();
+        cTwins = clv.twinEntries - twinsBefore;
+        ccC = Read(s_oc.color.Get());
+        ccD = Read(s_oc.depth.Get());
+        cfC = Read(g_s.focus.color.Get());
+        cfD = Read(g_s.focus.depth.Get());
+        cfH = Read(g_s.focus.half.Get());
+        cfHD = Read(g_s.focus.halfDepth.Get());
+        ComPtr<ID3D11Texture2D> ovTex = Tex(kOW, kOH, DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_RENDER_TARGET);
+        ComPtr<ID3D11RenderTargetView> ovRtv;
+        if (ovTex) dev->CreateRenderTargetView(ovTex.Get(), nullptr, &ovRtv);
+        if (ovRtv) {
+            ID3D11RenderTargetView* vr = ovRtv.Get();
+            ctx->OMSetRenderTargets(1, &vr, s_oc.dsv.Get());
+            ComPtr<ID3D11DepthStencilView> got;
+            ctx->OMGetRenderTargets(0, nullptr, &got);
+            ComPtr<ID3D11Resource> gr;
+            if (got) got->GetResource(&gr);
+            ComPtr<ID3D11Texture2D> gt;
+            if (gr) gr.As(&gt);
+            ovSwap = gt && gt.Get() != s_oc.depth.Get();
+            if (ovSwap) {
+                ctx->OMSetRenderTargets(0, nullptr, nullptr);
+                const std::vector<uint64_t> cp = Read(gt.Get());
+                ovDiff = cp.size() == ccD.size() ? 0 : -2;
+                for (size_t i = 0; ovDiff >= 0 && i < cp.size(); ++i) ovDiff += cp[i] != ccD[i];
+            }
+            ID3D11RenderTargetView* orv = s_oc.rtv.Get();
+            ctx->OMSetRenderTargets(1, &orv, s_oc.dsv.Get());
+            got.Reset();
+            gr.Reset();
+            ctx->OMGetRenderTargets(0, nullptr, &got);
+            if (got) got->GetResource(&gr);
+            ovPlain = gr.Get() == (ID3D11Resource*)s_oc.depth.Get();
+            ctx->OMSetRenderTargets(0, nullptr, nullptr);
+        }
+        qvfr::mvrpass::TestEnd();
+        qvfr::mvrpass::SetSizes(0, 0, 0, 0, 0, 0);
+        qvfr::mvrpass::TestOriginal(nullptr);
+    }
+    // B20 K5b: the same corner pass with focus's screen texture gt0 as slice 1 of a three-slice array (a G-buffer color
+    // with mvr_gbuffer_slices; slices 0 and 2 hold something else). The patched PS declares a Texture2D, which no view of
+    // an array is: view 1 must read the slice through a texture of its own. Focus's targets as in the corner run above.
+    static ComPtr<ID3D11Texture2D> s_gtArr;
+    std::vector<uint64_t> kfC, kfD;
+    qvfr::mvrpass::TestLiveState klv{};
+    if (cornerMade) {
+        D3D11_TEXTURE2D_DESC ad{};
+        g_s.focus.gt0->GetDesc(&ad);
+        ad.ArraySize = 3;
+        std::vector<float> other((size_t)ad.Width * ad.Height * 4, 7.0f);
+        if (SUCCEEDED(dev->CreateTexture2D(&ad, nullptr, &s_gtArr))) {
+            for (UINT k : {0u, 2u})
+                ctx->UpdateSubresource(s_gtArr.Get(), D3D11CalcSubresource(0, k, 1), nullptr, other.data(), ad.Width * 16, 0);
+            ctx->CopySubresourceRegion(s_gtArr.Get(), D3D11CalcSubresource(0, 1, 1), 0, 0, 0, g_s.focus.gt0.Get(), 0,
+                                       nullptr);
+            ctx->ClearRenderTargetView(s_oc.rtv.Get(), kOuterColor);
+            ctx->ClearDepthStencilView(s_oc.dsv.Get(), D3D11_CLEAR_DEPTH, kDepthLeft, 0);
+            Restore();
+            ctx->ClearRenderTargetView(g_s.focus.halfRtv.Get(), mark);
+            ctx->ClearDepthStencilView(g_s.focus.halfDsv.Get(), D3D11_CLEAR_DEPTH, 0.25f, 0);
+            qvfr::mvrpass::TestOriginal([](ID3D11Resource* r) -> ID3D11Resource* {
+                const Set& o = s_oc;
+                const Set& f = g_s.focus;
+                if (r == o.color.Get()) return f.color.Get();
+                if (r == o.depth.Get()) return f.depth.Get();
+                if (r == o.gt0.Get()) return s_gtArr.Get();
+                if (r == o.gt2.Get()) return f.gt2.Get();
+                if (r == o.half.Get()) return f.half.Get();
+                if (r == o.halfDepth.Get()) return f.halfDepth.Get();
+                return r;
+            });
+            qvfr::mvrpass::TestNative(nullptr, nullptr, [](ID3D11Resource* r, int, uint32_t* w, uint32_t* h) {
+                if (r != s_oc.gt0.Get() && r != s_gtArr.Get()) return 0;
+                if (w) *w = kFW;
+                if (h) *h = kFH;
+                return 1;
+            });
+            qvfr::mvrpass::SetSizes(kFW, kFH, kOW, kOH, kFW, kFH);
+            qvfr::mvrpass::OnFrameStart(true);
+            qvfr::mvrpass::SetWindow(0, true, sx, ox, sy, oy, kFW, kFH);
+            qvfr::mvrpass::TestForwardLive(g_vtPhase3);
+            g_outerSet = &s_oc;
+            FakeTask outerK5{g_vtPhase3};
+            if (!qvfr::mvrpass::BeforeTask((uint8_t*)&outerK5, 0)) RunTask(outerK5);
+            qvfr::mvrpass::AfterTask((uint8_t*)&outerK5);
+            g_outerSet = nullptr;
+            klv = qvfr::mvrpass::TestLiveGet();
+            kfC = Read(g_s.focus.color.Get());
+            kfD = Read(g_s.focus.depth.Get());
+            qvfr::mvrpass::TestEnd();
+            qvfr::mvrpass::TestNative(nullptr, nullptr);
+            qvfr::mvrpass::SetSizes(0, 0, 0, 0, 0, 0);
+            qvfr::mvrpass::TestOriginal(nullptr);
+        }
+    }
+    // B20 K5b, B11: the velocity pass's linear depth as a view of slice 1 of an R32 three-slice array is found with its
+    // slice; a view of all three slices is not.
+    bool k5bDepthOk = false;
+    {
+        ComPtr<ID3D11Texture2D> la = Tex(kFW, kFH, DXGI_FORMAT_R32_TYPELESS, D3D11_BIND_SHADER_RESOURCE);
+        D3D11_TEXTURE2D_DESC ld{};
+        if (la) la->GetDesc(&ld);
+        la.Reset();
+        ld.ArraySize = 3;
+        ComPtr<ID3D11ShaderResourceView> one, all;
+        if (ld.Width && SUCCEEDED(dev->CreateTexture2D(&ld, nullptr, &la))) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+            sv.Format = DXGI_FORMAT_R32_FLOAT;
+            sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+            sv.Texture2DArray = {0, 1, 1, 1};
+            dev->CreateShaderResourceView(la.Get(), &sv, &one);
+            sv.Texture2DArray = {0, 1, 0, 3};
+            dev->CreateShaderResourceView(la.Get(), &sv, &all);
+        }
+        if (one && all) {
+            UINT s1 = 9, s2 = 9;
+            ID3D11ShaderResourceView* v = one.Get();
+            ctx->PSSetShaderResources(0, 1, &v);
+            ID3D11Texture2D* f1 = qvfr::mvrpass::TestLinearDepth(ctx.Get(), kFW, kFH, &s1);
+            v = all.Get();
+            ctx->PSSetShaderResources(0, 1, &v);
+            ID3D11Texture2D* f2 = qvfr::mvrpass::TestLinearDepth(ctx.Get(), kFW, kFH, &s2);
+            ID3D11ShaderResourceView* none = nullptr;
+            ctx->PSSetShaderResources(0, 1, &none);
+            k5bDepthOk = f1 == la.Get() && s1 == 1 && !f2;
+        }
+    }
+    printf("  B20 K5b, B11: the linear depth as one slice of an array found with its slice, a view of all slices not "
+           "(%s)\n", k5bDepthOk ? "OK" : "WRONG");
+    int k5bDiff = 0;
+    if (kfC.size() != cfC.size() || kfD.size() != cfD.size() || kfC.empty()) {
+        k5bDiff = 1 << 30;
+    } else {
+        for (size_t i = 0; i < kfC.size(); ++i) k5bDiff += kfC[i] != cfC[i] || kfD[i] != cfD[i];
+    }
+    const bool k5bOk = cornerMade && klv.passes == 1 && klv.ok == 1 && k5bDiff == 0 && k5bDepthOk;
+    const int opx = (int)(kOW * kOH);
+    int cOuterC = 0, cOuterD = 0, cFC = 0, cFD = 0, cHalf = 0, cHalfD = 0, cCovered = 0;
+    float cOuterMax = 0, cOuterDMax = 0;
+    for (size_t i = 0; i < crefC.size() && i < ccC.size() && i < ccD.size() && i < crefD.size(); ++i) {
+        const float d = MaxHalfDiff(ccC[i], crefC[i]);
+        cOuterMax = std::max(cOuterMax, d);
+        cOuterC += d > 2.0f / 255;
+        const float dd = std::fabs(AsFloat(ccD[i]) - AsFloat(crefD[i]));
+        cOuterDMax = std::max(cOuterDMax, dd);
+        cOuterD += dd > 1e-5f;
+    }
+    for (size_t i = 0; i < cfC.size() && i < refFC.size() && i < cfD.size(); ++i) {
+        cFC += MaxHalfDiff(cfC[i], refFC[i]) > 0.02f;
+        cFD += std::fabs(AsFloat(cfD[i]) - AsFloat(refFD[i])) > 1e-5f;
+        cCovered += cfC[i] != startF[i];
+    }
+    for (uint64_t v : cfH) cHalf += v != 0;
+    for (uint64_t v : cfHD) cHalfD += AsFloat(v) != 1.0f;
+    const int fpx = (int)(kFW * kFH);
+    const bool cornerOk = cornerMade && clv.passes == 1 && clv.ok == 1 && crefC.size() == (size_t)opx &&
+                          ccC.size() == (size_t)opx && cfC.size() == (size_t)fpx && cOuterC * 100 <= opx &&
+                          cOuterD * 100 <= opx && cCovered > fpx / 3 && cFC * 100 <= fpx && cFD * 100 <= fpx &&
+                          cfH.size() == (size_t)(kFW / 2) * (kFH / 2) && cHalf == 0 && cHalfD == 0 &&
+                          clv.otherClears == 2 && clv.otherClearMisses == 0 && cTwins == 4 && ovSwap && ovDiff == 0 &&
+                          ovPlain;
+    const MsCheck msaa = RunMsaa(sx, ox, sy, oy, cornerMade ? &s_oc : nullptr);  // B12, B20 K5
     qvfr::mvrpass::SetForward(false);
     qvfr::mvrpass::TestDepthBias(-1, 0.0f, false);
     const int lpx = (int)(kFW * kFH);
@@ -1359,7 +1780,7 @@ int RunMvrForward() {
     const bool velSkipOk = g_fill.calls == 1 && g_fill.eye == 0 && g_fill.depth == g_s.focus.gt2.Get() &&
                            g_fill.target == velTex.Get() && lv.velFilled == 1 && lv.velSkippedDraws == 2 &&
                            lv.velDrawn == 0 && velQuarter == velPx / 4 && velMarked == velPx - velPx / 4 &&
-                           velOther == 0;
+                           velOther == 0 && fillWhyOn && fillWhyDepth && fillWhySkip;
 
     // B13: outer L's G-buffer pass (CPhase1Render) with a PS that reads the live track map like the game's: view 1 (the
     // corner of slice 1 of the color copy) must read outer's map in the focus window (texel = outer UV of the focus
@@ -1461,7 +1882,18 @@ int RunMvrForward() {
     const unsigned long long psReads = qvfr::sunfx::PsReads();
     const bool trackOk = trkChecks > 0 && trkMis == 0;
     const bool ok = countsOk && outerOk && focusOk && liveOk && velSkipOk && gbufOk && nativeOk && msaa.ok && ltOk &&
-                    trackOk && !warnings;
+                    trackOk && cornerOk && k5bOk && !warnings;
+    printf("  B20 K5b: the same with focus's screen texture as slice 1 of a three-slice array: passes %u, ok %u (%s); "
+           "focus's color and depth vs the corner run %d px differ (%s)\n",
+           klv.passes, klv.ok, klv.why.empty() ? "-" : klv.why.c_str(), k5bDiff, k5bOk ? "OK" : "WRONG");
+    printf("  B20 K4: live pass in the corner layout (outer %ux%u, focus at the game's size %ux%u): passes %u, ok %u "
+           "(%s); outer vs its own pass: color %d px by > 2/255 (max %.4f), depth %d px off (max %.2g); focus vs its own "
+           "pass: %d px covered, color %d px by > 0.02, depth %d px off; 1/2 clears %u (missed %u), left %d / %d px; "
+           "noted for focus R's twins %u; outer's velocity pass on a copy %s (vs the depth that went back %d px "
+           "differ), another target on outer's depth %s (%s)\n",
+           kOW, kOH, kFW, kFH, clv.passes, clv.ok, clv.why.empty() ? "-" : clv.why.c_str(), cOuterC, cOuterMax,
+           cOuterD, cOuterDMax, cCovered, cFC, cFD, clv.otherClears, clv.otherClearMisses, cHalf, cHalfD, cTwins,
+           ovSwap ? "yes" : "NO", ovDiff, ovPlain ? "as it is" : "SWAPPED", cornerOk ? "OK" : "WRONG");
     printf("  O1 step 3: MVR draws with the PS state from the hooks, checked against PS*Get*: %llu, mismatches %llu; "
            "PS read back %llu times (%s)\n",
            trkChecks, trkMis, psReads, trackOk ? "OK" : "WRONG");
@@ -1503,10 +1935,11 @@ int RunMvrForward() {
            velOk ? "yes" : "NO", lv.velBinds, plainOk ? "yes" : "NO", liveOk ? "OK" : "WRONG");
     printf("  velocity pass with outer's vectors (B11): fill calls %d (eye %d, linear depth %s, target %s), passes "
            "filled %u, draws skipped %u, passes drawn %u; target: drawn quarter %d / %d px, marker %d / %d px, other "
-           "%d px (%s)\n",
+           "%d px; fill refused up front in mode 2 %s, with the skip off %s, none in mode 3 %s (%s)\n",
            g_fill.calls, g_fill.eye, g_fill.depth == g_s.focus.gt2.Get() ? "ok" : "WRONG",
            g_fill.target == velTex.Get() ? "ok" : "WRONG", lv.velFilled, lv.velSkippedDraws, lv.velDrawn, velQuarter,
-           velPx / 4, velMarked, velPx - velPx / 4, velOther, velSkipOk ? "OK" : "WRONG");
+           velPx / 4, velMarked, velPx - velPx / 4, velOther, fillWhyDepth ? "yes" : "NO", fillWhySkip ? "yes" : "NO",
+           fillWhyOn ? "yes" : "NO", velSkipOk ? "OK" : "WRONG");
     printf("  G-buffer PS with the live track map (B13): PS %s (map in t%u); on: pass %s, stash %s, draws with view 1's "
            "rows %u, kept %u, map read %s, misses %u, view 1 %d px covered, %d off (max %.5f), slice 0 %d px off; off: "
            "draws %u, view 1 %d px covered, %d off (max %.3f), slice 0 %d px off (%s)\n",

@@ -1,7 +1,8 @@
 // Vertex shaders of the game made ready for NVIDIA Multi-View Rendering (docs/mvr.md, gate B6).
 //
 // A hook on the device's CreateVertexShader patches every vertex shader the game creates (qvfr_dxbc PatchVsForMvr:
-// one extra view with its position and clip distances, matrices in VS constant buffer slot 3) and creates it through
+// one extra view with its position and clip distances, matrices in VS constant buffer slot 3; with [debug]
+// mvr_vs_view0 also view 0's gated transform, B20 K1) and creates it through
 // NvAPI_D3D11_CreateVertexShaderEx with the NV_POSITION and NV_CLIP_DISTANCE_0 semantics. Multi-View Rendering itself
 // stays off, so the patched shaders draw view 0 only, as before (B1 case 0, B4 case 13). A refused patch or an NVAPI
 // error gives the game the original shader and a log entry with the reason. Only devices for which
@@ -19,6 +20,11 @@ namespace qvfr::mvrvs {
 
 // Constant buffer slot of the view matrices (free in every scene VS of the capture, docs/mvr.md B2).
 constexpr unsigned kCbSlot = 3;
+// Rows of that buffer (mvr_patch.h): view 1's M_1 and clip planes (rows 0..7), then view 0's M_0, its clip planes C_0
+// and the key row (rows 8..16, B20 K1; [debug] mvr_vs_view0; view 0 as before unless row 16.x = kMvrVsMagic). A buffer
+// of this size suits shaders with or without view 0's rows.
+constexpr unsigned kCbRows = 17;
+constexpr unsigned kCbView0Row = 8;
 
 // VR_Init in quad mode with the setting on, once per process: NVAPI and the D3D11 hook. False: the module stays off.
 bool Install();

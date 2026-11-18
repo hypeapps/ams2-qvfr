@@ -42,6 +42,12 @@ enum Span {
     MaskStashL, MaskStashR,                      // the masks into the stash
     FillL, FillR,                                // the stash into focus's clones and the masks in the window
     FwdOutL, FwdOutR,                            // B9d: the live forward pass's corners into focus's clones
+    // DLSS at each view's TAA resolve (dlaa.cpp), each kind in the order outer L, outer R, focus L, focus R:
+    DlssOuterL, DlssOuterR, DlssFocusL, DlssFocusR,                  // the whole step, inputs to the copy into the target
+    DlssEvalOuterL, DlssEvalOuterR, DlssEvalFocusL, DlssEvalFocusR,  // NVIDIA's evaluation
+    DlssMvOuterL, DlssMvOuterR, DlssMvFocusL, DlssMvFocusR,          // mvr_motion: outer's stored, focus's made
+    DlssDispOuterL, DlssDispOuterR, DlssDispFocusL, DlssDispFocusR,  // the displays pass
+    CarryOuterL, CarryOuterR, CarryFocusL, CarryFocusR,              // DLSS SR: the textures carried to the view's size
     kSpans
 };
 const char* SpanName(int s);  // "p1 outer L", ...

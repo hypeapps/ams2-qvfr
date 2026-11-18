@@ -21,6 +21,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace qvfr::nrbridge {
 
@@ -114,6 +115,15 @@ public:
     bool Guides(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* motion, ID3D11ShaderResourceView* depth,
                 UINT w, UINT h, UINT x0 = 0, UINT y0 = 0, UINT fullW = 0, UINT fullH = 0, UINT step = 1, UINT srcX = 0,
                 UINT srcY = 0);
+    // DLSS super resolution: the motion vectors and depth of the next Process and Guides calls were rendered at
+    // inW x inH (from the texture's top left) for an image of imageW x imageH; they are read at the matching render
+    // pixel and the vectors scaled to image pixels. Zeros (the default): the guides are at the image's size.
+    void SetSource(UINT imageW, UINT imageH, UINT inW, UINT inH) {
+        srcImageW_ = imageW;
+        srcImageH_ = imageH;
+        srcInW_ = inW;
+        srcInH_ = inH;
+    }
     // The atlas of final images (display-encoded, UNORM views; `c` as above), without a copy of the atlas: after the
     // slot's Guides (which give it its size), each image goes into its region with PackRegion, the slot through the
     // model once with Evaluate, and each image back out with UnpackRegion. False: nothing written (a failure is
@@ -141,6 +151,8 @@ public:
     void TimeMark(ID3D11DeviceContext* c, Mark k);
     void TimeFrameEnd(ID3D11DeviceContext* c);
     void Release();  // waits for the D3D12 queue, then releases everything
+    // Smoke test: the slot's motion vectors (x, y per pixel) and depth as the last Guides or Process wrote them.
+    bool TestReadGuides(ID3D11DeviceContext* c, int slot, std::vector<float>& motion, std::vector<float>& depth);
 
     bool ready() const { return ready_; }
     bool failed() const { return failed_; }
@@ -158,6 +170,7 @@ private:
     std::string why_;
     std::string adapter_;
     Stats stats_;
+    UINT srcImageW_ = 0, srcImageH_ = 0, srcInW_ = 0, srcInH_ = 0;  // SetSource
 
     bool Fail(const char* what, long hr = 0);
     bool EnsureContext(ID3D11DeviceContext* c);

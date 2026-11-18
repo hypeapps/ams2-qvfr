@@ -25,3 +25,32 @@ float4 PSColor(VsOut i) : SV_Target {
 float PSDepth(VsOut i) : SV_Depth {
     return src.SampleLevel(samp, i.uv, 0).r;
 }
+
+// DLSS SR in quad views (sr_cb.h, dlaa-plan S2.1): the passes after the TAA resolve were recorded while the scene's
+// render size was in the engine objects, so their constants hold it where the targets now have the view size (soft
+// particles and light glows read the depth at SV_Position / size and saw it 1.5 times too far out). A window of such a
+// constant buffer, copied into `fixWindow`, gets each pair of floats at an even index that equals a render-size pair
+// (width and height, their reciprocals and their fractions) replaced by the view-size pair; the table is in FixPairs.
+cbuffer FixPairs : register(b0) {
+    uint fixPairCount;   // entries used in fixPairs
+    uint fixUnused;      // (the window's size comes from the buffer)
+    uint2 fixPad;
+    float4 fixPairs[48];  // xy: the render-size pair, zw: the view-size pair
+};
+RWByteAddressBuffer fixWindow : register(u0);
+
+[numthreads(64, 1, 1)]
+void CSFixSizes(uint3 id : SV_DispatchThreadID) {
+    const uint i = id.x * 2;
+    uint bytes;
+    fixWindow.GetDimensions(bytes);
+    if (i + 1 >= bytes / 4) return;
+    const float2 v = asfloat(fixWindow.Load2(i * 4));
+    for (uint p = 0; p < fixPairCount; ++p) {
+        const float4 e = fixPairs[p];
+        if (all(abs(v - e.xy) <= abs(e.xy) * 2e-6)) {
+            fixWindow.Store2(i * 4, asuint(e.zw));
+            return;
+        }
+    }
+}

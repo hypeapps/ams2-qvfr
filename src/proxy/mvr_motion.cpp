@@ -38,6 +38,7 @@ struct Tex {
 
 struct DepthView {
     ID3D11Texture2D* tex = nullptr;  // compared only (the view keeps it alive)
+    UINT slice = 0;
     ComPtr<ID3D11ShaderResourceView> srv;
 };
 
@@ -90,7 +91,7 @@ Tex g_out[2];  // the result per focus view
 DepthView g_depth[4];
 int g_depthNext = 0;
 Stats g_st, g_last;
-bool g_loggedUse[2] = {}, g_loggedFail = false;
+bool g_loggedUse[2] = {}, g_loggedFail = false, g_loggedSize = false;
 
 const char* kEye[2] = {"L", "R"};
 
@@ -144,18 +145,30 @@ bool EnsureTex(Tex& t, UINT w, UINT h, bool uav, DXGI_FORMAT fmt = DXGI_FORMAT_R
     return true;
 }
 
-ID3D11ShaderResourceView* DepthSrv(ID3D11Texture2D* tex) {
+// B20 K5b: `slice` of an array (focus's slice of the engine's three-slice array; the shader reads a Texture2D, which a
+// one-slice view of an array feeds, as the MVR PS patch's screen textures).
+ID3D11ShaderResourceView* DepthSrv(ID3D11Texture2D* tex, UINT slice = 0) {
     for (DepthView& v : g_depth)
-        if (v.tex == tex && v.srv) return v.srv.Get();
+        if (v.tex == tex && v.slice == slice && v.srv) return v.srv.Get();
+    D3D11_TEXTURE2D_DESC td{};
+    tex->GetDesc(&td);
     D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
     sd.Format = DXGI_FORMAT_R32_FLOAT;
-    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-    sd.Texture2D.MipLevels = 1;
+    if (td.ArraySize > 1) {
+        if (slice >= td.ArraySize) return nullptr;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+        sd.Texture2DArray = {0, 1, slice, 1};
+    } else {
+        if (slice) return nullptr;
+        sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sd.Texture2D.MipLevels = 1;
+    }
     DepthView& v = g_depth[g_depthNext];
     g_depthNext = (g_depthNext + 1) % (int)std::size(g_depth);
     v = DepthView{};
     if (FAILED(g_dev->CreateShaderResourceView(tex, &sd, &v.srv))) return nullptr;
     v.tex = tex;
+    v.slice = slice;
     return v.srv.Get();
 }
 
@@ -168,10 +181,12 @@ UINT TexW(ID3D11Texture2D* t, UINT* h) {
 
 void Run(ID3D11DeviceContext* c, ID3D11ShaderResourceView* outer, ID3D11ShaderResourceView* outerDepth, UINT ow,
          UINT oh, ID3D11ShaderResourceView* depth, ID3D11UnorderedAccessView* out, UINT w, UINT h, const Map& cur, const Map& prev, bool nearest) {
+    // [debug] mvr_outlier_px: the outlier limit of the shader (the engine's night glows), 0 = no check.
+    const float outlier = Cfg().mvrOutlierPx > 0 ? Cfg().mvrOutlierPx : 1e30f;
     const Params p = {{cur.su, cur.ou, cur.sv, cur.ov},
                       {prev.su, prev.ou, prev.sv, prev.ov},
                       {(float)w, (float)h, (float)ow, (float)oh},
-                      {kDepthTolerance, nearest ? 1.0f : 0.0f, 0, 0}};
+                      {kDepthTolerance, nearest ? 1.0f : 0.0f, outlier, 0}};
     c->UpdateSubresource(g_cb.Get(), 0, nullptr, &p, 0, 0);
     ID3D11ShaderResourceView* srv[3] = {outer, depth, outerDepth};
     c->CSSetShader(g_cs.Get(), nullptr, 0);
@@ -213,6 +228,8 @@ ComPtr<ID3D11Texture2D> Staging(ID3D11DeviceContext* c, ID3D11Texture2D* src) {
 // focus's own geometry): the rounding of focus's matrices plus the resampling at silhouettes, in focus pixels.
 void Compare(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* ours, ID3D11Texture2D* game, UINT w, UINT h,
              bool fromOuter) {
+    UINT ah = 0, bh = 0;
+    if (TexW(ours, &ah) != w || ah != h || TexW(game, &bh) != w || bh != h) return;  // the loop reads w x h of both
     ComPtr<ID3D11Texture2D> a = Staging(c, ours), b = Staging(c, game);
     if (!a || !b) return;
     D3D11_MAPPED_SUBRESOURCE ma{}, mb{};
@@ -328,9 +345,21 @@ ID3D11Texture2D* ForFocus(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* dept
         ++g_st.noStore[eye];
         return nullptr;
     }
+    // The vectors go to DLSS with focus's depth: w x h is its size (DLSS SR: the render size, not the eye size).
+    UINT dh = 0;
+    if (!depth || TexW(depth, &dh) != w || dh != h) {
+        ++g_st.failed[eye];
+        if (!g_loggedSize) {
+            g_loggedSize = true;
+            UINT dw = depth ? TexW(depth, &dh) : 0;
+            Log("MVR motion: focus %s: asked for %ux%u, but focus's depth is %ux%u; the engine's motion vectors", kEye[eye],
+                w, h, dw, depth ? dh : 0);
+        }
+        return nullptr;
+    }
     ID3D11Texture2D* result = nullptr;
     [&] {
-        if (!depth || !EnsureDevice(c) || !EnsureTex(g_out[eye], w, h, true)) return;
+        if (!EnsureDevice(c) || !EnsureTex(g_out[eye], w, h, true)) return;
         ID3D11ShaderResourceView* ds = DepthSrv(depth);
         if (!ds) return;
         Run(c, g_store[eye].srv.Get(), g_storeDepth[eye].srv.Get(), g_store[eye].w, g_store[eye].h, ds,
@@ -362,7 +391,7 @@ ID3D11Texture2D* ForFocus(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* dept
 }
 
 bool FillFocus(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Texture2D* target, uint64_t frame,
-               const char** why) {
+               const char** why, UINT slice) {
     const char* no = nullptr;
     [&] {
         if (eye < 0 || eye > 1 || !depth || !target) {
@@ -404,7 +433,7 @@ bool FillFocus(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Te
             no = "device or texture";
             return;
         }
-        ID3D11ShaderResourceView* ds = DepthSrv(depth);
+        ID3D11ShaderResourceView* ds = DepthSrv(depth, slice);
         if (!ds) {
             no = "depth view";
             return;

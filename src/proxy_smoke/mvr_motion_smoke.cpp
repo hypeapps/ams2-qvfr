@@ -235,6 +235,50 @@ int RunMvrMotion() {
                diskPx, maxWindow, ok ? "ok" : "FAIL");
     }
 
+    // Outliers (2026-11-17, the night glows): a single background texel and a 2 x 2 block get 200 outer px of motion at
+    // the background's depth. Focus pixels around them must still get the background's motion (within 0.5 focus px),
+    // not a patch of the outlier's.
+    {
+        std::vector<uint16_t> mvBad = mv;
+        const int bad[5][2] = {{30, 26}, {56, 48}, {57, 48}, {56, 49}, {57, 49}};
+        for (const auto& t : bad) {
+            mvBad[(t[1] * kOW + t[0]) * 2] = ToHalf((float)(200.0 / kOW));
+            mvBad[(t[1] * kOW + t[0]) * 2 + 1] = ToHalf((float)(-150.0 / kOH));
+        }
+        ID3D11Texture2D* badTex = make(kOW, kOH, DXGI_FORMAT_R16G16_FLOAT, mvBad.data(), kOW * 4);
+        ID3D11Texture2D* out =
+            badTex ? qvfr::mvrmotion::TestRun(ctx, badTex, outerDepthTex, depthTex, mc, mp, kFW, kFH, false) : nullptr;
+        double maxNear = 0;
+        int nearPx = 0;
+        if (out) {
+            const std::vector<uint32_t> got = ReadTexels(dev, ctx, out);
+            for (UINT y = 0; y < kFH && !got.empty(); ++y)
+                for (UINT x = 0; x < kFW; ++x) {
+                    const double uf = (x + 0.5) / kFW, vf = (y + 0.5) / kFH;
+                    double uo, vo;
+                    focusToOuter(cur, uf, vf, uo, vo);
+                    const double tx = uo * kOW - 0.5, ty = vo * kOH - 0.5;
+                    bool close = false;
+                    for (const auto& t : bad) close |= std::fabs(tx - t[0]) <= 2.0 && std::fabs(ty - t[1]) <= 2.0;
+                    if (!close || InDisk(uo, vo)) continue;
+                    double e[2];
+                    BackV(uo, vo, e);
+                    double pu, pv;
+                    outerToFocus(prev, uo - e[0], vo - e[1], pu, pv);
+                    const uint32_t v = got[y * kFW + x];
+                    const double gx = FromHalf((uint16_t)(v & 0xFFFF)), gy = FromHalf((uint16_t)(v >> 16));
+                    maxNear = std::max(maxNear, std::hypot((gx - (uf - pu)) * kFW, (gy - (vf - pv)) * kFH));
+                    ++nearPx;
+                }
+        }
+        if (badTex) badTex->Release();
+        const bool ok = out && nearPx > 20 && maxNear <= 0.5;
+        if (!ok) ++fails;
+        printf("MVR motion outliers (200 px at the background's depth): %d focus px around them, max error %.4f px "
+               "(limit 0.5): %s\n",
+               nearPx, maxNear, ok ? "ok" : "FAIL");
+    }
+
     // B11: FillFocus writes the same vectors into the game's (typeless) velocity target from outer's copy of the window
     // (StoreOuter), puts back the CS state it changes, and ForFocus then leaves the view as it is.
     {
@@ -265,8 +309,8 @@ int RunMvrMotion() {
         if (uavTex) dev->CreateUnorderedAccessView(uavTex, nullptr, &gameUav);
         dev->CreateShaderResourceView(outerDepthTex, nullptr, &gameSrv);
         dev->CreateBuffer(&bd, nullptr, &gameCb);
-        bool fillOk = false, refusedOk = false, stateOk = false, forFocusOk = false;
-        int same = -1;
+        bool fillOk = false, refusedOk = false, stateOk = false, forFocusOk = false, sliceOk = false;
+        int same = -1, sliceSame = -1;
         if (target && gameUav && gameSrv && gameCb && !ref.empty()) {
             // The game's CS state while its pass runs.
             ctx->CSSetShaderResources(2, 1, &gameSrv);
@@ -296,14 +340,61 @@ int RunMvrMotion() {
             same = 0;
             for (size_t i = 0; i < got.size() && i < ref.size(); ++i) same += got[i] == ref[i];
             forFocusOk = !qvfr::mvrmotion::ForFocus(ctx, 0, depthTex, nullptr, kFW, kFH, 7, false);
+            // A shot frame with DLSS SR (the 2026-11-14 exception): DLAA asked for the eye size while focus's depth and
+            // the engine's vectors are at the render size. Refused (no compute pass, no comparison past the
+            // textures); the render size still runs the comparison.
+            {
+                const std::vector<uint16_t> zeroMv((size_t)kFW * kFH * 2, 0);
+                ID3D11Texture2D* gameMv = make(kFW, kFH, DXGI_FORMAT_R16G16_FLOAT, zeroMv.data(), kFW * 4);
+                qvfr::mvrmotion::SetEnabled(false);  // the view's own vectors: only the shot's comparison runs
+                const bool bigRefused =
+                    gameMv && !qvfr::mvrmotion::ForFocus(ctx, 0, depthTex, gameMv, kFW * 3 / 2, kFH * 3 / 2, 7, true);
+                const bool sameRuns =
+                    gameMv && !qvfr::mvrmotion::ForFocus(ctx, 0, depthTex, gameMv, kFW, kFH, 7, true);
+                qvfr::mvrmotion::SetEnabled(true);
+                printf("MVR motion shot with DLSS SR: the eye size refused %s, the render size compared %s\n",
+                       bigRefused ? "ok" : "FAIL", sameRuns ? "ok" : "FAIL");
+                if (!bigRefused || !sameRuns) ++fails;
+                if (gameMv) gameMv->Release();
+            }
+            // B20 K5b: the linear depth as slice 1 of a three-slice array (slices 0 and 2 hold another depth): the
+            // same vectors.
+            sliceSame = 0;
+            D3D11_TEXTURE2D_DESC ad{};
+            depthTex->GetDesc(&ad);
+            ad.ArraySize = 3;
+            ID3D11Texture2D* arr = nullptr;
+            if (SUCCEEDED(dev->CreateTexture2D(&ad, nullptr, &arr)) && arr) {
+                const std::vector<float> other((size_t)kFW * kFH, 3.5f);
+                for (UINT k : {0u, 2u})
+                    ctx->UpdateSubresource(arr, D3D11CalcSubresource(0, k, 1), nullptr, other.data(), kFW * 4, 0);
+                ctx->CopySubresourceRegion(arr, D3D11CalcSubresource(0, 1, 1), 0, 0, 0, depthTex, 0, nullptr);
+                const float zero[4] = {};
+                ID3D11RenderTargetView* rtv = nullptr;
+                D3D11_RENDER_TARGET_VIEW_DESC rv{};
+                rv.Format = DXGI_FORMAT_R16G16_FLOAT;
+                rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                if (SUCCEEDED(dev->CreateRenderTargetView(target, &rv, &rtv)) && rtv) {
+                    ctx->ClearRenderTargetView(rtv, zero);
+                    rtv->Release();
+                }
+                const char* why3 = "unset";
+                sliceOk = qvfr::mvrmotion::FillFocus(ctx, 0, arr, target, 7, &why3, 1) && !why3;
+                const std::vector<uint32_t> got3 = ReadTexels(dev, ctx, target);
+                for (size_t i = 0; i < got3.size() && i < ref.size(); ++i) sliceSame += got3[i] == ref[i];
+                arr->Release();
+            }
             printf("MVR motion fill (B11): written %s, refused without outer's copy of the frame %s (%s), CS state put "
-                   "back %s, target equals the compute pass %d / %u px, ForFocus leaves it %s\n",
+                   "back %s, target equals the compute pass %d / %u px, ForFocus leaves it %s; the depth as slice 1 of an "
+                   "array (B20 K5b) %s, %d / %u px equal\n",
                    fillOk ? "ok" : "FAIL", refusedOk ? "ok" : "FAIL", why2 ? why2 : "-", stateOk ? "ok" : "FAIL", same,
-                   kFW * kFH, forFocusOk ? "ok" : "FAIL");
+                   kFW * kFH, forFocusOk ? "ok" : "FAIL", sliceOk ? "ok" : "FAIL", sliceSame, kFW * kFH);
         } else {
             printf("MVR motion fill (B11): objects failed\n");
         }
-        if (!fillOk || !refusedOk || !stateOk || !forFocusOk || same != (int)(kFW * kFH)) ++fails;
+        if (!fillOk || !refusedOk || !stateOk || !forFocusOk || same != (int)(kFW * kFH) || !sliceOk ||
+            sliceSame != (int)(kFW * kFH))
+            ++fails;
         for (IUnknown* o : {(IUnknown*)target, (IUnknown*)uavTex, (IUnknown*)gameUav, (IUnknown*)gameSrv,
                             (IUnknown*)gameCb})
             if (o) o->Release();

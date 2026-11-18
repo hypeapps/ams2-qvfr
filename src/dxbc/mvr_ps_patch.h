@@ -25,7 +25,8 @@
 //           and screen inputs u = 0.5 * ssd.x * (x + w), v = 0.5 * ssd.y * (w - y):
 //           S = s, O.x = 0.5 * ssd.x * (1 + o.x - s.x), O.y = 0.5 * ssd.y * (1 - o.y - s.y);
 //   row 1 = (W / fw, H / fh, 1, 1), so a UV of the corner of the outer-size slice addresses the focus-size texture;
-//   row 2 = (kMvrPsMagic as uint bits, 0, 0, 0): the view number counts.
+//   row 2 = (kMvrPsMagic as uint bits, 0, 0, 0): the view number counts;
+//   rows 3, 4 = (-, -, z, w) of the extra view's screen constants (B20 K4, MvrPsPatchOptions::screenConstants).
 #pragma once
 
 #include <cstddef>
@@ -41,6 +42,10 @@ struct MvrPsPatchOptions {
     std::vector<std::string> screenTextures = {"globalTexture0", "globalTexture1", "globalTexture2", "globalTexture3",
                                                "globalTexture4"};
     uint32_t viewReg = 0;  // input register of SV_RenderTargetArrayIndex; 0 = the one after the last input
+    // B20 K4: screen size constants (cbuffer variables by name from the reflection chunk, each a float4 at a register
+    // start): in the extra view their .zw come from row 3 + i (the extra view's own screen size, so a clamp of a texel
+    // to the size - 1 does not cut the focus image in the corner layout); .xy stay the shader's.
+    std::vector<std::string> screenConstants = {"viewportPixelDimensions", "screenSpaceDimensions"};
 };
 
 struct MvrPsPatchInfo {
@@ -56,6 +61,9 @@ struct MvrPsPatchInfo {
     // branch. The extra view's copy then has to be bound at texBase + i.
     static constexpr uint32_t kNoRegister = 0xFFFFFFFFu;
     std::vector<uint32_t> textureRegs;
+    uint32_t constantMask = 0;   // bit i: screen constant i is read (and replaced in the extra view)
+    uint32_t constantReads = 0;  // operands that read one (rewritten)
+    uint32_t constantsDynamic = 0;  // screen constants in a dynamically indexed constant buffer (left as they are)
 };
 
 enum class MvrPsPatchResult {
@@ -65,7 +73,9 @@ enum class MvrPsPatchResult {
 };
 
 // The number of rows in the constant buffer, and the value of row 2.x (uint) that turns the view number on ("QVFR").
-constexpr uint32_t kMvrPsRows = 3;
+// Rows 3 and 4 (B20 K4): the extra view's screen constants (MvrPsPatchOptions::screenConstants).
+constexpr uint32_t kMvrPsRows = 5;
+constexpr uint32_t kMvrPsConstRow = 3;
 constexpr uint32_t kMvrPsMagic = 0x52465651;
 
 MvrPsPatchResult PatchPsForMvr(const void* code, size_t size, const MvrPsPatchOptions& opt, std::vector<uint8_t>& out,

@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <ctime>
 #include <mutex>
+#include <thread>
 
 namespace qvfr {
 
@@ -61,8 +62,8 @@ float IniFloat(const fs::path& ini, const wchar_t* sec, const wchar_t* key, floa
 }
 
 std::wstring IniPathValue(const fs::path& ini, const wchar_t* sec, const wchar_t* key) {
-    wchar_t buf[1024];
-    GetPrivateProfileStringW(sec, key, L"", buf, 1024, ini.c_str());
+    wchar_t buf[4096];  // also [benchmark] sequence, which can be long
+    GetPrivateProfileStringW(sec, key, L"", buf, 4096, ini.c_str());
     return buf;
 }
 
@@ -411,6 +412,7 @@ Config ReadConfig(const fs::path& ini) {
     c.mvr = mvr != "off";
     if (mvr != "off" && mvr != "mvr") Log("Settings: unknown [mvr] mode=\"%s\", using mvr", mvr.c_str());
     c.mvrVsPatch = c.mvr && IniInt(ini, L"debug", L"mvr_vs_patch", 1) != 0;
+    c.mvrVsView0 = IniInt(ini, L"debug", L"mvr_vs_view0", 1) != 0;
     c.mvrPsPatch = c.mvr && IniInt(ini, L"debug", L"mvr_ps_patch", 1) != 0;
     c.mvrGbuffer = c.mvr && IniInt(ini, L"debug", L"mvr_gbuffer", 1) != 0;
     c.mvrKeyMod = IniInt(ini, L"debug", L"mvr_modifier", c.mvrKeyMod);
@@ -423,25 +425,39 @@ Config ReadConfig(const fs::path& ini) {
     c.mvrEarly = std::clamp(IniInt(ini, L"debug", L"mvr_early", 1), 0, 5);
     c.mvrEarlyKey = IniInt(ini, L"debug", L"mvr_early_key", c.mvrEarlyKey);
     c.mvrMapKey = IniInt(ini, L"debug", L"mvr_map_key", c.mvrMapKey);
+    c.srProbeKeyMod = IniInt(ini, L"debug", L"sr_probe_modifier", c.srProbeKeyMod);
+    c.srProbeKey = IniInt(ini, L"debug", L"sr_probe_key", c.srProbeKey);
+    c.srCbFix = IniInt(ini, L"debug", L"sr_cb_fix", 1) != 0;
+    c.srCbFixKey = IniInt(ini, L"debug", L"sr_cb_fix_key", c.srCbFixKey);
+    if (c.srProbeKey || !c.srCbFix || c.srCbFixKey)
+        Log("Settings: [debug] sr_probe_modifier=0x%X sr_probe_key=0x%X sr_cb_fix=%d sr_cb_fix_key=0x%X", c.srProbeKeyMod,
+            c.srProbeKey, c.srCbFix, c.srCbFixKey);
     c.mvrShotCompare = IniInt(ini, L"debug", L"mvr_shot_compare", 0) != 0;
     c.mvrForwardTest = IniInt(ini, L"debug", L"mvr_forward_test", 0) != 0;
     c.mvrForward = IniInt(ini, L"debug", L"mvr_forward", 1) != 0;
     c.mvrForwardKey = IniInt(ini, L"debug", L"mvr_forward_key", c.mvrForwardKey);
     c.mvrForwardDepth = std::clamp(IniInt(ini, L"debug", L"mvr_forward_depth", 3), 0, 3);
     c.mvrForwardDepthKey = IniInt(ini, L"debug", L"mvr_forward_depth_key", c.mvrForwardDepthKey);
+    c.testKeyMod = IniInt(ini, L"debug", L"test_modifier", c.testKeyMod);
+    c.testKey = IniInt(ini, L"debug", L"test_key", c.testKey);
     c.mvrVelocity = IniInt(ini, L"debug", L"mvr_velocity", 1) != 0;
     c.mvrVelocityKey = IniInt(ini, L"debug", L"mvr_velocity_key", c.mvrVelocityKey);
     c.mvrVelocitySkip = IniInt(ini, L"debug", L"mvr_velocity_skip", 1) != 0;
+    c.mvrOutlierPx = std::max(0.0f, IniFloat(ini, L"debug", L"mvr_outlier_px", c.mvrOutlierPx));
+    c.mvrOuterVelCons = IniInt(ini, L"debug", L"mvr_outer_vel_cons", 1) != 0;
     c.mvrVelocitySkipKey = IniInt(ini, L"debug", L"mvr_velocity_skip_key", c.mvrVelocitySkipKey);
     c.mvrGbufferPs = IniInt(ini, L"debug", L"mvr_gbuffer_ps", 1) != 0;
     c.mvrGbufferPsKey = IniInt(ini, L"debug", L"mvr_gbuffer_ps_key", c.mvrGbufferPsKey);
     c.mvrDirectExtract = IniInt(ini, L"debug", L"mvr_direct_extract", 1) != 0;
+    c.mvrCorner = IniInt(ini, L"debug", L"mvr_corner", 1) != 0;
     c.mvrDirectExtractKey = IniInt(ini, L"debug", L"mvr_direct_extract_key", c.mvrDirectExtractKey);
     c.mvrNativeTargets = IniInt(ini, L"debug", L"mvr_native_targets", 1) != 0;
     c.mvrNativeKey = IniInt(ini, L"debug", L"mvr_native_key", c.mvrNativeKey);
     c.mvrMsColorSkip = IniInt(ini, L"debug", L"mvr_ms_color_skip", 1) != 0;
     c.mvrMsColorSkipKey = IniInt(ini, L"debug", L"mvr_ms_color_skip_key", c.mvrMsColorSkipKey);
     c.mvrMsSlices = IniInt(ini, L"debug", L"mvr_ms_slices", 1) != 0;
+    c.mvrGbufferSlices = IniInt(ini, L"debug", L"mvr_gbuffer_slices", 1) != 0;
+    c.mvrPsDump = IniInt(ini, L"debug", L"mvr_ps_dump", 0) != 0;
     c.mvrLiveTrackSkip = IniInt(ini, L"debug", L"mvr_livetrack_skip", 1) != 0;
     c.mvrLiveTrackSkipKey = IniInt(ini, L"debug", L"mvr_livetrack_skip_key", c.mvrLiveTrackSkipKey);
     c.mvrEmptyQueue = IniInt(ini, L"debug", L"mvr_empty_queue", 0) != 0;
@@ -454,37 +470,49 @@ Config ReadConfig(const fs::path& ini) {
             "cull_key=0x%X sun_effects=%d sun_effects_modifier=0x%X sun_effects_key=0x%X taa_views=%d "
             "taa_views_modifier=0x%X taa_views_key=0x%X taa_motion_fix=%d taa_motion_fix_key=0x%X task_profile=%d "
             "hook_profile=%d clones_map_cache=%d mvr_bind_skip=%d mvr_state_track=%d mvr_vs_patch=%d "
-            "mvr_ps_patch=%d mvr_gbuffer=%d mvr_modifier=0x%X mvr_key=0x%X mvr_jitter_fix=%d mvr_mode_key=0x%X mvr_depth_bias=%d mvr_depth_slope=%.3f mvr_depth_dilate=%d "
+            "mvr_vs_view0=%d mvr_ps_patch=%d mvr_gbuffer=%d mvr_modifier=0x%X mvr_key=0x%X mvr_jitter_fix=%d mvr_mode_key=0x%X mvr_depth_bias=%d mvr_depth_slope=%.3f mvr_depth_dilate=%d "
             "mvr_early=%d mvr_early_key=0x%X mvr_map_key=0x%X mvr_shot_compare=%d mvr_forward_test=%d "
             "mvr_forward=%d mvr_forward_key=0x%X mvr_forward_depth=%d mvr_forward_depth_key=0x%X mvr_velocity=%d "
             "mvr_velocity_key=0x%X mvr_velocity_skip=%d mvr_velocity_skip_key=0x%X mvr_gbuffer_ps=%d "
             "mvr_gbuffer_ps_key=0x%X mvr_direct_extract=%d mvr_direct_extract_key=0x%X mvr_native_targets=%d "
             "mvr_native_key=0x%X mvr_ms_color_skip=%d mvr_ms_color_skip_key=0x%X mvr_ms_slices=%d "
-            "mvr_livetrack_skip=%d mvr_livetrack_skip_key=0x%X mvr_empty_queue=%d queue_breakdown=%d mvr_velocity_record_skip=%d",
+            "mvr_gbuffer_slices=%d mvr_livetrack_skip=%d mvr_livetrack_skip_key=0x%X mvr_empty_queue=%d queue_breakdown=%d mvr_velocity_record_skip=%d",
             c.overlay, c.overlayKeyMod, c.overlayKey, c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey,
             c.gazeKeyMod, c.gazeKey, c.clones, c.clonesKeyMod, c.clonesKey, c.clonesViewportFix, c.clonesBindFix,
             c.shotClones, c.focusCull, c.cullKeyMod, c.cullKey, c.sunEffects, c.sunKeyMod, c.sunKey, c.taaViews,
-            c.taaViewsKeyMod, c.taaViewsKey, c.taaMotionFix, c.taaMotionFixKey, c.taskProfile, c.hookProfile, c.clonesMapCache, c.mvrBindSkip, c.mvrStateTrack, c.mvrVsPatch, c.mvrPsPatch, c.mvrGbuffer, c.mvrKeyMod, c.mvrKey,
+            c.taaViewsKeyMod, c.taaViewsKey, c.taaMotionFix, c.taaMotionFixKey, c.taskProfile, c.hookProfile, c.clonesMapCache, c.mvrBindSkip, c.mvrStateTrack, c.mvrVsPatch, c.mvrVsView0, c.mvrPsPatch, c.mvrGbuffer, c.mvrKeyMod, c.mvrKey,
             c.mvrJitterFix, c.mvrModeKey, c.mvrDepthBias, c.mvrDepthSlope, c.mvrDepthDilate,
             c.mvrEarly, c.mvrEarlyKey, c.mvrMapKey, c.mvrShotCompare, c.mvrForwardTest, c.mvrForward,
             c.mvrForwardKey, c.mvrForwardDepth, c.mvrForwardDepthKey, c.mvrVelocity, c.mvrVelocityKey,
             c.mvrVelocitySkip, c.mvrVelocitySkipKey, c.mvrGbufferPs, c.mvrGbufferPsKey, c.mvrDirectExtract,
             c.mvrDirectExtractKey, c.mvrNativeTargets, c.mvrNativeKey, c.mvrMsColorSkip, c.mvrMsColorSkipKey, c.mvrMsSlices,
-            c.mvrLiveTrackSkip, c.mvrLiveTrackSkipKey, c.mvrEmptyQueue, c.queueBreakdown, c.mvrVelocityRecordSkip);
+            c.mvrGbufferSlices, c.mvrLiveTrackSkip, c.mvrLiveTrackSkipKey, c.mvrEmptyQueue, c.queueBreakdown, c.mvrVelocityRecordSkip);
     const std::string dlaa = IniString(ini, L"dlaa", L"mode", L"off");
     c.dlaa = dlaa == "dlaa" || dlaa == "dlss";
     c.dlaaSr = dlaa == "dlss";
     if (dlaa != "off" && dlaa != "dlaa" && dlaa != "dlss")
         Log("Settings: unknown [dlaa] mode=\"%s\", using off", dlaa.c_str());
     c.dlaaRenderScale = std::clamp(IniFloat(ini, L"dlaa", L"render_scale", c.dlaaRenderScale), 0.33f, 1.0f);
-    const std::string preset = IniString(ini, L"dlaa", L"preset", L"k");  // K: NVIDIA's DLAA default, set explicitly
-    if (preset == "default") {
-        c.dlaaPreset = 0;
-    } else if (preset.size() == 1 && preset[0] >= 'a' && preset[0] <= 'o') {
-        c.dlaaPreset = preset[0] - 'a' + 1;  // NVSDK_NGX_DLSS_Hint_Render_Preset: A = 1 ... K = 11
-    } else {
-        Log("Settings: unknown [dlaa] preset=\"%s\", using default", preset.c_str());
-    }
+    c.dlaaOuterRenderScale =
+        std::clamp(IniFloat(ini, L"dlaa", L"outer_render_scale", c.dlaaRenderScale), 0.33f, 1.0f);
+    c.dlaaFocusRenderScale =
+        std::clamp(IniFloat(ini, L"dlaa", L"focus_render_scale", c.dlaaRenderScale), 0.33f, 1.0f);
+    // K: NVIDIA's DLAA default and far cheaper than M in quad views (benchmark 2026-11-18: 9.7 against 17.1 ms of GPU
+    // time per frame). M has the least ghosting on thin parts but takes no fixed exposure (DLSS Programming Guide 3.9:
+    // only J and K do).
+    const auto presetValue = [](const char* key, const std::string& v, int fallback) {
+        if (v == "default") return 0;
+        if (v.size() == 1 && v[0] >= 'a' && v[0] <= 'o') return v[0] - 'a' + 1;  // NVSDK_NGX_DLSS_Hint_Render_Preset: A = 1 ... K = 11
+        Log("Settings: unknown [dlaa] %s=\"%s\", ignored", key, v.c_str());
+        return fallback;
+    };
+    const std::string preset = IniString(ini, L"dlaa", L"preset", L"k");
+    c.dlaaPreset = presetValue("preset", preset, c.dlaaPreset);
+    // Quad views: each kind of view can have its own model; an absent or empty key follows preset.
+    const std::string outerPreset = IniString(ini, L"dlaa", L"outer_preset", L"");
+    const std::string focusPreset = IniString(ini, L"dlaa", L"focus_preset", L"");
+    c.dlaaOuterPreset = outerPreset.empty() ? c.dlaaPreset : presetValue("outer_preset", outerPreset, c.dlaaPreset);
+    c.dlaaFocusPreset = focusPreset.empty() ? c.dlaaPreset : presetValue("focus_preset", focusPreset, c.dlaaPreset);
     c.dlaaJitterScaleX = IniFloat(ini, L"dlaa", L"jitter_scale_x", c.dlaaJitterScaleX);
     c.dlaaJitterScaleY = IniFloat(ini, L"dlaa", L"jitter_scale_y", c.dlaaJitterScaleY);
     c.dlaaMvJittered = IniInt(ini, L"dlaa", L"mv_jittered", 0) != 0;
@@ -499,15 +527,18 @@ Config ReadConfig(const fs::path& ini) {
     c.dlaaExpKeyMod = IniInt(ini, L"dlaa", L"exposure_modifier", c.dlaaExpKeyMod);
     c.dlaaExpKey = IniInt(ini, L"dlaa", L"exposure_key", c.dlaaExpKey);
     c.dlaaCockpitTaa = std::clamp(IniInt(ini, L"dlaa", L"cockpit_taa", c.dlaaCockpitTaa), 0, 2);
-    c.dlaaPresetKeyMod = IniInt(ini, L"dlaa", L"preset_modifier", c.dlaaPresetKeyMod);
-    c.dlaaPresetKey = IniInt(ini, L"dlaa", L"preset_key", c.dlaaPresetKey);
+    c.dlaaDisplayPass = IniInt(ini, L"dlaa", L"display_pass", c.dlaaDisplayPass ? 1 : 0) != 0;
     if (c.dlaa)
-        Log("Settings: [dlaa] mode=%s render_scale=%.3f preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d "
+        Log("Settings: [dlaa] mode=%s render_scale=%.3f outer_render_scale=%.3f focus_render_scale=%.3f preset=%s "
+            "outer_preset=%s focus_preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d "
             "auto_exposure=%d exposure=%.4f exposure_scale=%.4f bias_mask=%.2f skip_locks=%d modifier=0x%X key=0x%X "
-            "exposure_key=0x%X preset_key=0x%X cockpit_taa=%d",
-            c.dlaaSr ? "dlss" : "dlaa", c.dlaaRenderScale, preset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY, c.dlaaMvJittered, c.dlaaAutoExposure,
+            "exposure_key=0x%X cockpit_taa=%d display_pass=%d",
+            c.dlaaSr ? "dlss" : "dlaa", c.dlaaRenderScale, c.dlaaOuterRenderScale, c.dlaaFocusRenderScale,
+            preset.c_str(), outerPreset.empty() ? preset.c_str() : outerPreset.c_str(),
+            focusPreset.empty() ? preset.c_str() : focusPreset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY,
+            c.dlaaMvJittered, c.dlaaAutoExposure,
             c.dlaaExposure, c.dlaaExposureScale, c.dlaaBiasMask, c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey,
-            c.dlaaExpKey, c.dlaaPresetKey, c.dlaaCockpitTaa);
+            c.dlaaExpKey, c.dlaaCockpitTaa, c.dlaaDisplayPass ? 1 : 0);
     const std::string nr = IniString(ini, L"nr", L"mode", L"off");
     c.nrMode = nr == "focus" ? 1 : nr == "final" ? 2 : 0;
     if (nr != "off" && nr != "focus" && nr != "final") Log("Settings: unknown [nr] mode=\"%s\", using off", nr.c_str());
@@ -582,6 +613,25 @@ Config ReadConfig(const fs::path& ini) {
 FILETIME g_iniTime{};
 double g_iniCheckMs = 0;
 
+// ---------------------------------------------------------------- test scenarios ([debug] test_key)
+// One hotkey for an in-game test: each press goes to the next scenario, which sets live settings over the ini's (the
+// modules pick the change up as from a live reload); after the last one it is the ini again. The table is the current
+// test's and changes with it.
+Config g_iniCfg;  // g_cfg as the ini has it (LoadConfig, ReloadConfig), before the scenario
+int g_testStep = 0;
+bool g_testKeyDown = false;
+struct TestScenario {
+    const char* name;
+    void (*apply)(Config&);
+};
+const TestScenario kTestScenarios[] = {
+    {"as in the ini", [](Config&) {}},
+};
+constexpr int kTestScenarioCount = (int)(sizeof(kTestScenarios) / sizeof(kTestScenarios[0]));
+// The settings any scenario sets, back to the ini's before the next one applies (c.field = ini.field for each; none
+// while the table holds only step 0).
+void RestoreTestFields(Config& /*c*/, const Config& /*ini*/) {}
+
 void NoteIniTime() {
     WIN32_FILE_ATTRIBUTE_DATA a{};
     if (GetFileAttributesExW(IniFile().c_str(), GetFileExInfoStandard, &a)) g_iniTime = a.ftLastWriteTime;
@@ -603,6 +653,7 @@ void LoadConfig() {
     NoteIniTime();
     Config c = ReadConfig(ini);
     g_cfg = c;
+    g_iniCfg = c;
     hud::Configure(c.fpsHud);
     Log("Settings %s: [runtime] path=%s opencomposite=\"%s\" openxr_layer=%d", Narrow(ini.wstring()).c_str(),
         c.pathOpenXr ? "openxr" : "openvr", Narrow(c.openComposite).c_str(), c.openxrLayer);
@@ -652,13 +703,27 @@ bool ReloadConfig(bool force) {
              n.fixedSectionX != c.fixedSectionX || n.fixedSectionY != c.fixedSectionY,
          "[quad] *_section");
     need(n.probeFrames != c.probeFrames || n.probeEngine != c.probeEngine || n.probeD3D != c.probeD3D, "[quad] probe_*");
-    need(n.dlaa != c.dlaa || n.dlaaSr != c.dlaaSr, "[dlaa] mode");
-    need(n.dlaaRenderScale != c.dlaaRenderScale, "[dlaa] render_scale");
+    // A game started with mode=dlss has DLSS SR's hooks: its render scales are live (quad.cpp, sr.cpp), and mode=dlaa
+    // there is a scale of 1. A game started without them needs a restart for SR.
+    need(n.dlaa != c.dlaa || (n.dlaaSr && !c.dlaaSr), "[dlaa] mode");
+    if (!c.dlaaSr) {
+        need(n.dlaaRenderScale != c.dlaaRenderScale || n.dlaaOuterRenderScale != c.dlaaOuterRenderScale ||
+                 n.dlaaFocusRenderScale != c.dlaaFocusRenderScale,
+             "[dlaa] *render_scale");
+    } else if (n.dlaa) {
+        c.dlaaRenderScale = n.dlaaSr ? n.dlaaRenderScale : 1.0f;
+        c.dlaaOuterRenderScale = n.dlaaSr ? n.dlaaOuterRenderScale : 1.0f;
+        c.dlaaFocusRenderScale = n.dlaaSr ? n.dlaaFocusRenderScale : 1.0f;
+    }
     need(n.mvr != c.mvr, "[mvr] mode");
     need(n.mvrVsPatch != c.mvrVsPatch, "[debug] mvr_vs_patch");
+    need(n.mvrVsView0 != c.mvrVsView0, "[debug] mvr_vs_view0");
     need(n.mvrPsPatch != c.mvrPsPatch, "[debug] mvr_ps_patch");
     need(n.mvrGbuffer != c.mvrGbuffer, "[debug] mvr_gbuffer");
     c.dlaaPreset = n.dlaaPreset;
+    c.dlaaOuterPreset = n.dlaaOuterPreset;
+    c.dlaaFocusPreset = n.dlaaFocusPreset;
+    c.srCbFix = n.srCbFix;  // live (sr_cb.h)
     c.dlaaJitterScaleX = n.dlaaJitterScaleX;
     c.dlaaJitterScaleY = n.dlaaJitterScaleY;
     c.dlaaMvJittered = n.dlaaMvJittered;
@@ -672,8 +737,7 @@ bool ReloadConfig(bool force) {
     c.dlaaExpKey = n.dlaaExpKey;
     c.dlaaExposureScale = n.dlaaExposureScale;
     c.dlaaCockpitTaa = n.dlaaCockpitTaa;
-    c.dlaaPresetKeyMod = n.dlaaPresetKeyMod;
-    c.dlaaPresetKey = n.dlaaPresetKey;
+    c.dlaaDisplayPass = n.dlaaDisplayPass;
     c.nrMode = n.nrMode;
     c.nrKeyMod = n.nrKeyMod;
     c.nrKey = n.nrKey;
@@ -782,13 +846,18 @@ bool ReloadConfig(bool force) {
     c.mvrForwardKey = n.mvrForwardKey;
     c.mvrForwardDepth = n.mvrForwardDepth;
     c.mvrForwardDepthKey = n.mvrForwardDepthKey;
+    c.testKeyMod = n.testKeyMod;
+    c.testKey = n.testKey;
     c.mvrVelocity = n.mvrVelocity;
     c.mvrVelocityKey = n.mvrVelocityKey;
     c.mvrVelocitySkip = n.mvrVelocitySkip;
+    c.mvrOutlierPx = n.mvrOutlierPx;
+    c.mvrOuterVelCons = n.mvrOuterVelCons;
     c.mvrVelocitySkipKey = n.mvrVelocitySkipKey;
     c.mvrGbufferPs = n.mvrGbufferPs;
     c.mvrGbufferPsKey = n.mvrGbufferPsKey;
     c.mvrDirectExtract = n.mvrDirectExtract;
+    c.mvrCorner = n.mvrCorner;
     c.mvrDirectExtractKey = n.mvrDirectExtractKey;
     c.mvrNativeTargets = n.mvrNativeTargets;
     c.mvrNativeKey = n.mvrNativeKey;
@@ -813,7 +882,38 @@ bool ReloadConfig(bool force) {
         c.freezeKeyMod, c.freezeKey, c.outerKeyMod, c.outerKey, c.gazeKeyMod, c.gazeKey, c.clonesKeyMod, c.clonesKey,
         c.cullKeyMod, c.cullKey, c.sunKeyMod, c.sunKey, c.taaViewsKeyMod, c.taaViewsKey, c.mvrKeyMod, c.mvrKey,
         restart.empty() ? "" : "; CHANGED BUT NEEDS A GAME RESTART: ", restart.c_str());
+    g_iniCfg = c;
+    if (g_testStep) {
+        kTestScenarios[g_testStep].apply(c);
+        Log("Test scenario %d of %d stays over the reloaded ini: %s", g_testStep, kTestScenarioCount - 1,
+            kTestScenarios[g_testStep].name);
+    }
     return true;
+}
+
+void TestScenarioFrame() {
+    const Config& c = g_cfg;
+    const bool down = c.testKey && (GetAsyncKeyState(c.testKey) & 0x8000) &&
+                      (!c.testKeyMod || (GetAsyncKeyState(c.testKeyMod) & 0x8000));
+    const bool pressed = down && !g_testKeyDown;
+    g_testKeyDown = down;
+    if (!pressed) return;
+    g_testStep = (g_testStep + 1) % kTestScenarioCount;
+    RestoreTestFields(g_cfg, g_iniCfg);
+    kTestScenarios[g_testStep].apply(g_cfg);
+    Log("Test scenario %d of %d (hotkey): %s", g_testStep, kTestScenarioCount - 1, kTestScenarios[g_testStep].name);
+    // The tester hears which one it is ([benchmark] beep): scenario 0 one low tone, scenario n n short high ones. A tap
+    // shorter than a frame is not seen (2026-11-18, ghosting run 2: the count went one ahead of the log).
+    if (c.benchBeep) {
+        const int n = g_testStep;
+        std::thread([n] {
+            if (n == 0) Beep(440, 400);
+            for (int i = 0; i < n; ++i) {
+                Beep(1100, 110);
+                Sleep(90);
+            }
+        }).detach();
+    }
 }
 
 const char* ExpModeName(ExpMode m) {

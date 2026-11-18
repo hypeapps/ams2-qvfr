@@ -244,7 +244,20 @@ struct Consts {
     float pad;
     uint32_t offsetX, offsetY, regionW, regionH;  // CSMotion, CSDepth, the region shaders: the region
     uint32_t srcStep, srcX, srcY, fade;  // source pixels per region pixel, the part's origin, CSUpEdit's fade (px)
+    float srcScaleX, srcScaleY;  // CSMotion, CSDepth: render pixels per image pixel with DLSS SR (0: the same size)
+    uint32_t imageW, imageH;     // CSMotion: the image's size, the unit of the vectors (0: the source's size)
 };
+
+// The guides of SetSource into the constants of CSMotion and CSDepth.
+void WithSource(Consts& k, UINT imageW, UINT imageH, UINT inW, UINT inH) {
+    if (!imageW || !imageH || !inW || !inH) return;
+    k.imageW = imageW;
+    k.imageH = imageH;
+    if (inW != imageW || inH != imageH) {
+        k.srcScaleX = (float)inW / (float)imageW;
+        k.srcScaleY = (float)inH / (float)imageH;
+    }
+}
 
 #ifdef QVFR_HAVE_NGX_HEADERS
 // The driver's NGX core (D3D12 entry points) and the forwarder's.
@@ -767,8 +780,9 @@ bool Bridge::Guides(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView* 
     if (!EnsureContext(c) || !EnsureSlot(slot, fullW, fullH)) return false;
     Impl::Slot& s = m.slots[slot];
     const bool gameDepth = set_.depthMode > 0 && depth;
-    const Consts k{1.0f, 0u, (set_.motion && motion) ? 1.0f : 0.0f, 0u, gameDepth ? (uint32_t)set_.depthMode : 0u,
-                   set_.depthK, 0u, 1.0f, x0, y0, w, h, step, srcX, srcY, 0u};
+    Consts k{1.0f, 0u, (set_.motion && motion) ? 1.0f : 0.0f, 0u, gameDepth ? (uint32_t)set_.depthMode : 0u,
+             set_.depthK, 0u, 1.0f, x0, y0, w, h, step, srcX, srcY, 0u};
+    WithSource(k, srcImageW_, srcImageH_, srcInW_, srcInH_);
     if (memcmp(&k, &m.cbValue, sizeof(k)) != 0) {
         c->UpdateSubresource(m.cb, 0, nullptr, &k, 0, 0);
         m.cbValue = k;
@@ -830,6 +844,47 @@ bool Bridge::PackRegion(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceVi
     c->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
     c->CSSetShader(nullptr, nullptr, 0);
     return true;
+}
+
+bool Bridge::TestReadGuides(ID3D11DeviceContext* c, int slot, std::vector<float>& motion, std::vector<float>& depth) {
+    if (!ready_ || !c || slot < 0 || slot >= kSlots) return false;
+    Impl& m = *impl_;
+    Impl::Slot& s = m.slots[slot];
+    if (!s.w || !s.motion11 || !s.depth11) return false;
+    auto read = [&](ID3D11Texture2D* t, UINT bytes, auto&& row) {
+        D3D11_TEXTURE2D_DESC d{};
+        t->GetDesc(&d);
+        d.Usage = D3D11_USAGE_STAGING;
+        d.BindFlags = 0;
+        d.MiscFlags = 0;
+        d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        ID3D11Texture2D* st = nullptr;
+        if (FAILED(m.dev11->CreateTexture2D(&d, nullptr, &st))) return false;
+        c->CopyResource(st, t);
+        D3D11_MAPPED_SUBRESOURCE map{};
+        const bool ok = SUCCEEDED(c->Map(st, 0, D3D11_MAP_READ, 0, &map));
+        if (ok) {
+            for (UINT y = 0; y < s.h; ++y) row(y, (const uint8_t*)map.pData + (size_t)y * map.RowPitch, bytes);
+            c->Unmap(st, 0);
+        }
+        st->Release();
+        return ok;
+    };
+    auto half = [](uint16_t h) {  // IEEE half to float (no Inf/NaN in the guides)
+        const uint32_t sign = (h >> 15) & 1, e = (h >> 10) & 31, f = h & 1023;
+        const float v = e ? std::ldexp(1.0f + f / 1024.0f, (int)e - 15) : std::ldexp(f / 1024.0f, -14);
+        return sign ? -v : v;
+    };
+    motion.assign((size_t)s.w * s.h * 2, 0.0f);
+    depth.assign((size_t)s.w * s.h, 0.0f);
+    return read(s.motion11, 4,
+                [&](UINT y, const uint8_t* p, UINT) {
+                    const uint16_t* q = (const uint16_t*)p;
+                    for (UINT x = 0; x < 2 * s.w; ++x) motion[(size_t)y * s.w * 2 + x] = half(q[x]);
+                }) &&
+           read(s.depth11, 4, [&](UINT y, const uint8_t* p, UINT) {
+               memcpy(&depth[(size_t)y * s.w], p, (size_t)s.w * 4);
+           });
 }
 
 void Bridge::ClearInput(int slot) {
@@ -1178,9 +1233,10 @@ bool Bridge::Process(ID3D11DeviceContext* c, int slot, ID3D11ShaderResourceView*
     uav->GetDesc(&ud);
     const bool four = ud.Format == DXGI_FORMAT_R8G8B8A8_UNORM || ud.Format == DXGI_FORMAT_R10G10B10A2_UNORM ||
                       ud.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
-    const Consts k{shaped ? set_.inputScale : 1.0f, shaped ? (uint32_t)set_.tonemap : 0u, set_.motion ? 1.0f : 0.0f,
-                   ratio ? 1u : 0u, gameDepth ? (uint32_t)set_.depthMode : 0u, set_.depthK, debugView ? 1u : 0u,
-                   strength, 0u, 0u, w, h, 1u, 0u, 0u, 0u};
+    Consts k{shaped ? set_.inputScale : 1.0f, shaped ? (uint32_t)set_.tonemap : 0u, set_.motion ? 1.0f : 0.0f,
+             ratio ? 1u : 0u, gameDepth ? (uint32_t)set_.depthMode : 0u, set_.depthK, debugView ? 1u : 0u,
+             strength, 0u, 0u, w, h, 1u, 0u, 0u, 0u};
+    if (!guidesReady) WithSource(k, srcImageW_, srcImageH_, srcInW_, srcInH_);
     if (ratio || diagNow || four) {  // the image as it came, for CSUnpack and the measurement
         ID3D11Resource* img = nullptr;
         srv->GetResource(&img);

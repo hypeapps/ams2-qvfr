@@ -56,6 +56,7 @@ enum : uint32_t {
     kOperandImm32 = 4,
     kOperandImm64 = 5,
     kOperandResource = 7,
+    kOperandConstantBuffer = 8,
 };
 constexpr uint32_t kPixelShader = 0;
 constexpr uint32_t kNameRenderTargetArrayIndex = 4;  // D3D_NAME_RENDER_TARGET_ARRAY_INDEX
@@ -104,6 +105,8 @@ struct Operand {
     uint32_t index = 0;
     uint32_t token = 0;
     size_t indexAt = 0;  // the index token, from the instruction start (immIndex)
+    bool immIndex2 = false;  // B20 K4: 2D immediate index (cb#[#])
+    uint32_t index2[2] = {};
 };
 
 // Parses operands and finds every register operand with a 1D immediate index, at any depth (relative indices hold
@@ -131,6 +134,11 @@ struct OperandParser {
         }
         if (type == kOperandImm32) n += comps == 2 ? 4 : 1;
         if (type == kOperandImm64) n += comps == 2 ? 8 : 2;
+        if (top && dim == 2 && ((tok >> 22) & 7) == 0 && ((tok >> 25) & 7) == 0 && n + 1 < avail) {
+            top->immIndex2 = true;
+            top->index2[0] = t[base + n];
+            top->index2[1] = t[base + n + 1];
+        }
         for (uint32_t d = 0; d < dim; ++d) {
             const uint32_t rep = (tok >> (22 + 3 * d)) & 7;
             if (d == 0 && dim == 1 && rep == 0) {
@@ -226,6 +234,54 @@ bool ScreenTextureRegs(std::vector<Chunk>& chunks, const MvrPsPatchOptions& opt,
     return true;
 }
 
+// B20 K4: the screen constants (cbuffer variables by name, float4 at a register start, used) as (constant buffer bind
+// point, register, option index).
+struct ScreenConst {
+    uint32_t point, reg, k;
+};
+bool ScreenConstantRegs(std::vector<Chunk>& chunks, const MvrPsPatchOptions& opt, std::vector<ScreenConst>& out,
+                        std::string* err) {
+    out.clear();
+    if (opt.screenConstants.empty()) return true;
+    const Chunk* rdef = Find(chunks, FourCC('R', 'D', 'E', 'F'));
+    if (!rdef) return true;  // stripped: none
+    const auto& d = rdef->data;
+    if (d.size() < 28) return SetErr(err, "reflection chunk too small"), false;
+    const uint32_t cbCount = Get32(d.data()), cbOffset = Get32(d.data() + 4);
+    const uint32_t bindCount = Get32(d.data() + 8), bindOffset = Get32(d.data() + 12), target = Get32(d.data() + 16);
+    // The target is 0xFFFF0500 for ps_5_0: major in bits 8..15, minor in 0..7; SM5 variables have 40-byte entries.
+    const uint32_t major = (target >> 8) & 0xFF, minor = target & 0xFF;
+    const size_t bindStride = major == 5 && minor >= 1 ? 40 : 32, varStride = major >= 5 ? 40 : 24;
+    if (bindOffset + bindStride * bindCount > d.size() || cbOffset + 24ull * cbCount > d.size())
+        return SetErr(err, "reflection out of range"), false;
+    auto name = [&](uint32_t off) {
+        if (off >= d.size()) return std::string();
+        const auto* s = reinterpret_cast<const char*>(d.data() + off);
+        return std::string(s, strnlen(s, d.size() - off));
+    };
+    for (uint32_t c = 0; c < cbCount; ++c) {
+        const uint8_t* cb = d.data() + cbOffset + 24 * c;
+        const uint32_t varCount = Get32(cb + 4), varOffset = Get32(cb + 8), cbType = Get32(cb + 20);
+        if (cbType != 0) continue;  // D3D_CT_CBUFFER only
+        const std::string cbName = name(Get32(cb));
+        uint32_t point = ~0u;
+        for (uint32_t i = 0; i < bindCount; ++i) {
+            const uint8_t* b = d.data() + bindOffset + bindStride * i;
+            if (Get32(b + 4) == 0 /* D3D_SIT_CBUFFER */ && name(Get32(b)) == cbName) point = Get32(b + 20);
+        }
+        if (point == ~0u || varOffset + varStride * varCount > d.size()) continue;
+        for (uint32_t v = 0; v < varCount; ++v) {
+            const uint8_t* var = d.data() + varOffset + varStride * v;
+            const uint32_t start = Get32(var + 4), size = Get32(var + 8), flags = Get32(var + 12);
+            if (!(flags & 2) /* D3D_SVF_USED */ || start % 16 || size != 16) continue;
+            const std::string varName = name(Get32(var));
+            for (uint32_t k = 0; k < opt.screenConstants.size() && kMvrPsConstRow + k < kMvrPsRows; ++k)
+                if (varName == opt.screenConstants[k]) out.push_back({point, start / 16, k});
+        }
+    }
+    return true;
+}
+
 }  // namespace
 
 MvrPsPatchResult PatchPsForMvr(const void* code, size_t size, const MvrPsPatchOptions& opt, std::vector<uint8_t>& out,
@@ -258,6 +314,17 @@ MvrPsPatchResult PatchPsForMvr(const void* code, size_t size, const MvrPsPatchOp
             if (r == reg) return static_cast<int>(k);
         return -1;
     };
+    std::vector<ScreenConst> consts;  // B20 K4
+    if (!ScreenConstantRegs(chunks, opt, consts, err)) return R::Refused;
+    uint32_t constsDynamic = 0;
+    // The entry of `consts` an operand reads (-1: none).
+    auto constIndex = [&](const Operand& o) -> int {
+        if (o.type != kOperandConstantBuffer || !o.immIndex2) return -1;
+        for (size_t e = 0; e < consts.size(); ++e)
+            if (consts[e].point == o.index2[0] && consts[e].reg == o.index2[1]) return static_cast<int>(e);
+        return -1;
+    };
+    if (consts.size() > 16) consts.resize(16);
 
     // Pass 1: declarations.
     struct InputDecl {
@@ -279,6 +346,14 @@ MvrPsPatchResult PatchPsForMvr(const void* code, size_t size, const MvrPsPatchOp
         if (op == kOpDclConstantBuffer) {
             if (len < 4) return refuse("bad constant buffer declaration");
             if (in[pc + 2] == opt.cbSlot) return refuse("constant buffer slot already used");
+            if (in[pc] & 0x800) {  // dynamically indexed: a screen constant there could be read by index (left as is)
+                const uint32_t point = in[pc + 2];
+                const size_t before = consts.size();
+                consts.erase(std::remove_if(consts.begin(), consts.end(),
+                                            [&](const ScreenConst& c) { return c.point == point; }),
+                             consts.end());
+                constsDynamic += static_cast<uint32_t>(before - consts.size());
+            }
             lastCb = pc + len;
         } else if (op == kOpDclInputPs || op == kOpDclInputPsSgv || op == kOpDclInputPsSiv) {
             if (len < 3 || ((in[pc + 1] >> 20) & 3) != 1) return refuse("unsupported input declaration");
@@ -307,7 +382,7 @@ MvrPsPatchResult PatchPsForMvr(const void* code, size_t size, const MvrPsPatchOp
     if (!firstInstr) return refuse("no instructions");
 
     // Pass 2: screen inputs (divided by their own w) and screen texture reads.
-    uint32_t screenMask = 0, texMask = 0, wraps = 0;
+    uint32_t screenMask = 0, texMask = 0, wraps = 0, constMask = 0;
     bool relativeInput = false;
     std::vector<uint32_t> evalInputs;
     std::vector<Operand> ops;
@@ -339,6 +414,8 @@ MvrPsPatchResult PatchPsForMvr(const void* code, size_t size, const MvrPsPatchOp
                 a.index < 32 && aXy && swzB && selB == 0xFF && (a.token >> 31) == 0 && (b.token >> 31) == 0)
                 screenMask |= 1u << a.index;
         }
+        for (const auto& o : ops)
+            if (const int k = constIndex(o); k >= 0) constMask |= 1u << k;
         for (const auto& o : ops) {
             if (o.type != kOperandResource || !o.immIndex) continue;
             const int k = texIndex(o.index);
@@ -406,6 +483,13 @@ MvrPsPatchResult PatchPsForMvr(const void* code, size_t size, const MvrPsPatchOp
             screenTemp[r] = next++;
             ++inf.screenInputs;
         }
+    uint32_t constTemp[16] = {};  // B20 K4: per used entry of `consts`
+    for (size_t e = 0; e < consts.size(); ++e)
+        if (constMask & (1u << e)) {
+            constTemp[e] = next++;
+            inf.constantMask |= 1u << consts[e].k;
+        }
+    inf.constantsDynamic = constsDynamic;
     inf.temps = next - temps;
     inf.screenInputMask = screenMask;
     inf.textureMask = texMask;
@@ -449,6 +533,17 @@ MvrPsPatchResult PatchPsForMvr(const void* code, size_t size, const MvrPsPatchOp
                                       Src(kOperandTemp, Swz(0, 0, 0, 0)), tView,
                                       kSrcCbXyzw, opt.cbSlot, 0,
                                       kSrcImm4, kFloatOne, kFloatOne, 0, 0};
+    // B20 K4: each screen constant read into its temp, its .zw from row kMvrPsConstRow + k in the extra view:
+    // mov t, cbP[reg]; movc t.zw, view.xxxx, cb[slot][row], t
+    for (size_t e = 0; e < consts.size(); ++e) {
+        if (!(constMask & (1u << e))) continue;
+        const uint32_t t = constTemp[e];
+        prologue.insert(prologue.end(), {kOpMov | (6u << 24), Dst(kOperandTemp, 0xF), t, kSrcCbXyzw, consts[e].point,
+                                         consts[e].reg});
+        prologue.insert(prologue.end(), {kOpMovc | (10u << 24), Dst(kOperandTemp, 0xC), t,
+                                         Src(kOperandTemp, Swz(0, 0, 0, 0)), tView, kSrcCbXyzw, opt.cbSlot,
+                                         kMvrPsConstRow + consts[e].k, Src(kOperandTemp, kXyzw), t});
+    }
     for (uint32_t r = 0; r < 32; ++r) {
         if (!(screenMask & (1u << r))) continue;
         const uint32_t t = screenTemp[r];
@@ -492,6 +587,32 @@ MvrPsPatchResult PatchPsForMvr(const void* code, size_t size, const MvrPsPatchOp
             if (r >= 32 || !(screenMask & (1u << r))) continue;
             ins[tokAt] = (ins[tokAt] & ~(0xFFu << 12)) | (kOperandTemp << 12);
             ins[idxAt] = screenTemp[r];
+        }
+        // B20 K4: a read of a screen constant becomes a read of its temp (cb#[#] -> r#, modifiers kept); from the last
+        // operand back, so the earlier positions hold, then parsed again for the rewrites below.
+        bool constRewritten = false;
+        for (size_t i = ops.size(); i-- > 0;) {
+            const int e = constIndex(ops[i]);
+            if (e < 0 || !(constMask & (1u << e))) continue;
+            const Operand& o = ops[i];
+            size_t ext = 0;
+            for (bool more = (ins[o.at] >> 31) != 0; more; ++ext) more = (ins[o.at + 1 + ext] >> 31) != 0;
+            uint32_t tok = ins[o.at];
+            tok &= ~((0xFFu << 12) | (3u << 20) | (0x1FFu << 22));
+            tok |= (kOperandTemp << 12) | (1u << 20);
+            std::vector<uint32_t> repl = {tok};
+            repl.insert(repl.end(), ins.begin() + o.at + 1, ins.begin() + o.at + 1 + ext);
+            repl.push_back(constTemp[e]);
+            ins.erase(ins.begin() + o.at, ins.begin() + o.at + o.len);
+            ins.insert(ins.begin() + o.at, repl.begin(), repl.end());
+            ++inf.constantReads;
+            constRewritten = true;
+        }
+        if (constRewritten) {
+            if (ins.size() > 127) return refuse("instruction too long");
+            ins[0] = (ins[0] & ~(0x7Fu << 24)) | (static_cast<uint32_t>(ins.size()) << 24);
+            OperandParser p2;
+            if (!ParseInstruction(ins, ops, p2)) return refuse("cannot parse a rewritten instruction");
         }
         int tex = -1;
         size_t texOp = 0;

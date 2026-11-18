@@ -7,6 +7,7 @@
 #include <d3d11sdklayers.h>
 #include <dxgi.h>
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <random>
@@ -443,6 +444,77 @@ int RunNrBridge() {
                 if (m.srv) m.srv->Release();
                 if (m.tex) m.tex->Release();
             }
+        }
+
+        // DLSS super resolution (dlaa-plan S2.1b): the game's motion vectors and depth at the render size (2/3 of the
+        // image here, from the texture's top left). Image pixel p reads render texel floor((p + 0.5) * render / image)
+        // and its vector is in image pixels: -uv * image size. With the guides at the image's size (SetSource with
+        // equal sizes, as without SR) pixel p reads texel p.
+        {
+            qvfr::nrbridge::Settings gs;
+            gs.depthMode = 1;
+            bridge.Configure(gs);
+            constexpr UINT kIw = 64, kIh = 48;
+            size_t bad = 0;
+            for (int pass = 0; pass < 2; ++pass) {
+                const UINT rw = pass == 0 ? 43 : kIw, rh = pass == 0 ? 32 : kIh;
+                std::vector<float> mv((size_t)rw * rh * 2), dp((size_t)rw * rh);
+                for (UINT y = 0; y < rh; ++y)
+                    for (UINT x = 0; x < rw; ++x) {
+                        mv[((size_t)y * rw + x) * 2] = x / 1024.0f;
+                        mv[((size_t)y * rw + x) * 2 + 1] = -(float)y / 2048.0f;
+                        dp[(size_t)y * rw + x] = (x + y * rw) / 8192.0f;
+                    }
+                D3D11_TEXTURE2D_DESC gd{};
+                gd.Width = rw;
+                gd.Height = rh;
+                gd.MipLevels = 1;
+                gd.ArraySize = 1;
+                gd.SampleDesc.Count = 1;
+                gd.Usage = D3D11_USAGE_DEFAULT;
+                gd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                ID3D11Texture2D *mt = nullptr, *dt = nullptr;
+                ID3D11ShaderResourceView *ms = nullptr, *ds = nullptr;
+                D3D11_SUBRESOURCE_DATA mi{mv.data(), rw * 8, 0};
+                D3D11_SUBRESOURCE_DATA di{dp.data(), rw * 4, 0};
+                gd.Format = DXGI_FORMAT_R32G32_FLOAT;
+                bool made = SUCCEEDED(dev->CreateTexture2D(&gd, &mi, &mt)) &&
+                            SUCCEEDED(dev->CreateShaderResourceView(mt, nullptr, &ms));
+                gd.Format = DXGI_FORMAT_R32_FLOAT;
+                made = made && SUCCEEDED(dev->CreateTexture2D(&gd, &di, &dt)) &&
+                       SUCCEEDED(dev->CreateShaderResourceView(dt, nullptr, &ds));
+                std::vector<float> gotMv, gotDp;
+                bridge.SetSource(kIw, kIh, rw, rh);
+                const bool ok = made && bridge.Guides(ctx, 0, ms, ds, kIw, kIh) &&
+                                bridge.TestReadGuides(ctx, 0, gotMv, gotDp) && gotDp.size() == (size_t)kIw * kIh;
+                bridge.SetSource(0, 0, 0, 0);
+                if (!ok) {
+                    printf("NR bridge: guides at the render size failed: %s\n", bridge.why().c_str());
+                    ++bad;
+                }
+                const float scaleX = (float)rw / (float)kIw, scaleY = (float)rh / (float)kIh;  // as the bridge's
+                for (UINT y = 0; ok && y < kIh; ++y)
+                    for (UINT x = 0; x < kIw; ++x) {
+                        const UINT sx = rw == kIw ? x : (UINT)((x + 0.5f) * scaleX);
+                        const UINT sy = rh == kIh ? y : (UINT)((y + 0.5f) * scaleY);
+                        const size_t si = (size_t)sy * rw + sx, i = (size_t)y * kIw + x;
+                        const float wx = -mv[si * 2] * kIw, wy = -mv[si * 2 + 1] * kIh;
+                        const bool off = gotDp[i] != dp[si] ||
+                                         std::fabs(gotMv[i * 2] - wx) > 1e-3f * (1 + std::fabs(wx)) ||
+                                         std::fabs(gotMv[i * 2 + 1] - wy) > 1e-3f * (1 + std::fabs(wy));
+                        if (off && bad < 5)
+                            printf("  guides (%u, %u): motion %g %g depth %g, want %g %g %g\n", x, y, gotMv[i * 2],
+                                   gotMv[i * 2 + 1], gotDp[i], wx, wy, dp[si]);
+                        bad += off;
+                    }
+                if (ds) ds->Release();
+                if (dt) dt->Release();
+                if (ms) ms->Release();
+                if (mt) mt->Release();
+            }
+            printf("NR bridge: guides at the render size (43x32 for 64x48) and at the image's size: %zu pixels off\n",
+                   bad);
+            if (bad) ++fails;
         }
 
         const qvfr::nrbridge::Stats s = bridge.stats();

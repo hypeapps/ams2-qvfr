@@ -18,11 +18,12 @@ namespace qvfr::nr {
 // view: dlaa's view index (1 outer L, 2 outer R, 3 focus L, 4 focus R; outer only in mode=final with outer on).
 bool Wanted(int view);
 // The DLAA result (w x h, an SRV and a UAV of the same texture) through the bridge. motion: the motion vectors DLAA
-// used (R16G16_FLOAT, uv now - uv before), depth: its linear depth (R32_FLOAT); either may be null. reset: DLAA reset
-// its history in this evaluation. Guards itself (SEH); a failure turns NR off for the session and leaves the DLAA
+// used (R16G16_FLOAT, uv now - uv before), depth: its linear depth (R32_FLOAT); either may be null; both rendered at
+// inW x inH (the top left of their textures; smaller than w x h with DLSS super resolution). reset: DLAA reset its
+// history in this evaluation. Guards itself (SEH); a failure turns NR off for the session and leaves the DLAA
 // result.
 void Process(ID3D11DeviceContext* c, int view, ID3D11ShaderResourceView* srv, ID3D11UnorderedAccessView* uav,
-             ID3D11Resource* motion, ID3D11Resource* depth, UINT w, UINT h, bool reset);
+             ID3D11Resource* motion, ID3D11Resource* depth, UINT w, UINT h, UINT inW, UINT inH, bool reset);
 // Render thread, at the composition (quad.cpp, before compose::Draw): true when the eyes' final images go through the
 // model (mode=final; the outer ones too with [nr] outer).
 bool WantedFinal();
@@ -38,6 +39,12 @@ void ProcessFinal(ID3D11DeviceContext* c, int eye, ID3D11Texture2D*& focus, ID3D
 // Live on/off ([nr] key, benchmark switch `nr`).
 bool Active();
 void SetActive(bool on);
+// The tuning panel's switch: NR on the final images now. On also works with [nr] mode=off in the ini, for this session
+// (SessionOn) until the panel saves it to the ini (then ClearSession) or the settings turn NR off.
+bool FinalOn();
+void SetFinal(bool on);
+bool SessionOn();
+void ClearSession();
 // Live settings over the ini: the benchmark sequence switches (quad.cpp) and the tuning panel (panel.cpp).
 // nr_outer 0/1, nr_batch 0/1, nr_outer_res (source pixels per outer pixel in the atlas, 1..4), nr_outer_area (the outer images'
 // centre part through the model, percent 50..100), nr_preset 0..3, nr_style 0..3, nr_strength (percent 0..300),

@@ -225,8 +225,10 @@ public:
         callers::Note(site);
         frame::OnWaitGetPosesBegin();
         probe::OnFrameStart();
-        quad::OnFrameStart();
+        // DLAA's hotkey first: quad's frame start puts the DLSS SR scene sets in only for a frame in which DLSS runs
+        // (else the switch's frame has scene sets without DLSS, or DLSS without them: DLAA at the eye size).
         dlaa::OnFrameStart();
+        quad::OnFrameStart();
         sr::OnFrameStart(dlaa::SrWanted());
         double t0 = NowMs();
         vr::EVRCompositorError err = CompositorWrapBase::WaitGetPoses(render, nRender, game, nGame);

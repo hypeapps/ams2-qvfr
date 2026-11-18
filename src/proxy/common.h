@@ -163,6 +163,9 @@ struct Config {
     // NVIDIA Multi-View Rendering, gate B6 (mvr_vs.h): the game's vertex shaders patched and made through NVAPI.
     // [debug] key for development (with [mvr] mode=mvr); a change needs a restart.
     bool mvrVsPatch = true;
+    // B20 K1 (mvr_vs.h): the patched vertex shaders also take view 0's transform from slot 3, only while its key row
+    // holds the magic value (view 0 draws as before otherwise). [debug] mvr_vs_view0; a change needs a restart.
+    bool mvrVsView0 = true;
     // Gate B9b (mvr_ps.h): with mvr_vs_patch, the game's pixel shaders that read screen inputs or screen textures are
     // patched for an extra MVR view (view 0 draws as before). [debug] key; a change needs a restart.
     bool mvrPsPatch = true;
@@ -189,6 +192,15 @@ struct Config {
     int mvrEarly = 1;
     int mvrEarlyKey = 0;
     int mvrMapKey = 0;
+    // DLSS SR in quad views (dlaa-plan S2.1, sr_probe.h): sr_probe_modifier + sr_probe_key (testers: VK_DELETE) reads the
+    // constant buffers of the next frame's draws in the eye groups and logs the ones that hold a render, view or game
+    // size (0 = off; the instanced draw hooks only exist with a key set).
+    int srProbeKeyMod = VK_RCONTROL;
+    int srProbeKey = 0;
+    // DLSS SR in quad views (sr_cb.h): the constants of the passes after the TAA resolve set to the view size (live);
+    // sr_probe_modifier + sr_cb_fix_key toggles it (testers: VK_PRIOR).
+    bool srCbFix = true;
+    int srCbFixKey = 0;
     // Live: a shot compares focus L's own G-buffer pass with outer's stash (B8); 0 = the shot shows the frame as it runs.
     bool mvrShotCompare = false;
     // Live, gate B9c (mvr_pass.h): with mvr_early=1 and mvr_ps_patch, a shot also runs outer L's forward pass
@@ -201,10 +213,15 @@ struct Config {
     int mvrForwardKey = 0;
     // Live: the depth the live forward pass leaves in focus's clone (the game's later passes test against it): 0 as MVR
     // drew it, 1 plus mvr_depth_bias float steps, 2 conservative like the G-buffer stash (dilate, slope, bias), 3 as
-    // drawn with the velocity pass on a conservative copy (mvr_pass.h). The hotkey (mvr_modifier +
+    // drawn with the velocity passes (focus's, and outer's in the corner layout) on a conservative copy (mvr_pass.h).
+    // The hotkey (mvr_modifier +
     // mvr_forward_depth_key; testers: VK_PRIOR) cycles them.
     int mvrForwardDepth = 3;
     int mvrForwardDepthKey = 0;
+    // [debug] test_modifier + test_key (testers, live): one hotkey steps through the scenarios of the current in-game
+    // test (common.cpp kTestScenarios: each sets live settings over the ini's; step 0 is the ini as it is).
+    int testKeyMod = VK_RCONTROL;
+    int testKey = 0;
     // Live (docs/mvr.md B10, mvr_motion.h): with the live forward, DLSS gets the focus views' motion vectors made from
     // outer's (the geometry the focus image shows) in place of the focus velocity pass's. The hotkey (mvr_modifier +
     // mvr_velocity_key; testers: VK_PAUSE) toggles it.
@@ -214,6 +231,13 @@ struct Config {
     // into its target at its first draw and skips its draws (CPU). The hotkey (mvr_modifier + mvr_velocity_skip_key)
     // toggles it.
     bool mvrVelocitySkip = true;
+    // Live ([debug] mvr_outlier_px, shaders/mvr_motion.hlsl): an outer texel whose motion is more than this many outer
+    // pixels off the shortest depth-matching one around it counts as an outlier; 0 = off. High enough to leave the road
+    // at a nearby car's tyres alone (same depth, tens of pixels more motion) and still catch vectors hundreds of pixels off.
+    float mvrOutlierPx = 128.0f;
+    // Live ([debug] mvr_outer_vel_cons, mvr_pass.h mvr_forward_depth): in mode 3 and the corner layout (B20) outer's
+    // velocity pass draws on a conservative copy of outer's forward depth (off: the night artefacts of 2026-11-17).
+    bool mvrOuterVelCons = true;
     int mvrVelocitySkipKey = 0;
     // Live (docs/mvr.md B13, mvr_pass.h): the G-buffer pass's patched pixel shaders get view 1's rows and the live track
     // map read in the focus window, as in the forward pass. The hotkey (mvr_modifier + mvr_gbuffer_ps_key) toggles it.
@@ -222,6 +246,9 @@ struct Config {
     // Live (docs/mvr.md B15, mvr_pass.h): the G-buffer pass's corners of slice 1 go straight into focus's clones instead
     // of through the stash. The hotkey (mvr_modifier + mvr_direct_extract_key) toggles it.
     bool mvrDirectExtract = true;
+    // B20 K2 (mvr_pass.h): with outer smaller than the game's size, outer's G-buffer pass in the corner layout.
+    // [debug] mvr_corner (live from the ini).
+    bool mvrCorner = true;
     int mvrDirectExtractKey = 0;
     // Live (docs/mvr.md B17, mvr_pass.h): the G-buffer pass's targets become the game's own two-slice arrays (no copy
     // of slice 0 in or back). The hotkey (mvr_modifier + mvr_native_key) toggles their use (off: copies as before).
@@ -235,6 +262,13 @@ struct Config {
     // outer R draws focus R into slice 2, and focus's clones of them are slices 1 (focus L) and 2 (focus R) of the
     // array itself (no copy out of the corner).
     bool mvrMsSlices = true;
+    // Restart only (docs/mvr.md B20 K5b, mvr_pass.h): in the corner layout without DLSS SR (focus at the game's size) the
+    // G-buffer pass's colors become three-slice arrays whose slices 1 and 2 are focus L's and focus R's clones of them
+    // (no extract copy), and the pass's other copies get three slices (outer R draws view 1 into slice 2).
+    bool mvrGbufferSlices = true;
+    // Restart only (docs/mvr.md B20 K4): the original bytecode of every pixel shader the MVR PS patch changes goes to
+    // x64\qvfr\ps_dump\<checksum>.dxbc (for a disassembly: how the game's forward PS read their screen textures).
+    bool mvrPsDump = false;
     // Live (docs/mvr.md B19, mvr_pass.h): a focus group skips its own live track map (CLiveTrackBuildCommandThread and
     // CLiveTrackRender) when its G-buffer and forward come from outer. The hotkey (mvr_modifier +
     // mvr_livetrack_skip_key) toggles it.
@@ -252,11 +286,17 @@ struct Config {
     // [dlaa] (prototype: NVIDIA DLSS in DLAA mode replaces the game's TAA resolve; needs TAA on in the game and a
     // proxy built with the DLSS SDK)
     bool dlaa = false;                // mode=dlaa or dlss (a change needs a restart)
-    // mode=dlss (dlaa-plan S1, stereo only): the scene renders at render_scale of the eye size into the clones
-    // (sr.h) and DLSS Super Resolution scales it to the eye size at the TAA resolve. Restart for both.
+    // mode=dlss (dlaa-plan S1 in stereo, S2 in quad views): the scene renders at a render scale of each view's size into
+    // the clones (sr.h, clones.h scene sets) and DLSS Super Resolution scales it to the view's size at the TAA resolve.
+    // Quad views: outer_render_scale and focus_render_scale, each render_scale when absent. mode needs a restart; the
+    // scales are live in a game started with mode=dlss (mode=dlaa then means 1, the SR passes stay).
     bool dlaaSr = false;
     float dlaaRenderScale = 0.67f;
+    float dlaaOuterRenderScale = 0.67f;
+    float dlaaFocusRenderScale = 0.67f;
     int dlaaPreset = 0;               // DLSS render preset hint for DLAA: 0 = DLSS default, 10 = J, 11 = K, ...
+    int dlaaOuterPreset = 0;          // quad views: outer_preset and focus_preset, each preset when absent (live)
+    int dlaaFocusPreset = 0;
     float dlaaJitterScaleX = 0.5f;    // DLSS jitter in pixels = the engine's projection offset * scale
     float dlaaJitterScaleY = -0.5f;
     bool dlaaMvJittered = false;      // the engine's motion vectors include the jitter
@@ -265,17 +305,20 @@ struct Config {
     bool dlaaAutoExposure = false;    // DLSS auto exposure (0 = dlaaExposure)
     float dlaaExposure = 0.002f;      // with auto exposure off: fixed DLSS exposure (0 = DLSS default 1)
     float dlaaExposureScale = 1.0f;   // DLSS exposure scale (multiplies the auto or fixed exposure)
-    float dlaaBiasMask = 0.0f;        // DLSS bias-current-color mask value at stencil bit 0x200 pixels (0 = no mask)
+    float dlaaBiasMask = 0.0f;        // DLSS bias-current-color mask value on the displays (stencil 0x88; 0 = no mask;
+                                      // diagnostic: DLSS 310.9 preset K ignores it)
     bool dlaaSkipLocks = true;        // skip the engine's TAA locks pass while DLAA replaces the resolve
     int dlaaKeyMod = VK_RCONTROL;     // DLAA <-> the game's TAA (A/B comparison)
     int dlaaKey = 0;                  // testers: VK_F1 (F4 is focus culling in quad mode)
     int dlaaExpKeyMod = VK_RCONTROL;  // DLSS exposure steps (testers, dlaa.cpp kExpSteps)
     int dlaaExpKey = 0;               // testers: VK_F12
-    // From the game's TAA instead of DLSS: 0 nothing, 1 displays and mirrors (stencil 0x88xx), 2 also the rest of the
-    // player's car (0x80xx). DLSS smears changing digits (dlaa-plan D4, tests 2-7).
+    // Pixels DLSS must not keep in its history (it smears changing digits, dlaa-plan D4 tests 2-7): 0 nothing, 1 displays
+    // and mirrors (stencil 0x88xx), 2 also the rest of the player's car (0x80xx). They take the current frame alone in
+    // the displays pass after DLSS (dlaa.cpp DisplaysNow); with DLAA and display_pass=0 the game's TAA instead.
     int dlaaCockpitTaa = 1;
-    int dlaaPresetKeyMod = VK_RCONTROL;  // DLSS preset steps: ini, J, K, M, L (testers)
-    int dlaaPresetKey = 0;               // testers: VK_HOME
+    // [dlaa] display_pass (live, not in the default ini): with DLAA too the displays pass instead of the game's TAA (no TAA
+    // draw, copy and composition; the locks pass is skipped). 0 = the game's TAA, the way before 2026-11-17.
+    bool dlaaDisplayPass = true;
     // [nr] (prototype NR-P1, dlaa-plan D7; not in the default ini): 0 off, 1 focus = after DLAA the focus views go
     // through the NR bridge (nr.h; step 1: passthrough without a model); 2 final = the finished focus images at the
     // composition (motion vectors and depth from DLAA). Live, like its hotkey.
@@ -342,6 +385,8 @@ void LoadConfig();                    // creates a default qvfr.ini if it does n
 // (listed at the end of the default ini) and logs the ones that need a restart. True when it reloaded. now: check at
 // once (the tuning panel after it saved).
 bool ReloadConfig(bool now = false);
+// Render thread, every frame after ReloadConfig: the test hotkey ([debug] test_key) steps the test scenario.
+void TestScenarioFrame();
 
 fs::path ModuleDir();                 // folder of the proxy DLL (the game's x64\)
 fs::path BaseDir();                   // %QVFR_HOME% (tests) or x64\qvfr; %TEMP%\ams2-qvfr when x64\qvfr is not writable

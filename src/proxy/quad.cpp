@@ -32,6 +32,8 @@
 #include "mvr_vs.h"
 #include "nr.h"
 #include "shots.h"
+#include "sr_cb.h"
+#include "sr_probe.h"
 #include "sun_fx.h"
 #include "taa_views.h"
 
@@ -40,6 +42,15 @@ namespace qvfr::quad {
 namespace {
 
 using hooks::Anchor;
+
+// DLSS SR in quad views (docs/dlaa-plan.md S2): [dlaa] mode=dlss in a proxy built with the DLSS SDK.
+bool SrConfigured() {
+#ifdef QVFR_HAVE_DLSS
+    return Cfg().dlaa && Cfg().dlaaSr;
+#else
+    return false;
+#endif
+}
 
 // Engine layout from M3 and M4.1 (docs/ams2-renderer.md), AMS2AVX.exe build aa43bd68.
 constexpr size_t kTaskCtx = 0x860;       // eye tasks: render context pointer
@@ -342,13 +353,13 @@ bool MotionWindows(int eye, mvrmotion::Map* cur, mvrmotion::Map* prev, bool* fro
 
 // mvr_pass's velocity fill (B11): mvr_motion writes into the focus velocity pass's target, except in a shot frame
 // (the shot compares mvr_motion's vectors with the velocity pass's).
-bool FillFocusMotion(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, ID3D11Texture2D* target,
+bool FillFocusMotion(ID3D11DeviceContext* c, int eye, ID3D11Texture2D* depth, UINT slice, ID3D11Texture2D* target,
                      const char** why) {
     if (g_shotFrame) {
         *why = "shot frame";
         return false;
     }
-    return mvrmotion::FillFocus(c, eye, depth, target, dlaa::Frame(), why);
+    return mvrmotion::FillFocus(c, eye, depth, target, dlaa::Frame(), why, slice);
 }
 bool g_mvrMapKeyDown = false;
 bool g_mapFrame = false;  // a task map with PS resources in this frame (mvr_map_key)
@@ -693,14 +704,23 @@ void QueueBreakdownLocked(uint8_t* ctx, int group) {
 }
 
 // O2 step 3, [debug] mvr_velocity_record_skip (live): a focus group whose G-buffer, forward and velocity come from
-// outer in this frame (B11 filled the velocity pass from outer in the previous frame too) has its forward recording
-// armed: its velocity sub-passes submit only until the first draw (fwd_rec.h). Checked at the group's CEndEye.
+// outer in this frame (B11 filled the velocity pass from outer in the previous frame too, and this frame's settings
+// still let it fill) has its forward recording armed: its velocity sub-passes submit only until the first draw
+// (fwd_rec.h). Checked at the group's CEndEye.
 void VelocityRecordLocked(int group) {
     if (group < FocusL || group > FocusR) return;
     const int eye = group - FocusL;
     if (!g_vrOn || g_fault.load(std::memory_order_relaxed)) return;
     const char* why = g_vrStopped ? "stopped: an armed group got no outer vectors" : mvrpass::FromOuterWhy(eye);
+    // A live switch at this frame's start (forward depth mode, B10, B11) leaves this frame's velocity pass without
+    // outer's vectors although the previous one had them.
+    if (!why) why = mvrpass::VelocityFillWhy();
+    if (!why && !mvrmotion::Enabled()) why = "mvr_velocity off";
     if (!why && !mvrpass::VelocityFilled(eye, true)) why = "the velocity pass did not get outer's vectors last frame";
+    // The frame of a switch to the game's TAA (DLAA hotkey): no DLSS evaluation stores outer's vectors for the fill.
+    if (!why && !dlaa::DlssNow()) why = "DLSS does not run in this frame (no copy of outer's vectors)";
+    // A shot frame: FillFocusMotion leaves the velocity pass to the engine (the shot compares both).
+    if (!why && g_shotFrame) why = "shot frame (the velocity pass draws its own)";
     if (g_vrEye >= 0) {  // a group whose CEndEye did not end its arming
         fwdrec::Disarm();
         g_vrEye = -1;
@@ -2508,7 +2528,7 @@ void EarlyFocus(int eye) {
             why = "a view swap is active";
             return;
         }
-        if (!clones::IsReady()) {
+        if (!clones::IsReady(true)) {  // outer's clones may be in (B20 K3: corner layout, DLSS SR)
             why = "the clones are not ready";
             return;
         }
@@ -2534,7 +2554,9 @@ void EarlyFocus(int eye) {
     const gpu::Span span = eye ? gpu::EarlyR : gpu::EarlyL;
     gpu::SpanBegin(span);
     ID3D11DeviceContext* imm = gpu::Context();
-    clones::EndGroup(imm);  // outer's (no clones of its own in the game's render size)
+    // Outer's set out (its clones in the corner layout, B20 K3; its scene clones with DLSS SR), focus's in (its clones,
+    // its scene clones, or none at the game's size: the engine's textures); BeginGroup(Outer) below puts outer's back.
+    clones::EndGroup(imm);
     clones::BeginGroup(imm, clones::Focus);
     bool ran = false, ok = true;
     if (mvrpass::GetEarly() == 3) {  // diagnosis: the swap and both CBeginEye, no task moved
@@ -2721,6 +2743,30 @@ void ShotRectsLocked(const focus::Eye* eye) {
     }
 }
 
+uint32_t SizePx(double v) { return (uint32_t)std::clamp(std::lround(v), 16L, 16384L); }
+
+// DLSS SR (S2): the scene phase of each view at its render scale of the view's size. At the start, and at a frame start
+// after the scales changed in qvfr.ini (a DLSS mode picked while the game runs).
+uint32_t g_srSizes[4] = {};
+int g_srScaleSwitch[2] = {-1, -1};  // benchmark sequence: outer's and focus's scale in percent over the ini's; -1 = not set
+float SrScale(int which, float ini) {
+    return g_srScaleSwitch[which] > 0 ? std::clamp(g_srScaleSwitch[which], 33, 100) / 100.0f : ini;
+}
+void ApplySrScalesLocked() {
+    const Config& c = Cfg();
+    const float so = SrScale(0, c.dlaaOuterRenderScale), sf = SrScale(1, c.dlaaFocusRenderScale);
+    const uint32_t r[4] = {SizePx(g_focus.outerW * (double)so), SizePx(g_focus.outerH * (double)so),
+                           SizePx(g_focus.focusTexW * (double)sf), SizePx(g_focus.focusTexH * (double)sf)};
+    if (std::equal(r, r + 4, g_srSizes)) return;
+    const bool live = g_srSizes[0] != 0;
+    std::copy(r, r + 4, g_srSizes);
+    clones::SetSceneSizes(r[0], r[1], r[2], r[3]);
+    mvrpass::SetSceneSizes(r[0], r[1], r[2], r[3]);
+    if (live) dlaa::OnSrScalesChanged(sf, so);
+    Log("Quad: DLSS SR%s: outer's scene at %u x %u -> %u x %u, focus's at %u x %u -> %u x %u", live ? " (changed live)" : "",
+        r[0], r[1], g_focus.outerW, g_focus.outerH, r[2], r[3], g_focus.focusTexW, g_focus.focusTexH);
+}
+
 // First size query of a VR session: the focus window. Only with the engine hooks and the builder patch in place, so a
 // game without focus groups keeps its full size.
 void SetupLocked(vr::IVRSystem* real) {
@@ -2746,16 +2792,18 @@ void SetupLocked(vr::IVRSystem* real) {
     }
     // Texture sizes as in mbucchia: multiplier x SteamVR size (focus: x section too). The game renders all four views
     // at its one size, so it gets the larger per axis.
-    auto px = [](double v) { return (uint32_t)std::clamp(std::lround(v), 16L, 16384L); };
-    g_focus.outerW = px(c.peripheralMultiplier * g.gridW);
-    g_focus.outerH = px(c.peripheralMultiplier * g.gridH);
-    g_focus.focusTexW = px((double)c.focusMultiplier * secX * g.gridW);
-    g_focus.focusTexH = px((double)c.focusMultiplier * secY * g.gridH);
+    g_focus.outerW = SizePx(c.peripheralMultiplier * g.gridW);
+    g_focus.outerH = SizePx(c.peripheralMultiplier * g.gridH);
+    g_focus.focusTexW = SizePx((double)c.focusMultiplier * secX * g.gridW);
+    g_focus.focusTexH = SizePx((double)c.focusMultiplier * secY * g.gridH);
     g_focus.gameW = std::max(g_focus.outerW, g_focus.focusTexW);
     g_focus.gameH = std::max(g_focus.outerH, g_focus.focusTexH);
     g_focus.on = true;
     clones::SetSizes(g_focus.gameW, g_focus.gameH, g_focus.outerW, g_focus.outerH, g_focus.focusTexW,
                      g_focus.focusTexH);
+    mvrpass::SetSizes(g_focus.gameW, g_focus.gameH, g_focus.outerW, g_focus.outerH, g_focus.focusTexW,
+                      g_focus.focusTexH);
+    if (SrConfigured()) ApplySrScalesLocked();
     g_focus.engaged = true;
     for (int i = 0; i < 2; ++i) {
         float cx = 0, cy = 0;
@@ -2867,6 +2915,13 @@ void Install() {
         g_patched = WritePatch(true);
         // Clones (M7.3): the factory hooks must be in place before the engine creates its render target pool.
         if (g_patched) clones::InstallEngineHooks();
+        // DLSS SR (dlaa-plan S2): each group's scene phase in its kind's scene set at the render size.
+        if (g_patched && SrConfigured()) {
+            clones::SetSr(true);
+            Log("Quad: DLSS SR: the scene renders at outer_render_scale %.3f of outer's size and focus_render_scale "
+                "%.3f of focus's, DLSS scales it to the view size at the TAA resolve",
+                Cfg().dlaaOuterRenderScale, Cfg().dlaaFocusRenderScale);
+        }
         // Sun effects: the shader creation hook must be in place before the game makes its effect shaders.
         if (g_patched) sunfx::Install();
         // MVR gate B6: the vertex shader hook must be in place before the game makes its scene shaders.
@@ -2887,6 +2942,7 @@ void Install() {
         else if (g_patched)
             Log("Quad: no add-task hook; no quad <-> outer only switch");
         // MVR gate B8: needs the patched VS (mvr_vs) and the executor thunk (it skips the focus groups' pass).
+        // S2.2: with DLSS SR the G-buffer pass runs at the scene sets' render sizes (mvrpass::SetSceneSizes).
         if (Cfg().mvrGbuffer && g_execPatched && Cfg().mvrVsPatch) {
             mvrpass::SetJitterSource(&dlaa::FrameJitter);
             mvrpass::Install();
@@ -2953,6 +3009,13 @@ void OnFrameStart() {
         HandleToolsLocked();
         mvrpass::OnFrameStart(g_mvrOn);  // reports the comparison of the previous shot frame
         HandleShotLocked();
+        // DLSS SR: the scene sets only while DLSS runs (setting, hotkey, no failure), else the views' own sizes.
+        srprobe::OnFrameStart(gpu::Context());  // S2.1: the probed frame's report, the hotkey
+        srcb::OnFrameStart();
+        if (g_focus.engaged && SrConfigured()) ApplySrScalesLocked();
+        const bool srNow = SrConfigured() && dlaa::SrWanted();
+        clones::SetSrActive(srNow);
+        mvrpass::SetSrActive(srNow);
         clones::OnFrameStart(gpu::Context(), g_clonesOn && g_focus.on);
         sunfx::OnFrameStart(gpu::Context(), g_sunOn && g_focus.on && !g_frameSkip);
         mvrvs::OnFrameStart(gpu::Context());
@@ -3077,6 +3140,9 @@ void OnSubmitBegin(vr::EVREye eye, const vr::Texture_t* tex) {
             g_d3dHooked ? "installed" : "FAILED");
         if (g_d3dHooked) clones::InstallD3DHooks(imm);
         if (g_d3dHooked) mvrpass::InstallD3DHooks(imm);
+        // S2.1: constants after TAA at the view size (S2.2: the instanced draws through mvr_pass's hooks when it has them)
+        if (g_d3dHooked && SrConfigured()) srcb::Install(imm, !mvrpass::InstancedDrawHooks());
+        if (g_d3dHooked && SrConfigured()) srprobe::Install(imm);  // S2.1 probe (only with [debug] sr_probe_key)
     });
 }
 
@@ -3186,6 +3252,7 @@ void LogStats(bool totals) {
         }
         g_st = Stats{};
         clones::LogStats(totals);
+        srcb::LogStats(totals);
         sunfx::LogStats(totals);
         mvrvs::LogStats(totals);
         mvrps::LogStats(totals);
@@ -3273,6 +3340,14 @@ const Switch kSwitches[] = {
          g_qbOn = v != 0;
          g_qbWant = g_qbOn ? (1u << OuterL) | (1u << FocusL) : 0;
      }},
+    // DLSS, over the ini (-1 = the ini's): presets as NVIDIA numbers them (10 J, 11 K, 12 L, 13 M), scales in percent.
+    {"dlss_preset", false, -1, 15, [] { return dlaa::GetPresetSwitch(0); }, [](int v) { dlaa::SetPresetSwitch(0, v); }},
+    {"dlss_preset_outer", false, -1, 15, [] { return dlaa::GetPresetSwitch(1); },
+     [](int v) { dlaa::SetPresetSwitch(1, v); }},
+    {"dlss_preset_focus", false, -1, 15, [] { return dlaa::GetPresetSwitch(2); },
+     [](int v) { dlaa::SetPresetSwitch(2, v); }},
+    {"dlss_scale_outer", false, -1, 100, [] { return g_srScaleSwitch[0]; }, [](int v) { g_srScaleSwitch[0] = v; }},
+    {"dlss_scale_focus", false, -1, 100, [] { return g_srScaleSwitch[1]; }, [](int v) { g_srScaleSwitch[1] = v; }},
 };
 
 const Switch* FindSwitch(const std::string& name, std::string* why) {
@@ -3280,6 +3355,15 @@ const Switch* FindSwitch(const std::string& name, std::string* why) {
         if (name != s.name) continue;
         if (s.mvr && !mvrpass::On()) {
             if (why) *why = name + ": MVR is not installed ([debug] mvr_gbuffer=1)";
+            return nullptr;
+        }
+        // A step that could not take effect would measure the wrong thing under its label.
+        if (name.rfind("dlss_", 0) == 0 && !Cfg().dlaa) {
+            if (why) *why = name + ": NVIDIA DLSS is off ([dlaa] mode)";
+            return nullptr;
+        }
+        if (name.rfind("dlss_scale", 0) == 0 && !SrConfigured()) {
+            if (why) *why = name + ": needs a game started with [dlaa] mode=dlss";
             return nullptr;
         }
         return &s;
@@ -3372,6 +3456,8 @@ const char* RunSuffix() {
 void Shutdown() {
     if (!g_installed) return;
     g_on = false;
+    srprobe::Shutdown();
+    srcb::Shutdown();
     // The patch goes first: a builder call without the ctor hooks must not see the patched loop.
     Guard("Shutdown", [&] {
         std::lock_guard lock(g_m);

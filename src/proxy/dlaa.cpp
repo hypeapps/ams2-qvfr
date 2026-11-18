@@ -29,6 +29,7 @@
 #include <nvsdk_ngx_helpers_d3d.h>
 
 #include "dlaa_cockpit_cs.h"  // kDlaaCockpitCS (fxc from shaders/dlaa.hlsl)
+#include "dlaa_displays_cs.h"  // kDlaaDisplaysCS
 #include "dlaa_mask_cs.h"     // kDlaaMaskCS
 #include "sr_color_ps.h"       // kSrColorPS (fxc from shaders/sr.hlsl)
 #include "sr_depth_ps.h"       // kSrDepthPS
@@ -71,10 +72,23 @@ uint64_t g_lastViewEvals[kViews] = {};
 bool g_viewLogged[kViews] = {};  // first DLSS evaluation of the view logged
 bool g_keyDown = false;
 bool g_expKeyDown = false;
-bool g_presetKeyDown = false;
-bool g_sr = false;  // DLSS SR (sr.h): [dlaa] mode=dlss in stereo
-// Displays/cockpit from the game's TAA (ini, read live); not with DLSS SR (the game's TAA would run at the render size).
-int CockpitTaaNow() { return g_sr ? 0 : Cfg().dlaaCockpitTaa; }
+bool g_sr = false;  // DLSS SR: [dlaa] mode=dlss (sr.h in stereo, S2 in quad views)
+// Displays/cockpit from the game's TAA (ini, read live); not with DLSS SR (the game's TAA would run at the render size)
+// and not with [dlaa] display_pass (the displays pass takes these pixels).
+int CockpitTaaNow() { return g_sr || Cfg().dlaaDisplayPass ? 0 : Cfg().dlaaCockpitTaa; }
+// DLSS's bias-current-color mask ([dlaa] bias_mask, diagnostic, shaders/dlaa.hlsl), 0 = none. DLSS 310.9 with preset K
+// ignores it, even on the whole image (dlaa-plan S2.4 A, run 2).
+float MaskValueNow() { return Cfg().dlaaBiasMask; }
+// Stencil high byte bits of the mask and the displays pass (as CSCockpit's): 0x88 displays and mirrors, 0x80 the whole
+// player's car.
+uint32_t MaskBitsNow() { return Cfg().dlaaCockpitTaa >= 2 ? 0x80 : 0x88; }
+const char* MaskBitsText(uint32_t bits) {
+    return bits == 0x80 ? "displays, mirrors and the player's car" : "displays and mirrors";
+}
+// Displays pass (cockpit_taa > 0 instead of the game's TAA; with DLSS SR always, else with [dlaa] display_pass;
+// shaders/dlaa.hlsl CSDisplays): after DLSS the displays and mirrors take the current frame alone (DLSS leaves trails
+// of changing digits there).
+bool DisplaysNow() { return Cfg().dlaaCockpitTaa > 0 && (g_sr || Cfg().dlaaDisplayPass); }
 const char* CockpitText(int mode) {
     return mode == 0 ? "nothing" : mode == 1 ? "displays and mirrors" : "displays, mirrors and the player's car";
 }
@@ -102,20 +116,29 @@ float ExposureScaleNow() {
     if (s == 0) return Cfg().dlaaExposureScale;
     return kExpSteps[s].autoExp ? kExpSteps[s].value : 1.0f;
 }
-// Preset hotkey ([dlaa] preset_key): step 0 = the ini preset, then J, K, M, L.
-constexpr int kPresetSteps[] = {-1, 10, 11, 13, 12};
-constexpr int kPresetStepCount = (int)(sizeof(kPresetSteps) / sizeof(kPresetSteps[0]));
-std::atomic<int> g_presetStep{0};
-int PresetNow() {
-    const int s = g_presetStep.load();
-    return s == 0 ? Cfg().dlaaPreset : kPresetSteps[s];
+// Benchmark sequence switches: the preset of all views, of outer's, of focus's; -1 = not set.
+std::atomic<int> g_presetSwitch[3] = {-1, -1, -1};
+// The preset of a view (kViewName): a benchmark switch, else the ini's for that kind of view.
+int PresetFor(int view) {
+    const int kind = view == 0 ? g_presetSwitch[0].load() : g_presetSwitch[view <= 2 ? 1 : 2].load();
+    if (kind >= 0) return kind;
+    if (g_presetSwitch[0].load() >= 0) return g_presetSwitch[0].load();
+    const Config& c = Cfg();
+    return view == 0 ? c.dlaaPreset : view <= 2 ? c.dlaaOuterPreset : c.dlaaFocusPreset;
+}
+std::string PresetName(int p) {
+    char buf[16];
+    snprintf(buf, sizeof(buf), p > 0 ? "%c" : "default", 'a' + p - 1);
+    return buf;
 }
 std::string ExposureText() {
-    char buf[96];
+    char buf[128];
     const float e = ExposureNow(), k = ExposureScaleNow();
-    const int p = PresetNow();
-    char preset[16];
-    snprintf(preset, sizeof(preset), p > 0 ? "%c" : "default", 'a' + p - 1);
+    const int outer = PresetFor(1), focus = PresetFor(3);
+    const std::string names = Cfg().quadMode == QuadMode::Off ? PresetName(PresetFor(0))
+                              : outer == focus               ? PresetName(outer)
+                                                             : "outer " + PresetName(outer) + ", focus " + PresetName(focus);
+    const char* preset = names.c_str();
     if (AutoExposureNow())
         snprintf(buf, sizeof(buf), "exposure auto x %g, preset %s", k, preset);
     else if (e > 0)
@@ -126,6 +149,9 @@ std::string ExposureText() {
 }
 std::atomic<uint64_t> g_frame{0};
 std::atomic<uint64_t> g_lastOkFrame{0};  // frame of the last DLSS evaluation (locks may be skipped)
+// A view's DLSS feature that a newer one of the same view replaced (another size: a transition frame, a changed
+// render scale) is released once it has not run for this many frames.
+constexpr uint64_t kFeatureIdleFrames = 300;
 std::atomic<uint32_t> g_lastCtx{0};      // render context of the last recorded TAA resolve (jitter index)
 int g_diagLogs = 0;
 
@@ -153,6 +179,26 @@ void SetState(const std::string& s) {
     std::lock_guard lock(g_sm);
     g_state = s;
     diag::Set("DLAA", s);
+}
+
+// The state while DLSS runs; with DLSS SR it names the render scales in use.
+bool g_ran = false, g_ranQuad = false;
+float g_scaleNow[2] = {-1, -1};  // focus (stereo: the eye) and outer after a live change; -1: the ini's at the start
+void SetRunningState(bool quad) {
+    g_ran = true;
+    g_ranQuad = quad;
+    char state[128];
+    const Config& cfg = Cfg();
+    const float focus = g_scaleNow[0] >= 0 ? g_scaleNow[0] : quad ? cfg.dlaaFocusRenderScale : cfg.dlaaRenderScale;
+    const float outer = g_scaleNow[1] >= 0 ? g_scaleNow[1] : cfg.dlaaOuterRenderScale;
+    if (!g_sr)
+        snprintf(state, sizeof(state), "%s (DLSS replaces the game's TAA)", quad ? "on in quad views" : "on");
+    else if (quad)
+        snprintf(state, sizeof(state), "on in quad views (DLSS Super Resolution: focus %.0f%%, peripheral %.0f%%)",
+                 focus * 100, outer * 100);
+    else
+        snprintf(state, sizeof(state), "on (DLSS Super Resolution: %.0f%%)", focus * 100);
+    SetState(state);
 }
 
 template <class F>
@@ -242,6 +288,7 @@ uint32_t g_gen = 0;
 bool g_ngxInit = false;
 NVSDK_NGX_Parameter* g_params = nullptr;
 std::vector<Feature> g_feat;
+std::atomic<size_t> g_featCount{0};  // g_feat.size() for the stats line (another thread)
 std::vector<Scratch> g_scratch;
 int g_evalFails = 0;
 int g_sizeLogs = 0;
@@ -255,7 +302,24 @@ uint32_t g_cockpitCbBits = 0;
 uint64_t g_cockpitEvals = 0;
 ID3D11Buffer* g_maskCb = nullptr;
 float g_maskCbValue = -1;
+uint32_t g_maskCbBits = 0;
 bool g_maskFailed = false;
+bool g_maskSizeLogged = false;
+bool g_maskViewLogged[kViews] = {};
+// Displays pass (DisplaysNow): shader, constants (dispBits, jitter, scale, render size), evaluations.
+ID3D11ComputeShader* g_dispCs = nullptr;
+ID3D11Buffer* g_dispCb = nullptr;
+bool g_dispFailed = false;
+uint64_t g_dispEvals = 0;
+// The mask's and the displays pass's own view of the game's normal/stencil: one slice as a one-slice array (the game's
+// view may be a slice of an array: focus's scene clones with MVR, B20 K5b). Holds the texture; the oldest goes past 8.
+struct StencilView {
+    ID3D11Resource* res = nullptr;
+    UINT slice = 0;
+    DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+    ID3D11ShaderResourceView* srv = nullptr;
+};
+std::vector<StencilView> g_stencilViews;
 ID3D11Texture2D* g_expTex = nullptr;
 float g_expValue = -1;
 uint64_t g_maskEvals = 0, g_expEvals = 0;
@@ -280,6 +344,7 @@ void DropNgxLocked() {
     for (Feature& f : g_feat)
         if (f.handle) NVSDK_NGX_D3D11_ReleaseFeature(f.handle);
     g_feat.clear();
+    g_featCount = 0;
     for (Scratch& s : g_scratch) {
         SafeRelease(s.srv);
         SafeRelease(s.uav);
@@ -294,6 +359,11 @@ void DropNgxLocked() {
     SafeRelease(g_maskCb);
     g_maskCbValue = -1;
     g_maskFailed = false;
+    for (StencilView& v : g_stencilViews) SafeRelease(v.srv);
+    g_stencilViews.clear();
+    SafeRelease(g_dispCs);
+    SafeRelease(g_dispCb);
+    g_dispFailed = false;
     SafeRelease(g_expTex);
     g_expValue = -1;
     DropCarry();
@@ -378,7 +448,9 @@ ID3D11Texture2D* ScratchFor(const D3D11_TEXTURE2D_DESC& like, DXGI_FORMAT fmt, U
         if (s.tex && s.w == like.Width && s.h == like.Height && s.mips == like.MipLevels && s.arr == 1 &&
             s.fmt == fmt && s.bind == bind)
             return s.tex;
-    if (g_scratch.size() >= 12) {
+    // 11 in a DLSS SR session with the mask (2026-11-17): 4 at the eye size from the learning frames, 3-4 per view size.
+    // The oldest goes; one still used in this evaluation must not, so the cap stays well above that.
+    if (g_scratch.size() >= 16) {
         SafeRelease(g_scratch.front().srv);
         SafeRelease(g_scratch.front().uav);
         SafeRelease(g_scratch.front().tex);
@@ -435,6 +507,35 @@ ID3D11ShaderResourceView* SrvFor(ID3D11Texture2D* tex) {
     return nullptr;
 }
 
+// Our one-slice array view of `slice` of the game's normal/stencil in format `fmt` (StencilView).
+ID3D11ShaderResourceView* StencilViewFor(ID3D11Resource* res, UINT slice, DXGI_FORMAT fmt) {
+    for (size_t i = 0; i < g_stencilViews.size(); ++i) {
+        StencilView& v = g_stencilViews[i];
+        if (v.res != res || v.slice != slice || v.fmt != fmt) continue;
+        if (i + 1 != g_stencilViews.size()) std::rotate(g_stencilViews.begin() + i, g_stencilViews.begin() + i + 1,
+                                                        g_stencilViews.end());  // most recent last
+        return g_stencilViews.back().srv;
+    }
+    D3D11_SHADER_RESOURCE_VIEW_DESC d{};
+    d.Format = fmt;
+    d.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+    d.Texture2DArray.MostDetailedMip = 0;
+    d.Texture2DArray.MipLevels = 1;
+    d.Texture2DArray.FirstArraySlice = slice;
+    d.Texture2DArray.ArraySize = 1;
+    StencilView v{res, slice, fmt, nullptr};
+    if (FAILED(g_dev->CreateShaderResourceView(res, &d, &v.srv)) || !v.srv) {
+        v.srv = nullptr;  // kept as a failed entry: not tried (and logged) again each frame
+        Log("DLAA: view of the stencil (slice %u, format %d) failed; no bias mask there", slice, (int)fmt);
+    }
+    if (g_stencilViews.size() >= 8) {
+        SafeRelease(g_stencilViews.front().srv);
+        g_stencilViews.erase(g_stencilViews.begin());
+    }
+    g_stencilViews.push_back(v);
+    return v.srv;
+}
+
 bool EnsureCockpitShader() {
     if (g_cockpitCs && g_cockpitCb) return true;
     D3D11_BUFFER_DESC bd{};
@@ -448,6 +549,24 @@ bool EnsureCockpitShader() {
         return false;
     }
     g_cockpitCbBits = 0;
+    return true;
+}
+
+bool EnsureDisplaysShader() {
+    if (g_dispCs && g_dispCb) return true;
+    if (g_dispFailed) return false;
+    D3D11_BUFFER_DESC bd{};
+    bd.ByteWidth = 32;
+    bd.Usage = D3D11_USAGE_DEFAULT;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    if (FAILED(g_dev->CreateComputeShader(kDlaaDisplaysCS, sizeof(kDlaaDisplaysCS), nullptr, &g_dispCs)) ||
+        FAILED(g_dev->CreateBuffer(&bd, nullptr, &g_dispCb))) {
+        Log("DLAA: the displays shader could not be made; the displays stay as DLSS made them");
+        g_dispFailed = true;
+        SafeRelease(g_dispCs);
+        SafeRelease(g_dispCb);
+        return false;
+    }
     return true;
 }
 
@@ -467,6 +586,7 @@ bool EnsureMaskShader() {
         return false;
     }
     g_maskCbValue = -1;
+    g_maskCbBits = 0;
     return true;
 }
 
@@ -684,6 +804,68 @@ void MeasureShot(ID3D11DeviceContext* c, int view, const char* mode, ID3D11Textu
     }
 }
 
+// Shot frame with DLSS SR (S2.4): the stencil classes (high byte) of the slice the displays pass and the mask read, at
+// the render size `w` x `h`, and how many pixels and where have all of `bits` (the displays). Stalls the frame.
+void MeasureDisplays(ID3D11DeviceContext* c, int view, ID3D11Texture2D* stencil, UINT slice, UINT w, UINT h,
+                     uint32_t bits, bool passOn) {
+    if (!stencil) return;
+    D3D11_TEXTURE2D_DESC ds;
+    stencil->GetDesc(&ds);
+    if (ds.Width < w || ds.Height < h || slice >= ds.ArraySize || ds.SampleDesc.Count != 1 ||
+        ds.Format < DXGI_FORMAT_R16G16B16A16_TYPELESS || ds.Format > DXGI_FORMAT_R16G16B16A16_SINT) {
+        Log("DLAA shot %s: stencil classes not measured (stencil %ux%u x%u format %d, slice %u, render size %ux%u)",
+            kViewName[view], ds.Width, ds.Height, ds.ArraySize, (int)ds.Format, slice, w, h);
+        return;
+    }
+    D3D11_TEXTURE2D_DESC sd = ds;  // one slice, mip 0
+    sd.ArraySize = 1;
+    sd.MipLevels = 1;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags = 0;
+    ID3D11Texture2D* ss = nullptr;
+    if (FAILED(g_dev->CreateTexture2D(&sd, nullptr, &ss))) ss = nullptr;
+    if (ss) c->CopySubresourceRegion(ss, 0, 0, 0, 0, stencil, D3D11CalcSubresource(0, slice, ds.MipLevels), nullptr);
+    D3D11_MAPPED_SUBRESOURCE ms{};
+    if (ss && SUCCEEDED(c->Map(ss, 0, D3D11_MAP_READ, 0, &ms))) {
+        uint64_t on = 0, cls[256] = {};
+        UINT x0 = w, y0 = h, x1 = 0, y1 = 0;
+        for (UINT y = 0; y < h; ++y) {
+            const uint16_t* rs = (const uint16_t*)((const uint8_t*)ms.pData + (size_t)y * ms.RowPitch);
+            for (UINT x = 0; x < w; ++x) {
+                const uint32_t k = rs[x * 4 + 3] >> 8;
+                ++cls[k];
+                if ((k & bits) != bits) continue;
+                ++on;
+                x0 = std::min(x0, x);
+                y0 = std::min(y0, y);
+                x1 = std::max(x1, x);
+                y1 = std::max(y1, y);
+            }
+        }
+        c->Unmap(ss, 0);
+        const double px = (double)w * h;
+        std::vector<int> order;
+        for (int k = 0; k < 256; ++k)
+            if (cls[k]) order.push_back(k);
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return cls[a] > cls[b]; });
+        std::string list;
+        for (size_t i = 0; i < order.size() && i < 12; ++i) {
+            char buf[48];
+            snprintf(buf, sizeof(buf), "%s0x%02X %.2f%%", i ? "; " : "", order[i], 100.0 * (double)cls[order[i]] / px);
+            list += buf;
+        }
+        Log("DLAA shot %s: displays pass %s on %s (0x%02X), render size %ux%u, stencil slice %u of %ux%u x%u: %.2f%% of "
+            "the pixels, in x %u..%u y %u..%u; stencil classes: %s",
+            kViewName[view], passOn ? "on" : "off", MaskBitsText(bits), bits, w, h, slice, ds.Width, ds.Height,
+            ds.ArraySize, 100.0 * (double)on / px, on ? x0 : 0, on ? x1 : 0, on ? y0 : 0, on ? y1 : 0, list.c_str());
+    } else {
+        Log("DLAA shot %s: stencil not read back", kViewName[view]);
+    }
+    SafeRelease(ss);
+}
+
 void ReleasePending() {
     SafeRelease(g_pend.in);
     SafeRelease(g_pend.stencil);
@@ -698,6 +880,7 @@ void ReleasePending() {
 struct CarryViews {
     ID3D11Resource* src = nullptr;  // clone (only compared)
     ID3D11Resource* dst = nullptr;  // original (only compared)
+    UINT srcSlice = 0, dstSlice = 0;  // B20 K5b: the slices of three-slice arrays (clones::CarryList)
     ID3D11ShaderResourceView* srv = nullptr;
     ID3D11RenderTargetView* rtv = nullptr;
     ID3D11DepthStencilView* dsv = nullptr;
@@ -854,14 +1037,16 @@ bool IsLinearColor(DXGI_FORMAT f) {
     }
 }
 
-CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes) {
+CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes, UINT srcSlice, UINT dstSlice) {
     for (CarryViews& v : g_carry)
-        if (v.src == src && v.dst == dstRes) return &v;
+        if (v.src == src && v.dst == dstRes && v.srcSlice == srcSlice && v.dstSlice == dstSlice) return &v;
     if (g_carry.size() >= 64) return nullptr;
     g_carry.push_back(CarryViews{});
     CarryViews& v = g_carry.back();
     v.src = src;
     v.dst = dstRes;
+    v.srcSlice = srcSlice;
+    v.dstSlice = dstSlice;
     ID3D11Texture2D* dst = nullptr;
     D3D11_TEXTURE2D_DESC sd{}, dd{};
     src->GetDesc(&sd);
@@ -874,7 +1059,9 @@ CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes) {
         const DXGI_FORMAT rf = ReadFormat(sd.Format);
         if (sd.SampleDesc.Count != 1 || dd.SampleDesc.Count != 1)
             why = "multisampled";
-        else if (sd.ArraySize != 1 || dd.ArraySize != 1)
+        // B20 K5b: a slice of a three-slice array (a focus scene clone of ours, focus's slice of an engine array)
+        else if ((sd.ArraySize != 1 && srcSlice >= sd.ArraySize) || (sd.ArraySize == 1 && srcSlice) ||
+                 (dd.ArraySize != 1 && dstSlice >= dd.ArraySize) || (dd.ArraySize == 1 && dstSlice))
             why = "a texture array";
         else if (!(sd.BindFlags & D3D11_BIND_SHADER_RESOURCE))
             why = "no shader view on the clone";
@@ -885,18 +1072,33 @@ CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes) {
         if (!why) {
             D3D11_SHADER_RESOURCE_VIEW_DESC s{};
             s.Format = rf;
-            s.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-            s.Texture2D.MipLevels = 1;
+            if (sd.ArraySize != 1) {
+                s.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+                s.Texture2DArray = {0, 1, srcSlice, 1};
+            } else {
+                s.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                s.Texture2D.MipLevels = 1;
+            }
             HRESULT hr = g_dev->CreateShaderResourceView(src, &s, &v.srv);
             if (SUCCEEDED(hr) && depth) {
                 D3D11_DEPTH_STENCIL_VIEW_DESC d{};
                 d.Format = DepthFormat(dd.Format);
-                d.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+                if (dd.ArraySize != 1) {
+                    d.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+                    d.Texture2DArray = {0, dstSlice, 1};
+                } else {
+                    d.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+                }
                 hr = g_dev->CreateDepthStencilView(dst, &d, &v.dsv);
             } else if (SUCCEEDED(hr)) {
                 D3D11_RENDER_TARGET_VIEW_DESC r{};
                 r.Format = ReadFormat(dd.Format);
-                r.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                if (dd.ArraySize != 1) {
+                    r.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+                    r.Texture2DArray = {0, dstSlice, 1};
+                } else {
+                    r.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                }
                 hr = g_dev->CreateRenderTargetView(dst, &r, &v.rtv);
             }
             if (FAILED(hr)) why = "its views could not be made";
@@ -911,8 +1113,10 @@ CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes) {
         SafeRelease(v.rtv);
         SafeRelease(v.dsv);
     }
-    Log("DLAA: DLSS SR: carry %ux%u fmt %d -> %ux%u fmt %d (%s): %s", sd.Width, sd.Height, (int)sd.Format, dd.Width,
-        dd.Height, (int)dd.Format, v.dsv ? "depth" : v.linear ? "linear" : "nearest", why ? why : "ok");
+    Log("DLAA: DLSS SR: carry %ux%u fmt %d%s -> %ux%u fmt %d%s (%s): %s", sd.Width, sd.Height, (int)sd.Format,
+        sd.ArraySize != 1 ? (" slice " + std::to_string(srcSlice)).c_str() : "", dd.Width, dd.Height, (int)dd.Format,
+        dd.ArraySize != 1 ? (" slice " + std::to_string(dstSlice)).c_str() : "",
+        v.dsv ? "depth" : v.linear ? "linear" : "nearest", why ? why : "ok");
     if (!why && dd.MipLevels > 1) Log("DLAA: DLSS SR: only mip 0 of that texture is carried (%u mips)", dd.MipLevels);
     SafeRelease(dst);
     return &v;
@@ -922,7 +1126,8 @@ CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes) {
 void Carry(ID3D11DeviceContext* c) {
     ID3D11Texture2D* clone[24] = {};
     ID3D11Resource* orig[24] = {};
-    const int n = clones::CarryList(clone, orig, 24);
+    UINT srcSlice[24] = {}, dstSlice[24] = {};
+    const int n = clones::CarryList(clone, orig, 24, srcSlice, dstSlice);
     if (!n || !g_ctx1 || !EnsureCarry()) return;
     const uint32_t gen = clones::Generation() * 977u + gpu::Generation();
     if (gen != g_carryGen) {
@@ -940,7 +1145,7 @@ void Carry(ID3D11DeviceContext* c) {
         c->RSSetState(g_carryRs);
         c->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
         for (int i = 0; i < n; ++i) {
-            CarryViews* v = CarryViewsFor(clone[i], orig[i]);
+            CarryViews* v = CarryViewsFor(clone[i], orig[i], srcSlice[i], dstSlice[i]);
             if (!v || v->skip) continue;
             D3D11_VIEWPORT vp{0, 0, (float)v->w, (float)v->h, 0, 1};
             c->RSSetViewports(1, &vp);
@@ -1000,7 +1205,23 @@ Feature* FeatureFor(ID3D11DeviceContext* c, int view, uintptr_t key, UINT w, UIN
     int flags = NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes;
     if (cfg.dlaaMvJittered) flags |= NVSDK_NGX_DLSS_Feature_Flags_MVJittered;
     if (AutoExposureNow()) flags |= NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
-    const int preset = PresetNow();
+    const int preset = PresetFor(view);
+    // Features of this view that another one replaced and that have not run for a while go (VRAM).
+    const uint64_t frame = g_frame.load();
+    for (auto it = g_feat.begin(); it != g_feat.end();) {
+        const bool same = it->key == key && it->w == w && it->h == h && it->ow == ow && it->oh == oh;
+        if (it->view != view || same || it->lastFrame + kFeatureIdleFrames >= frame) {
+            ++it;
+            continue;
+        }
+        Log("DLAA: DLSS feature for %s, motion vectors %p (%ux%u -> %ux%u) released: not run for %llu frames, the view "
+            "now runs %ux%u -> %ux%u",
+            kViewName[view], (void*)it->key, it->w, it->h, it->ow, it->oh,
+            (unsigned long long)(frame - it->lastFrame), w, h, ow, oh);
+        if (it->handle) NVSDK_NGX_D3D11_ReleaseFeature(it->handle);
+        it = g_feat.erase(it);
+        g_featCount = g_feat.size();
+    }
     Feature* f = nullptr;
     for (Feature& x : g_feat)
         if (x.view == view && x.key == key && x.w == w && x.h == h && x.ow == ow && x.oh == oh) f = &x;
@@ -1046,6 +1267,7 @@ Feature* FeatureFor(ID3D11DeviceContext* c, int view, uintptr_t key, UINT w, UIN
     f->fresh = true;
     Log("DLAA: DLSS feature for %s, motion vectors %p created (%ux%u -> %ux%u, %s, flags 0x%X, preset %d)",
         kViewName[view], (void*)key, w, h, ow, oh, QualityName(quality), flags, preset);
+    g_featCount = g_feat.size();
     return f;
 }
 
@@ -1100,6 +1322,14 @@ void FinishTaaShot(ID3D11DeviceContext* c) {
     ReleasePending();
 }
 
+// GPU spans of a quad view's DLSS step (kViewName 1..4; `first`: the kind's outer L entry); stereo has none.
+void ViewSpanBegin(gpu::Span first, int view) {
+    if (view >= 1) gpu::SpanBegin((gpu::Span)(first + view - 1));
+}
+void ViewSpanEnd(gpu::Span first, int view) {
+    if (view >= 1) gpu::SpanEnd((gpu::Span)(first + view - 1));
+}
+
 // A DrawIndexed(6) on the immediate context. The engine records its TAA resolve into a command buffer and replays it
 // later, so the draw is recognized by what is bound (docs/ams2-renderer.md): target and history R11G11B10_FLOAT,
 // t3 motion vectors R16G16_FLOAT, t5 locks R8_UNORM. Returns kNotTaa, kDone (DLSS ran, skip the draw) or kFailed.
@@ -1118,6 +1348,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
         if (!IsTaaResolve(rtv, srv)) return;
         result = kFailed;  // from here on it is the TAA resolve
         if (g_failed) return;
+        ViewSpanBegin(gpu::DlssOuterL, view);
         if (g_dev && g_gen != gpu::Generation()) {
             Log("DLAA: the device changed; NGX starts again");
             DropNgxLocked();
@@ -1171,30 +1402,91 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             }
             ID3D11Texture2D* s = ScratchFor(d[i], vf[i], D3D11_BIND_SHADER_RESOURCE);
             if (!s) return;
-            c->CopyResource(s, tex[i]);
+            // B20 K5b: the slice the game's view reads (focus's slice of the engine's three-slice array; MVR B17's
+            // arrays: slice 0), not the array as a whole (a copy of it sees slice 0 without the clones' hooks).
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+            static_cast<ID3D11ShaderResourceView*>(views[i])->GetDesc(&sd);
+            const UINT slice = sd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY ? sd.Texture2DArray.FirstArraySlice : 0;
+            if (d[i].ArraySize == 1)
+                c->CopyResource(s, tex[i]);
+            else
+                for (UINT m = 0; m < d[i].MipLevels; ++m)
+                    c->CopySubresourceRegion(s, m, 0, 0, 0, tex[i], D3D11CalcSubresource(m, slice, d[i].MipLevels), nullptr);
             in[i] = s;
         }
         ID3D11Texture2D* out = ScratchFor(d[3], d[3].Format, D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);
         if (!out) return;
         stencil = TexOf(srv[4]);
 
-        // Bias-current-color mask where the game's TAA keeps a short history (stencil bit 0x200, shaders/dlaa.hlsl).
-        const Config& cfg = Cfg();
+        // Bias-current-color mask on the displays (stencil 0x88, MaskValueNow), at the render size like DLSS's color
+        // input: with DLSS SR the stencil is the scene's, at the render size (or larger: the corner of its slice).
+        const float maskValue = MaskValueNow();
+        const uint32_t maskBits = MaskBitsNow();
         ID3D11Texture2D* mask = nullptr;
         ID3D11UnorderedAccessView* maskUav = nullptr;
-        if (cfg.dlaaBiasMask > 0 && stencil && EnsureMaskShader()) {
+        ID3D11ShaderResourceView* maskStencil = nullptr;  // ours (StencilViewFor), not referenced
+        UINT stencilSlice = 0;
+        if (stencil) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+            srv[4]->GetDesc(&vd);
+            if (vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY) stencilSlice = vd.Texture2DArray.FirstArraySlice;
             D3D11_TEXTURE2D_DESC sd;
             stencil->GetDesc(&sd);
-            if (sd.Width == w && sd.Height == h && sd.SampleDesc.Count == 1) {
-                mask = ScratchFor(d[3], DXGI_FORMAT_R8_UNORM, D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);
+            if (!g_maskViewLogged[view]) {
+                g_maskViewLogged[view] = true;
+                Log("DLAA: %s: the game's normal/stencil %ux%u, %u slice(s), format %d; its view: dimension %d, format "
+                    "%d, slice %u (of %u); render size %ux%u",
+                    kViewName[view], sd.Width, sd.Height, sd.ArraySize, (int)sd.Format, (int)vd.ViewDimension,
+                    (int)vd.Format, stencilSlice,
+                    vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY ? vd.Texture2DArray.ArraySize : 1, iw, ih);
+            }
+            if ((maskValue > 0 || DisplaysNow()) && sd.SampleDesc.Count == 1 && sd.Width >= iw && sd.Height >= ih)
+                maskStencil = StencilViewFor(stencil, stencilSlice, vd.Format);
+        }
+        // Displays pass after DLSS (DisplaysNow): DLSS's result (out, read) into a second texture (dispTex), the
+        // displays from the current frame's color (curSrv) at the render size.
+        const bool dispOn = DisplaysNow();
+        bool dispDone = false;  // the pass ran: dispTex holds the result
+        ID3D11Texture2D* dispTex = nullptr;
+        ID3D11UnorderedAccessView* dispUav = nullptr;
+        ID3D11ShaderResourceView* dispIn[2] = {};  // DLSS's result, the current frame (not referenced)
+        if (dispOn && maskStencil && EnsureDisplaysShader()) {
+            dispTex = ScratchFor(d[3], d[3].Format, D3D11_BIND_UNORDERED_ACCESS);
+            dispUav = dispTex ? UavFor(dispTex) : nullptr;
+            dispIn[0] = SrvFor(out);
+            if (in[1] != tex[1]) {
+                dispIn[1] = SrvFor((ID3D11Texture2D*)in[1]);
+            } else {
+                D3D11_SHADER_RESOURCE_VIEW_DESC cd{};
+                srv[1]->GetDesc(&cd);
+                if (cd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2D) dispIn[1] = srv[1];
+            }
+            if (!dispUav || !dispIn[0] || !dispIn[1]) dispTex = nullptr;
+        }
+        if (maskValue > 0 && maskStencil && EnsureMaskShader()) {
+            D3D11_TEXTURE2D_DESC sd;
+            stencil->GetDesc(&sd);
+            if (sd.Width >= iw && sd.Height >= ih && sd.SampleDesc.Count == 1) {
+                D3D11_TEXTURE2D_DESC md = d[3];
+                md.Width = iw;
+                md.Height = ih;
+                md.MipLevels = 1;
+                mask = ScratchFor(md, DXGI_FORMAT_R8_UNORM, D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_SHADER_RESOURCE);
                 maskUav = mask ? UavFor(mask) : nullptr;
+            } else if (!g_maskSizeLogged) {
+                g_maskSizeLogged = true;
+                Log("DLAA: no bias mask for %s: the stencil is %ux%u (%u samples), the render size %ux%u",
+                    kViewName[view], sd.Width, sd.Height, sd.SampleDesc.Count, iw, ih);
             }
             if (!maskUav) {
                 mask = nullptr;
-            } else if (cfg.dlaaBiasMask != g_maskCbValue) {
-                const float v[4] = {cfg.dlaaBiasMask, 0, 0, 0};
+            } else if (maskValue != g_maskCbValue || maskBits != g_maskCbBits) {
+                float v[4] = {maskValue, 0, 0, 0};
+                memcpy(&v[1], &maskBits, sizeof(maskBits));
                 c->UpdateSubresource(g_maskCb, 0, nullptr, v, 0, 0);
-                g_maskCbValue = cfg.dlaaBiasMask;
+                g_maskCbValue = maskValue;
+                g_maskCbBits = maskBits;
+                Log("DLAA: bias mask %.2f on stencil class 0x%02X (%s)", maskValue, maskBits, MaskBitsText(maskBits));
             }
         }
         ID3D11Texture2D* expTex =
@@ -1257,23 +1549,25 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             // MVR (mvr_motion.h): outer's motion vectors kept per eye, the focus views' made from them.
             ID3D11Resource* mv = in[2];
             if (view >= 1) {
+                ViewSpanBegin(gpu::DlssMvOuterL, view);
                 const int eye = (view - 1) & 1;
                 const bool shot = g_shot.load(std::memory_order_relaxed);
                 if (view <= 2)
                     mvrmotion::StoreOuter(c, eye, (ID3D11Texture2D*)in[2], (ID3D11Texture2D*)in[0], frame, shot);
                 else if (ID3D11Texture2D* m = mvrmotion::ForFocus(c, eye, (ID3D11Texture2D*)in[0],
-                                                                  (ID3D11Texture2D*)in[2], w, h, frame, shot))
+                                                                  (ID3D11Texture2D*)in[2], iw, ih, frame, shot))
                     mv = m;
+                ViewSpanEnd(gpu::DlssMvOuterL, view);
             }
             if (mask) {
                 c->CSSetShader(g_maskCs, nullptr, 0);
                 c->CSSetConstantBuffers(0, 1, &g_maskCb);
-                c->CSSetShaderResources(0, 1, &srv[4]);
+                c->CSSetShaderResources(2, 1, &maskStencil);
                 c->CSSetUnorderedAccessViews(0, 1, &maskUav, nullptr);
-                c->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+                c->Dispatch((iw + 7) / 8, (ih + 7) / 8, 1);
                 ID3D11ShaderResourceView* noSrv = nullptr;
                 ID3D11UnorderedAccessView* noUav = nullptr;
-                c->CSSetShaderResources(0, 1, &noSrv);
+                c->CSSetShaderResources(2, 1, &noSrv);
                 c->CSSetUnorderedAccessViews(0, 1, &noUav, nullptr);
                 c->CSSetShader(nullptr, nullptr, 0);
                 ++g_maskEvals;
@@ -1296,7 +1590,9 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             e.InExposureScale = ExposureScaleNow();
             e.pInBiasCurrentColorMask = mask;
             e.pInExposureTexture = expTex;
+            ViewSpanBegin(gpu::DlssEvalOuterL, view);
             r = NGX_D3D11_EVALUATE_DLSS_EXT(c, f->handle, g_params, &e);
+            ViewSpanEnd(gpu::DlssEvalOuterL, view);
             if (afterDraw && NVSDK_NGX_SUCCEED(r)) {
                 ID3D11ShaderResourceView* in2[2] = {srv[4], taaSrv};
                 c->CSSetShader(g_cockpitCs, nullptr, 0);
@@ -1314,7 +1610,33 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             // NR prototype (nr.h, [nr] mode=focus): the focus views' DLAA result through the D3D12 bridge, still in
             // DLAA's own context state.
             if (NVSDK_NGX_SUCCEED(r) && nr::Wanted(view))
-                nr::Process(c, view, SrvFor(out), UavFor(out), mv, in[0], w, h, e.InReset != 0);
+                nr::Process(c, view, SrvFor(out), UavFor(out), mv, in[0], w, h, iw, ih, e.InReset != 0);
+            // Displays pass (S2.4): the result goes to dispTex, which then replaces out as the copy into the target.
+            if (NVSDK_NGX_SUCCEED(r) && dispTex) {
+                ViewSpanBegin(gpu::DlssDispOuterL, view);
+                struct {
+                    uint32_t bits, pad;
+                    float jitter[2], toRender[2];
+                    uint32_t renderSize[2];
+                } cb{MaskBitsNow(), 0, {e.InJitterOffsetX, e.InJitterOffsetY},
+                     {(float)iw / (float)w, (float)ih / (float)h}, {iw, ih}};
+                static_assert(sizeof(cb) == 32, "DisplayParams in shaders/dlaa.hlsl");
+                c->UpdateSubresource(g_dispCb, 0, nullptr, &cb, 0, 0);
+                c->CSSetShader(g_dispCs, nullptr, 0);
+                c->CSSetConstantBuffers(2, 1, &g_dispCb);
+                c->CSSetShaderResources(2, 1, &maskStencil);
+                c->CSSetShaderResources(3, 2, dispIn);
+                c->CSSetUnorderedAccessViews(1, 1, &dispUav, nullptr);
+                c->Dispatch((w + 7) / 8, (h + 7) / 8, 1);
+                ID3D11ShaderResourceView* noSrv[3] = {};
+                ID3D11UnorderedAccessView* noUav = nullptr;
+                c->CSSetShaderResources(2, 3, noSrv);
+                c->CSSetUnorderedAccessViews(1, 1, &noUav, nullptr);
+                c->CSSetShader(nullptr, nullptr, 0);
+                ++g_dispEvals;
+                dispDone = true;
+                ViewSpanEnd(gpu::DlssDispOuterL, view);
+            }
         });
         t_inside = false;
         g_ctx1->SwapDeviceContextState(prev, nullptr);
@@ -1332,7 +1654,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
         if (g_evalFails || !g_viewLogged[view]) {
             g_viewLogged[view] = true;
             Log("DLAA: DLSS replaces the game's TAA resolve (%s, %ux%u -> %ux%u)", kViewName[view], iw, ih, w, h);
-            SetState(view ? "on in quad views (DLSS replaces the game's TAA)" : "on (DLSS replaces the game's TAA)");
+            SetRunningState(view != 0);
         }
         g_viewEvals[view].fetch_add(1, std::memory_order_relaxed);
         g_evalFails = 0;
@@ -1344,14 +1666,18 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             ID3D11Texture2D* sSt = StagingCopy(c, stencil);
             ID3D11Texture2D* sOut = StagingCopy(c, out);
             char mode[192];
-            snprintf(mode, sizeof(mode), "DLAA, game's TAA for %s, %s, bias mask %.2f",
-                     CockpitText(afterDraw ? CockpitTaaNow() : 0), ExposureText().c_str(), mask ? cfg.dlaaBiasMask : 0.0f);
+            snprintf(mode, sizeof(mode), "%s, game's TAA for %s, %s, bias mask %.2f, displays pass: %s",
+                     iw != w ? "DLSS SR" : "DLAA", CockpitText(afterDraw ? CockpitTaaNow() : 0), ExposureText().c_str(),
+                     mask ? maskValue : 0.0f, dispDone ? "on" : "off");
             MeasureShot(c, view, mode, sIn, sSt, sOut);
             SafeRelease(sIn);
             SafeRelease(sSt);
             SafeRelease(sOut);
+            if (g_sr && view >= 1)
+                MeasureDisplays(c, view, stencil, stencilSlice, iw, ih, MaskBitsNow(), dispDone);
         }
-        c->CopyResource(tex[3], out);
+        c->CopyResource(tex[3], dispDone ? dispTex : out);
+        ViewSpanEnd(gpu::DlssOuterL, view);
         if (g_sr) sr::ShotDlss(c, tex[1], tex[3]);  // shot frame only
         result = kDone;
     }();
@@ -1397,11 +1723,17 @@ bool Replace(ID3D11DeviceContext* c, UINT n) {
         bool taa = false;
         Protect("draw", [&] { taa = BoundIsTaa(c); });
         if (!taa) return false;
-        if (clones::SwappedIn(clones::Outer)) {
+        if (clones::SceneIn()) {
             {
                 clones::RawScope raw;  // our calls pass the clones' hooks as they are
                 Protect("draw", [&] { r = Evaluate(c, false); });
-                if (r == kDone) Protect("carry", [&] { Carry(c); });
+                if (r == kDone)
+                    Protect("carry", [&] {
+                        const int view = g_group.load(std::memory_order_relaxed) + 1;
+                        ViewSpanBegin(gpu::CarryOuterL, view);
+                        Carry(c);
+                        ViewSpanEnd(gpu::CarryOuterL, view);
+                    });
             }
             clones::SceneEnd(c);
             if (r == kDone) {
@@ -1413,6 +1745,9 @@ bool Replace(ID3D11DeviceContext* c, UINT n) {
             g_fallbacks.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
+        // Learning keeps DLAA at the eye size, not the game's TAA: with the game's draw in the learning groups the
+        // clones learned fewer carried textures (5-7 instead of 10-12) and the windscreen flickered (2026-11-17).
+        // Its DLSS features go once the scene sets' ones run (kFeatureIdleFrames).
         clones::MarkTaa(c);
     }
     if (CockpitTaaNow()) {
@@ -1580,9 +1915,7 @@ void Install() {
         SetState("off with [quad] mode=probe");
         return;
     }
-    g_sr = Cfg().dlaaSr && Cfg().quadMode == QuadMode::Off;
-    if (Cfg().dlaaSr && !g_sr)
-        Log("DLAA: [dlaa] mode=dlss is for stereo only so far ([quad] mode=off); DLAA at the render size instead");
+    g_sr = Cfg().dlaaSr && (Cfg().quadMode == QuadMode::Off || Cfg().quadMode == QuadMode::Quad);
     if (Cfg().quadMode == QuadMode::Quad && !Cfg().taaViews)
         Log("DLAA: [debug] taa_views=0: the focus views share outer R's TAA targets and get motion vectors without the "
             "focus window's motion (smearing in the focus area)");
@@ -1641,25 +1974,38 @@ void OnFrameStart() {
             g_expStep = (g_expStep.load() + 1) % kExpStepCount;
             Log("DLAA: exposure hotkey: %s%s", ExposureText().c_str(), g_expStep.load() == 0 ? " (the ini settings)" : "");
         }
-        if (Pressed(c.dlaaPresetKeyMod, c.dlaaPresetKey, g_presetKeyDown)) {
-            g_presetStep = (g_presetStep.load() + 1) % kPresetStepCount;
-            Log("DLAA: preset hotkey: %s%s", ExposureText().c_str(), g_presetStep.load() == 0 ? " (the ini preset)" : "");
-        }
     });
     nr::OnFrameStart();
 }
 
 bool SrWanted() { return g_sr && Wanted(); }
 
+void OnSrScalesChanged(float focus, float outer) {
+    Protect("render scales", [&] {
+        ResetAllLocked();  // a feature of an earlier size that comes back has an old history
+        g_scaleNow[0] = focus;
+        g_scaleNow[1] = outer;
+        if (g_ran) SetRunningState(g_ranQuad);
+    });
+}
+
+int GetPresetSwitch(int which) { return g_presetSwitch[which].load(); }
+
+void SetPresetSwitch(int which, int preset) { g_presetSwitch[which] = preset; }
+
+bool DlssNow() { return g_installed && Wanted(); }
+
 void LogStats(bool totals) {
     if (!g_installed) return;
 #ifdef QVFR_HAVE_DLSS
     if (g_sr) {
         const uint64_t se = g_srEvals.load();
-        Log("DLAA%s: DLSS SR: %llu evaluations at the render size, %llu textures carried in %llu resolves",
+        Log("DLAA%s: DLSS SR: %llu evaluations at the render size, %llu textures carried in %llu resolves; DLSS "
+            "features %zu",
             totals ? " (session total)" : "", (unsigned long long)(totals ? se : se - g_lastSrEvals),
             (unsigned long long)(totals ? g_carried : g_carried - g_lastCarried),
-            (unsigned long long)(totals ? g_carryFrames : g_carryFrames - g_lastCarryFrames));
+            (unsigned long long)(totals ? g_carryFrames : g_carryFrames - g_lastCarryFrames),
+            g_featCount.load());
         g_lastSrEvals = se;
         g_lastCarried = g_carried;
         g_lastCarryFrames = g_carryFrames;
@@ -1681,10 +2027,11 @@ void LogStats(bool totals) {
     g_lastSetCalls = sc;
     g_lastSetNonzero = sn;
 #ifdef QVFR_HAVE_DLSS
-    if (g_maskEvals || g_expEvals || g_cockpitEvals)
+    if (g_maskEvals || g_expEvals || g_cockpitEvals || g_dispEvals)
         Log("DLAA: evaluations with the bias mask %llu, with the fixed exposure %llu, with the cockpit from the game's "
-            "TAA %llu (session)",
-            (unsigned long long)g_maskEvals, (unsigned long long)g_expEvals, (unsigned long long)g_cockpitEvals);
+            "TAA %llu, with the displays pass %llu (session; the pass now %s)",
+            (unsigned long long)g_maskEvals, (unsigned long long)g_expEvals, (unsigned long long)g_cockpitEvals,
+            (unsigned long long)g_dispEvals, DisplaysNow() ? "on" : "off");
 #endif
     nr::LogStats(totals);
     if (Cfg().quadMode != QuadMode::Quad) return;
@@ -1721,6 +2068,7 @@ void SetShotFrame(bool shot) {
     (void)shot;
 #endif
 }
+
 
 void BeginGroup(int group) { g_group.store(group >= 0 && group < 4 ? group : -1, std::memory_order_relaxed); }
 

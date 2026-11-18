@@ -33,6 +33,16 @@ bool FrameJitter(float out[2]);
 void TraceJitter(int calls);
 // DLSS SR (sr.h, [dlaa] mode=dlss in stereo): DLSS can run now, so the scene may render at the render size.
 bool SrWanted();
+// Render thread: DLSS SR's render sizes changed while the game runs: the histories start over, the state names the scales
+// (focus's, or the eye's in stereo, and outer's).
+void OnSrScalesChanged(float focus, float outer);
+// Benchmark sequence switches (quad.cpp): the DLSS preset of all views (0), of outer's (1), of focus's (2) over the ini's,
+// as NVSDK_NGX_DLSS_Hint_Render_Preset (10 J, 11 K, 12 L, 13 M); -1 = the ini's.
+int GetPresetSwitch(int which);
+void SetPresetSwitch(int which, int preset);
+// DLSS replaces the game's TAA in this frame (setting, hotkey, no failure); its evaluation stores outer's motion
+// vectors for focus (mvr_motion.h StoreOuter), so without it focus's velocity pass gets none from outer.
+bool DlssNow();
 void LogStats(bool totals);
 std::string Describe();  // one line for summary.txt
 void Shutdown();         // VR_Shutdown: DLSS features and NGX released

@@ -25,7 +25,13 @@
 
 namespace qvfr::clones {
 
-enum Set { Outer = 0, Focus = 1 };
+// Outer and Focus: a view's size (O), for the whole group, or with DLSS SR only after the TAA resolve. OuterScene and
+// FocusScene (DLSS SR, docs/dlaa-plan.md S1/S2): the render size (R) of the scene phase, until the TAA resolve's draw.
+// A group is of one kind (outer or focus); learning is per kind.
+enum Set { Outer = 0, Focus = 1, OuterScene = 2, FocusScene = 3 };
+constexpr int kSets = 4;
+inline Set KindOf(Set s) { return (Set)(s & 1); }
+inline Set SceneOf(Set s) { return (Set)((s & 1) | 2); }
 
 // VR_Init on the supported exe (quad mode): factory and destructor hooks. False: no clones in this process.
 bool InstallEngineHooks();
@@ -42,16 +48,43 @@ void SetSizes(uint32_t gameW, uint32_t gameH, uint32_t outerW, uint32_t outerH, 
 void OnFrameStart(ID3D11DeviceContext* imm, bool enabled);
 void BeginGroup(ID3D11DeviceContext* imm, Set set);  // eye group CBeginEye, before the engine's Execute
 void EndGroup(ID3D11DeviceContext* imm);             // eye group CEndEye, after the engine's Execute (no-op without Begin)
-// S1 (docs/dlaa-plan.md, sr.h): stereo with the outer set at the render size. Only the scene phase of an eye group
-// (until the TAA resolve's draw) renders into the clones. In the learning groups MarkTaa at the TAA draw ends the scene
-// phase: a texture gets a clone when it is written before it and is not the TAA draw's target; one used after it too is
-// carried (its clone's contents go into the original at the TAA draw).
-void SetStereoSr(bool on);                    // before the first frame
+// DLSS SR (docs/dlaa-plan.md S1 in stereo, S2 in quad views; sr.h, dlaa.cpp): the scene phase of an eye group (until
+// the TAA resolve's draw) renders into the scene set of its kind at the render size. In the learning groups MarkTaa at
+// the TAA draw ends the scene phase: a texture gets a scene clone when its kind writes it before the draw and it is not
+// the draw's target; one used after it too is carried (the scene clone's contents go into the kind's texture of the
+// view size, the post set's clone or the original, at the TAA draw). From SceneEnd to the group's end the group runs in
+// its kind's post set (Outer or Focus) when that has clones, else with the originals.
+void SetStereoSr(bool on);                    // before the first frame (stereo: no focus groups)
+void SetSr(bool on);                          // quad views, before the first frame
+// The scene sets' sizes (0 = no scene set for that kind): BeginGroup(kind) puts the kind's scene set in. Render thread,
+// before OnFrameStart; with clones ready a change makes them again at that frame start, without learning.
+void SetSceneSizes(uint32_t outerW, uint32_t outerH, uint32_t focusW, uint32_t focusH);
+// Quad views, render thread, before OnFrameStart: DLSS runs in this frame, so the groups use the scene sets (else
+// each group stays in its post set, as without DLSS SR). Stereo (SetStereoSr): always on.
+void SetSrActive(bool on);
 void MarkTaa(ID3D11DeviceContext* imm);       // learning: the TAA draw comes now (its target bound)
-// While the outer clones are in: the carried textures' clones and originals (not referenced; valid until frame start).
-int CarryList(ID3D11Texture2D** clone, ID3D11Resource** orig, int max);
-// At the TAA draw while the clones are in: they go out as at CEndEye (fields, size constants, viewport, the bound
-// state); until the group ends the bind fix sends views of clones to their originals. False: no clones were in.
+// While a scene set is in: the carried textures' scene clones and where they go (the post set's clone or the original;
+// not referenced; valid until frame start).
+// B20 K5b: srcSlice / dstSlice (when not null) the array slice each is in (0: a texture of its own, or its slice 0): a
+// focus scene clone that is a three-slice array (WantSceneSlices), a focus clone that is slice 1 of an engine array.
+int CarryList(ID3D11Texture2D** clone, ID3D11Resource** dest, int max, UINT* srcSlice = nullptr,
+              UINT* dstSlice = nullptr);
+// A scene set is in now (the group's scene phase with clones).
+bool SceneIn();
+// The SR probe (sr_probe.h), render thread: an eye group with DLSS SR's scene sets runs now (its kind, the phase, its
+// number in the frame from 1, the render, view and game sizes). False outside one.
+struct SrGroup {
+    int kind = 0;       // Outer or Focus
+    bool post = false;  // after the TAA resolve's draw
+    int group = 0;
+    uint32_t rw = 0, rh = 0, ow = 0, oh = 0, gw = 0, gh = 0;
+};
+bool SrGroupNow(SrGroup& out);
+// Any thread, lock-free: an eye group with DLSS SR is after its TAA resolve's draw now (SceneEnd to the group's end).
+bool SrPostNow();
+// At the TAA draw while a scene set is in: it goes out as at CEndEye (fields, size constants, viewport, the bound
+// state) and the kind's post set goes in when it has clones; until the group ends the bind fix sends views of the
+// scene clones to the textures of the view size. False: no scene set was in.
 bool SceneEnd(ID3D11DeviceContext* imm);
 // From quad's OMSetRenderTargets hook, before the real call: the targets to bind instead of the engine's (bind fix;
 // `rtvOut` holds 8 entries). False: bind the engine's as they are.
@@ -74,10 +107,18 @@ bool SwappedIn(Set set);
 // (clones without a twin stay shared). Original() of a twin is the engine's texture.
 // Render thread, at the start of each eye group: the focus eye of the work that follows (0 L, 1 R).
 void SetFocusEye(int eye);
+// B20 K4: with DLSS SR running in this frame (SetSrActive) the twin is of the focus scene clone when the texture has one
+// (CloneOf(…, FocusScene) and the focus scene set's swap give it to eye 1 too), else of the focus clone.
 // Render thread: `original`'s focus clone gets a twin at the next frame start (no-op without a focus clone).
 void WantTwin(ID3D11Resource* original);
-// Render thread: `original`'s focus clone has its twin now.
+// Render thread: `original`'s focus clone (as WantTwin picks it) has its twin now.
 bool HasTwin(ID3D11Resource* original);
+// B20 K4: focus at the game's size with outer smaller (the MVR corner layout) gets an identity focus set: each texture
+// focus writes is its own focus clone (views of ours on the engine's texture, no memory), so focus R's twins of the
+// textures outer's groups write for it work as with clones of their own. A change drops the clones (learned again).
+void SetFocusIdentity(bool on);
+// Render thread: `res` is a clone or twin of any set (an identity focus clone too).
+bool IsClone(ID3D11Resource* res);
 // MVR gate B17 (docs/mvr.md): two-slice arrays in place of the engine's own textures. mvr_pass asks for the targets of
 // outer's G-buffer pass (B12: and the multisampled ones of its forward pass, the arrays then multisampled too); at the
 // next frame start each listed texture whose object still holds it gets a Texture2DArray
@@ -93,12 +134,23 @@ bool HasTwin(ID3D11Resource* original);
 // clone of a three-slice array is then the array itself: focus L's swapped fields and translated views see slice 1,
 // focus R's (its twin) slice 2, in the focus clones' size (the engine's size fields and the viewport check say focus's
 // size; the corner at the top left). No texture of its own, nothing copied when the twin is made.
-void WantArray(ID3D11Resource* original, UINT slices = 2);
+// B20 K5 (`outerSlice`, three slices): outer smaller than the game's size (the MVR corner layout), its clone of the
+// array is the array too: outer's swapped fields and views are like the engine's (slice 0), the size fields and the
+// viewport check say outer's size (the corner at the top left of slice 0). Focus's clones are slices 1 and 2 as above.
+void WantArray(ID3D11Resource* original, UINT slices = 2, bool outerSlice = false);
+// B20 K5b with DLSS SR (docs/mvr.md): `original`'s focus scene clone becomes a three-slice array of ours (single-sample,
+// one mip, focus's render size) when the clones are made again at the next frame start. Focus L's swapped fields and
+// translated views see slice 1, focus R's (its twin, no memory of its own) slice 2; slice 0 is the MVR pass's scratch
+// (view 0). A copy or resolve of the array in a focus scene group goes to the group's slice. Render thread.
+void WantSceneSlices(ID3D11Resource* original);
 // Any thread, lock-free: `res` is one of these arrays.
 bool IsArray(ID3D11Resource* res);
+// Render thread (B20 K5): `res` is an array whose outer clone is its own slice 0; w, h: outer's corner of it.
+bool OuterSlice(ID3D11Resource* res, uint32_t* w = nullptr, uint32_t* h = nullptr);
 // Render thread: the slice of `original`'s array that focus's work of `eye` uses as its clone (1 focus L, 2 focus R
 // with its twin, 1 for focus R before its twin is made), 0 when the focus clone is a texture of its own (or none).
-// w, h: focus's size of the slice clone (when not null and the result is not 0).
+// w, h: focus's size of the slice clone (when not null and the result is not 0). B20 K5b: with DLSS SR running (the
+// focus scene clone as WantTwin picks it) the slice of the focus scene clone's array (WantSceneSlices).
 int FocusSlice(ID3D11Resource* original, int eye, uint32_t* w = nullptr, uint32_t* h = nullptr);
 // Any thread: changes whenever the clones are dropped (views kept on old clones would keep them alive).
 uint32_t Generation();
@@ -121,7 +173,8 @@ private:
 };
 // Render thread: the clones are made, wanted in this frame and their list unchanged (a group of a set with clones
 // would get them now). MVR forward step 1 swaps focus's in inside outer's group only then (not while learning).
-bool IsReady();
+// `outerIn`: outer's own set may be in (B20 K3: outer's clones or scene clones during its group), no other set.
+bool IsReady(bool outerIn = false);
 // For a shot: up to `max` clones of `set` (not referenced; valid until the next frame start) with a label each
 // ("<set>_NN_<w>x<h>_f<format>_<role>", NN as in the list order of the log). Returns the count.
 int ListForShot(Set set, ID3D11Resource** out, char (*labels)[64], int max);
@@ -155,13 +208,15 @@ void TestSetDevice(void* device);  // fake engine device (size per context at +0
 struct TestState {
     int phase = 0;  // 0 waiting, 1 learning, 2 ready, 3 failed, 4 not needed
     int textures = 0, renderTargets = 0, entries = 0;
-    int clones[2] = {};
+    int clones[kSets] = {};
     bool swapped = false;
     uint64_t cloneUses = 0, leaks = 0, translated = 0, viewportsFixed = 0, viewportMismatches = 0;
     uint64_t bindsToClone = 0, bindsToOriginal = 0, lazyViews = 0;
     int twins = 0, twinViews = 0;
     int arrays = 0;  // B17
     uint64_t arrayFixes = 0, arrayLazy = 0, arrayCopies = 0;
+    uint64_t sliceResolves = 0, sliceResolveFails = 0, sliceCopies = 0;  // B20 K5
+    int sceneSlices = 0;  // B20 K5b with DLSS SR: focus scene clones that are three-slice arrays
 };
 TestState TestGet();
 
