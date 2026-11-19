@@ -5,6 +5,11 @@
 #include "xr_layer.h"
 #include "xr_layer_order.h"
 
+#include <cstring>
+#include <fstream>
+#include <iterator>
+#include <mutex>
+
 namespace qvfr::runtime {
 
 namespace {
@@ -139,6 +144,48 @@ void AddImplicitManifests(HKEY root, std::vector<std::wstring>& out) {
 }
 
 bool g_movedLayerHasGaze = false;
+std::string g_movedLayers;  // names of the layers moved below ours, for the report when VR does not start
+
+// The loader reports why it refuses layers only through OutputDebugString (and stderr, which a game does not have).
+// Without a debugger OutputDebugString raises DBG_PRINTEXCEPTION_WIDE_C and then DBG_PRINTEXCEPTION_C, which a vectored
+// handler sees before the system swallows them; the handler only copies the text and lets the exception go on.
+PVOID g_debugHandler = nullptr;
+std::mutex g_debugM;
+std::string g_lastDebug;
+int g_debugLines = 0;
+
+void LogDebugText(std::string s) {
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    std::lock_guard lock(g_debugM);
+    if (s.empty() || s == g_lastDebug || g_debugLines >= 300) return;
+    g_lastDebug = s;
+    ++g_debugLines;
+    Log("Debug output (OpenXR loader, OpenComposite or a layer): %s", s.c_str());
+}
+
+LONG CALLBACK DebugStringHandler(EXCEPTION_POINTERS* e) {
+    const EXCEPTION_RECORD* r = e->ExceptionRecord;
+    constexpr DWORD kWide = 0x4001000A;  // DBG_PRINTEXCEPTION_WIDE_C
+    if (r->ExceptionCode == kWide && r->NumberParameters >= 2 && r->ExceptionInformation[1])
+        LogDebugText(Narrow(std::wstring(reinterpret_cast<const wchar_t*>(r->ExceptionInformation[1]),
+                                         wcsnlen(reinterpret_cast<const wchar_t*>(r->ExceptionInformation[1]), 4096))));
+    else if (r->ExceptionCode == DBG_PRINTEXCEPTION_C && r->NumberParameters >= 2 && r->ExceptionInformation[1])
+        LogDebugText(std::string(reinterpret_cast<const char*>(r->ExceptionInformation[1]),
+                                 strnlen(reinterpret_cast<const char*>(r->ExceptionInformation[1]), 4096)));
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void LogManifest(const std::wstring& file) {
+    std::ifstream f{fs::path(file), std::ios::binary};
+    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::string flat;
+    for (char ch : text.substr(0, 1500)) {
+        if (ch == '\r' || ch == '\n' || ch == '\t') ch = ' ';
+        if (ch == ' ' && !flat.empty() && flat.back() == ' ') continue;
+        flat += ch;
+    }
+    Log("Runtime: manifest %s: %s", Narrow(file).c_str(), flat.c_str());
+}
 
 // Implicit layers that provide the gaze sit above our layer, so our gaze calls would miss them (xr_layer_order.h). For
 // this process only they are turned off as implicit layers and enabled again after ours. Nothing outside the process
@@ -165,7 +212,9 @@ void AddGazeLayers(std::wstring& layerPath, std::wstring& enable) {
         moved += (moved.empty() ? "" : ", ") + l.name;
         Log("Runtime: OpenXR layer %s moved below the mod's layer for this process (%s; %s=1, manifest %s)", l.name.c_str(),
             l.reason.c_str(), l.disableEnv.c_str(), Narrow(l.manifest).c_str());
+        LogManifest(l.manifest);
     }
+    g_movedLayers = moved;
     if (!moved.empty()) diag::Set("OpenXR gaze layers", "moved below the mod's layer in this game: " + moved);
 }
 
@@ -253,5 +302,23 @@ void LogStartup() {
 
 bool OpenXrPath() { return g_openxr; }
 bool MovedLayerHasGaze() { return g_movedLayerHasGaze; }
+
+void BeginBackendInit() {
+    if (!g_openxr || g_debugHandler) return;
+    g_debugHandler = AddVectoredExceptionHandler(1, DebugStringHandler);
+}
+
+void EndBackendInit(bool started) {
+    if (g_debugHandler) {
+        RemoveVectoredExceptionHandler(g_debugHandler);
+        g_debugHandler = nullptr;
+    }
+    if (!started && !g_movedLayers.empty())
+        diag::Report(diag::Level::Serious, "gaze-layers-vr",
+                     "VR did not start after the mod loaded the OpenXR layers %s below its own layer. Set "
+                     "openxr_gaze_layers=off in [runtime] of %s to start VR without them, and send the log from "
+                     "x64\\qvfr\\logs\\ to the mod's author.",
+                     g_movedLayers.c_str(), Narrow(IniFile().wstring()).c_str());
+}
 
 }  // namespace qvfr::runtime
