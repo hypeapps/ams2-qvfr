@@ -64,7 +64,7 @@ void Scene(UINT x, UINT y, float& z, float n[3]) {
     }
 }
 
-// The game's spheremap encoding (the inverse of its decode, docs/ssgi-plan.md "Ustalenia G0").
+// The game's spheremap encoding (the inverse of its decode, docs/ssgi/ssgi-plan-g0.md "Ustalenia G0").
 void Encode(const float n[3], uint16_t out[4]) {
     const float w = (n[2] + 1) * 0.5f;
     float ex = 0, ey = 0;

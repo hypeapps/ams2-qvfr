@@ -23,8 +23,8 @@ namespace qvfr::ssgiao {
 
 namespace {
 
-// Slots of the game's draws (docs/ssgi-plan.md "Ustalenia G0"): the overlay's SSAO, normals and depth, the ambient
-// pass's SSAO and normals.
+// Slots of the game's draws (docs/ssgi/ssgi-plan-g0.md "Ustalenia G0"): the overlay's SSAO, normals and depth, the
+// ambient pass's SSAO and normals.
 constexpr UINT kOverlaySsao = 1, kOverlayNormals = 2, kOverlayDepth = 3;
 // The ambient pass's slots (SSAO, normals, the deferred-ambient weight): PS 15549 and the lightmap variant.
 struct AmbientSlots {

@@ -638,7 +638,7 @@ struct TestScenario {
     const char* name;
     void (*apply)(Config&);
 };
-// SSGI G2 (docs/ssgi-plan.md), the stronger bounce: own AO and the bounce with a reach of 3 m (at most 600 px on the
+// SSGI G2 (docs/ssgi/ssgi-g2.md), the stronger bounce: own AO and the bounce with a reach of 3 m (at most 600 px on the
 // screen, 12 steps; the 200 px of the defaults cut the cockpit's reach to about 0.2 m in focus) and the bounce x 3,
 // without the bounce, its preview, the defaults with the bounce, the game's SSAO.
 void StrongReach(Config& c) {

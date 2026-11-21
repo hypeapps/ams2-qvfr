@@ -1,4 +1,5 @@
-// Own ambient occlusion in place of the game's SSAO (docs/ssgi-plan.md G1; the game's passes in "Ustalenia G0").
+// Own ambient occlusion in place of the game's SSAO (docs/ssgi/ssgi-g1.md; the game's passes in
+// docs/ssgi/ssgi-plan-g0.md "Ustalenia G0").
 //
 // The game lights the scene in a light pre-pass: its SSAO (CSSAORender) ends in a half-size R16 texture that two
 // full-screen draws read, the overlay (PS 15564: the sun's shadow and the AO into the G-buffer target's alpha, which the
@@ -15,7 +16,7 @@
 // 3 as 1 plus a grey preview of the AO drawn over each view's MSAA resolve (PS 15179) or, without MSAA, over DLSS's
 // output of the view (PreviewInto).
 //
-// One bounce of light (docs/ssgi-plan.md G2, [ssgi] gi, needs own AO): the same compute pass gives each pixel the light
+// One bounce of light (docs/ssgi/ssgi-g2.md, [ssgi] gi, needs own AO): the same compute pass gives each pixel the light
 // of the samples that occlude it, read from the view's history (its final image of the previous frame: the MSAA resolve
 // or DLSS's output, half size), with the previous frame's camera of the view (the pass keeps each view's camera in a
 // small buffer) for the world; vehicles (the deferred-ambient weight 0 in the overlay's target) at the same place of

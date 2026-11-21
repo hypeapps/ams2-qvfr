@@ -9,7 +9,7 @@
 // (R16G16B16A16_UNORM, xy spheremap-encoded, w the flags), the deferred-ambient weight (R8G8B8A8_UNORM, rgb: 1 the
 // world, 0 vehicles) and the constant windows the overlay draw (PS 15564) binds, so the view's projection, camera and
 // size need no CPU copy. View space: x right, y up, z forward (visible surfaces have n.z < 0); world = viewI applied to
-// it as the game's shaders do (docs/ssgi-plan.md "Ustalenia G0").
+// it as the game's shaders do (docs/ssgi/ssgi-plan-g0.md "Ustalenia G0").
 
 // The game's constant windows at the overlay draw (COMMON_BUFFER2 and that shader's _GLOBAL_, offsets from the
 // capture).

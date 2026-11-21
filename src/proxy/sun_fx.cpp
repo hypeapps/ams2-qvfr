@@ -35,12 +35,12 @@ struct Known {
 const Known kKnown[] = {
     {{0x8df2fc6f, 0x36155ac1, 0x9db80c63, 0x453230e5}, KindRays, "crepuscular rays to screen"},
     {{0x82975810, 0x569f4c4b, 0xafbdb398, 0x3d613fba}, KindFlare, "lens flare sprite"},
-    // Own AO (ssgi_ao.h), capture 2026-10-31 (docs/ssgi-plan.md "Ustalenia G0").
+    // Own AO (ssgi_ao.h), capture 2026-10-31 (docs/ssgi/ssgi-plan-g0.md "Ustalenia G0").
     {{0x71791790, 0xbd7b3f9b, 0xef29f554, 0xa8e97639}, KindAoOverlay, "sun shadow and SSAO overlay"},
     {{0x7c92fb13, 0xc710b2da, 0x00288a56, 0xbbebd7be}, KindAoAmbient, "ambient light"},
     {{0x595347c5, 0xf51bfbd6, 0x6edc95c2, 0xcaf0e7f4}, KindAoResolve, "MSAA resolve"},
     // The ambient pass of tracks with a lightmap (sLightmapMap t2; SSAO t3, weight t4, normals t5), seen 2026-11-20 at
-    // night in the draw dump (docs/ssgi-g2.md).
+    // night in the draw dump (docs/ssgi/ssgi-g2.md).
     {{0x73359356, 0x8041f2c5, 0x0b32855a, 0x8d0eac66}, KindAoAmbientLightmap, "ambient light with a lightmap"},
 };
 constexpr int kKnownCount = (int)(sizeof(kKnown) / sizeof(kKnown[0]));
