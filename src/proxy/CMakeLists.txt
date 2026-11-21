@@ -116,6 +116,29 @@ add_custom_command(
   DEPENDS ${QVFR_MVRMOTION_HLSL}
   COMMENT "fxc mvr_motion.hlsl"
   VERBATIM)
+set(QVFR_SSGI_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/shaders/ssgi_ao.hlsl)
+add_custom_command(
+  OUTPUT ${QVFR_SHADER_OUT}/ssgi_ao_cs.h ${QVFR_SHADER_OUT}/ssgi_blur_cs.h ${QVFR_SHADER_OUT}/ssgi_full_vs.h
+         ${QVFR_SHADER_OUT}/ssgi_preview_ps.h ${QVFR_SHADER_OUT}/ssgi_history_cs.h ${QVFR_SHADER_OUT}/ssgi_gi_ps.h
+         ${QVFR_SHADER_OUT}/ssgi_probe_cs.h
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${QVFR_SHADER_OUT}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSAo /Vn kSsgiAoCS
+          /Fh ${QVFR_SHADER_OUT}/ssgi_ao_cs.h ${QVFR_SSGI_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSBlur /Vn kSsgiBlurCS
+          /Fh ${QVFR_SHADER_OUT}/ssgi_blur_cs.h ${QVFR_SSGI_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T vs_5_0 /E VSFull /Vn kSsgiFullVS
+          /Fh ${QVFR_SHADER_OUT}/ssgi_full_vs.h ${QVFR_SSGI_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T ps_5_0 /E PSPreview /Vn kSsgiPreviewPS
+          /Fh ${QVFR_SHADER_OUT}/ssgi_preview_ps.h ${QVFR_SSGI_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSHistory /Vn kSsgiHistoryCS
+          /Fh ${QVFR_SHADER_OUT}/ssgi_history_cs.h ${QVFR_SSGI_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T ps_5_0 /E PSGi /Vn kSsgiGiPS
+          /Fh ${QVFR_SHADER_OUT}/ssgi_gi_ps.h ${QVFR_SSGI_HLSL}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /D SSGI_PROBE=1 /E CSProbe /Vn kSsgiProbeCS
+          /Fh ${QVFR_SHADER_OUT}/ssgi_probe_cs.h ${QVFR_SSGI_HLSL}
+  DEPENDS ${QVFR_SSGI_HLSL}
+  COMMENT "fxc ssgi_ao.hlsl"
+  VERBATIM)
 # Linking this target gives the include directory and builds the headers first (proxy and smoke test).
 add_library(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT}/compose_vs.h ${QVFR_SHADER_OUT}/compose_ps.h
             ${QVFR_SHADER_OUT}/sun_fx_vs.h ${QVFR_SHADER_OUT}/sun_fx_ps.h ${QVFR_SHADER_OUT}/dlaa_mask_cs.h
@@ -128,7 +151,10 @@ add_library(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT}/compose_vs.h ${QVFR_SHADER
             ${QVFR_SHADER_OUT}/sr_vs.h ${QVFR_SHADER_OUT}/sr_color_ps.h ${QVFR_SHADER_OUT}/sr_depth_ps.h
             ${QVFR_SHADER_OUT}/sr_fix_cs.h ${QVFR_SHADER_OUT}/nr_pack_cs.h ${QVFR_SHADER_OUT}/nr_unpack_cs.h ${QVFR_SHADER_OUT}/nr_motion_cs.h
             ${QVFR_SHADER_OUT}/nr_depth_cs.h ${QVFR_SHADER_OUT}/nr_unpack4_cs.h ${QVFR_SHADER_OUT}/nr_pack_region_cs.h
-            ${QVFR_SHADER_OUT}/nr_unpack_region_cs.h ${QVFR_SHADER_OUT}/nr_upedit_cs.h)
+            ${QVFR_SHADER_OUT}/nr_unpack_region_cs.h ${QVFR_SHADER_OUT}/nr_upedit_cs.h
+            ${QVFR_SHADER_OUT}/ssgi_ao_cs.h ${QVFR_SHADER_OUT}/ssgi_blur_cs.h ${QVFR_SHADER_OUT}/ssgi_full_vs.h
+            ${QVFR_SHADER_OUT}/ssgi_preview_ps.h ${QVFR_SHADER_OUT}/ssgi_history_cs.h ${QVFR_SHADER_OUT}/ssgi_gi_ps.h
+            ${QVFR_SHADER_OUT}/ssgi_probe_cs.h)
 target_include_directories(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT})
 
 enable_language(ASM_MASM)  # export thunks (generated/thunks.asm)
@@ -172,6 +198,7 @@ add_library(qvfr_proxy SHARED
   fps_hud.cpp
   sysinfo.cpp
   sun_fx.cpp
+  ssgi_ao.cpp
   mvr_ps.cpp
   mvr_vs.cpp
   mvr_pass.cpp

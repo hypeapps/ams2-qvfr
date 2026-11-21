@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 
 #include "clones.h"
 #include "common.h"
@@ -15,6 +16,7 @@
 #include "mvr_pass.h"
 #include "sr_cb.h"
 #include "sr_probe.h"
+#include "ssgi_ao.h"
 #include "sun_fx_ps.h"  // kSunFxPS (fxc from shaders/sun_fx.hlsl)
 #include "sun_fx_vs.h"  // kSunFxVS
 #include "taa_views.h"
@@ -33,6 +35,13 @@ struct Known {
 const Known kKnown[] = {
     {{0x8df2fc6f, 0x36155ac1, 0x9db80c63, 0x453230e5}, KindRays, "crepuscular rays to screen"},
     {{0x82975810, 0x569f4c4b, 0xafbdb398, 0x3d613fba}, KindFlare, "lens flare sprite"},
+    // Own AO (ssgi_ao.h), capture 2026-10-31 (docs/ssgi-plan.md "Ustalenia G0").
+    {{0x71791790, 0xbd7b3f9b, 0xef29f554, 0xa8e97639}, KindAoOverlay, "sun shadow and SSAO overlay"},
+    {{0x7c92fb13, 0xc710b2da, 0x00288a56, 0xbbebd7be}, KindAoAmbient, "ambient light"},
+    {{0x595347c5, 0xf51bfbd6, 0x6edc95c2, 0xcaf0e7f4}, KindAoResolve, "MSAA resolve"},
+    // The ambient pass of tracks with a lightmap (sLightmapMap t2; SSAO t3, weight t4, normals t5), seen 2026-11-20 at
+    // night in the draw dump (docs/ssgi-g2.md).
+    {{0x73359356, 0x8041f2c5, 0x0b32855a, 0x8d0eac66}, KindAoAmbientLightmap, "ambient light with a lightmap"},
 };
 constexpr int kKnownCount = (int)(sizeof(kKnown) / sizeof(kKnown[0]));
 
@@ -67,6 +76,13 @@ std::mutex g_tableM;
 std::atomic<int> g_entries{0};
 std::atomic<uint64_t> g_created[kKnownCount];  // shader objects made from each known bytecode
 std::atomic<bool> g_createdLogged[kKnownCount];
+
+// Every pixel shader's checksum (made rarely; read by ssgi_ao's draw dump only).
+struct Sum {
+    uint32_t v[4];
+};
+std::mutex g_sumM;
+std::unordered_map<const void*, Sum> g_sums;
 
 size_t Slot(const void* p) { return (size_t)((((uintptr_t)p >> 4) * 0x9E3779B97F4A7C15ull) >> 56); }
 
@@ -524,7 +540,7 @@ enum Action { Forward, Skip, Done };
 // Render thread, a draw on the game's immediate context inside an eye group with the module on.
 template <class D>
 Action OnDraw(ID3D11DeviceContext* c, int g, D&& draw) {
-    const Kind k = g_curKind;
+    const Kind k = g_curKind == KindRays || g_curKind == KindFlare ? g_curKind : KindNone;  // not ssgi_ao's kinds
     if (g < 2) {
         if (k != KindNone) {
             ReplayOuter(c, g, draw);
@@ -557,6 +573,14 @@ bool Active(ID3D11DeviceContext* c, int& g) {
     return g >= 0 && g_enabled && c == g_imm.load(std::memory_order_relaxed) && !g_dead.load(std::memory_order_relaxed);
 }
 
+// Own AO (ssgi_ao.h): its draws on the immediate context, whatever the sun effects do. True: AoAfter must follow.
+bool AoBefore(ID3D11DeviceContext* c) {
+    const Kind k = g_curKind;
+    if (k < KindAoOverlay || c != g_imm.load(std::memory_order_relaxed)) return false;
+    return ssgiao::BeforeDraw(c, ssgiao::DrawOverlay + (k - KindAoOverlay), g_curPs,
+                              g_group.load(std::memory_order_relaxed));
+}
+
 // ---------------------------------------------------------------- detours
 
 std::atomic<CreatePsFilterFn> g_createPsFilter{nullptr};
@@ -569,6 +593,12 @@ HRESULT STDMETHODCALLTYPE D_CreatePixelShader(ID3D11Device* dev, const void* cod
     if (SUCCEEDED(hr) && out && *out) {
         Protect("CreatePixelShader", [&] {
             taaviews::OnPixelShaderMade(*out, code, len);  // the game's TAA resolve (focus motion fix)
+            if (code && len >= 20 && !memcmp(code, "DXBC", 4)) {
+                Sum s;
+                memcpy(s.v, (const uint8_t*)code + 4, sizeof(s.v));
+                std::lock_guard lock(g_sumM);
+                g_sums[*out] = s;
+            }
             const int k = Classify(code, len);
             if (k >= 0) {
                 SetKind(*out, kKnown[k].kind);
@@ -627,10 +657,13 @@ void STDMETHODCALLTYPE D_DrawIndexed(ID3D11DeviceContext* c, UINT count, UINT st
             });
         });
     }
+    if (ssgiao::DumpWanted() && c == g_imm.load(std::memory_order_relaxed)) ssgiao::DumpDraw(c, count);
+    const bool ao = a == Forward && AoBefore(c);
     if (a == Forward) {
         hookprof::Orig o;
         o_drawIndexed(c, count, start, base);
     }
+    if (ao) ssgiao::AfterDraw(c);
     if (mvr) mvrpass::AfterDraw(c);
     if (taaFix) taaviews::AfterDraw(c);
     if (const AfterFn after = g_drawAfter.load(std::memory_order_relaxed)) after(c);
@@ -662,10 +695,13 @@ void STDMETHODCALLTYPE D_Draw(ID3D11DeviceContext* c, UINT count, UINT start) {
             });
         });
     }
+    if (ssgiao::DumpWanted() && c == g_imm.load(std::memory_order_relaxed)) ssgiao::DumpDraw(c, count);
+    const bool ao = a == Forward && AoBefore(c);
     if (a == Forward) {
         hookprof::Orig o;
         o_draw(c, count, start);
     }
+    if (ao) ssgiao::AfterDraw(c);
     if (mvr) mvrpass::AfterDraw(c);
     if (taaFix) taaviews::AfterDraw(c);
 }
@@ -858,6 +894,13 @@ void Shutdown() {
     });
 }
 
+void DrawUnhooked(ID3D11DeviceContext* c, UINT count, UINT start) {
+    if (o_draw)
+        o_draw(c, count, start);
+    else
+        c->Draw(count, start);
+}
+
 void NewPsEpoch() { ++g_psEpoch; }
 ID3D11PixelShader* CurrentPs(ID3D11DeviceContext* c) {
     // The hook sees the game's calls only when its device uses the hooked functions (CheckContext). A fault that stops
@@ -887,6 +930,14 @@ bool TestInstall(ID3D11Device* dev, ID3D11DeviceContext* ctx) {
 }
 
 void TestRegister(ID3D11PixelShader* ps, Kind kind) { SetKind(ps, kind); }
+
+bool PsChecksum(ID3D11PixelShader* ps, uint32_t out[4]) {
+    std::lock_guard lock(g_sumM);
+    const auto it = g_sums.find(ps);
+    if (it == g_sums.end()) return false;
+    memcpy(out, it->second.v, sizeof(it->second.v));
+    return true;
+}
 
 TestState TestGet() {
     TestState t;

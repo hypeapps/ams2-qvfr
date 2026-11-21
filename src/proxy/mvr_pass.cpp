@@ -75,6 +75,7 @@ std::atomic<bool> g_dead{false};
 uintptr_t g_phase1Vt = 0, g_buildVt = 0;  // absolute vtable addresses
 uintptr_t g_ssaoVt = 0, g_phase2Vt = 0, g_phase3Vt = 0;  // 0: their vtables did not match (no early step)
 int g_early = 0;  // [debug] mvr_early and its hotkey (mvr_pass.h)
+int g_earlyEye = -1;  // EarlyEye
 ID3D11DeviceContext* g_testCtx = nullptr;
 CloneFn g_cloneFn = nullptr;
 JitterFn g_jitterFn = nullptr;
@@ -4477,6 +4478,7 @@ bool On() { return g_on.load(std::memory_order_relaxed); }
 bool InstancedDrawHooks() { return g_instHooks; }
 
 void OnFrameStart(bool enabled) {
+    g_earlyEye = -1;  // an early run never spans frames
     if (!g_installed) return;
     Protect("OnFrameStart", [&] {
         const uint32_t gen = gpu::Generation();
@@ -4895,8 +4897,11 @@ bool EarlyBegin(int eye, bool projected) {
         Fill(Imm(), eye);
         ok = true;
     });
+    if (ok) g_earlyEye = eye;
     return ok;
 }
+
+int EarlyEye() { return g_earlyEye; }
 
 void EarlyWaited(double ms) {
     for (Stats* s : {&g_st, &g_tot}) {
@@ -4909,6 +4914,7 @@ void EarlyWaited(double ms) {
 
 void EarlyEnd(int eye, double ms, bool ok) {
     g_track = false;
+    g_earlyEye = -1;
     if (eye < 0 || eye > 1) return;
     ++g_st.earlyRuns[eye];
     ++g_tot.earlyRuns[eye];

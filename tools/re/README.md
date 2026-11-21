@@ -41,6 +41,12 @@ Analyzed binaries are data: run the scripts with `-I` and never execute anything
   DXBC disassembly and bytecode (`.dxbc`), plus a per-draw shader list; same environment as `rdc_dump.py`.
 - `renderdoc/rdc_events.py`: every API call with its parameters in chosen event ranges (`RDC_RANGES=a-b;c-d`), for
   comparing what two passes bind and set; same environment as `rdc_dump.py`.
+- `renderdoc/rdc_bindings.py`: per-slot bindings of chosen events (`RDC_EIDS`): render targets with blend and write
+  mask, depth state, and for VS, PS and CS every used constant buffer, shader resource (slot, reflection name, texture id,
+  format, size, creation flags) and sampler; optionally saves textures after chosen events (`RDC_SAVE=eid:id;...`) as
+  one PNG per channel plus their minimum, maximum and a grid of raw values. Replay uses zeroed constants (see
+  `rdc_dump.py`), so saved contents are only meaningful for resources nothing in the frame has rewritten yet (initial
+  state); same environment as `rdc_dump.py`.
 - `renderdoc/rdc_usage.py`: every use of chosen resources (`RDC_RES=id;id`, optional `RDC_RANGES`) with the event and the
   kind of use (target, shader resource, clear, copy), e.g. whether anything reads a target after its pass; same
   environment as `rdc_dump.py`.

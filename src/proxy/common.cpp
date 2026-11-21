@@ -539,6 +539,20 @@ Config ReadConfig(const fs::path& ini) {
             c.dlaaMvJittered, c.dlaaAutoExposure,
             c.dlaaExposure, c.dlaaExposureScale, c.dlaaBiasMask, c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey,
             c.dlaaExpKey, c.dlaaCockpitTaa, c.dlaaDisplayPass ? 1 : 0);
+    c.ssgiAo = std::clamp(IniInt(ini, L"ssgi", L"ao", c.ssgiAo), 0, 3);
+    c.ssgiRadius = std::clamp(IniFloat(ini, L"ssgi", L"radius", c.ssgiRadius), 0.05f, 10.0f);
+    c.ssgiThickness = std::clamp(IniFloat(ini, L"ssgi", L"thickness", c.ssgiThickness), 0.01f, 10.0f);
+    c.ssgiPower = std::clamp(IniFloat(ini, L"ssgi", L"power", c.ssgiPower), 0.1f, 8.0f);
+    c.ssgiSlices = std::clamp(IniInt(ini, L"ssgi", L"slices", c.ssgiSlices), 1, 8);
+    c.ssgiSteps = std::clamp(IniInt(ini, L"ssgi", L"steps", c.ssgiSteps), 1, 32);
+    c.ssgiMaxRadiusPx = std::clamp(IniFloat(ini, L"ssgi", L"max_radius_px", c.ssgiMaxRadiusPx), 4.0f, 1024.0f);
+    c.ssgiBlurDepth = std::clamp(IniFloat(ini, L"ssgi", L"blur_depth", c.ssgiBlurDepth), 0.001f, 1.0f);
+    c.ssgiPreviewLevel = std::clamp(IniFloat(ini, L"ssgi", L"preview_level", c.ssgiPreviewLevel), 0.001f, 1e6f);
+    c.ssgiGi = std::clamp(IniInt(ini, L"ssgi", L"gi", c.ssgiGi), 0, 2);
+    c.ssgiGiStrength = std::clamp(IniFloat(ini, L"ssgi", L"gi_strength", c.ssgiGiStrength), 0.0f, 8.0f);
+    c.ssgiGiVehicle = std::clamp(IniFloat(ini, L"ssgi", L"gi_vehicle", c.ssgiGiVehicle), 0.0f, 4.0f);
+    c.ssgiGiClamp = std::clamp(IniFloat(ini, L"ssgi", L"gi_clamp", c.ssgiGiClamp), 0.0f, 1e6f);
+    c.ssgiGiPreviewLevel = std::clamp(IniFloat(ini, L"ssgi", L"gi_preview_level", c.ssgiGiPreviewLevel), 0.001f, 1e6f);
     const std::string nr = IniString(ini, L"nr", L"mode", L"off");
     c.nrMode = nr == "focus" ? 1 : nr == "final" ? 2 : 0;
     if (nr != "off" && nr != "focus" && nr != "final") Log("Settings: unknown [nr] mode=\"%s\", using off", nr.c_str());
@@ -624,13 +638,38 @@ struct TestScenario {
     const char* name;
     void (*apply)(Config&);
 };
+// SSGI G2 (docs/ssgi-plan.md), the stronger bounce: own AO and the bounce with a reach of 3 m (at most 600 px on the
+// screen, 12 steps; the 200 px of the defaults cut the cockpit's reach to about 0.2 m in focus) and the bounce x 3,
+// without the bounce, its preview, the defaults with the bounce, the game's SSAO.
+void StrongReach(Config& c) {
+    c.ssgiAo = 1;
+    c.ssgiRadius = 3.0f;
+    c.ssgiMaxRadiusPx = 600.0f;
+    c.ssgiSteps = 12;
+    c.ssgiGiStrength = 3.0f;
+    c.ssgiGiPreviewLevel = 4.0f;
+}
 const TestScenario kTestScenarios[] = {
     {"as in the ini", [](Config&) {}},
+    {"[ssgi] ao=1 gi=0, reach 3 m (own AO, no bounced light)", [](Config& c) { StrongReach(c), c.ssgiGi = 0; }},
+    {"[ssgi] ao=1 gi=1, reach 3 m, bounce x 3 (own AO and a strong bounce)", [](Config& c) { StrongReach(c), c.ssgiGi = 1; }},
+    {"[ssgi] ao=1 gi=2, reach 3 m, bounce x 3 (the bounced light alone over the image)",
+     [](Config& c) { StrongReach(c), c.ssgiGi = 2; }},
+    {"[ssgi] ao=1 gi=1 with the ini's reach and strength (own AO and the plain bounce)",
+     [](Config& c) { c.ssgiAo = 1, c.ssgiGi = 1; }},
+    {"[ssgi] ao=0 gi=0 (the game's SSAO)", [](Config& c) { c.ssgiAo = 0, c.ssgiGi = 0; }},
 };
 constexpr int kTestScenarioCount = (int)(sizeof(kTestScenarios) / sizeof(kTestScenarios[0]));
-// The settings any scenario sets, back to the ini's before the next one applies (c.field = ini.field for each; none
-// while the table holds only step 0).
-void RestoreTestFields(Config& /*c*/, const Config& /*ini*/) {}
+// The settings any scenario sets, back to the ini's before the next one applies.
+void RestoreTestFields(Config& c, const Config& ini) {
+    c.ssgiAo = ini.ssgiAo;
+    c.ssgiGi = ini.ssgiGi;
+    c.ssgiRadius = ini.ssgiRadius;
+    c.ssgiMaxRadiusPx = ini.ssgiMaxRadiusPx;
+    c.ssgiSteps = ini.ssgiSteps;
+    c.ssgiGiStrength = ini.ssgiGiStrength;
+    c.ssgiGiPreviewLevel = ini.ssgiGiPreviewLevel;
+}
 
 void NoteIniTime() {
     WIN32_FILE_ATTRIBUTE_DATA a{};
@@ -817,6 +856,20 @@ bool ReloadConfig(bool force) {
     c.focusCull = n.focusCull;
     c.cullKeyMod = n.cullKeyMod;
     c.cullKey = n.cullKey;
+    c.ssgiAo = n.ssgiAo;
+    c.ssgiRadius = n.ssgiRadius;
+    c.ssgiThickness = n.ssgiThickness;
+    c.ssgiPower = n.ssgiPower;
+    c.ssgiSlices = n.ssgiSlices;
+    c.ssgiSteps = n.ssgiSteps;
+    c.ssgiMaxRadiusPx = n.ssgiMaxRadiusPx;
+    c.ssgiBlurDepth = n.ssgiBlurDepth;
+    c.ssgiPreviewLevel = n.ssgiPreviewLevel;
+    c.ssgiGi = n.ssgiGi;
+    c.ssgiGiStrength = n.ssgiGiStrength;
+    c.ssgiGiVehicle = n.ssgiGiVehicle;
+    c.ssgiGiClamp = n.ssgiGiClamp;
+    c.ssgiGiPreviewLevel = n.ssgiGiPreviewLevel;
     c.sunEffects = n.sunEffects;
     c.sunKeyMod = n.sunKeyMod;
     c.sunKey = n.sunKey;

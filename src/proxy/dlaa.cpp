@@ -22,6 +22,7 @@
 #include "mvr_pass.h"
 #include "nr.h"
 #include "sr.h"
+#include "ssgi_ao.h"
 #include "sun_fx.h"
 #include "sysinfo.h"
 
@@ -1677,6 +1678,10 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
                 MeasureDisplays(c, view, stencil, stencilSlice, iw, ih, MaskBitsNow(), dispDone);
         }
         c->CopyResource(tex[3], dispDone ? dispTex : out);
+        if (view >= 1) {
+            ssgiao::CaptureHistory(c, view - 1, tex[3]);  // [ssgi] gi: the view's image for the next frame's bounce
+            ssgiao::PreviewInto(c, view - 1, tex[3]);     // [ssgi] ao=3 or gi=2 without MSAA
+        }
         ViewSpanEnd(gpu::DlssOuterL, view);
         if (g_sr) sr::ShotDlss(c, tex[1], tex[3]);  // shot frame only
         result = kDone;

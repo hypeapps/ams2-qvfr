@@ -125,6 +125,8 @@ bool EarlyBegin(int eye, bool projected);
 void EarlyRefused(int eye, const char* why);  // quad could not swap (the reason is counted)
 void EarlyEnd(int eye, double ms, bool ok);   // ok = false: an engine fault in the early tasks
 void EarlyWaited(double ms);                  // time quad waited for the engine's recording workers before the swap
+// Render thread: the eye whose focus tasks run early now (from a successful EarlyBegin to EarlyEnd), else -1.
+int EarlyEye();
 // MVR forward, step 2 (docs/mvr.md B9c), [debug] mvr_forward_test with mvr_early=1 and the PS patch (mvr_ps.h): a shot
 // frame also runs outer L's forward pass (CPhase3Render, right after the early run) with MVR. Its targets go to the
 // two-slice copies as in the G-buffer pass, each filled at its first bind or clear: slice 0 with the game's texture,

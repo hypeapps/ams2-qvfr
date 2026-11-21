@@ -33,6 +33,9 @@
 //   --sun-fx                          without SteamVR and without the proxy DLL: the proxy's sun effects module (outer's
 //                                     effect draws repeated into its accumulation, focus's replaced by the pass, at an
 //                                     effect draw and at the anchor, module off) on a D3D11 device (sun_fx_smoke.cpp)
+//   --ssgi-ao                         without SteamVR and without the proxy DLL: the proxy's own AO module (compute
+//                                     pass on a synthetic G-buffer at the overlay draw, the slot swaps, the preview,
+//                                     the game's SSAO with ao=0) on a D3D11 device (ssgi_ao_smoke.cpp)
 //   --mvr-vs                          without SteamVR and without the proxy DLL: the proxy's MVR vertex shader patch
 //                                     (hook, NVAPI creation, image unchanged with MVR off, view 1 with MVR on, refusal)
 //                                     on an NVIDIA D3D11 device (mvr_vs_smoke.cpp)
@@ -90,6 +93,7 @@
 #include "compose.h"
 
 int RunSunFx();  // sun_fx_smoke.cpp
+int RunSsgiAo();  // ssgi_ao_smoke.cpp
 int RunMvrVs();  // mvr_vs_smoke.cpp
 int RunMvrPs();  // mvr_ps_smoke.cpp
 int RunPsPatchDir(const char* dir);  // mvr_ps_smoke.cpp (B20 K4)
@@ -2483,6 +2487,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--clones")) clonesTest = true;
         else if (!strcmp(argv[i], "--sun-fx")) sunFxTest = true;
         else if (!strcmp(argv[i], "--taa-fix")) return RunTaaFix();
+        else if (!strcmp(argv[i], "--ssgi-ao")) return RunSsgiAo();
         else if (!strcmp(argv[i], "--mvr-motion")) return RunMvrMotion();
         else if (!strcmp(argv[i], "--dlaa-displays")) return RunDlaaDisplays();
         else if (!strcmp(argv[i], "--nr-bridge")) return RunNrBridge();

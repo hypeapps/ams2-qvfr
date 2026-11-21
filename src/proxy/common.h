@@ -367,6 +367,25 @@ struct Config {
     // Fixed for the session: 0 auto (the driver's NGX core, then the model directly), 1 core, 2 model directly.
     int nrNgx = 0;
     unsigned long long nrAppId = 0x24480451ull;  // NGX application id (nr-bridge's default)
+    // [ssgi] own ambient occlusion in place of the game's SSAO (ssgi_ao.h), all live. ao: 0 the game's SSAO, 1 own AO
+    // on the ambient light and on the sun's shadow term (as the game uses its SSAO), 2 own AO on the ambient light only,
+    // 3 as 1 plus a grey image of the AO over each view's MSAA resolve or DLSS output (preview).
+    int ssgiAo = 0;
+    float ssgiRadius = 1.0f;         // metres
+    float ssgiThickness = 0.3f;      // metres a sample occludes behind its front face
+    float ssgiPower = 1.0f;          // the AO to this power
+    int ssgiSlices = 3;              // directions per pixel
+    int ssgiSteps = 8;               // samples per side of a direction
+    float ssgiMaxRadiusPx = 200.0f;  // the radius on screen at most this many pixels
+    float ssgiBlurDepth = 0.05f;     // the blur mixes pixels whose depths differ by less than this share
+    float ssgiPreviewLevel = 500.0f; // ao=3: the grey image's brightness (the game's HDR units)
+    // gi (needs ao 1 to 3): 0 off, 1 one bounce of light from the view's previous image, 2 as 1 plus the bounce alone
+    // drawn over the image (preview).
+    int ssgiGi = 0;
+    float ssgiGiStrength = 1.0f;      // the bounce times this
+    float ssgiGiVehicle = 1.0f;       // on vehicles (the player's car has its own ambient light) times this as well
+    float ssgiGiClamp = 0.0f;         // the light of a sample at most this luminance (the game's HDR units), 0 no limit
+    float ssgiGiPreviewLevel = 2.0f;  // gi=2: the bounce times this in the preview
     // [panel] the tuning panel in the headset (dlaa-plan D7.P): hotkey (modifier + key, VK codes) and its place in the
     // seated space: width, distance ahead of and drop below the seated origin, tilt towards the eyes (degrees).
     int panelKeyMod = VK_RCONTROL;

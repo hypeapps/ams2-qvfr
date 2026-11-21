@@ -70,7 +70,9 @@ const char* const kSpanNames[kSpans] = {
     "dlss eval outer L", "dlss eval outer R", "dlss eval focus L", "dlss eval focus R",
     "dlss motion outer L", "dlss motion outer R", "dlss motion focus L", "dlss motion focus R",
     "dlss displays outer L", "dlss displays outer R", "dlss displays focus L", "dlss displays focus R",
-    "carry outer L", "carry outer R", "carry focus L", "carry focus R"};
+    "carry outer L", "carry outer R", "carry focus L", "carry focus R",
+    "ao outer L",   "ao outer R",   "ao focus L",    "ao focus R",
+    "gi hist outer L", "gi hist outer R", "gi hist focus L", "gi hist focus R"};
 
 template <class T>
 void SafeRelease(T*& p) {

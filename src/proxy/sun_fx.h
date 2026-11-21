@@ -58,14 +58,27 @@ bool SetCreatePsFilter(CreatePsFilterFn create);
 // not see (DLSS's SwapDeviceContextState back) never runs inside a pass.
 void NewPsEpoch();
 ID3D11PixelShader* CurrentPs(ID3D11DeviceContext* c);
+// A Draw past this module's hook (ssgi_ao's preview inside a hooked draw); the context's own when not hooked.
+void DrawUnhooked(ID3D11DeviceContext* c, UINT count, UINT start);
 uint64_t PsReads();  // CurrentPs calls that read the shader back, so far
+// The DXBC checksum of a pixel shader the game made since the hooks went in (ssgi_ao's draw dump); false: unknown.
+bool PsChecksum(ID3D11PixelShader* ps, uint32_t out[4]);
 
 std::string Describe();      // one part of the summary line
 void LogStats(bool totals);  // a stats line, with the session totals at the end
 void Shutdown();             // VR_Shutdown: D3D11 objects released (hooks stay)
 
 // qvfr_proxy_smoke --sun-fx: hooks on the test device and pixel shaders registered as effect shaders.
-enum Kind { KindNone = 0, KindRays = 1, KindFlare = 2 };
+// The table also holds the draws of own AO (ssgi_ao.h), which the hooks hand to that module.
+enum Kind {
+    KindNone = 0,
+    KindRays = 1,
+    KindFlare = 2,
+    KindAoOverlay = 3,
+    KindAoAmbient = 4,
+    KindAoResolve = 5,
+    KindAoAmbientLightmap = 6
+};
 bool TestInstall(ID3D11Device* dev, ID3D11DeviceContext* ctx);
 void TestRegister(ID3D11PixelShader* ps, Kind kind);
 struct TestState {

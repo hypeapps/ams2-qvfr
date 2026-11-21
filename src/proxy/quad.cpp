@@ -34,6 +34,7 @@
 #include "shots.h"
 #include "sr_cb.h"
 #include "sr_probe.h"
+#include "ssgi_ao.h"
 #include "sun_fx.h"
 #include "taa_views.h"
 
@@ -3000,6 +3001,7 @@ void OnFrameStart() {
             if (g_skipSet.load() && !GroupsAliveLocked()) ClearGroups();
             clones::OnFrameStart(gpu::Context(), false);  // a swap left over goes back
             sunfx::OnFrameStart(gpu::Context(), false);
+            ssgiao::OnFrameStart(gpu::Context(), false);
             taaviews::OnFrameStart(false, false);
             return;
         }
@@ -3018,6 +3020,7 @@ void OnFrameStart() {
         mvrpass::SetSrActive(srNow);
         clones::OnFrameStart(gpu::Context(), g_clonesOn && g_focus.on);
         sunfx::OnFrameStart(gpu::Context(), g_sunOn && g_focus.on && !g_frameSkip);
+        ssgiao::OnFrameStart(gpu::Context(), true);
         mvrvs::OnFrameStart(gpu::Context());
         mvrps::OnFrameStart(gpu::Context());
         taaviews::OnFrameStart(g_taaOn && !g_frameSkip, g_shotFrame);
@@ -3254,6 +3257,7 @@ void LogStats(bool totals) {
         clones::LogStats(totals);
         srcb::LogStats(totals);
         sunfx::LogStats(totals);
+        ssgiao::LogStats(totals);
         mvrvs::LogStats(totals);
         mvrps::LogStats(totals);
         mvrpass::LogStats(totals);
@@ -3435,11 +3439,11 @@ std::string Describe() {
                            : g_cull.failed ? "focus culling off after failed checks"
                            : g_cullOn      ? "focus culling on"
                                            : "focus culling off";
-        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s, %s, %s, %s, %s, %s, %s, %s%s",
+        snprintf(buf, sizeof(buf), "Quad: mode quad, %s, builder patch %s, focus groups %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s%s",
                  g_installed ? "engine hooks on" : "engine hooks off", g_patched ? "on" : "off",
                  g_graph.ok ? "running" : "not running", focus, view, cull, clones::Describe().c_str(),
-                 sunfx::Describe().c_str(), taaviews::Describe().c_str(), mvrvs::Describe().c_str(),
-                 mvrps::Describe().c_str(), mvrpass::Describe().c_str(), g_fault ? ", stopped after an exception" : "");
+                 sunfx::Describe().c_str(), ssgiao::Describe().c_str(), taaviews::Describe().c_str(),
+                 mvrvs::Describe().c_str(), mvrps::Describe().c_str(), mvrpass::Describe().c_str(), g_fault ? ", stopped after an exception" : "");
     });
     return buf;
 }
@@ -3473,6 +3477,7 @@ void Shutdown() {
         RestoreLocked();
         clones::Shutdown();
         sunfx::Shutdown();
+        ssgiao::Shutdown();
         taaviews::Shutdown();
         mvrpass::Shutdown();
         shots::Cancel();

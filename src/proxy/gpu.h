@@ -48,6 +48,8 @@ enum Span {
     DlssMvOuterL, DlssMvOuterR, DlssMvFocusL, DlssMvFocusR,          // mvr_motion: outer's stored, focus's made
     DlssDispOuterL, DlssDispOuterR, DlssDispFocusL, DlssDispFocusR,  // the displays pass
     CarryOuterL, CarryOuterR, CarryFocusL, CarryFocusR,              // DLSS SR: the textures carried to the view's size
+    AoOuterL, AoOuterR, AoFocusL, AoFocusR,                          // ssgi_ao: own AO, the bounce and the blur
+    GiHistOuterL, GiHistOuterR, GiHistFocusL, GiHistFocusR,          // ssgi_ao: the history copy, per view
     kSpans
 };
 const char* SpanName(int s);  // "p1 outer L", ...
