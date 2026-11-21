@@ -334,7 +334,7 @@ Plan MakePlan(const Input& in) {
         listed.insert(Narrow(token));
     }
     const std::vector<std::wstring> searched = Split(in.layerPath, L";");
-    std::vector<std::wstring> folders;  // already on the path through an earlier moved layer
+    std::vector<int> priority;  // per plan.move entry: 0 named in the setting, 1 VIVE's layer, 2 lists the extension
     for (const std::wstring& manifest : in.enabledManifests) {
         const fs::path file = manifest;
         Manifest m;
@@ -380,12 +380,35 @@ Plan MakePlan(const Input& in) {
                                          : "VIVE's layer that provides the gaze";
         bool found = false;
         for (const std::wstring& dir : searched) found |= HasLoadableCopy(dir, m.name, {});
-        const std::wstring folder = file.parent_path().wstring();
-        if (!found && std::find(folders.begin(), folders.end(), folder) == folders.end()) {
-            layer.folder = folder;
-            folders.push_back(folder);
-        }
+        if (!found) layer.folder = file.parent_path().wstring();
         plan.move.push_back(std::move(layer));
+        priority.push_back(byName ? 0 : vive ? 1 : 2);
+    }
+    if (in.maxMoved > 0 && plan.move.size() > in.maxMoved) {
+        // Keep the best maxMoved, in the loader's order.
+        std::vector<size_t> rank(plan.move.size());
+        for (size_t i = 0; i < rank.size(); ++i) rank[i] = i;
+        std::stable_sort(rank.begin(), rank.end(), [&](size_t a, size_t b) { return priority[a] < priority[b]; });
+        std::vector<bool> keep(plan.move.size(), false);
+        for (size_t i = 0; i < in.maxMoved; ++i) keep[rank[i]] = true;
+        std::vector<Layer> kept;
+        for (size_t i = 0; i < plan.move.size(); ++i) {
+            if (keep[i]) {
+                kept.push_back(std::move(plan.move[i]));
+                continue;
+            }
+            plan.notes.push_back(plan.move[i].name + " (" + Narrow(plan.move[i].manifest) +
+                                 "): left in place, OpenComposite's OpenXR loader reads only " +
+                                 std::to_string(in.maxMoved) + " moved layer(s) from XR_ENABLE_API_LAYERS");
+        }
+        plan.move = std::move(kept);
+    }
+    // A folder shared by two moved layers goes on the path once.
+    std::vector<std::wstring> folders;
+    for (Layer& l : plan.move) {
+        if (l.folder.empty()) continue;
+        if (std::find(folders.begin(), folders.end(), l.folder) != folders.end()) l.folder.clear();
+        else folders.push_back(l.folder);
     }
     for (const std::string& name : listed)
         if (!used.count(name)) plan.notes.push_back("openxr_gaze_layers names " + name + ", not an enabled implicit layer");

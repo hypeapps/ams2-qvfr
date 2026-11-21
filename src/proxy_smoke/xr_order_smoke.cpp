@@ -150,6 +150,24 @@ int RunXrGazeLayers(const fs::path& home) {
     Check(noted("not valid JSON"), "a broken manifest stays in place");
     Check(noted("names XR_APILAYER_absent"), "a name in the setting that matches nothing is reported");
 
+    // OpenComposite's loader takes only one more name: the best layer stays, in priority over the loader's order.
+    in.maxMoved = 1;
+    const qvfr::xrorder::Plan one = qvfr::xrorder::MakePlan(in);
+    Check(one.move.size() == 1 && one.move[0].name == "XR_APILAYER_listed" && one.move[0].folder == listed.wstring(),
+          "with one place a layer named in openxr_gaze_layers wins");
+    in.setting.clear();
+    const qvfr::xrorder::Plan vivePlan = qvfr::xrorder::MakePlan(in);
+    bool limitNoted = false;
+    for (const auto& n : vivePlan.notes) limitNoted |= n.find("XR_APILAYER_gaze") != std::string::npos &&
+                                                       n.find("reads only 1 moved layer") != std::string::npos;
+    Check(vivePlan.move.size() == 1 && vivePlan.move[0].name == "XR_APILAYER_vive_facial" && limitNoted,
+          "without one, VIVE's layer wins over a layer that only lists the extension, and the rest is noted");
+    // Even when the other layer comes first in the loader's order (the case of issue #15 the other way round).
+    in.enabledManifests = {(gaze / L"openxr-api-layer.json").wstring(), (vive / L"ViveOpenXRFacialTracking.json").wstring()};
+    const qvfr::xrorder::Plan swapped = qvfr::xrorder::MakePlan(in);
+    Check(swapped.move.size() == 1 && swapped.move[0].name == "XR_APILAYER_vive_facial", "VIVE's layer wins in any order");
+    in.maxMoved = 0;
+
     in.setting = L"OFF";
     const qvfr::xrorder::Plan off = qvfr::xrorder::MakePlan(in);
     Check(off.move.empty(), "openxr_gaze_layers=off moves nothing");

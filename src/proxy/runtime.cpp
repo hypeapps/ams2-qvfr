@@ -191,7 +191,16 @@ void LogManifest(const std::wstring& file) {
 // this process only they are turned off as implicit layers and enabled again after ours. Nothing outside the process
 // changes: other OpenXR applications keep their layers as they are.
 void AddGazeLayers(std::wstring& layerPath, std::wstring& enable) {
+    // OpenComposite's loader reads only two names from XR_ENABLE_API_LAYERS right (xr_layer_order.h): ours and one more.
+    const std::wstring playerLayers = GetEnv(L"XR_ENABLE_API_LAYERS");
+    if (!playerLayers.empty()) {
+        Log("Runtime: OpenXR gaze layers: none moved, XR_ENABLE_API_LAYERS already names %s and OpenComposite's loader "
+            "reads only two names",
+            Narrow(playerLayers).c_str());
+        return;
+    }
     xrorder::Input in;
+    in.maxMoved = 1;
     AddImplicitManifests(HKEY_LOCAL_MACHINE, in.enabledManifests);
     AddImplicitManifests(HKEY_CURRENT_USER, in.enabledManifests);
     in.setting = Cfg().openxrGazeLayers;

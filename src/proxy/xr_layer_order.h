@@ -32,10 +32,16 @@ struct Input {
     std::wstring layerPath;                      // XR_API_LAYER_PATH set outside the mod
     std::string ownLayer;                        // the mod's layer name, never moved
     std::function<bool(const std::string&)> envSet;  // is this environment variable set?
+    // How many layers may move (0 = all). The loader inside OpenComposite 1.0.1539 is older than Khronos 1.0.14 and
+    // splits XR_ENABLE_API_LAYERS wrongly: from three names on, the middle ones run together ("a;b") and the loader
+    // fails xrCreateInstance because it finds no such layer (issue #15). Ours plus one moved layer is all it reads right.
+    size_t maxMoved = 0;
 };
 
 struct Plan {
-    std::vector<Layer> move;         // in the loader's order, which the chain keeps
+    // In the loader's order, which the chain keeps. With maxMoved the best ones stay: a layer named in the setting, then
+    // VIVE's layer, then one that lists the gaze extension.
+    std::vector<Layer> move;
     std::vector<std::string> notes;  // layers left alone and why (for the log)
 };
 
