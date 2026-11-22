@@ -341,6 +341,7 @@ bool g_mvrMsColorSkipCfg = true;  // Cfg().mvrMsColorSkip last seen
 bool g_mvrMsColorSkipKeyDown = false;
 bool g_mvrLiveTrackCfg = true;  // Cfg().mvrLiveTrackSkip last seen
 bool g_mvrLiveTrackKeyDown = false;
+bool g_mvrLtEarlyCfg = true;  // Cfg().mvrLiveTrackEarly last seen
 
 // mvr_motion's window source: mvr_pass's maps in uv.
 bool MotionWindows(int eye, mvrmotion::Map* cur, mvrmotion::Map* prev, bool* fromOuter) {
@@ -368,6 +369,8 @@ bool g_mapNext = false;
 struct EyeTasks {
     uint8_t* ssao = nullptr;
     uint8_t* phase2 = nullptr;
+    uint8_t* ltBuild = nullptr;   // issue 19: CLiveTrackBuildCommandThread (one per group, else none)
+    uint8_t* ltRender = nullptr;  // CLiveTrackRender
 };
 EyeTasks g_eyeTasks[kGroups];  // under g_m, from BuildProfileLocked
 // Crepuscular rays and lens flares of the focus views from outer (sun_fx.h): setting and hotkey.
@@ -570,6 +573,7 @@ const ProfTask* ProfFind(uint8_t* task) {
 }
 
 void EarlyFocus(int eye);
+void EarlyMap(int eye);
 
 // GPU spans of an eye group's render task (gpu.h): its begin and end span, -1 for none.
 struct TaskSpans {
@@ -814,6 +818,12 @@ void __fastcall RunTask(uint8_t* task) {
         mvrpass::KindOf(task) == mvrpass::Kind::Phase3) {
         hookprof::Orig o;  // the moved focus tasks (their D3D11 detours count on their own)
         EarlyFocus(prof->group - OuterL);
+    }
+    // Issue 19: focus's live track map right before outer's G-buffer pass (EarlyMap).
+    if (mvr && prof && (prof->group == OuterL || prof->group == OuterR) &&
+        mvrpass::KindOf(task) == mvrpass::Kind::Phase1) {
+        hookprof::Orig o;
+        EarlyMap(prof->group - OuterL);
     }
     const TaskSpans spans = mvr ? SpansOf(task, prof) : TaskSpans{};
     if (spans.begin >= 0) gpu::SpanBegin((gpu::Span)spans.begin);
@@ -1062,12 +1072,21 @@ void BuildProfileLocked() {
     mvrpass::SetPhase3BuildVtable(build3);
     // B19: the focus groups' CLiveTrackRender and CLiveTrackBuildCommandThread (skipped when focus reads outer's map).
     uintptr_t ltRender = 0, ltBuild = 0;
+    bool ltTwice[kGroups] = {};
     for (size_t i = 0; i < p->n; ++i) {
         if (p->entries[i].group < FocusL) continue;
-        if (!ltRender && !strcmp(p->entries[i].name, "CLiveTrackRender")) hooks::TryRead(items[i].task, &ltRender, 8);
-        if (!ltBuild && !strcmp(p->entries[i].name, "CLiveTrackBuildCommandThread"))
-            hooks::TryRead(items[i].task, &ltBuild, 8);
+        const bool render = !strcmp(p->entries[i].name, "CLiveTrackRender");
+        const bool build = !render && !strcmp(p->entries[i].name, "CLiveTrackBuildCommandThread");
+        if (!render && !build) continue;
+        if (render && !ltRender) hooks::TryRead(items[i].task, &ltRender, 8);
+        if (build && !ltBuild) hooks::TryRead(items[i].task, &ltBuild, 8);
+        // Issue 19: the focus group's pair for its early map (EarlyMap)
+        uint8_t*& slot = render ? g_eyeTasks[p->entries[i].group].ltRender : g_eyeTasks[p->entries[i].group].ltBuild;
+        if (slot) ltTwice[p->entries[i].group] = true;
+        slot = (uint8_t*)items[i].task;
     }
+    for (int g = 0; g < kGroups; ++g)
+        if (ltTwice[g]) g_eyeTasks[g].ltBuild = g_eyeTasks[g].ltRender = nullptr;
     mvrpass::SetLiveTrackVtables(ltRender, ltBuild);
     std::vector<uint32_t> idx(p->n);
     for (uint32_t i = 0; i < p->n; ++i) idx[i] = i;
@@ -1786,6 +1805,11 @@ void HandleToolsLocked() {
         g_mvrLiveTrackCfg = c.mvrLiveTrackSkip;
         mvrpass::SetLiveTrackSkip(c.mvrLiveTrackSkip);
         Log("Quad: MVR focus skips its own live track map %s (ini)", c.mvrLiveTrackSkip ? "on" : "off");
+    }
+    if (mvrpass::On() && c.mvrLiveTrackEarly != g_mvrLtEarlyCfg) {
+        g_mvrLtEarlyCfg = c.mvrLiveTrackEarly;
+        mvrpass::SetLiveTrackEarly(c.mvrLiveTrackEarly);
+        Log("Quad: MVR focus's live track map early in outer's group %s (ini)", c.mvrLiveTrackEarly ? "on" : "off");
     }
     if (mvrpass::On() && Pressed(c.mvrKeyMod, c.mvrLiveTrackSkipKey, g_mvrLiveTrackKeyDown)) {
         mvrpass::SetLiveTrackSkip(!mvrpass::GetLiveTrackSkip());
@@ -2585,6 +2609,163 @@ void EarlyFocus(int eye) {
     }
 }
 
+// Issue 19 (docs/issue-19.md, mvr_pass.h EarlyMapWanted): focus's live track map right before outer's CPhase1Render
+// of the eye, so view 1 of outer's G-buffer and forward passes reads focus's own map. Ghidra (2026-11-21):
+//   - CLiveTrackBuildCommandThread::Execute (0xaf96b0): with the context (task+0x860) on (bytes 0 and 1), its two
+//     command buffers (ctx+0x7d0, +0x7d8) and the live track manager's track (0xb0df10 returns 0x29e57c0, +0x268) it
+//     calls 0xcde2e0 (state 3: releases the task's dependents) and 0xaf9710, which queues the two recordings
+//     (device+0x558); else only its Finish;
+//   - CLiveTrackRender::Execute (0xaf9a20) waits for each buffer (+0x60) and replays it, then Finish.
+// So the early run calls 0xaf9710 alone (focus's group must not be released now) and the render's Execute without its
+// Finish, with focus's view and targets in as for the early SSAO and lights (EarlyFocus); the focus group then skips both
+// (B19). Both tasks belong to focus's group, whose context is outer's (checked), so the buffers are free: outer's own
+// CLiveTrackRender replayed them before its CPhase1Render.
+constexpr uintptr_t kLtBuildExecute = 0xaf96b0, kLtBuildRecord = 0xaf9710, kLtRenderExecute = 0xaf9a20;
+constexpr uintptr_t kLtManager = 0x29e57c0;  // DAT_1429e57c0 (RVA)
+constexpr size_t kLtManagerTrack = 0x268, kCtxLtBuffers = 0x7d0;
+using RecordFn = void(__fastcall*)(uint8_t*);
+bool g_ltCodeChecked = false, g_ltCodeOk = false;
+
+// The two tasks' Execute are the ones read in Ghidra (another game build: the step stays off).
+bool LiveTrackCodeOk(uint8_t* build, uint8_t* render) {
+    if (g_ltCodeChecked) return g_ltCodeOk;
+    g_ltCodeChecked = true;
+    const uintptr_t base = hooks::ExeBase();
+    uintptr_t bvt = 0, rvt = 0, bex = 0, rex = 0;
+    g_ltCodeOk = hooks::TryRead(build, &bvt, 8) && hooks::TryRead(render, &rvt, 8) &&
+                 hooks::TryRead((void*)(bvt + kExecuteSlot * 8), &bex, 8) &&
+                 hooks::TryRead((void*)(rvt + kExecuteSlot * 8), &rex, 8) && bex == base + kLtBuildExecute &&
+                 rex == base + kLtRenderExecute;
+    Log("Quad: MVR live track early: %s (build Execute AMS2AVX.exe+0x%llX, render Execute +0x%llX)",
+        g_ltCodeOk ? "the tasks' code matches" : "the tasks' code does NOT match this game build; the step is off",
+        (unsigned long long)(bex ? bex - base : 0), (unsigned long long)(rex ? rex - base : 0));
+    return g_ltCodeOk;
+}
+
+// What CLiveTrackBuildCommandThread::Execute checks before it records (false: it would only finish, nothing to draw).
+bool LiveTrackRecords(uint8_t* build) {
+    uint8_t* ctx = nullptr;
+    uint8_t on[2] = {};
+    uint64_t buf[2] = {}, track = 0;
+    return hooks::TryRead(build + kTaskCtx, &ctx, 8) && ctx && hooks::TryRead(ctx, on, 2) && on[0] && on[1] &&
+           hooks::TryRead(ctx + kCtxLtBuffers, buf, 16) && buf[0] && buf[1] &&
+           hooks::TryRead((void*)(hooks::ExeBase() + kLtManager + kLtManagerTrack), &track, 8) && track;
+}
+
+bool RecordOnly(uint8_t* build) {
+    __try {
+        ((RecordFn)(hooks::ExeBase() + kLtBuildRecord))(build);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
+void EarlyMap(int eye) {
+    if (!mvrpass::EarlyMapWanted(eye)) return;
+    const int og = OuterL + eye, fg = FocusL + eye;
+    uint8_t *fBegin = nullptr, *oBegin = nullptr, *build = nullptr, *render = nullptr;
+    const char* why = nullptr;
+    Run run{};
+    // No recording may run while focus's view and clones are in (EngineIdle). The ones the early run queues itself are
+    // done when the render's replay returns (it waits for them).
+    {
+        uint8_t* octx = nullptr;
+        Safe("early map (context)", [&] {
+            std::lock_guard lock(g_m);
+            if (g_graph.begin[og]) octx = *(uint8_t**)((uint8_t*)g_graph.begin[og] + kTaskCtx);
+        });
+        double waited = 0;
+        if (!octx) why = "no eye groups";
+        else if (!WaitEngineIdle(octx, &why, &waited)) {
+            if (!why) why = "the engine's workers busy";
+        }
+        if (why) {
+            mvrpass::EarlyMapRefused(eye, why);
+            return;
+        }
+    }
+    Safe("early map (swap)", [&] {
+        std::lock_guard lock(g_m);
+        fBegin = (uint8_t*)g_graph.begin[fg];
+        oBegin = (uint8_t*)g_graph.begin[og];
+        build = g_eyeTasks[fg].ltBuild;
+        render = g_eyeTasks[fg].ltRender;
+        if (!g_graph.ok || !fBegin || !oBegin) {
+            why = "no eye groups";
+            return;
+        }
+        if (!build || !render) {
+            why = "the focus group has no single CLiveTrackBuildCommandThread and CLiveTrackRender";
+            return;
+        }
+        if (!LiveTrackCodeOk(build, render)) {
+            why = "the live track tasks' code does not match this game build";
+            return;
+        }
+        if (!(g_began & (1u << og)) || (g_began & (1u << fg))) {
+            why = "outer's group not running or focus's already begun";
+            return;
+        }
+        if (!g_focus.on || g_frameSkip) {
+            why = "no focus window or outer only";
+            return;
+        }
+        if (g_swap.ctx) {
+            why = "a view swap is active";
+            return;
+        }
+        if (!clones::IsReady(true)) {
+            why = "the clones are not ready";
+            return;
+        }
+        uint8_t* ctx = *(uint8_t**)(fBegin + kTaskCtx);
+        const int view = *(int*)(fBegin + kTaskView);
+        uint8_t* bctx = nullptr;
+        if (!ctx || view != kFocusView || ctx != *(uint8_t**)(oBegin + kTaskCtx) ||
+            !hooks::TryRead(build + kTaskCtx, &bctx, 8) || bctx != ctx) {
+            why = "focus's CBeginEye or live track build has another context or view";
+            return;
+        }
+        if (!LiveTrackRecords(build)) {
+            why = "the live track build would not record";
+            return;
+        }
+        SwapInLocked(ctx, fg, kSourceView[fg], run, false, true);
+        if (!run.projected) {
+            RestoreLocked();
+            why = "no focus projection";
+        }
+    });
+    if (g_fault.load(std::memory_order_relaxed)) why = "proxy fault";
+    if (why) {
+        mvrpass::EarlyMapRefused(eye, why);
+        return;
+    }
+    LARGE_INTEGER t0{}, t1{};
+    QueryPerformanceCounter(&t0);
+    ID3D11DeviceContext* imm = gpu::Context();
+    // Outer's set out, focus's in (its clones, its scene clones, or the engine's textures at the game's size), as in
+    // EarlyFocus; BeginGroup(Outer) below puts outer's back.
+    clones::EndGroup(imm);
+    clones::BeginGroup(imm, clones::Focus);
+    bool ok = ExecuteOnly(fBegin, o_beginExec) && RecordOnly(build) && ExecuteOnly(render, nullptr);
+    clones::EndGroup(imm);
+    clones::BeginGroup(imm, clones::Outer);
+    Guard("early map (restore)", [&] {
+        std::lock_guard lock(g_m);
+        if (g_swap.ctx && g_swap.group == fg) RestoreLocked();
+    });
+    ok &= ExecuteOnly(oBegin, o_beginExec);
+    QueryPerformanceCounter(&t1);
+    mvrpass::EarlyMapEnd(eye, g_qpcFreq ? (t1.QuadPart - t0.QuadPart) * 1000.0 / g_qpcFreq : 0, ok);
+    if (!ok) {
+        mvrpass::SetLiveTrackEarly(false);
+        Log("Quad: MVR live track early: ENGINE FAULT in a moved task (frame %llu); the step is off",
+            (unsigned long long)g_frameNo);
+    }
+}
+
 // ---------------------------------------------------------------- D3D11 detour
 
 using OMSetRenderTargetsFn = void(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*,
@@ -2959,6 +3140,7 @@ void Install() {
             g_mvrNativeCfg = Cfg().mvrNativeTargets;
             g_mvrMsColorSkipCfg = Cfg().mvrMsColorSkip;
             g_mvrLiveTrackCfg = Cfg().mvrLiveTrackSkip;
+            g_mvrLtEarlyCfg = Cfg().mvrLiveTrackEarly;
             mvrpass::SetVelocityFill(&FillFocusMotion);
         }
         else if (Cfg().mvrGbuffer)

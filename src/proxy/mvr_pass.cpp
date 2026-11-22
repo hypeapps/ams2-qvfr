@@ -630,6 +630,7 @@ struct Pass {
     // B9d run 5: the live track map of outer read in the focus window into a focus-size texture for view 1 (once per
     // forward pass, at the first draw whose PS reads it).
     bool liveTrackDone = false, liveTrackOk = false;
+    bool liveTrackEarly = false;  // issue 19: the map is focus's own from its early run (EarlyMapSrv)
     // B13 (mvr_gbuffer_ps): the G-buffer pass's draws of patched PS; psSlot3 holds the game's PS slot 3 from the first.
     bool gbufPsBound = false;
     unsigned gbufPsDraws = 0, gbufPsKept = 0;  // with view 1's rows; kept as before (they read globalTexture0..4)
@@ -845,6 +846,11 @@ bool g_ltLastReads = false;
 struct LtStats {
     uint64_t skipped[2] = {}, builds[2] = {}, ran[2] = {}, checked = 0, reads = 0;
     std::vector<Reason> reasons;
+    // Issue 19: focus's early map (quad's EarlyMap) per eye: runs, their CPU, engine faults, why not run; the passes
+    // whose view 1 read it, those that read outer's window, why they did not get it after a run.
+    uint64_t earlyRuns[2] = {}, earlyFaults = 0, earlyUsed[2] = {}, windowUsed[2] = {};
+    double earlyMs[2] = {};
+    std::vector<Reason> earlyReasons, earlyMissed;
 };
 LtStats g_lts, g_ltot;
 std::string g_ltLastWhy;  // the smoke's
@@ -1813,11 +1819,68 @@ struct LiveTrackMap {
     ComPtr<ID3D11RenderTargetView> rtv;
 };
 LiveTrackMap g_liveTrack;
-void ResetLiveTrack() { g_liveTrack = LiveTrackMap{}; }
+// Issue 19 (docs/issue-19.md): with DLSS SR outer's map has outer's render size, and its thin parts (the far edge of
+// the track, kerbs, verges) read in the focus window, stretched up to 7.6x, came out in focus as blocks that moved with
+// the jitter (white rectangles on the rubber in a race). Quad's EarlyMap draws focus's own map right before outer's
+// G-buffer pass (EarlyMapWanted); view 1 of both passes then reads it (a view of focus's target) in place of the window.
+struct EarlyLiveTrack {
+    ID3D11Texture2D* tex = nullptr;  // focus's target the view is of (only compared)
+    DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+    ComPtr<ID3D11ShaderResourceView> srv;
+};
+EarlyLiveTrack g_ltEarly[2];
+uint64_t g_ltEarlyFrame[2] = {};  // the frame of the eye's latest early map without an engine fault
+bool g_ltEarlyOn = true;          // [debug] mvr_livetrack_early (live)
+void ResetLiveTrack() {
+    g_liveTrack = LiveTrackMap{};
+    for (EarlyLiveTrack& m : g_ltEarly) m = EarlyLiveTrack{};
+}
+
+void EarlyMapMiss(const char* why) {
+    AddReason(g_lts.earlyMissed, why);
+    AddReason(g_ltot.earlyMissed, why);
+}
+
+// View 1's map from focus's early run in this frame (null: none, the reason counted when there was a run): a view of
+// focus's target behind outer's map `r` (its focus clone, or the engine's texture with focus at the game's size).
+ID3D11ShaderResourceView* EarlyMapSrv(int eye, ID3D11Resource* r, DXGI_FORMAT fmt, ID3D11Texture2D** tex) {
+    if (eye < 0 || eye > 1 || g_ltEarlyFrame[eye] != g_frame) return nullptr;
+    const Pass& p = g_p;
+    ID3D11Texture2D* t = FocusTarget(r);
+    if (!t) {
+        EarlyMapMiss("no focus target of the map");
+        return nullptr;
+    }
+    D3D11_TEXTURE2D_DESC d{};
+    t->GetDesc(&d);
+    if (d.Width != p.fw || d.Height != p.fh || d.ArraySize != 1 || d.SampleDesc.Count != 1 ||
+        !(d.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+        EarlyMapMiss("focus's map is not a single texture at focus's size");
+        return nullptr;
+    }
+    EarlyLiveTrack& m = g_ltEarly[eye];
+    if (m.tex != t || m.fmt != fmt || !m.srv) {
+        m = EarlyLiveTrack{};
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = fmt;
+        sv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D = {0, d.MipLevels};
+        if (FAILED(g_g.dev->CreateShaderResourceView(t, &sv, &m.srv))) {
+            m = EarlyLiveTrack{};
+            EarlyMapMiss("no shader view of focus's map");
+            return nullptr;
+        }
+        m.tex = t;
+        m.fmt = fmt;
+    }
+    *tex = t;
+    return m.srv.Get();
+}
 
 ID3D11ShaderResourceView* LiveTrackSrv(ID3D11DeviceContext* c, ID3D11ShaderResourceView* g) {
     Pass& p = g_p;
-    if (p.liveTrackDone) return p.liveTrackOk ? g_liveTrack.srv.Get() : nullptr;
+    if (p.liveTrackDone)
+        return !p.liveTrackOk ? nullptr : p.liveTrackEarly ? g_ltEarly[p.eye].srv.Get() : g_liveTrack.srv.Get();
     p.liveTrackDone = true;
     auto fail = [&]() -> ID3D11ShaderResourceView* {
         ++(p.forward ? g_fs.liveTrackFails : g_st.liveTrackFails);
@@ -1833,6 +1896,15 @@ ID3D11ShaderResourceView* LiveTrackSrv(ID3D11DeviceContext* c, ID3D11ShaderResou
     if (!ok || d.Width != p.w || d.Height != p.h || d.ArraySize != 1 || d.SampleDesc.Count != 1 ||
         sv.ViewDimension != D3D11_SRV_DIMENSION_TEXTURE2D)
         return fail();
+    ID3D11Texture2D* early = nullptr;
+    if (ID3D11ShaderResourceView* v = EarlyMapSrv(p.eye, r.Get(), sv.Format, &early)) {
+        p.liveTrackOk = p.liveTrackEarly = true;
+        ++(p.forward ? g_fs.liveTracks : g_st.liveTracks);
+        ++(p.forward ? g_ftot.liveTracks : g_tot.liveTracks);
+        ++g_lts.earlyUsed[p.eye];
+        ++g_ltot.earlyUsed[p.eye];
+        return v;
+    }
     D3D11_TEXTURE2D_DESC want = d;
     want.Width = p.fw;
     want.Height = p.fh;
@@ -1870,6 +1942,10 @@ ID3D11ShaderResourceView* LiveTrackSrv(ID3D11DeviceContext* c, ID3D11ShaderResou
     p.liveTrackOk = true;
     ++(p.forward ? g_fs.liveTracks : g_st.liveTracks);
     ++(p.forward ? g_ftot.liveTracks : g_tot.liveTracks);
+    if (p.eye == 0 || p.eye == 1) {
+        ++g_lts.windowUsed[p.eye];
+        ++g_ltot.windowUsed[p.eye];
+    }
     return m.srv.Get();
 }
 
@@ -4413,6 +4489,7 @@ bool Install() {
         g_msSlices = Cfg().mvrMsSlices;
         g_gbufSlices = Cfg().mvrGbufferSlices;
         g_ltOn = Cfg().mvrLiveTrackSkip;
+        g_ltEarlyOn = Cfg().mvrLiveTrackEarly;
         g_installed = true;
         Log("MVR G-buffer: on; outer L's and outer R's G-buffer pass draw the eye's focus too (MVR, view 1 in the "
             "corner of slice 1 of two-slice copies), the focus groups skip CPhase1BuildCommandThread and CPhase1Render "
@@ -5071,6 +5148,41 @@ const char* LiveTrackWhy(int eye) {
     if (g_ltStopped) return "stopped: a draw in a focus group read the map it had skipped";
     return FromOuterWhy(eye);
 }
+
+void EarlyMapRefused(int eye, const char* why) {
+    if (eye < 0 || eye > 1 || !why || !*why) return;
+    char b[200];
+    snprintf(b, sizeof(b), "%s %s", kEye[eye], why);
+    AddReason(g_lts.earlyReasons, b);
+    AddReason(g_ltot.earlyReasons, b);
+}
+
+bool EarlyMapWanted(int eye) {
+    if (!On() || !g_ltEarlyOn || !g_ltRenderVt || !g_ltBuildVt || eye < 0 || eye > 1) return false;
+    const Win& w = g_win[eye];
+    const char* why = !g_enabled                        ? "MVR G-buffer off (hotkey)"
+                      : !g_forwardOn && !g_gbufPsOn     ? ""  // view 1 reads no map (nothing counted)
+                      : g_mode != Mode::Skip            ? "a diagnosis mode of the G-buffer is on"
+                      : g_shot.armed || g_fshot.armed   ? "shot frame"
+                      : g_ltMapFrame                    ? "task map frame"
+                      : !w.valid || w.frame != g_frame  ? "no focus window in this frame"
+                                                        : nullptr;
+    if (why) EarlyMapRefused(eye, why);
+    return why == nullptr;
+}
+
+void EarlyMapEnd(int eye, double ms, bool ok) {
+    if (eye < 0 || eye > 1) return;
+    for (LtStats* s : {&g_lts, &g_ltot}) {
+        ++s->earlyRuns[eye];
+        s->earlyMs[eye] += ms;
+        if (!ok) ++s->earlyFaults;
+    }
+    if (ok) g_ltEarlyFrame[eye] = g_frame;
+}
+
+void SetLiveTrackEarly(bool on) { g_ltEarlyOn = on; }
+bool GetLiveTrackEarly() { return g_ltEarlyOn; }
 
 const char* FromOuterWhy(int eye) {
     if (eye < 0 || eye > 1) return "not a focus group";
@@ -5870,6 +5982,27 @@ void LogStats(bool totals) {
             (unsigned long long)l.builds[0], (unsigned long long)l.builds[1], (unsigned long long)l.ran[0],
             (unsigned long long)l.ran[1], (unsigned long long)l.checked, (unsigned long long)l.reads,
             lr.empty() ? "" : "; drawn because: ", lr.c_str());
+    }
+    if (g_ltRenderVt && (g_ltEarlyOn || l.earlyRuns[0] || l.earlyRuns[1] || l.earlyUsed[0] || l.earlyUsed[1])) {
+        auto list = [](const std::vector<Reason>& v) {
+            std::string t;
+            for (const Reason& r : v) {
+                char b[240];
+                snprintf(b, sizeof(b), "%s%s %llu", t.empty() ? "" : "; ", r.text.c_str(), (unsigned long long)r.n);
+                t += b;
+            }
+            return t;
+        };
+        const std::string er = list(l.earlyReasons), em = list(l.earlyMissed);
+        auto runMs = [&](int e) { return l.earlyRuns[e] ? l.earlyMs[e] / l.earlyRuns[e] : 0.0; };
+        Log("MVR live track early%s (%llu frames, mvr_livetrack_early %s): focus's map drawn in outer's group L %llu / R "
+            "%llu, CPU per run L %.3f / R %.3f ms, engine faults %llu; view 1 read it in passes L %llu / R %llu, outer's "
+            "window L %llu / R %llu%s%s%s%s",
+            totals ? " (session)" : "", (unsigned long long)s.frames, g_ltEarlyOn ? "on" : "off",
+            (unsigned long long)l.earlyRuns[0], (unsigned long long)l.earlyRuns[1], runMs(0), runMs(1),
+            (unsigned long long)l.earlyFaults, (unsigned long long)l.earlyUsed[0], (unsigned long long)l.earlyUsed[1],
+            (unsigned long long)l.windowUsed[0], (unsigned long long)l.windowUsed[1], er.empty() ? "" : "; not run: ",
+            er.c_str(), em.empty() ? "" : "; not read after a run: ", em.c_str());
     }
     if (!totals) {
         g_trkTot.checks += g_trk.checks;
