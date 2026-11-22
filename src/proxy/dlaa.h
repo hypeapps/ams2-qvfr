@@ -40,6 +40,10 @@ void OnSrScalesChanged(float focus, float outer);
 // as NVSDK_NGX_DLSS_Hint_Render_Preset (10 J, 11 K, 12 L, 13 M); -1 = the ini's.
 int GetPresetSwitch(int which);
 void SetPresetSwitch(int which, int preset);
+// Benchmark sequence switch dlss_game_taa: 1 = the game's TAA, 0 = DLSS (as the [dlaa] key hotkey); applied at the next
+// frame start.
+int GetGameTaaSwitch();
+void SetGameTaaSwitch(int on);
 // DLSS replaces the game's TAA in this frame (setting, hotkey, no failure); its evaluation stores outer's motion
 // vectors for focus (mvr_motion.h StoreOuter), so without it focus's velocity pass gets none from outer.
 bool DlssNow();

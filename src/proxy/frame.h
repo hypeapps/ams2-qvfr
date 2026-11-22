@@ -38,4 +38,8 @@ struct Totals {
 };
 Totals LiveTotals();
 
+// Any thread, no lock: milliseconds since the benchmark recording started, -1 when none runs; `run` counts the
+// recordings of the session.
+double RecordingMs(uint32_t* run);
+
 }  // namespace qvfr::frame

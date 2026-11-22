@@ -60,6 +60,7 @@ bool g_installed = false;
 bool g_failed = false;               // a hard failure (NGX, faults): the game's TAA for the rest of the session
 std::atomic<bool> g_on{false};       // hooks in place and not failed
 std::atomic<bool> g_active{true};    // hotkey: DLAA (true) or the game's TAA
+std::atomic<int> g_gameTaaReq{-1};   // sequence switch dlss_game_taa for the next frame start (-1 = none)
 void** g_devGlobal = nullptr;        // address of the engine device pointer
 bool g_d3dHooked = false;
 bool g_external = false;             // quad mode: the draws come from sun_fx's DrawIndexed hook (Replace)
@@ -1970,6 +1971,15 @@ void OnFrameStart() {
             if (on) ResetAllLocked();
 #endif
         }
+        const int req = g_gameTaaReq.exchange(-1);
+        if (req >= 0 && (req == 0) != g_active.load()) {
+            const bool on = req == 0;
+            g_active = on;
+            Log("DLAA: sequence switch: %s", on ? "DLAA" : "the game's TAA");
+#ifdef QVFR_HAVE_DLSS
+            if (on) ResetAllLocked();
+#endif
+        }
         if (Pressed(c.dlaaExpKeyMod, c.dlaaExpKey, g_expKeyDown)) {
             g_expStep = (g_expStep.load() + 1) % kExpStepCount;
             Log("DLAA: exposure hotkey: %s%s", ExposureText().c_str(), g_expStep.load() == 0 ? " (the ini settings)" : "");
@@ -1992,6 +2002,13 @@ void OnSrScalesChanged(float focus, float outer) {
 int GetPresetSwitch(int which) { return g_presetSwitch[which].load(); }
 
 void SetPresetSwitch(int which, int preset) { g_presetSwitch[which] = preset; }
+
+int GetGameTaaSwitch() {
+    const int req = g_gameTaaReq.load();
+    return req >= 0 ? req : (g_active.load() ? 0 : 1);
+}
+
+void SetGameTaaSwitch(int on) { g_gameTaaReq = on ? 1 : 0; }
 
 bool DlssNow() { return g_installed && Wanted(); }
 

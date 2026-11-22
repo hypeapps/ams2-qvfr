@@ -55,6 +55,7 @@ struct Config {
     float benchDelayS = 5.0f;         // from key press to recording start (time to settle)
     float benchDurationS = 30.0f;     // recording length
     bool benchFreezePose = true;      // constant head pose for the game while recording
+    bool benchPoseFile = false;       // the frozen pose from bench\frozen_pose.bin; written there when it is missing
     bool benchBeep = true;            // beeps: countdown start, recording start, end
     // Developers: steps "label: switch=value, ..." separated by "|"; the hotkey then runs them one after another,
     // each from the state before the sequence plus its switches (quad::SetSwitch), and restores that state at the end.
@@ -80,6 +81,8 @@ struct Config {
     int shotKeyMod = VK_RCONTROL;     // quad: shot of the four views (PNG + pixel differences), modifier (0 = none)
     int shotKey = 0;                  // quad: shot key (testers: VK_F10; 0 = no hotkey)
     float shotAutoS = 0.0f;           // quad: > 0 = one shot this many seconds after the first frame with focus groups
+    bool shotFull = false;            // quad: shot PNGs at full resolution (else half)
+    float shotBenchS = 0.0f;          // quad: > 0 = a shot every this many seconds of each benchmark recording
     // quad, M8.5: preset=quality|balanced|performance gives the defaults of peripheral_multiplier and the four
     // *_section keys; a key given in the ini wins. balanced = the mbucchia defaults below.
     std::string preset = "balanced";
