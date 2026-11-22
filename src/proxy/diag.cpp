@@ -30,7 +30,7 @@ int g_warnings = 0, g_notes = 0;
 
 // The Detected block lists these keys first, in this order; any other key follows.
 const char* const kOrder[] = {"Game", "Game settings", "Path", "Backend", "OpenXR active runtime", "OpenXR runtime",
-                              "Headset", "Gaze", "Focus window", "Quad", "OpenXR layers", "OpenXR mod layer",
+                              "Headset", "Gaze", "Focus window", "Quad", "OpenXR layers", "OpenXR gaze layers", "OpenXR mod layer",
                               "OpenXR Toolkit", "Modules"};
 
 // Render thread only (OnFrame), except the flag that OnShutdown also reads.

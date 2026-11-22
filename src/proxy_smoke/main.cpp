@@ -55,6 +55,7 @@
 //                                     passthrough) on two focus-sized images, bit for bit (nr_bridge_smoke.cpp)
 //   --panel                           without SteamVR and without the proxy DLL: the tuning panel's picture (RmlUi on
 //                                     D3D11), its redraws and the game's state around it (panel_smoke.cpp)
+//   --xr-gaze-layers                  without SteamVR: which implicit OpenXR layers move below ours (test manifests)
 //   --xr-layer                        without SteamVR: the proxy DLL as an OpenXR API layer between a fake loader and a
 //                                     fake runtime (extension, gaze set in attach and sync, own sync, gaze, 2 sessions)
 //   --openxr-path                     [runtime] path=openxr with the Valve DLL as the backend: loader environment,
@@ -2457,6 +2458,7 @@ int main(int argc, char** argv) {
     bool mvrForwardTest = false;
     bool xrLayerTest = false;
     bool openxrPathTest = false;
+    bool xrGazeLayersTest = false;
     bool openxr = false;
     bool noLayer = false;
     bool hookProfile = false;
@@ -2496,6 +2498,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--sequence") && hasValue(i)) sequence = argv[++i];
         else if (!strcmp(argv[i], "--xr-layer")) xrLayerTest = true;
         else if (!strcmp(argv[i], "--openxr-path")) openxrPathTest = true;
+        else if (!strcmp(argv[i], "--xr-gaze-layers")) xrGazeLayersTest = true;
         else if (!strcmp(argv[i], "--openxr")) openxr = true;
         else if (!strcmp(argv[i], "--openxr-nolayer")) openxr = noLayer = true;
         else if (!strcmp(argv[i], "--center") && i + 2 < argc) {
@@ -2538,6 +2541,7 @@ int main(int argc, char** argv) {
     if (mvrForwardTest) return profiled(RunMvrForward);
     if (xrLayerTest) return RunXrLayer(ExeDir() / L"proxy" / L"openvr_api.dll", home);
     if (openxrPathTest) return RunOpenXrPath(ExeDir() / L"proxy" / L"openvr_api.dll", home);
+    if (xrGazeLayersTest) return RunXrGazeLayers(home);
     if (FILE* f = _wfopen((home / L"qvfr.ini").c_str(), L"wb")) {
         std::string base = scene > 0 ? kSceneIni : kBackgroundIni;
         if (scene > 0 && !sequence.empty()) {  // inside [benchmark]: a second section of that name would not be read

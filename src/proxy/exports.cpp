@@ -207,8 +207,10 @@ IVRSystem* VR_CALLTYPE VR_Init(EVRInitError* peError, EVRApplicationType eApplic
     }
     Log("VR_Init(application type %d)", (int)eApplicationType);
     EVRInitError err = VRInitError_None;
+    Guarded("runtime::BeginBackendInit", [] { runtime::BeginBackendInit(); });
     IVRSystem* real = g_fn.init(&err, eApplicationType);
     if (peError) *peError = err;
+    Guarded("runtime::EndBackendInit", [&] { runtime::EndBackendInit(real != nullptr); });
     Log("VR_Init = %p, error %d (%s)", (void*)real, (int)err, g_fn.errEnglish ? g_fn.errEnglish(err) : "?");
     if (!real) return nullptr;
     if (!Cfg().wrap) {

@@ -3,6 +3,12 @@
 #include "common.h"
 #include "diag.h"
 #include "xr_layer.h"
+#include "xr_layer_order.h"
+
+#include <cstring>
+#include <fstream>
+#include <iterator>
+#include <mutex>
 
 namespace qvfr::runtime {
 
@@ -122,6 +128,105 @@ void LogImplicitLayers(HKEY root, const char* rootName) {
     RegCloseKey(key);
 }
 
+// The enabled implicit layers under one registry root, in the order the loader reads them.
+void AddImplicitManifests(HKEY root, std::vector<std::wstring>& out) {
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(root, L"SOFTWARE\\Khronos\\OpenXR\\1\\ApiLayers\\Implicit", 0, KEY_READ, &key) != ERROR_SUCCESS)
+        return;
+    for (DWORD i = 0;; ++i) {
+        wchar_t name[1024];
+        DWORD nameLen = 1024, type = 0, data = 0, dataLen = sizeof(data);
+        LONG r = RegEnumValueW(key, i, name, &nameLen, nullptr, &type, (BYTE*)&data, &dataLen);
+        if (r == ERROR_NO_MORE_ITEMS) break;
+        if (r == ERROR_SUCCESS && type == REG_DWORD && data == 0) out.push_back(name);
+    }
+    RegCloseKey(key);
+}
+
+bool g_movedLayerHasGaze = false;
+std::string g_movedLayers;  // names of the layers moved below ours, for the report when VR does not start
+
+// The loader reports why it refuses layers only through OutputDebugString (and stderr, which a game does not have).
+// Without a debugger OutputDebugString raises DBG_PRINTEXCEPTION_WIDE_C and then DBG_PRINTEXCEPTION_C, which a vectored
+// handler sees before the system swallows them; the handler only copies the text and lets the exception go on.
+PVOID g_debugHandler = nullptr;
+std::mutex g_debugM;
+std::string g_lastDebug;
+int g_debugLines = 0;
+
+void LogDebugText(std::string s) {
+    while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
+    std::lock_guard lock(g_debugM);
+    if (s.empty() || s == g_lastDebug || g_debugLines >= 300) return;
+    g_lastDebug = s;
+    ++g_debugLines;
+    Log("Debug output (OpenXR loader, OpenComposite or a layer): %s", s.c_str());
+}
+
+LONG CALLBACK DebugStringHandler(EXCEPTION_POINTERS* e) {
+    const EXCEPTION_RECORD* r = e->ExceptionRecord;
+    constexpr DWORD kWide = 0x4001000A;  // DBG_PRINTEXCEPTION_WIDE_C
+    if (r->ExceptionCode == kWide && r->NumberParameters >= 2 && r->ExceptionInformation[1])
+        LogDebugText(Narrow(std::wstring(reinterpret_cast<const wchar_t*>(r->ExceptionInformation[1]),
+                                         wcsnlen(reinterpret_cast<const wchar_t*>(r->ExceptionInformation[1]), 4096))));
+    else if (r->ExceptionCode == DBG_PRINTEXCEPTION_C && r->NumberParameters >= 2 && r->ExceptionInformation[1])
+        LogDebugText(std::string(reinterpret_cast<const char*>(r->ExceptionInformation[1]),
+                                 strnlen(reinterpret_cast<const char*>(r->ExceptionInformation[1]), 4096)));
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void LogManifest(const std::wstring& file) {
+    std::ifstream f{fs::path(file), std::ios::binary};
+    std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    std::string flat;
+    for (char ch : text.substr(0, 1500)) {
+        if (ch == '\r' || ch == '\n' || ch == '\t') ch = ' ';
+        if (ch == ' ' && !flat.empty() && flat.back() == ' ') continue;
+        flat += ch;
+    }
+    Log("Runtime: manifest %s: %s", Narrow(file).c_str(), flat.c_str());
+}
+
+// Implicit layers that provide the gaze sit above our layer, so our gaze calls would miss them (xr_layer_order.h). For
+// this process only they are turned off as implicit layers and enabled again after ours. Nothing outside the process
+// changes: other OpenXR applications keep their layers as they are.
+void AddGazeLayers(std::wstring& layerPath, std::wstring& enable) {
+    // OpenComposite's loader reads only two names from XR_ENABLE_API_LAYERS right (xr_layer_order.h): ours and one more.
+    const std::wstring playerLayers = GetEnv(L"XR_ENABLE_API_LAYERS");
+    if (!playerLayers.empty()) {
+        Log("Runtime: OpenXR gaze layers: none moved, XR_ENABLE_API_LAYERS already names %s and OpenComposite's loader "
+            "reads only two names",
+            Narrow(playerLayers).c_str());
+        return;
+    }
+    xrorder::Input in;
+    in.maxMoved = 1;
+    AddImplicitManifests(HKEY_LOCAL_MACHINE, in.enabledManifests);
+    AddImplicitManifests(HKEY_CURRENT_USER, in.enabledManifests);
+    in.setting = Cfg().openxrGazeLayers;
+    in.layerPath = GetEnv(L"XR_API_LAYER_PATH");
+    in.ownLayer = xrlayer::kLayerName;
+    in.envSet = [](const std::string& name) {
+        wchar_t buf[2];
+        return GetEnvironmentVariableW(Widen(name).c_str(), buf, 2) != 0;
+    };
+    const xrorder::Plan plan = xrorder::MakePlan(in);
+    for (const std::string& note : plan.notes) Log("Runtime: OpenXR gaze layers: %s", note.c_str());
+    std::string moved;
+    for (const xrorder::Layer& l : plan.move) {
+        SetEnvironmentVariableW(Widen(l.disableEnv).c_str(), L"1");
+        if (!l.folder.empty()) layerPath += L";" + l.folder;
+        enable += L";" + Widen(l.name);
+        g_movedLayerHasGaze |= l.declaresGaze;
+        moved += (moved.empty() ? "" : ", ") + l.name;
+        Log("Runtime: OpenXR layer %s moved below the mod's layer for this process (%s; %s=1, manifest %s)", l.name.c_str(),
+            l.reason.c_str(), l.disableEnv.c_str(), Narrow(l.manifest).c_str());
+        LogManifest(l.manifest);
+    }
+    g_movedLayers = moved;
+    if (!moved.empty()) diag::Set("OpenXR gaze layers", "moved below the mod's layer in this game: " + moved);
+}
+
 void LogActiveRuntime() {
     wchar_t buf[1024] = {};
     DWORD len = sizeof(buf);
@@ -177,12 +282,16 @@ std::wstring Prepare(HMODULE self) {
                      Narrow(manifest.wstring()).c_str());
         return g_backend;
     }
-    if (Elevated())
+    std::wstring layerPath = qvfr.wstring(), enable = Widen(xrlayer::kLayerName);
+    const bool elevated = Elevated();
+    // Elevated, the loader ignores XR_API_LAYER_PATH: a moved layer would be lost, so everything stays where it is.
+    if (!elevated) Guarded("runtime gaze layers", [&] { AddGazeLayers(layerPath, enable); });
+    if (elevated)
         diag::Report(diag::Level::Warning, "elevated",
                      "The game runs as administrator. The OpenXR loader then ignores the mod's environment, so the mod's "
                      "OpenXR layer does not load and there is no eye tracking on path=openxr. Start the game normally.");
-    PrependEnv(L"XR_API_LAYER_PATH", qvfr.wstring());
-    PrependEnv(L"XR_ENABLE_API_LAYERS", Widen(xrlayer::kLayerName));
+    PrependEnv(L"XR_API_LAYER_PATH", layerPath);
+    PrependEnv(L"XR_ENABLE_API_LAYERS", enable);
     diag::Set("OpenXR mod layer", "set up for the OpenXR loader, not loaded yet");
     return g_backend;
 }
@@ -201,5 +310,24 @@ void LogStartup() {
 }
 
 bool OpenXrPath() { return g_openxr; }
+bool MovedLayerHasGaze() { return g_movedLayerHasGaze; }
+
+void BeginBackendInit() {
+    if (!g_openxr || g_debugHandler) return;
+    g_debugHandler = AddVectoredExceptionHandler(1, DebugStringHandler);
+}
+
+void EndBackendInit(bool started) {
+    if (g_debugHandler) {
+        RemoveVectoredExceptionHandler(g_debugHandler);
+        g_debugHandler = nullptr;
+    }
+    if (!started && !g_movedLayers.empty())
+        diag::Report(diag::Level::Serious, "gaze-layers-vr",
+                     "VR did not start after the mod loaded the OpenXR layers %s below its own layer. Set "
+                     "openxr_gaze_layers=off in [runtime] of %s to start VR without them, and send the log from "
+                     "x64\\qvfr\\logs\\ to the mod's author.",
+                     g_movedLayers.c_str(), Narrow(IniFile().wstring()).c_str());
+}
 
 }  // namespace qvfr::runtime

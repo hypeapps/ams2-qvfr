@@ -169,6 +169,7 @@ add_library(qvfr_proxy SHARED
   nr.cpp
   nr_bridge.cpp
   xr_layer.cpp
+  xr_layer_order.cpp
   fps_hud.cpp
   sysinfo.cpp
   sun_fx.cpp

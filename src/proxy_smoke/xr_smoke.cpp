@@ -47,6 +47,9 @@ struct Fake {
     int locates = 0, waits = 0, endFrames = 0, spaces = 0;
     XrActionSet ourSet = XR_NULL_HANDLE;  // the set named "ams2qvfr-gaze"
     bool reversedAxis = false;  // the gaze pose with +Z forward, as Pimax's SteamVR driver reports it
+    bool localOnly = false;     // the gaze can be located only against LOCAL
+    XrSpace gazeSpace = XR_NULL_HANDLE, viewSpace = XR_NULL_HANDLE, localSpace = XR_NULL_HANDLE;
+    int layerEnumerations = 0;  // xrEnumerateInstanceExtensionProperties asked of the layer below ours
 } g_f;
 
 XrResult XRAPI_CALL FEnumerateExt(const char*, uint32_t cap, uint32_t* count, XrExtensionProperties* props) {
@@ -163,13 +166,14 @@ XrResult XRAPI_CALL FSync(XrSession, const XrActionsSyncInfo* i) {
 }
 
 XrResult XRAPI_CALL FCreateActionSpace(XrSession, const XrActionSpaceCreateInfo*, XrSpace* s) {
-    *s = MakeHandle<XrSpace>(g_f.nextHandle++);
+    *s = g_f.gazeSpace = MakeHandle<XrSpace>(g_f.nextHandle++);
     ++g_f.spaces;
     return XR_SUCCESS;
 }
 
-XrResult XRAPI_CALL FCreateReferenceSpace(XrSession, const XrReferenceSpaceCreateInfo*, XrSpace* s) {
+XrResult XRAPI_CALL FCreateReferenceSpace(XrSession, const XrReferenceSpaceCreateInfo* i, XrSpace* s) {
     *s = MakeHandle<XrSpace>(g_f.nextHandle++);
+    (i->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL ? g_f.localSpace : g_f.viewSpace) = *s;
     ++g_f.spaces;
     return XR_SUCCESS;
 }
@@ -187,9 +191,19 @@ XrResult XRAPI_CALL FGetActionStatePose(XrSession, const XrActionStateGetInfo*, 
 // The gaze 10 degrees to the right: a rotation of -10 degrees about +y turns (0, 0, -1) into (sin 10, 0, -cos 10).
 // With the reversed axis (Pimax's SteamVR driver: +Z forward, right and up as usual) the same gaze is a pose whose
 // -Z is (sin 10, 0, cos 10): a rotation of -170 degrees about +y.
-XrResult XRAPI_CALL FLocateSpace(XrSpace, XrSpace, XrTime, XrSpaceLocation* loc) {
+// With localOnly the head is turned 30 degrees left of LOCAL, so the same gaze is 20 degrees left of LOCAL's forward, and
+// the runtime has no answer against VIEW.
+XrResult XRAPI_CALL FLocateSpace(XrSpace space, XrSpace base, XrTime, XrSpaceLocation* loc) {
     ++g_f.locates;
-    const double half = (g_f.reversedAxis ? -170.0 : -10.0) * 3.14159265358979 / 180.0 / 2.0;
+    double degrees = g_f.reversedAxis ? -170.0 : -10.0;
+    if (g_f.localOnly) {
+        if (base != g_f.localSpace) {
+            loc->locationFlags = 0;
+            return XR_SUCCESS;
+        }
+        degrees = space == g_f.viewSpace ? 30.0 : 20.0;
+    }
+    const double half = degrees * 3.14159265358979 / 180.0 / 2.0;
     loc->pose.orientation = {0.0f, (float)std::sin(half), 0.0f, (float)std::cos(half)};
     loc->pose.position = {0.03f, 0.0f, 0.0f};
     loc->locationFlags = XR_SPACE_LOCATION_ORIENTATION_VALID_BIT | XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
@@ -246,6 +260,17 @@ XrResult XRAPI_CALL FGipa(XrInstance, const char* name, PFN_xrVoidFunction* fn) 
     }
     *fn = it->second;
     return XR_SUCCESS;
+}
+
+// A layer between ours and the runtime: it passes everything on but cannot list extensions before it has an instance
+// (the case of a layer that resolves the next function only in xrCreateInstance).
+XrResult XRAPI_CALL FLayerGipa(XrInstance instance, const char* name, PFN_xrVoidFunction* fn) {
+    if (instance == XR_NULL_HANDLE && !strcmp(name, "xrEnumerateInstanceExtensionProperties")) {
+        ++g_f.layerEnumerations;
+        *fn = nullptr;
+        return XR_ERROR_RUNTIME_FAILURE;
+    }
+    return FGipa(instance, name, fn);
 }
 
 // ---------------------------------------------------------------- helpers
@@ -312,10 +337,17 @@ int RunXrLayer(const fs::path& dll, const fs::path& home) {
     if (r != XR_SUCCESS) return 1;
     PFN_xrGetInstanceProcAddr gipa = req.getInstanceProcAddr;
 
+    // As the loader links them: our entry points at the layer below, whose entry points at the runtime.
+    XrApiLayerNextInfo below{XR_LOADER_INTERFACE_STRUCT_API_LAYER_NEXT_INFO, XR_API_LAYER_NEXT_INFO_STRUCT_VERSION,
+                             sizeof(XrApiLayerNextInfo)};
+    strcpy_s(below.layerName, "XR_APILAYER_fake_gaze");
+    below.nextGetInstanceProcAddr = FGipa;
+    below.nextCreateApiLayerInstance = FCreateApiLayerInstance;
     XrApiLayerNextInfo next{XR_LOADER_INTERFACE_STRUCT_API_LAYER_NEXT_INFO, XR_API_LAYER_NEXT_INFO_STRUCT_VERSION,
                             sizeof(XrApiLayerNextInfo)};
-    strcpy_s(next.layerName, "fake runtime");
-    next.nextGetInstanceProcAddr = FGipa;
+    strcpy_s(next.layerName, "XR_APILAYER_AMS2QVFR_eye_gaze");
+    next.next = &below;
+    next.nextGetInstanceProcAddr = FLayerGipa;
     next.nextCreateApiLayerInstance = FCreateApiLayerInstance;
     XrApiLayerCreateInfo lci{XR_LOADER_INTERFACE_STRUCT_API_LAYER_CREATE_INFO, XR_API_LAYER_CREATE_INFO_STRUCT_VERSION,
                              sizeof(XrApiLayerCreateInfo)};
@@ -332,6 +364,7 @@ int RunXrLayer(const fs::path& dll, const fs::path& home) {
     bool gazeExt = false;
     for (auto& e : g_f.instanceExts) gazeExt |= e == XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME;
     Check(g_f.instanceExts.size() == 2 && gazeExt, "the runtime got the application's extension plus eye gaze");
+    Check(g_f.layerEnumerations == 0, "the runtime's extensions are read past the layer below ours");
     Check(g_f.actionSets.empty() && g_f.suggestedProfiles.empty(),
           "no action set or binding of the layer at instance creation (they wait for the first attach)");
 
@@ -372,9 +405,10 @@ int RunXrLayer(const fs::path& dll, const fs::path& home) {
     Check(suggest(inst, &appSuggest) == XR_SUCCESS && g_f.suggestedProfiles.size() == 1,
           "the application's suggestion passes through before any of the layer's");
 
-    for (int sessionNo = 1; sessionNo <= 2; ++sessionNo) {
+    for (int sessionNo = 1; sessionNo <= 3; ++sessionNo) {
         printf(" session %d\n", sessionNo);
         g_f.reversedAxis = sessionNo == 2;  // the second session: a runtime with the opposite axis convention
+        g_f.localOnly = sessionNo == 3;     // the third: a gaze provider that answers only against LOCAL
         XrSessionCreateInfo sci{XR_TYPE_SESSION_CREATE_INFO};
         sci.systemId = sys;
         XrSession s = XR_NULL_HANDLE;
@@ -421,7 +455,7 @@ int RunXrLayer(const fs::path& dll, const fs::path& home) {
         }
         Check(g_f.syncs - syncs0 == 5 && g_f.syncsWithOurs - withOurs0 == 5,
               "the application's 5 xrSyncActions carried the gaze set, no extra sync");
-        Check(g_f.locates - locates0 == 5, "the gaze was located after each of the 5 xrWaitFrame");
+        Check(g_f.locates - locates0 == (g_f.localOnly ? 15 : 5), "the gaze was located after each of the 5 xrWaitFrame");
 
         // The application stops syncing: after 50 ms the layer syncs by itself (and keeps the application's set).
         Sleep(80);
@@ -433,7 +467,7 @@ int RunXrLayer(const fs::path& dll, const fs::path& home) {
         }
         Check(g_f.syncs - syncs1 == 3 && g_f.lastSyncHadOurs, "without the application's sync the layer synced each frame");
         destroySession(s);
-        Check(g_f.spaces == 0, "both spaces of the session destroyed with it");
+        Check(g_f.spaces == 0, "all spaces of the session destroyed with it");
     }
     destroyInstance(inst);
 
@@ -445,6 +479,12 @@ int RunXrLayer(const fs::path& dll, const fs::path& home) {
           "a gaze pose pointing backwards is noticed only on the reversed axis");
     Check(log.find("session 2: first gaze, direction (0.1736, 0.0000, -0.9848)") != std::string::npos,
           "with the reversed axis the gaze is the same 10 degrees right");
+    Check(log.find("session 3: the gaze is located through LOCAL") != std::string::npos &&
+              log.find("session 1: the gaze is located through LOCAL") == std::string::npos &&
+              log.find("session 3: first gaze, direction (0.1736, 0.0000, -0.9848)") != std::string::npos,
+          "a gaze available only against LOCAL gives the same direction relative to the head");
+    Check(log.find("layers below the mod's: XR_APILAYER_fake_gaze") != std::string::npos,
+          "the log names the layer below ours");
     Check(log.find("gaze sample 0.0 s: 10.0 deg right, 0.0 deg up, position") != std::string::npos &&
               log.find("gaze sample 0.0 s: 10.0 deg right, 0.0 deg up (mirrored in Z)") != std::string::npos,
           "the log has gaze samples on both axes");
@@ -459,7 +499,7 @@ int RunOpenXrPath(const fs::path& dll, const fs::path& home) {
     printf("[runtime] path=openxr with the Valve DLL as the backend (%ls)\n", dll.c_str());
     if (FILE* f = _wfopen((home / L"qvfr.ini").c_str(), L"wb")) {
         // Relative to the proxy's folder; the Valve DLL stands in for OpenComposite.
-        fputs("[runtime]\npath=openxr\nopencomposite=qvfr\\openvr\\openvr_api.dll\nopenxr_layer=1\n[proxy]\nwrap=1\n[log]\nwarning_box=0\n", f);
+        fputs("[runtime]\npath=openxr\nopencomposite=qvfr\\openvr\\openvr_api.dll\nopenxr_layer=1\nopenxr_gaze_layers=off\n[proxy]\nwrap=1\n[log]\nwarning_box=0\n", f);
         fclose(f);
     }
     SetEnvironmentVariableW(L"XR_ENABLE_API_LAYERS", L"XR_APILAYER_player_own");

@@ -40,6 +40,7 @@ struct Config {
     bool pathOpenXr = false;          // path=openvr: the Valve DLL; path=openxr: OpenComposite to the OpenXR runtime
     std::wstring openComposite;       // opencomposite=: OpenComposite DLL (empty = the default in x64\qvfr\opencomposite)
     bool openxrLayer = true;          // openxr_layer=: our OpenXR API layer for the gaze on the OpenXR path
+    std::wstring openxrGazeLayers;    // openxr_gaze_layers=: empty = automatic, off, or more layer names (xr_layer_order.h)
     // [proxy]
     bool wrap = true;                 // 0 = the game gets the real interfaces, the proxy only logs startup
     // [log]

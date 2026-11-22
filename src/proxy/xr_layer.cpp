@@ -19,6 +19,7 @@
 #include "common.h"
 #include "diag.h"
 #include "fps_hud.h"
+#include "runtime.h"
 
 namespace qvfr::xrlayer {
 
@@ -66,6 +67,9 @@ struct Session {
     int number = 0;                 // 1 = the first session of the process
     bool attached = false;          // our set is attached to it
     XrSpace gazeSpace = XR_NULL_HANDLE, viewSpace = XR_NULL_HANDLE;
+    XrSpace localSpace = XR_NULL_HANDLE;  // made when the gaze cannot be located against VIEW
+    bool localTried = false;
+    uint64_t gazeViaLocal = 0;      // located gazes that went through LOCAL
     uint64_t waits = 0, endFrames = 0;
     uint64_t appSyncs = 0, ownSyncs = 0, gazeOk = 0, gazeInactive = 0, gazeInvalid = 0, locateFail = 0;
     uint64_t gazeFlipped = 0;       // located gazes whose -Z pointed backwards (mirrored in Z)
@@ -207,6 +211,7 @@ void ResetSession() {
     if (g_next.destroySpace) {
         if (g_s.gazeSpace) g_next.destroySpace(g_s.gazeSpace);
         if (g_s.viewSpace) g_next.destroySpace(g_s.viewSpace);
+        if (g_s.localSpace) g_next.destroySpace(g_s.localSpace);
     }
     g_s = Session{};
     std::lock_guard lock(g_gm);
@@ -216,11 +221,57 @@ void ResetSession() {
 void LogSessionStats(const char* why) {
     const Session& s = g_s;
     Log("OpenXR layer: session %d %s: %llu xrWaitFrame, %llu xrEndFrame; xrSyncActions by OpenComposite %llu, by the "
-        "layer %llu; gaze located %llu (mirrored in Z %llu), action inactive %llu, orientation invalid %llu, xrLocateSpace "
-        "failed %llu",
+        "layer %llu; gaze located %llu (mirrored in Z %llu, through LOCAL %llu), action inactive %llu, orientation "
+        "invalid %llu, xrLocateSpace failed %llu",
         s.number, why, (unsigned long long)s.waits, (unsigned long long)s.endFrames, (unsigned long long)s.appSyncs,
         (unsigned long long)s.ownSyncs, (unsigned long long)s.gazeOk, (unsigned long long)s.gazeFlipped,
+        (unsigned long long)s.gazeViaLocal,
         (unsigned long long)s.gazeInactive, (unsigned long long)s.gazeInvalid, (unsigned long long)s.locateFail);
+}
+
+XrQuaternionf Multiply(const XrQuaternionf& a, const XrQuaternionf& b) {
+    return {a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y, a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+            a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w, a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z};
+}
+
+// The gaze relative to VIEW. Some gaze providers answer only against LOCAL (the DragonDreams replacement of VIVE's layer
+// says so), so when VIEW gives nothing the gaze and VIEW are both located in LOCAL and the difference is taken.
+bool LocateGaze(Session& s, XrTime time, XrSpaceLocation& loc) {
+    const XrResult r = g_next.locateSpace(s.gazeSpace, s.viewSpace, time, &loc);
+    if (XR_SUCCEEDED(r) && (loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) return true;
+    if (!s.localTried) {
+        s.localTried = true;
+        XrReferenceSpaceCreateInfo ri{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+        ri.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+        ri.poseInReferenceSpace.orientation.w = 1;
+        const XrResult rr = g_next.createReferenceSpace ? g_next.createReferenceSpace(s.h, &ri, &s.localSpace)
+                                                        : XR_ERROR_FUNCTION_UNSUPPORTED;
+        if (XR_FAILED(rr)) s.localSpace = XR_NULL_HANDLE;
+        Log("OpenXR layer: session %d: no gaze against VIEW (%d, %s, flags 0x%llX), trying LOCAL: space = %d (%s)", s.number,
+            (int)r, R(r), (unsigned long long)loc.locationFlags, (int)rr, R(rr));
+    }
+    if (s.localSpace) {
+        XrSpaceLocation gaze{XR_TYPE_SPACE_LOCATION}, view{XR_TYPE_SPACE_LOCATION};
+        if (XR_SUCCEEDED(g_next.locateSpace(s.gazeSpace, s.localSpace, time, &gaze)) &&
+            XR_SUCCEEDED(g_next.locateSpace(s.viewSpace, s.localSpace, time, &view)) &&
+            (gaze.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) &&
+            (view.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
+            const XrQuaternionf& v = view.pose.orientation;
+            const XrQuaternionf toView{-v.x, -v.y, -v.z, v.w};
+            loc.pose.orientation = Multiply(toView, gaze.pose.orientation);
+            const XrQuaternionf offset{gaze.pose.position.x - view.pose.position.x,
+                                       gaze.pose.position.y - view.pose.position.y,
+                                       gaze.pose.position.z - view.pose.position.z, 0};
+            const XrQuaternionf p = Multiply(Multiply(toView, offset), v);
+            loc.pose.position = {p.x, p.y, p.z};
+            loc.locationFlags = gaze.locationFlags & view.locationFlags;
+            if (s.gazeViaLocal++ == 0) Log("OpenXR layer: session %d: the gaze is located through LOCAL", s.number);
+            return true;
+        }
+    }
+    if (XR_FAILED(r)) ++s.locateFail;
+    else ++s.gazeInvalid;
+    return false;
 }
 
 // After xrWaitFrame: our own sync when OpenComposite has not synced lately, then the gaze at the display time.
@@ -250,12 +301,7 @@ void UpdateGaze(XrSession session, XrTime time) {
         ++s.gazeInactive;
     } else {
         XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
-        r = g_next.locateSpace(s.gazeSpace, s.viewSpace, time, &loc);
-        if (XR_FAILED(r)) {
-            ++s.locateFail;
-        } else if (!(loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)) {
-            ++s.gazeInvalid;
-        } else {
+        if (LocateGaze(s, time, loc)) {
             // Forward (0, 0, -1) rotated by the orientation: v' = v + 2 q.xyz x (q.xyz x v + w v).
             const XrQuaternionf& q = loc.pose.orientation;
             const double v[3] = {0, 0, -1};
@@ -719,13 +765,24 @@ XrResult XRAPI_CALL CreateApiLayerInstance(const XrInstanceCreateInfo* info, con
             appExts += info->enabledExtensionNames[i];
             requested |= strcmp(info->enabledExtensionNames[i], XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME) == 0;
         }
-        const bool has = RuntimeHasExtension(g_next.gipa, XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME, runtimeExts);
+        // The last link of the chain is the loader's own entry to the runtime. A layer below ours (moved there by
+        // runtime.cpp) need not answer xrEnumerateInstanceExtensionProperties before it has an instance.
+        const XrApiLayerNextInfo* last = layerInfo->nextInfo;
+        std::string below;
+        while (last->next) {
+            last = last->next;
+            below += (below.empty() ? "" : ", ") + std::string(last->layerName);
+        }
+        const bool has = RuntimeHasExtension(last->nextGetInstanceProcAddr, XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME,
+                                             runtimeExts) ||
+                         runtime::MovedLayerHasGaze();
+        Log("OpenXR layer: layers below the mod's: %s", below.empty() ? "none" : below.c_str());
         Log("OpenXR layer: xrCreateInstance by \"%s\" (engine \"%s\", API %u.%u.%u), next layer \"%s\"",
             info->applicationInfo.applicationName, info->applicationInfo.engineName,
             XR_VERSION_MAJOR(info->applicationInfo.apiVersion), XR_VERSION_MINOR(info->applicationInfo.apiVersion),
             XR_VERSION_PATCH(info->applicationInfo.apiVersion), layerInfo->nextInfo->layerName);
         Log("OpenXR layer: extensions requested by OpenComposite: %s", appExts.c_str());
-        Log("OpenXR layer: extensions of the next layer/runtime: %s", runtimeExts.c_str());
+        Log("OpenXR layer: extensions of the runtime: %s", runtimeExts.c_str());
         if (has && !requested) {
             exts.push_back(XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME);
             added = true;

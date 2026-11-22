@@ -14,5 +14,10 @@ std::wstring Prepare(HMODULE self);
 // Startup log: backend, environment set for the loader, OpenXR implicit layers in the registry (with their state).
 void LogStartup();
 bool OpenXrPath();  // path=openxr was prepared
+bool MovedLayerHasGaze();  // a layer moved below ours lists XR_EXT_eye_gaze_interaction in its manifest
+// Around the backend's VR_Init on the OpenXR path: the debug output of the loader, OpenComposite and the layers goes to
+// the log, and a failed start after moving layers is reported.
+void BeginBackendInit();
+void EndBackendInit(bool started);
 
 }  // namespace qvfr::runtime
