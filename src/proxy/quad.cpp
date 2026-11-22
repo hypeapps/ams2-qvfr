@@ -369,7 +369,7 @@ bool g_mapNext = false;
 struct EyeTasks {
     uint8_t* ssao = nullptr;
     uint8_t* phase2 = nullptr;
-    uint8_t* ltBuild = nullptr;   // issue 19: CLiveTrackBuildCommandThread (one per group, else none)
+    uint8_t* ltBuild = nullptr;   // CLiveTrackBuildCommandThread (one per group, else none)
     uint8_t* ltRender = nullptr;  // CLiveTrackRender
 };
 EyeTasks g_eyeTasks[kGroups];  // under g_m, from BuildProfileLocked
@@ -819,7 +819,7 @@ void __fastcall RunTask(uint8_t* task) {
         hookprof::Orig o;  // the moved focus tasks (their D3D11 detours count on their own)
         EarlyFocus(prof->group - OuterL);
     }
-    // Issue 19: focus's live track map right before outer's G-buffer pass (EarlyMap).
+    // Focus's live track map right before outer's G-buffer pass (EarlyMap).
     if (mvr && prof && (prof->group == OuterL || prof->group == OuterR) &&
         mvrpass::KindOf(task) == mvrpass::Kind::Phase1) {
         hookprof::Orig o;
@@ -1080,7 +1080,7 @@ void BuildProfileLocked() {
         if (!render && !build) continue;
         if (render && !ltRender) hooks::TryRead(items[i].task, &ltRender, 8);
         if (build && !ltBuild) hooks::TryRead(items[i].task, &ltBuild, 8);
-        // Issue 19: the focus group's pair for its early map (EarlyMap)
+        // The focus group's pair for its early map (EarlyMap)
         uint8_t*& slot = render ? g_eyeTasks[p->entries[i].group].ltRender : g_eyeTasks[p->entries[i].group].ltBuild;
         if (slot) ltTwice[p->entries[i].group] = true;
         slot = (uint8_t*)items[i].task;
@@ -2609,16 +2609,16 @@ void EarlyFocus(int eye) {
     }
 }
 
-// Issue 19 (docs/issue-19.md, mvr_pass.h EarlyMapWanted): focus's live track map right before outer's CPhase1Render
-// of the eye, so view 1 of outer's G-buffer and forward passes reads focus's own map. Ghidra (2026-11-21):
+// Focus's live track map right before outer's CPhase1Render of the eye, so view 1 of outer's G-buffer and forward
+// passes reads focus's own map (mvr_pass.h EarlyMapWanted). The game build's code:
 //   - CLiveTrackBuildCommandThread::Execute (0xaf96b0): with the context (task+0x860) on (bytes 0 and 1), its two
 //     command buffers (ctx+0x7d0, +0x7d8) and the live track manager's track (0xb0df10 returns 0x29e57c0, +0x268) it
 //     calls 0xcde2e0 (state 3: releases the task's dependents) and 0xaf9710, which queues the two recordings
 //     (device+0x558); else only its Finish;
 //   - CLiveTrackRender::Execute (0xaf9a20) waits for each buffer (+0x60) and replays it, then Finish.
 // So the early run calls 0xaf9710 alone (focus's group must not be released now) and the render's Execute without its
-// Finish, with focus's view and targets in as for the early SSAO and lights (EarlyFocus); the focus group then skips both
-// (B19). Both tasks belong to focus's group, whose context is outer's (checked), so the buffers are free: outer's own
+// Finish, with focus's view and targets in as for the early SSAO and lights (EarlyFocus); the focus group then skips
+// both. Both tasks belong to focus's group, whose context is outer's (checked), so the buffers are free: outer's own
 // CLiveTrackRender replayed them before its CPhase1Render.
 constexpr uintptr_t kLtBuildExecute = 0xaf96b0, kLtBuildRecord = 0xaf9710, kLtRenderExecute = 0xaf9a20;
 constexpr uintptr_t kLtManager = 0x29e57c0;  // DAT_1429e57c0 (RVA)
@@ -2626,7 +2626,7 @@ constexpr size_t kLtManagerTrack = 0x268, kCtxLtBuffers = 0x7d0;
 using RecordFn = void(__fastcall*)(uint8_t*);
 bool g_ltCodeChecked = false, g_ltCodeOk = false;
 
-// The two tasks' Execute are the ones read in Ghidra (another game build: the step stays off).
+// The two tasks' Execute are at the addresses above (another game build: the step stays off).
 bool LiveTrackCodeOk(uint8_t* build, uint8_t* render) {
     if (g_ltCodeChecked) return g_ltCodeOk;
     g_ltCodeChecked = true;

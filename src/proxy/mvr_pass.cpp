@@ -630,7 +630,7 @@ struct Pass {
     // B9d run 5: the live track map of outer read in the focus window into a focus-size texture for view 1 (once per
     // forward pass, at the first draw whose PS reads it).
     bool liveTrackDone = false, liveTrackOk = false;
-    bool liveTrackEarly = false;  // issue 19: the map is focus's own from its early run (EarlyMapSrv)
+    bool liveTrackEarly = false;  // the map is focus's own from its early run (EarlyMapSrv)
     // B13 (mvr_gbuffer_ps): the G-buffer pass's draws of patched PS; psSlot3 holds the game's PS slot 3 from the first.
     bool gbufPsBound = false;
     unsigned gbufPsDraws = 0, gbufPsKept = 0;  // with view 1's rows; kept as before (they read globalTexture0..4)
@@ -846,7 +846,7 @@ bool g_ltLastReads = false;
 struct LtStats {
     uint64_t skipped[2] = {}, builds[2] = {}, ran[2] = {}, checked = 0, reads = 0;
     std::vector<Reason> reasons;
-    // Issue 19: focus's early map (quad's EarlyMap) per eye: runs, their CPU, engine faults, why not run; the passes
+    // Focus's early map (quad's EarlyMap) per eye: runs, their CPU, engine faults, why not run; the passes
     // whose view 1 read it, those that read outer's window, why they did not get it after a run.
     uint64_t earlyRuns[2] = {}, earlyFaults = 0, earlyUsed[2] = {}, windowUsed[2] = {};
     double earlyMs[2] = {};
@@ -1819,10 +1819,10 @@ struct LiveTrackMap {
     ComPtr<ID3D11RenderTargetView> rtv;
 };
 LiveTrackMap g_liveTrack;
-// Issue 19 (docs/issue-19.md): with DLSS SR outer's map has outer's render size, and its thin parts (the far edge of
-// the track, kerbs, verges) read in the focus window, stretched up to 7.6x, came out in focus as blocks that moved with
-// the jitter (white rectangles on the rubber in a race). Quad's EarlyMap draws focus's own map right before outer's
-// G-buffer pass (EarlyMapWanted); view 1 of both passes then reads it (a view of focus's target) in place of the window.
+// With DLSS SR outer's map has outer's render size: read in the focus window, its thin parts (the far edge of the
+// track, kerbs, verges) come out in focus stretched into blocks that move with the jitter. So quad's EarlyMap draws
+// focus's own map right before outer's G-buffer pass (EarlyMapWanted), and view 1 of both passes reads a view of
+// focus's target in place of the window.
 struct EarlyLiveTrack {
     ID3D11Texture2D* tex = nullptr;  // focus's target the view is of (only compared)
     DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;

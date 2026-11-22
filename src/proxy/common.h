@@ -274,9 +274,9 @@ struct Config {
     // mvr_livetrack_skip_key) toggles it.
     bool mvrLiveTrackSkip = true;
     int mvrLiveTrackSkipKey = 0;
-    // Live (docs/issue-19.md, mvr_pass.h EarlyMapWanted): focus's own live track map drawn early in outer's group,
-    // right before outer's G-buffer pass, for view 1 of outer's G-buffer and forward passes (else outer's map in the
-    // focus window, at outer's render size with DLSS SR).
+    // Live: view 1 of outer's G-buffer and forward passes reads focus's own live track map, drawn early in outer's
+    // group right before outer's G-buffer pass (mvr_pass.h EarlyMapWanted); off: outer's map read in the focus window,
+    // which with DLSS SR has outer's render size.
     bool mvrLiveTrackEarly = true;
     // O2 step 2 (diagnosis, docs/mvr_optimizations.md): a focus group whose G-buffer and forward come from outer gets
     // an empty draw queue before its CForwardBuildCommandThread (focus loses its transparent objects).
