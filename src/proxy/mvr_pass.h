@@ -252,6 +252,18 @@ void SetPhase3BuildVtable(uintptr_t vt);
 void SetLiveTrackVtables(uintptr_t render, uintptr_t build);
 void SetLiveTrackSkip(bool on);
 bool GetLiveTrackSkip();
+// [debug] mvr_livetrack_early (live): focus's own live track map for view 1 of outer's G-buffer and forward passes, in
+// place of outer's map read in the focus window (with DLSS SR at outer's render size, its thin parts stretched into
+// blocks). Quad's RunTask, right before outer's CPhase1Render of the eye: EarlyMapWanted(eye) -> quad swaps focus's
+// view and targets in as for the early SSAO and lights -> focus's CBeginEye, the recording of its
+// CLiveTrackBuildCommandThread (without the release of its dependents) and its CLiveTrackRender (the replay) run
+// without their Finish -> outer's back -> EarlyMapEnd(eye, ...). View 1 then reads a view of focus's target (else
+// outer's window); the focus group skips both tasks.
+bool EarlyMapWanted(int eye);                    // true: run it now (else the reason is counted)
+void EarlyMapRefused(int eye, const char* why);  // quad could not run it (the reason is counted)
+void EarlyMapEnd(int eye, double ms, bool ok);   // ok = false: an engine fault in the moved tasks
+void SetLiveTrackEarly(bool on);
+bool GetLiveTrackEarly();
 // Why focus eye `eye` (0 L, 1 R) draws its own G-buffer, SSAO, lights or forward in this frame; null when all of them
 // come from outer's passes (decided once the group's CPhase1Render ran or was skipped). Not in a shot or task map frame.
 const char* FromOuterWhy(int eye);
