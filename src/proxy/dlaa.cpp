@@ -90,6 +90,14 @@ const char* MaskBitsText(uint32_t bits) {
 // shaders/dlaa.hlsl CSDisplays): after DLSS the displays and mirrors take the current frame alone (DLSS leaves trails
 // of changing digits there).
 bool DisplaysNow() { return Cfg().dlaaCockpitTaa > 0 && (g_sr || Cfg().dlaaDisplayPass); }
+// Quad views: outer's displays stay with DLSS unless [dlaa] outer_display_pass. The gaze puts the focus on what the
+// player reads, and the current frame alone flickers in the periphery (more so at outer's lower density).
+// `scale`: render size over output size. Below [dlaa] display_pass_min_scale the current frame alone has too few pixels
+// per digit stroke and flickers with the jitter, so DLSS keeps the displays (the margin covers the rounded render size).
+bool DisplaysFor(int view, double scale) {
+    return DisplaysNow() && (view == 0 || view >= 3 || Cfg().dlaaOuterDisplayPass) &&
+           scale + 0.005 >= Cfg().dlaaDisplayPassMinScale;
+}
 const char* CockpitText(int mode) {
     return mode == 0 ? "nothing" : mode == 1 ? "displays and mirrors" : "displays, mirrors and the player's car";
 }
@@ -1441,12 +1449,13 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
                     (int)vd.Format, stencilSlice,
                     vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY ? vd.Texture2DArray.ArraySize : 1, iw, ih);
             }
-            if ((maskValue > 0 || DisplaysNow()) && sd.SampleDesc.Count == 1 && sd.Width >= iw && sd.Height >= ih)
+            if ((maskValue > 0 || DisplaysFor(view, (double)iw / w)) && sd.SampleDesc.Count == 1 && sd.Width >= iw &&
+                sd.Height >= ih)
                 maskStencil = StencilViewFor(stencil, stencilSlice, vd.Format);
         }
         // Displays pass after DLSS (DisplaysNow): DLSS's result (out, read) into a second texture (dispTex), the
         // displays from the current frame's color (curSrv) at the render size.
-        const bool dispOn = DisplaysNow();
+        const bool dispOn = DisplaysFor(view, (double)iw / w);
         bool dispDone = false;  // the pass ran: dispTex holds the result
         ID3D11Texture2D* dispTex = nullptr;
         ID3D11UnorderedAccessView* dispUav = nullptr;
@@ -2048,7 +2057,8 @@ void LogStats(bool totals) {
         Log("DLAA: evaluations with the bias mask %llu, with the fixed exposure %llu, with the cockpit from the game's "
             "TAA %llu, with the displays pass %llu (session; the pass now %s)",
             (unsigned long long)g_maskEvals, (unsigned long long)g_expEvals, (unsigned long long)g_cockpitEvals,
-            (unsigned long long)g_dispEvals, DisplaysNow() ? "on" : "off");
+            (unsigned long long)g_dispEvals,
+            !DisplaysNow() ? "off" : Cfg().dlaaOuterDisplayPass ? "on" : "on, outer's displays with DLSS");
 #endif
     nr::LogStats(totals);
     if (Cfg().quadMode != QuadMode::Quad) return;

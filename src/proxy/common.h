@@ -326,6 +326,12 @@ struct Config {
     // [dlaa] display_pass (live, not in the default ini): with DLAA too the displays pass instead of the game's TAA (no TAA
     // draw, copy and composition; the locks pass is skipped). 0 = the game's TAA, the way before 2026-11-17.
     bool dlaaDisplayPass = true;
+    // [dlaa] outer_display_pass (live): quad views, the displays pass in outer too; 0 = outer's displays and mirrors stay
+    // with DLSS (no flicker in the periphery, changing digits may trail there).
+    bool dlaaOuterDisplayPass = false;
+    // [dlaa] display_pass_min_scale (live): the displays pass only in views rendered at least at this fraction of their
+    // size (DLSS SR); below it DLSS keeps the displays. 0.67 = from Quality up; 1 = only with DLAA; 0 = always.
+    float dlaaDisplayPassMinScale = 0.67f;
     // [nr] (prototype NR-P1, dlaa-plan D7; not in the default ini): 0 off, 1 focus = after DLAA the focus views go
     // through the NR bridge (nr.h; step 1: passthrough without a model); 2 final = the finished focus images at the
     // composition (motion vectors and depth from DLAA). Live, like its hotkey.
