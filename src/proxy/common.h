@@ -56,6 +56,7 @@ struct Config {
     float benchDelayS = 5.0f;         // from key press to recording start (time to settle)
     float benchDurationS = 30.0f;     // recording length
     bool benchFreezePose = true;      // constant head pose for the game while recording
+    bool benchPoseFile = false;       // the frozen pose from bench\frozen_pose.bin; written there when it is missing
     bool benchBeep = true;            // beeps: countdown start, recording start, end
     // Developers: steps "label: switch=value, ..." separated by "|"; the hotkey then runs them one after another,
     // each from the state before the sequence plus its switches (quad::SetSwitch), and restores that state at the end.
@@ -81,6 +82,8 @@ struct Config {
     int shotKeyMod = VK_RCONTROL;     // quad: shot of the four views (PNG + pixel differences), modifier (0 = none)
     int shotKey = 0;                  // quad: shot key (testers: VK_F10; 0 = no hotkey)
     float shotAutoS = 0.0f;           // quad: > 0 = one shot this many seconds after the first frame with focus groups
+    bool shotFull = false;            // quad: shot PNGs at full resolution (else half)
+    float shotBenchS = 0.0f;          // quad: > 0 = a shot every this many seconds of each benchmark recording
     // quad, M8.5: preset=quality|balanced|performance gives the defaults of peripheral_multiplier and the four
     // *_section keys; a key given in the ini wins. balanced = the mbucchia defaults below.
     std::string preset = "balanced";
@@ -324,6 +327,12 @@ struct Config {
     // [dlaa] display_pass (live, not in the default ini): with DLAA too the displays pass instead of the game's TAA (no TAA
     // draw, copy and composition; the locks pass is skipped). 0 = the game's TAA, the way before 2026-11-17.
     bool dlaaDisplayPass = true;
+    // [dlaa] outer_display_pass (live): quad views, the displays pass in outer too; 0 = outer's displays and mirrors stay
+    // with DLSS (no flicker in the periphery, changing digits may trail there).
+    bool dlaaOuterDisplayPass = false;
+    // [dlaa] display_pass_min_scale (live): the displays pass only in views rendered at least at this fraction of their
+    // size (DLSS SR); below it DLSS keeps the displays. 0.67 = from Quality up; 1 = only with DLAA; 0 = always.
+    float dlaaDisplayPassMinScale = 0.67f;
     // [nr] (prototype NR-P1, dlaa-plan D7; not in the default ini): 0 off, 1 focus = after DLAA the focus views go
     // through the NR bridge (nr.h; step 1: passthrough without a model); 2 final = the finished focus images at the
     // composition (motion vectors and depth from DLAA). Live, like its hotkey.

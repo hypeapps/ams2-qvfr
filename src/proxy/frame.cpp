@@ -204,6 +204,12 @@ bool g_frozen = false;
 vr::TrackedDevicePose_t g_frozenPose{};
 vr::ETrackingUniverseOrigin g_trackingSpace = vr::TrackingUniverseSeated;
 bool g_trackingSpaceKnown = false;
+// Read without g_mutex (quad's shots, under quad's lock): the recording's start time (-1 = not recording) and number.
+std::atomic<double> g_recStartMs{-1.0};
+std::atomic<uint32_t> g_recRun{0};
+
+// [benchmark] pose_file: the pose this frame would freeze, replaced by the saved one; saved when there is none yet.
+void PoseFromFile(vr::TrackedDevicePose_t& pose);
 
 struct Series {
     std::vector<float> v;
@@ -444,6 +450,30 @@ std::vector<SeqResult> g_seqRes;
 std::string g_seqStamp;
 double g_countdownS = 0;  // this countdown's length
 
+void PoseFromFile(vr::TrackedDevicePose_t& pose) {
+    const fs::path file = BenchDir() / L"frozen_pose.bin";
+    vr::TrackedDevicePose_t saved{};
+    if (FILE* f = _wfopen(file.c_str(), L"rb")) {
+        const bool ok = fread(&saved, sizeof(saved), 1, f) == 1 && saved.bPoseIsValid;
+        fclose(f);
+        if (ok) {
+            pose = saved;
+            Log("Benchmark: HMD pose from %s", Narrow(file.wstring()).c_str());
+            return;
+        }
+        Log("Benchmark: %s is not a pose; it gets this one", Narrow(file.wstring()).c_str());
+    }
+    std::error_code ec;
+    fs::create_directories(file.parent_path(), ec);
+    if (FILE* f = _wfopen(file.c_str(), L"wb")) {
+        const bool ok = fwrite(&pose, sizeof(pose), 1, f) == 1;
+        fclose(f);
+        Log("Benchmark: HMD pose %s %s", ok ? "saved to" : "NOT saved to", Narrow(file.wstring()).c_str());
+    } else {
+        Log("Benchmark: HMD pose NOT saved (cannot write %s)", Narrow(file.wstring()).c_str());
+    }
+}
+
 void StartCountdown(const char* why, double seconds = -1) {
     g_bench = Bench::Countdown;
     g_benchT0 = NowMs();
@@ -479,6 +509,8 @@ void StartRun(uint32_t newestIndex) {
     modern::GetCumulative(g_cumStart);
     g_bench = Bench::Running;
     g_benchT0 = NowMs();
+    g_recRun.fetch_add(1);
+    g_recStartMs = g_benchT0;
     if (Cfg().benchFreezePose) {
         // OnWaitGetPosesEnd captures the pose from the current frame; a sequence's later steps keep the first one's.
         if (!(g_seqOn && g_frozen && g_frozenPose.bPoseIsValid)) g_frozenPose.bPoseIsValid = false;
@@ -502,6 +534,7 @@ void FinishRun(bool aborted) {
     g_frozen = false;
     g_frozenPose.bPoseIsValid = false;
     g_bench = Bench::Idle;
+    g_recStartMs = -1.0;
     if (g_runCsv) {
         fclose(g_runCsv);
         g_runCsv = nullptr;
@@ -1137,6 +1170,7 @@ void OnWaitGetPosesEnd(vr::IVRCompositor* real, vr::TrackedDevicePose_t* render,
                 g_frozenPose = render[0];
                 g_frozenPose.vVelocity = {};
                 g_frozenPose.vAngularVelocity = {};
+                if (Cfg().benchPoseFile) PoseFromFile(g_frozenPose);
                 const auto& m = g_frozenPose.mDeviceToAbsoluteTracking.m;
                 Log("Benchmark: HMD pose frozen, position (%.3f, %.3f, %.3f) m", m[0][3], m[1][3], m[2][3]);
             }
@@ -1289,5 +1323,11 @@ void OnShutdown() {
 }
 
 Totals LiveTotals() { return g_live; }
+
+double RecordingMs(uint32_t* run) {
+    const double t0 = g_recStartMs.load();
+    if (run) *run = g_recRun.load();
+    return t0 < 0 ? -1.0 : NowMs() - t0;
+}
 
 }  // namespace qvfr::frame

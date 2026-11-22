@@ -22,6 +22,7 @@
 #include "dlaa.h"
 #include "focus_cull.h"
 #include "focus_geometry.h"
+#include "frame.h"
 #include "fwd_rec.h"
 #include "gpu.h"
 #include "hook_prof.h"
@@ -283,6 +284,8 @@ Stats g_st, g_tot;
 double g_lastWindowMs[kGroups] = {};  // the eye groups' CPU per full frame of the latest stats interval
 bool g_shotFrame = false;
 bool g_autoShotDone = false;
+uint32_t g_benchShotRun = 0;  // [quad] shot_bench_s: the recording the shots below belong to
+int g_benchShots = 0;         // shots taken in that recording
 bool g_keyWasDown = false;
 void* g_lastSubmit[2] = {};  // texture of the latest Submit per eye (only compared)
 Focus g_focus;
@@ -1963,9 +1966,20 @@ void HandleShotLocked() {
     g_keyWasDown = down;
     bool autoShot = !g_autoShotDone && c.shotAutoS > 0 && g_firstFocusMs >= 0 &&
                     NowMs() - g_firstFocusMs >= c.shotAutoS * 1000.0;
-    if (!pressed && !autoShot) return;
+    bool benchShot = false;
+    if (c.shotBenchS > 0 && !pressed && !autoShot) {
+        uint32_t run = 0;
+        const double ms = frame::RecordingMs(&run);
+        if (ms >= 0 && run != g_benchShotRun) {
+            g_benchShotRun = run;
+            g_benchShots = 0;
+        }
+        benchShot = ms >= 0 && !shots::Active() && ms >= (g_benchShots + 1) * c.shotBenchS * 1000.0;
+        if (benchShot) ++g_benchShots;
+    }
+    if (!pressed && !autoShot && !benchShot) return;
     if (autoShot) g_autoShotDone = true;
-    const char* why = autoShot ? "shot_auto_s" : "hotkey";
+    const char* why = autoShot ? "shot_auto_s" : benchShot ? "shot_bench_s" : "hotkey";
     // The blend band may have changed (live reload).
     for (int i = 0; i < 2; ++i) g_shotPairs[3 + i].inset = SharpInsetLocked();
     // Diagnostics (M7.4): focus's clones join the shot, grabbed at the end of focus L.
@@ -3524,6 +3538,7 @@ const Switch kSwitches[] = {
      }},
     // DLSS, over the ini (-1 = the ini's): presets as NVIDIA numbers them (10 J, 11 K, 12 L, 13 M), scales in percent.
     {"dlss_preset", false, -1, 15, [] { return dlaa::GetPresetSwitch(0); }, [](int v) { dlaa::SetPresetSwitch(0, v); }},
+    {"dlss_game_taa", false, 0, 1, [] { return dlaa::GetGameTaaSwitch(); }, [](int v) { dlaa::SetGameTaaSwitch(v); }},
     {"dlss_preset_outer", false, -1, 15, [] { return dlaa::GetPresetSwitch(1); },
      [](int v) { dlaa::SetPresetSwitch(1, v); }},
     {"dlss_preset_focus", false, -1, 15, [] { return dlaa::GetPresetSwitch(2); },

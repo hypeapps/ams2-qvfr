@@ -201,11 +201,16 @@ void ConvertRow(DXGI_FORMAT f, const uint8_t* src, uint8_t* dst, UINT w, Values&
     }
 }
 
-// 24-bit BGR PNG at half resolution (2 x 2 box filter).
+// 24-bit BGR PNG at half resolution (2 x 2 box filter), or at full resolution with [quad] shot_full=1.
 bool WritePng(const fs::path& path, const Image& img, std::string& err) {
-    UINT w = std::max(1u, img.w / 2), h = std::max(1u, img.h / 2);
+    const bool full = Cfg().shotFull;
+    UINT w = full ? img.w : std::max(1u, img.w / 2), h = full ? img.h : std::max(1u, img.h / 2);
     std::vector<uint8_t> bgr((size_t)w * h * 3);
-    for (UINT y = 0; y < h; ++y) {
+    if (full) {
+        for (size_t i = 0; i < (size_t)w * h; ++i)
+            for (int c = 0; c < 3; ++c) bgr[i * 3 + 2 - c] = img.rgb[i * 3 + c];
+    }
+    for (UINT y = 0; y < h && !full; ++y) {
         const uint8_t* r0 = img.rgb.data() + (size_t)std::min(2 * y, img.h - 1) * img.w * 3;
         const uint8_t* r1 = img.rgb.data() + (size_t)std::min(2 * y + 1, img.h - 1) * img.w * 3;
         uint8_t* d = bgr.data() + (size_t)y * w * 3;
@@ -351,8 +356,8 @@ void RunJob(std::unique_ptr<Job> job) {
         else
             Log("Shot: cannot write %s.png (%s)", img.name.c_str(), err.c_str());
     }
-    Log("Shot: %d PNG files (half resolution) in %s, %.1f s", written, Narrow(dir.wstring()).c_str(),
-        (NowMs() - t0) / 1000.0);
+    Log("Shot: %d PNG files (%s resolution) in %s, %.1f s", written, Cfg().shotFull ? "full" : "half",
+        Narrow(dir.wstring()).c_str(), (NowMs() - t0) / 1000.0);
     if (SUCCEEDED(co)) CoUninitialize();
 }
 

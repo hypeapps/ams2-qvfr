@@ -304,6 +304,7 @@ Config ReadConfig(const fs::path& ini) {
     c.benchDelayS = IniFloat(ini, L"benchmark", L"delay_s", c.benchDelayS);
     c.benchDurationS = IniFloat(ini, L"benchmark", L"duration_s", c.benchDurationS);
     c.benchFreezePose = IniInt(ini, L"benchmark", L"freeze_pose", 1) != 0;
+    c.benchPoseFile = IniInt(ini, L"benchmark", L"pose_file", 0) != 0;
     c.benchBeep = IniInt(ini, L"benchmark", L"beep", 1) != 0;
     c.benchAutoStartS = IniFloat(ini, L"benchmark", L"auto_start_s", 0.0f);
     c.benchSequence = Narrow(IniPathValue(ini, L"benchmark", L"sequence"));
@@ -350,6 +351,8 @@ Config ReadConfig(const fs::path& ini) {
     c.shotKeyMod = IniInt(ini, L"quad", L"shot_modifier", c.shotKeyMod);
     c.shotKey = IniInt(ini, L"quad", L"shot_key", c.shotKey);
     c.shotAutoS = IniFloat(ini, L"quad", L"shot_auto_s", 0.0f);
+    c.shotFull = IniInt(ini, L"quad", L"shot_full", 0) != 0;
+    c.shotBenchS = std::max(0.0f, IniFloat(ini, L"quad", L"shot_bench_s", 0.0f));
     if (c.quadMode == QuadMode::Quad) ReadQuadView(ini, c);
     c.followGaze = IniInt(ini, L"quad", L"follow_gaze", 1) != 0;
     c.gazeHoldS = IniFloat(ini, L"quad", L"gaze_hold_s", c.gazeHoldS);
@@ -367,12 +370,13 @@ Config ReadConfig(const fs::path& ini) {
         Log("Settings: [quad] mode=%s preset=%s peripheral_multiplier=%.3f focus_multiplier=%.3f focus_section=%.3f x %.3f "
             "fixed_section=%.3f x %.3f focus_offset=(%.3f, %.3f) fixed_offset=(%.3f, %.3f) "
             "smoothen_focus_view_edges=%.3f%s follow_gaze=%d gaze_hold_s=%.2f compose=%d margin_px=%d probe_frames=%d "
-            "probe_engine=%d probe_d3d=%d shot_modifier=0x%X shot_key=0x%X shot_auto_s=%.1f",
+            "probe_engine=%d probe_d3d=%d shot_modifier=0x%X shot_key=0x%X shot_auto_s=%.1f shot_full=%d "
+            "shot_bench_s=%.1f",
             QuadModeName(c.quadMode), c.preset.c_str(), c.peripheralMultiplier, c.focusMultiplier, c.focusSectionX, c.focusSectionY,
             c.fixedSectionX, c.fixedSectionY, c.focusOffsetX, c.focusOffsetY, c.fixedOffsetX, c.fixedOffsetY,
             c.smoothen, c.legacyEdge ? " (overridden by the pre-M7 feather_px)" : "", c.followGaze, c.gazeHoldS,
             c.quadCompose, c.quadMarginPx, c.probeFrames, c.probeEngine, c.probeD3D, c.shotKeyMod, c.shotKey,
-            c.shotAutoS);
+            c.shotAutoS, c.shotFull, c.shotBenchS);
     if (c.quadMode == QuadMode::Quad && c.expMode != ExpMode::Off) {
         Log("Settings: [experiment] mode=%s ignored: [quad] mode=quad sets the size and projection itself",
             ExpModeName(c.expMode));
@@ -530,17 +534,21 @@ Config ReadConfig(const fs::path& ini) {
     c.dlaaExpKey = IniInt(ini, L"dlaa", L"exposure_key", c.dlaaExpKey);
     c.dlaaCockpitTaa = std::clamp(IniInt(ini, L"dlaa", L"cockpit_taa", c.dlaaCockpitTaa), 0, 2);
     c.dlaaDisplayPass = IniInt(ini, L"dlaa", L"display_pass", c.dlaaDisplayPass ? 1 : 0) != 0;
+    c.dlaaOuterDisplayPass = IniInt(ini, L"dlaa", L"outer_display_pass", c.dlaaOuterDisplayPass ? 1 : 0) != 0;
+    c.dlaaDisplayPassMinScale =
+        std::clamp(IniFloat(ini, L"dlaa", L"display_pass_min_scale", c.dlaaDisplayPassMinScale), 0.0f, 1.0f);
     if (c.dlaa)
         Log("Settings: [dlaa] mode=%s render_scale=%.3f outer_render_scale=%.3f focus_render_scale=%.3f preset=%s "
             "outer_preset=%s focus_preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d "
             "auto_exposure=%d exposure=%.4f exposure_scale=%.4f bias_mask=%.2f skip_locks=%d modifier=0x%X key=0x%X "
-            "exposure_key=0x%X cockpit_taa=%d display_pass=%d",
+            "exposure_key=0x%X cockpit_taa=%d display_pass=%d outer_display_pass=%d display_pass_min_scale=%.2f",
             c.dlaaSr ? "dlss" : "dlaa", c.dlaaRenderScale, c.dlaaOuterRenderScale, c.dlaaFocusRenderScale,
             preset.c_str(), outerPreset.empty() ? preset.c_str() : outerPreset.c_str(),
             focusPreset.empty() ? preset.c_str() : focusPreset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY,
             c.dlaaMvJittered, c.dlaaAutoExposure,
             c.dlaaExposure, c.dlaaExposureScale, c.dlaaBiasMask, c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey,
-            c.dlaaExpKey, c.dlaaCockpitTaa, c.dlaaDisplayPass ? 1 : 0);
+            c.dlaaExpKey, c.dlaaCockpitTaa, c.dlaaDisplayPass ? 1 : 0, c.dlaaOuterDisplayPass ? 1 : 0,
+            c.dlaaDisplayPassMinScale);
     const std::string nr = IniString(ini, L"nr", L"mode", L"off");
     c.nrMode = nr == "focus" ? 1 : nr == "final" ? 2 : 0;
     if (nr != "off" && nr != "focus" && nr != "final") Log("Settings: unknown [nr] mode=\"%s\", using off", nr.c_str());
@@ -660,13 +668,13 @@ void LoadConfig() {
     Log("Settings %s: [runtime] path=%s opencomposite=\"%s\" openxr_layer=%d", Narrow(ini.wstring()).c_str(),
         c.pathOpenXr ? "openxr" : "openvr", Narrow(c.openComposite).c_str(), c.openxrLayer);
     Log("Settings %s: wrap=%d first_calls=%d stats_interval_s=%d csv_always=%d gpu=%d | benchmark: modifier=0x%X key=0x%X "
-        "delay_s=%.1f duration_s=%.1f freeze_pose=%d beep=%d auto_start_s=%.1f settle_s=%.1f sequence=\"%s\" | gaze read=%d | "
-        "experiment: mode=%s "
+        "delay_s=%.1f duration_s=%.1f freeze_pose=%d pose_file=%d beep=%d auto_start_s=%.1f settle_s=%.1f sequence=\"%s\" | "
+        "gaze read=%d | experiment: mode=%s "
         "focus_size=%.3f center=(%.3f, %.3f) pad=%d",
         Narrow(ini.wstring()).c_str(), c.wrap, c.firstCalls, c.statsIntervalS, c.csvAlways, c.gpuTiming, c.benchKeyMod,
         c.benchKey,
-        c.benchDelayS, c.benchDurationS, c.benchFreezePose, c.benchBeep, c.benchAutoStartS, c.benchSettleS,
-        c.benchSequence.c_str(), c.gazeRead, ExpModeName(c.expMode), c.expFocusSize, c.expCenterX, c.expCenterY, c.expPad);
+        c.benchDelayS, c.benchDurationS, c.benchFreezePose, c.benchPoseFile, c.benchBeep, c.benchAutoStartS,
+        c.benchSettleS, c.benchSequence.c_str(), c.gazeRead, ExpModeName(c.expMode), c.expFocusSize, c.expCenterX, c.expCenterY, c.expPad);
 }
 
 bool ReloadConfig(bool force) {
@@ -741,6 +749,8 @@ bool ReloadConfig(bool force) {
     c.dlaaExposureScale = n.dlaaExposureScale;
     c.dlaaCockpitTaa = n.dlaaCockpitTaa;
     c.dlaaDisplayPass = n.dlaaDisplayPass;
+    c.dlaaOuterDisplayPass = n.dlaaOuterDisplayPass;
+    c.dlaaDisplayPassMinScale = n.dlaaDisplayPassMinScale;
     c.nrMode = n.nrMode;
     c.nrKeyMod = n.nrKeyMod;
     c.nrKey = n.nrKey;
@@ -782,6 +792,7 @@ bool ReloadConfig(bool force) {
     c.benchDelayS = n.benchDelayS;
     c.benchDurationS = n.benchDurationS;
     c.benchFreezePose = n.benchFreezePose;
+    c.benchPoseFile = n.benchPoseFile;
     c.benchBeep = n.benchBeep;
     c.benchSequence = n.benchSequence;
     c.benchSettleS = n.benchSettleS;
@@ -802,6 +813,8 @@ bool ReloadConfig(bool force) {
     c.shotKeyMod = n.shotKeyMod;
     c.shotKey = n.shotKey;
     c.shotAutoS = n.shotAutoS;
+    c.shotFull = n.shotFull;
+    c.shotBenchS = n.shotBenchS;
     c.overlay = n.overlay;
     c.overlayKeyMod = n.overlayKeyMod;
     c.overlayKey = n.overlayKey;
