@@ -2184,6 +2184,20 @@ int RunClones() {
         if (fixBound) fixBound->Release();
     }
     // Windows of a dynamic buffer share a block: two neighbours take one, a far one its own, and a Map of the buffer
+    // At half the view size the render-size pairs are also the view size's own halves, quarters and reciprocals: the
+    // render size grows until none is. Other scales and the view size itself stay.
+    {
+        uint32_t w = 907, h = 760;
+        const bool half = qvfr::srcb::Ambiguous(w, h, 1814, 1520);
+        const bool grown = qvfr::srcb::AvoidAmbiguous(w, h, 1814, 1520);
+        uint32_t w67 = 1215, h67 = 1018, w33 = 798, h33 = 669, wo = 1814, ho = 1520;
+        const bool kept = !qvfr::srcb::AvoidAmbiguous(w67, h67, 1814, 1520) &&
+                          !qvfr::srcb::AvoidAmbiguous(w33, h33, 2419, 2027) &&
+                          !qvfr::srcb::AvoidAmbiguous(wo, ho, 1814, 1520) && w67 == 1215 && w33 == 798 && wo == 1814;
+        expect(half && grown && w > 907 && w - 907 == h - 760 && !qvfr::srcb::Ambiguous(w, h, 1814, 1520) && kept,
+               "SR constants fix: 907 x 760 of 1814 x 1520 is ambiguous and grows, 67%, 33% and 100% stay");
+        printf("SR constants fix: 907 x 760 of 1814 x 1520 grows to %u x %u\n", w, h);
+    }
     // drops them, so the next draw sees the new data.
     {
         D3D11_BUFFER_DESC dd{};
