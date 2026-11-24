@@ -540,8 +540,9 @@ std::atomic<const Profile*> g_profile{nullptr};
 std::vector<const Profile*> g_profRetired;
 std::atomic<bool> g_profOn{false};
 bool g_hookProfCfg = false;  // [debug] hook_profile as last applied
+bool g_hookFastCfg = true;   // [debug] hook_fast as last applied
 bool g_profCfg = false;      // [debug] task_profile as last applied
-bool g_mapCacheCfg = true;   // [debug] clones_map_cache as last applied
+int g_mapCacheCfg = 2;       // [debug] clones_map_cache as last applied
 bool g_bindSkipCfg = true;   // [debug] mvr_bind_skip as last applied
 int g_stateTrackCfg = 1;     // [debug] mvr_state_track as last applied
 bool g_emptyQueue = false;     // O2 step 2, [debug] mvr_empty_queue (live)
@@ -1760,6 +1761,10 @@ void HandleToolsLocked() {
     if (c.hookProfile != g_hookProfCfg) {  // on a change only: a benchmark sequence step may switch it
         g_hookProfCfg = c.hookProfile;
         hookprof::SetOn(c.hookProfile);  // logs it
+    }
+    if (c.hookFast != g_hookFastCfg) {
+        g_hookFastCfg = c.hookFast;
+        hookprof::SetFast(c.hookFast);  // logs it
     }
     if (c.focusCull != g_cullCfg) {
         g_cullCfg = c.focusCull;
@@ -3497,9 +3502,9 @@ const Switch kSwitches[] = {
      [](int v) { taaviews::SetMotionFix(v != 0); }},
     {"outer_only", false, 0, 1, [] { return (int)g_userOuter; }, [](int v) { g_userOuter = v != 0; }},
     {"task_profile", false, 0, 1, [] { return (int)g_profOn.load(); }, [](int v) { g_profOn = v != 0; }},
-    {"clones_map_cache", false, 0, 1, [] { return (int)clones::GetMapCache(); },
-     [](int v) { clones::SetMapCache(v != 0); }},
+    {"clones_map_cache", false, 0, 3, [] { return clones::GetMapCache(); }, [](int v) { clones::SetMapCache(v); }},
     {"hook_profile", false, 0, 1, [] { return (int)hookprof::On(); }, [](int v) { hookprof::SetOn(v != 0); }},
+    {"hook_fast", false, 0, 1, [] { return (int)hookprof::Fast(); }, [](int v) { hookprof::SetFast(v != 0); }},
     {"mvr_early", true, 0, mvrpass::kEarlyModes - 1, [] { return mvrpass::GetEarly(); },
      [](int v) { mvrpass::SetEarly(v); }},
     {"mvr_mode", true, 0, (int)mvrpass::Mode::Overwrite, [] { return (int)mvrpass::GetMode(); },

@@ -185,10 +185,13 @@ int ListForShot(Set set, ID3D11Resource** out, char (*labels)[64], int max);
 
 std::string Describe();      // one part of the summary line
 void LogStats(bool totals);  // a stats line, with the session totals at the end
-// O1 ([debug] clones_map_cache, live): binds whose views all mapped to themselves since the latest change of the maps
-// skip the lock (a cache on the render thread).
-void SetMapCache(bool on);
-bool GetMapCache();
+// [debug] clones_map_cache (live): binds whose views all map to themselves skip the lock. 0: no cache; 1: a cache whose
+// entries last until the maps or the state change (every group begin and end); 2: per view the states it maps to
+// itself in, until the maps' contents change (a view made at an address drops its entry); 3: as 2, each hit also mapped
+// through the lock and compared (mismatches logged).
+void SetMapCache(int mode);
+int GetMapCache();
+uint64_t MapMismatches();  // mode 3's mismatches, so far
 // O1: PSSetShaderResources calls on the immediate context that reach slot kPsWatchSlot or above (any caller, the
 // proxy's own too), counted: mvr_pass binds its t21..t26 (mvrps::kTexBase) again only when they may have changed.
 constexpr UINT kPsWatchSlot = 21;
@@ -203,6 +206,9 @@ uint64_t PsViewReads();  // PsView calls that read the slot back, so far
 // qvfr_proxy_smoke --clones: the map cache's binds without and with the lock so far; true while a group watches
 // (learning or proof: no cache).
 bool TestMapCache(uint64_t& hits, uint64_t& locked);
+// qvfr_proxy_smoke --clones: a view made at v as the device hooks see it; the views they saw made so far.
+void TestViewMade(void* v);
+uint64_t TestViewsMade();
 void Shutdown();             // VR_Shutdown: originals back, clones released, lists cleared (hooks stay)
 
 // qvfr_proxy_smoke --clones: fake engine objects without the engine hooks.

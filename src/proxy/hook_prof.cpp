@@ -8,6 +8,7 @@
 namespace qvfr::hookprof {
 
 std::atomic<bool> g_on{false};
+std::atomic<bool> g_fast{true};
 thread_local ThreadState t_state;
 
 namespace {
@@ -112,8 +113,13 @@ void RecordSub(Sub s, uint64_t cycles) {
     Add(k.cycles, cycles);
 }
 
-void Count(Counter c, uint32_t n) {
-    if (On()) Add(g_b[BucketOf()].counter[c], n);
+void CountOn(Counter c, uint32_t n) { Add(g_b[BucketOf()].counter[c], n); }
+
+void SetFast(bool on) {
+    if (on == Fast()) return;
+    g_fast = on;
+    Log("Hook profile: hook_fast %s (with the profile off: Orig without the thread state, Fibonacci-hashed shader memos)",
+        on ? "on" : "off");
 }
 
 void SetGroup(int group) {

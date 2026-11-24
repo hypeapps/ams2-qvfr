@@ -1290,6 +1290,7 @@ int RunClones() {
     ctx->PSSetShaderResources(0, 2, none);
     // O1 map cache (after the proof groups): in a focus group C's view (no clone) bound twice, the second time without the lock; then A's
     // original view with C's (translated: never from the cache) and C's again (from the cache).
+    cl::SetMapCache(1);
     {
         uint64_t h0 = 0, m0 = 0, h1 = 0, m1 = 0;
         bool watching = true;
@@ -1334,10 +1335,74 @@ int RunClones() {
         }
         cl::EndGroup(ctx);
         expect(translated, "map cache: A's original view still translated to its clone");
+        expect(cl::GetMapCache() == 1 || watching, "map cache mode 1 for this part");
         expect(watching || (h1 - h0 == 2 && m1 - m0 == 2),
                "map cache: C's view bound again without the lock (2 of 4 binds), A's through the lock");
         printf("Clones map cache: %s group, binds without the lock %llu, locked %llu\n", watching ? "watching" : "plain",
                (unsigned long long)(h1 - h0), (unsigned long long)(m1 - m0));
+    }
+    // View cache (clones_map_cache 2): C's view, known to map to itself, binds without the lock in the next focus group
+    // and in a second outer group; A's original is translated; a view made at C's address takes the lock again; mode 3
+    // checks its hits through the lock without a mismatch; the device hooks see a view made.
+    {
+        cl::SetMapCache(2);
+        ID3D11ShaderResourceView* cv[1] = {srvC};
+        ID3D11ShaderResourceView* nil[2] = {};
+        uint64_t h0 = 0, m0 = 0, h1 = 0, m1 = 0, h2 = 0, m2 = 0, h3 = 0, m3 = 0;
+        bool watching = cl::TestMapCache(h0, m0);
+        cl::BeginGroup(ctx, cl::Focus);
+        ctx->PSSetShaderResources(1, 1, cv);
+        cl::EndGroup(ctx);
+        cl::BeginGroup(ctx, cl::Focus);
+        watching |= cl::TestMapCache(h0, m0);
+        ctx->PSSetShaderResources(1, 1, cv);
+        cl::TestMapCache(h1, m1);
+        ctx->PSSetShaderResources(0, 1, &srvA);
+        ID3D11ShaderResourceView* got = nullptr;
+        ctx->PSGetShaderResources(0, 1, &got);
+        const bool translated = got && got == A.at<ID3D11ShaderResourceView*>(0x70);
+        if (got) got->Release();
+        cl::TestMapCache(h2, m2);
+        cl::TestViewMade(srvC);
+        ctx->PSSetShaderResources(1, 1, cv);
+        ctx->PSSetShaderResources(1, 1, cv);
+        cl::TestMapCache(h3, m3);
+        cl::EndGroup(ctx);
+        expect(!watching, "view cache: no watching group");
+        expect(h1 - h0 == 1 && m1 == m0, "view cache: C's view in the next focus group without the lock");
+        expect(translated && m2 == m1 + 1, "view cache: A's original translated through the lock");
+        expect(m3 - m2 == 1 && h3 - h2 == 1, "view cache: a view made at C's address takes the lock once");
+        uint64_t o0 = 0, o1 = 0, l0 = 0, l1 = 0;
+        cl::BeginGroup(ctx, cl::Outer);
+        ctx->PSSetShaderResources(1, 1, cv);
+        cl::EndGroup(ctx);
+        cl::BeginGroup(ctx, cl::Outer);
+        cl::TestMapCache(o0, l0);
+        ctx->PSSetShaderResources(1, 1, cv);
+        cl::TestMapCache(o1, l1);
+        cl::EndGroup(ctx);
+        expect(o1 - o0 == 1 && l1 == l0, "view cache: C's view in the second outer group without the lock");
+        cl::SetMapCache(3);
+        const uint64_t x0 = cl::MapMismatches();
+        cl::BeginGroup(ctx, cl::Focus);
+        ctx->PSSetShaderResources(1, 1, cv);
+        ID3D11ShaderResourceView* ac[2] = {srvA, srvC};
+        ctx->PSSetShaderResources(0, 2, ac);
+        cl::EndGroup(ctx);
+        cl::BeginGroup(ctx, cl::Outer);
+        ctx->PSSetShaderResources(1, 1, cv);
+        cl::EndGroup(ctx);
+        expect(cl::MapMismatches() == x0, "view cache mode 3: no mismatch");
+        cl::SetMapCache(2);
+        ctx->PSSetShaderResources(0, 2, nil);
+        const uint64_t made0 = cl::TestViewsMade();
+        ID3D11ShaderResourceView* extra = srv(texC);
+        expect(cl::TestViewsMade() == made0 + 1, "the device hooks see a view made");
+        if (extra) extra->Release();
+        printf("Clones view cache: next group %s, outer %s, after a view made at its address %s, mode 3 mismatches "
+               "%llu, views made seen %llu\n",
+               h1 - h0 == 1 ? "hit" : "MISS", o1 - o0 == 1 ? "hit" : "MISS", m3 - m2 == 1 ? "locked once" : "WRONG",
+               (unsigned long long)(cl::MapMismatches() - x0), (unsigned long long)(cl::TestViewsMade() - made0));
     }
     // An object destroyed inside a focus group gets its originals back at once; the list is watched again.
     cl::OnFrameStart(ctx, true);

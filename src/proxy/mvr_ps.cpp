@@ -16,6 +16,7 @@
 
 #include "common.h"
 #include "dxbc.h"
+#include "hook_prof.h"
 #include "hooks.h"
 #include "mvr_ps_patch.h"
 #include "mvr_vs.h"
@@ -70,7 +71,8 @@ struct Memo {
     uint32_t gen = 0;
     Info info;
 };
-constexpr size_t kMemo = 2048;
+constexpr unsigned kMemoBits = 11;
+constexpr size_t kMemo = size_t(1) << kMemoBits;
 Memo g_memo[kMemo];
 
 void Fail(const char* where, unsigned long code) {
@@ -367,7 +369,7 @@ Info InfoOf(ID3D11PixelShader* ps) {
 
 Info InfoOfRt(ID3D11PixelShader* ps) {
     if (!ps) return Info{};
-    Memo& m = g_memo[((uintptr_t)ps >> 4) & (kMemo - 1)];
+    Memo& m = g_memo[hookprof::MemoSlot(ps, kMemoBits)];
     const uint32_t gen = g_gen.load(std::memory_order_acquire);  // before the lookup: a shader made meanwhile misses next
     if (m.ps == ps && m.gen == gen) return m.info;
     const Info info = InfoOf(ps);

@@ -149,8 +149,10 @@ struct Config {
     // The proxy's own CPU time in its D3D11 detours and the task hook, one log line per eye group with the stats
     // (hook_prof.h, mvr_optimizations O1 step 0 diagnostics).
     bool hookProfile = false;
-    // O1: binds whose views all map to themselves skip the clones' lock (clones.h SetMapCache).
-    bool clonesMapCache = true;
+    // O1: binds whose views all map to themselves skip the clones' lock, 0..3 (clones.h SetMapCache).
+    int clonesMapCache = 2;
+    // With the hook profile off: detours skip its thread state, shader memos hash addresses (hook_prof.h SetFast).
+    bool hookFast = true;
     // O1: an MVR draw binds its t21..t26 only when they changed (mvr_pass.h SetBindSkip).
     bool mvrBindSkip = true;
     // O1 step 3: where an MVR draw takes its PS state, 0..2 (mvr_pass.h SetStateTrack).

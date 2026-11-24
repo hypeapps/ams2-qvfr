@@ -1,5 +1,6 @@
 #include "clones.h"
 
+#include <d3d11_3.h>
 #include <intrin.h>
 #include <psapi.h>
 
@@ -244,10 +245,17 @@ std::atomic<int> g_live{LiveOff};
 // of the maps, of the live mode, of the set or of the eye (and every group begin and end) starts a new generation.
 // Learning and proof groups (Watching) always take the locked path, which also counts the fixes and logs new callers.
 std::atomic<uint32_t> g_mapGen{1};
-void MapsChanged() { g_mapGen.fetch_add(1, std::memory_order_acq_rel); }
+// The view cache's generation (kMapViews): only a change of the maps' contents starts a new one, not a change of state.
+std::atomic<uint32_t> g_contentGen{1};
+void MapsChanged() {
+    g_mapGen.fetch_add(1, std::memory_order_acq_rel);
+    g_contentGen.fetch_add(1, std::memory_order_acq_rel);
+}
+// The live mode, the set, the eye or the post phase changed: what a view maps to may differ, the maps did not.
+void StateChanged() { g_mapGen.fetch_add(1, std::memory_order_acq_rel); }
 void SetLive(int v) {
     g_live = v;
-    MapsChanged();
+    StateChanged();
 }
 struct SameEntry {
     void* v = nullptr;
@@ -257,8 +265,37 @@ constexpr size_t kSameCache = 4096;
 SameEntry g_same[kSameCache];
 size_t SameSlot(const void* v) { return ((uintptr_t)v >> 4) & (kSameCache - 1); }
 std::atomic<uint64_t> g_sameHits{0}, g_sameMiss{0};
-std::atomic<bool> g_sameOn{true};  // [debug] clones_map_cache (live)
 uint64_t g_sameHitsTot = 0, g_sameMissTot = 0;
+// [debug] clones_map_cache (live): kMapLocked every bind through the lock, kMapGen the cache above (one generation for
+// maps and state), kMapViews the view cache below, kMapCheck that cache with every hit also mapped through the lock and
+// compared.
+enum MapMode { kMapLocked = 0, kMapGen = 1, kMapViews = 2, kMapCheck = 3 };
+std::atomic<int> g_mapMode{kMapViews};
+// kMapViews: per view the states (live mode, set, eye, post phase; StateBit) it maps to itself in, valid while the maps
+// keep their contents (g_contentGen). 4-way sets of one cache line, by a Fibonacci hash of the address. Written on the
+// render thread (the immediate context's only user); a view made at an address drops its entry (ViewMade, any thread).
+struct ViewEntry {
+    std::atomic<void*> v{nullptr};
+    uint32_t gen = 0;
+    uint32_t mask = 0;
+};
+constexpr size_t kViewWays = 4, kViewSetBits = 11;
+struct alignas(64) ViewSet {
+    ViewEntry e[kViewWays];
+};
+ViewSet g_views[size_t(1) << kViewSetBits];
+uint32_t g_viewVictim = 0;
+ViewSet& ViewSetOf(const void* v) {
+    return g_views[((uintptr_t)v * 0x9E3779B97F4A7C15ull) >> (64 - kViewSetBits)];
+}
+// Render thread counters (no locked increments); read for the log.
+std::atomic<uint64_t> g_viewHits{0}, g_viewMiss{0}, g_viewChecked{0}, g_viewMismatch{0};
+uint64_t g_viewHitsTot = 0, g_viewMissTot = 0, g_viewCheckedTot = 0, g_viewMismatchTot = 0;
+std::atomic<uint64_t> g_viewsMade{0};  // views the device hooks saw made
+bool g_devHooked = false;
+int g_mismatchLogs = 0;
+uint64_t g_contentSig = 0;  // OnFrameStart: the lists' sizes and the phase as of the latest frame start
+void Bump(std::atomic<uint64_t>& c) { c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
 std::atomic<uint32_t> g_psHighGen{0};  // PsHighSlotsGen
 // O1 step 3 (PsView): the views each PS slot of the immediate context got from its latest PSSetShaderResources since
 // the epoch began (after the bind fix: what is really bound), and that epoch. Render thread only.
@@ -297,7 +334,7 @@ std::unordered_map<void*, ID3D11Texture2D*> g_arrRes;  // replaced engine textur
 // Views seen that are not of a replaced texture (nearly every bound view), direct-mapped by address: one compare per
 // bound view while arrays exist. Cleared when the arrays change.
 constexpr size_t kPlainCache = 4096;
-void* g_arrPlain[kPlainCache] = {};
+std::atomic<void*> g_arrPlain[kPlainCache] = {};  // cleared per address by ViewMade on any thread
 void ClearPlain();
 struct ArrWant {
     ID3D11Resource* res;  // only compared
@@ -337,7 +374,7 @@ int g_arrLogs = 0;
 uint64_t g_arrMade = 0;                            // arrays made in this process
 
 void ClearPlain() {
-    memset(g_arrPlain, 0, sizeof(g_arrPlain));
+    for (auto& p : g_arrPlain) p.store(nullptr, std::memory_order_relaxed);
     MapsChanged();
 }
 
@@ -1677,8 +1714,8 @@ void NoteArrFixLocked(const char* method, void* caller, bool lazy) {
 // The view to use for v: the same view on the array when v belongs to a replaced texture, else v.
 void* ArrViewLocked(void* v, const char* method, void* caller) {
     if (!v || g_arrs.empty()) return v;
-    void*& plain = g_arrPlain[((uintptr_t)v >> 4) & (kPlainCache - 1)];
-    if (plain == v) return v;
+    std::atomic<void*>& plain = g_arrPlain[((uintptr_t)v >> 4) & (kPlainCache - 1)];
+    if (plain.load(std::memory_order_relaxed) == v) return v;
     if (auto it = g_arrView.find(v); it != g_arrView.end()) {
         NoteArrFixLocked(method, caller, false);
         return it->second;
@@ -1691,12 +1728,12 @@ void* ArrViewLocked(void* v, const char* method, void* caller) {
         if (a.old == r) rec = &a;
     r->Release();
     if (!rec) {  // the arrays' own views land here too
-        plain = v;
+        plain.store(v, std::memory_order_relaxed);
         return v;
     }
     void* nv = ArrViewForLocked(*rec, v);
     if (!nv) {
-        plain = v;
+        plain.store(v, std::memory_order_relaxed);
         return v;
     }
     NoteArrFixLocked(method, caller, true);
@@ -2050,7 +2087,7 @@ void Fail(const char* where, unsigned long code) {
 
 bool Live(ID3D11DeviceContext* c) {
     return (g_live.load(std::memory_order_relaxed) != LiveOff || g_arrOn.load(std::memory_order_relaxed)) &&
-           !t_internal && c == g_imm;
+           c == g_imm && !t_internal;
 }
 
 const Tex* TexOfResLocked(ID3D11Resource* r) {
@@ -2232,13 +2269,76 @@ ID3D11Resource* MapResLocked(ID3D11Resource* r, const char* method, void* caller
     return r;
 }
 
+// kMapViews: the state a view's mapping depends on besides the maps. LiveOff and LiveBack map by the maps alone (the
+// arrays, every set's views back); LiveSwap by the set in, the eye of the swap and the post phase.
+uint32_t StateBit() {
+    const int live = g_live.load(std::memory_order_relaxed);
+    if (live == LiveOff) return 1u;
+    if (live == LiveBack) return 2u;
+    return 4u << ((int)g_cur * 4 + (g_swapEye == 1 ? 2 : 0) + (g_post ? 1 : 0));
+}
+
+bool ViewSame(const void* v, uint32_t gen, uint32_t bit) {
+    ViewSet& s = ViewSetOf(v);
+    for (ViewEntry& e : s.e)
+        if (e.v.load(std::memory_order_relaxed) == v) return e.gen == gen && (e.mask & bit);
+    return false;
+}
+
+// v maps to itself in state `bit` while the maps are at generation gen.
+void ViewNoteSame(void* v, uint32_t gen, uint32_t bit) {
+    ViewSet& s = ViewSetOf(v);
+    ViewEntry* e = nullptr;
+    for (ViewEntry& x : s.e)
+        if (x.v.load(std::memory_order_relaxed) == v) e = &x;
+    if (e && e->gen == gen) {
+        e->mask |= bit;
+        return;
+    }
+    if (!e)
+        for (ViewEntry& x : s.e)
+            if (!e && (!x.v.load(std::memory_order_relaxed) || x.gen != gen)) e = &x;
+    if (!e) e = &s.e[g_viewVictim++ & (kViewWays - 1)];
+    e->v.store(nullptr, std::memory_order_relaxed);
+    e->gen = gen;
+    e->mask = bit;
+    e->v.store(v, std::memory_order_release);
+}
+
+// A view was made at v (device hooks, any thread): whatever was cached for a view there before is dropped.
+void ViewMade(void* v) {
+    if (!v) return;
+    for (ViewEntry& e : ViewSetOf(v).e) {
+        void* want = v;
+        e.v.compare_exchange_strong(want, nullptr, std::memory_order_relaxed);
+    }
+    void* want = v;
+    g_arrPlain[((uintptr_t)v >> 4) & (kPlainCache - 1)].compare_exchange_strong(want, nullptr,
+                                                                                 std::memory_order_relaxed);
+    Bump(g_viewsMade);
+}
+
 // The views to bind: `views` itself, or `tmp` (n entries) with translations.
 template <class V>
 V* const* MapViews(ID3D11DeviceContext* c, V* const* views, UINT n, V** tmp, const char* method, void* caller) {
     if (!views || !n || n > kMapMax || !Live(c)) return views;
     hookprof::SubScope prof(hookprof::SCloneMap);
     const bool watching = g_watch.load(std::memory_order_relaxed);  // learning and proof (Watching)
-    if (!watching && g_sameOn.load(std::memory_order_relaxed)) {
+    const int mode = watching ? kMapLocked : g_mapMode.load(std::memory_order_relaxed);
+    bool check = false;  // kMapCheck: a hit, mapped through the lock too
+    if (mode >= kMapViews) {
+        const uint32_t gen = g_contentGen.load(std::memory_order_acquire);
+        const uint32_t bit = StateBit();
+        UINT i = 0;
+        while (i < n && (!views[i] || ViewSame(views[i], gen, bit))) ++i;
+        if (i == n) {
+            Bump(g_viewHits);
+            if (mode != kMapCheck) return views;
+            check = true;
+        } else {
+            Bump(g_viewMiss);
+        }
+    } else if (mode == kMapGen) {
         const uint32_t gen = g_mapGen.load(std::memory_order_acquire);
         UINT i = 0;
         for (; i < n; ++i) {
@@ -2255,13 +2355,31 @@ V* const* MapViews(ID3D11DeviceContext* c, V* const* views, UINT n, V** tmp, con
     Protect(method, [&] {
         std::lock_guard lock(g_cm);
         if (g_live.load(std::memory_order_relaxed) == LiveOff && g_arrs.empty()) return;
-        const uint32_t gen = g_mapGen.load(std::memory_order_acquire);  // no change while the lock is held
+        // No change while the lock is held, but MapViewLocked may start a new generation: then no entry.
+        const uint32_t gen = g_mapGen.load(std::memory_order_acquire);
+        const uint32_t cgen = g_contentGen.load(std::memory_order_acquire);
+        const uint32_t bit = StateBit();
         for (UINT i = 0; i < n; ++i) {
             tmp[i] = (V*)MapViewLocked(views[i], method, caller);
             changed |= tmp[i] != views[i];
-            // A view that maps to itself at this generation (MapViewLocked may have started a new one: then no entry).
-            if (views[i] && tmp[i] == views[i] && !watching && g_mapGen.load(std::memory_order_relaxed) == gen)
+            if (!views[i] || tmp[i] != views[i]) continue;
+            if (mode == kMapGen && g_mapGen.load(std::memory_order_relaxed) == gen)
                 g_same[SameSlot(views[i])] = {views[i], gen};
+            else if (mode >= kMapViews && g_contentGen.load(std::memory_order_relaxed) == cgen)
+                ViewNoteSame(views[i], cgen, bit);
+        }
+        if (!check) return;
+        Bump(g_viewChecked);
+        if (!changed) return;
+        Bump(g_viewMismatch);
+        if (g_mismatchLogs < kMaxCallerLogs) {
+            ++g_mismatchLogs;
+            UINT k = 0;
+            while (k < n && tmp[k] == views[k]) ++k;
+            Log("Clones: MAP CACHE MISMATCH: %s from %s: view %p maps to %p (live %d, set %s, eye %d, post %d), the "
+                "view cache said itself%s",
+                method, Where(caller).c_str(), (void*)views[k], (void*)tmp[k], g_live.load(), kSetNames[g_cur],
+                g_swapEye, (int)g_post, g_mismatchLogs == kMaxCallerLogs ? " (further ones only counted)" : "");
         }
     });
     return changed ? tmp : views;
@@ -2573,6 +2691,62 @@ void STDMETHODCALLTYPE D_CSSetUav(ID3D11DeviceContext* c, UINT s, UINT n, ID3D11
     hookprof::Orig o;
     o_csUav(c, s, n, uav, counts);
 }
+// Device: every view made drops what the view cache held for its address (a released view's address reused).
+using CreateSrvFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC*,
+                                                ID3D11ShaderResourceView**);
+using CreateUavFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, ID3D11Resource*, const D3D11_UNORDERED_ACCESS_VIEW_DESC*,
+                                                ID3D11UnorderedAccessView**);
+using CreateRtvFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, ID3D11Resource*, const D3D11_RENDER_TARGET_VIEW_DESC*,
+                                                ID3D11RenderTargetView**);
+using CreateDsvFn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device*, ID3D11Resource*, const D3D11_DEPTH_STENCIL_VIEW_DESC*,
+                                                ID3D11DepthStencilView**);
+using CreateSrv1Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device3*, ID3D11Resource*, const D3D11_SHADER_RESOURCE_VIEW_DESC1*,
+                                                 ID3D11ShaderResourceView1**);
+using CreateUav1Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device3*, ID3D11Resource*,
+                                                 const D3D11_UNORDERED_ACCESS_VIEW_DESC1*, ID3D11UnorderedAccessView1**);
+using CreateRtv1Fn = HRESULT(STDMETHODCALLTYPE*)(ID3D11Device3*, ID3D11Resource*, const D3D11_RENDER_TARGET_VIEW_DESC1*,
+                                                 ID3D11RenderTargetView1**);
+CreateSrvFn o_createSrv = nullptr;
+CreateUavFn o_createUav = nullptr;
+CreateRtvFn o_createRtv = nullptr;
+CreateDsvFn o_createDsv = nullptr;
+CreateSrv1Fn o_createSrv1 = nullptr;
+CreateUav1Fn o_createUav1 = nullptr;
+CreateRtv1Fn o_createRtv1 = nullptr;
+template <class T>
+HRESULT Made(HRESULT hr, T** out) {
+    if (SUCCEEDED(hr) && out && *out) ViewMade(*out);
+    return hr;
+}
+HRESULT STDMETHODCALLTYPE D_CreateSrv(ID3D11Device* d, ID3D11Resource* r, const D3D11_SHADER_RESOURCE_VIEW_DESC* desc,
+                                      ID3D11ShaderResourceView** out) {
+    return Made(o_createSrv(d, r, desc, out), out);
+}
+HRESULT STDMETHODCALLTYPE D_CreateUav(ID3D11Device* d, ID3D11Resource* r, const D3D11_UNORDERED_ACCESS_VIEW_DESC* desc,
+                                      ID3D11UnorderedAccessView** out) {
+    return Made(o_createUav(d, r, desc, out), out);
+}
+HRESULT STDMETHODCALLTYPE D_CreateRtv(ID3D11Device* d, ID3D11Resource* r, const D3D11_RENDER_TARGET_VIEW_DESC* desc,
+                                      ID3D11RenderTargetView** out) {
+    return Made(o_createRtv(d, r, desc, out), out);
+}
+HRESULT STDMETHODCALLTYPE D_CreateDsv(ID3D11Device* d, ID3D11Resource* r, const D3D11_DEPTH_STENCIL_VIEW_DESC* desc,
+                                      ID3D11DepthStencilView** out) {
+    return Made(o_createDsv(d, r, desc, out), out);
+}
+HRESULT STDMETHODCALLTYPE D_CreateSrv1(ID3D11Device3* d, ID3D11Resource* r, const D3D11_SHADER_RESOURCE_VIEW_DESC1* desc,
+                                       ID3D11ShaderResourceView1** out) {
+    return Made(o_createSrv1(d, r, desc, out), out);
+}
+HRESULT STDMETHODCALLTYPE D_CreateUav1(ID3D11Device3* d, ID3D11Resource* r,
+                                       const D3D11_UNORDERED_ACCESS_VIEW_DESC1* desc, ID3D11UnorderedAccessView1** out) {
+    return Made(o_createUav1(d, r, desc, out), out);
+}
+HRESULT STDMETHODCALLTYPE D_CreateRtv1(ID3D11Device3* d, ID3D11Resource* r, const D3D11_RENDER_TARGET_VIEW_DESC1* desc,
+                                       ID3D11RenderTargetView1** out) {
+    return Made(o_createRtv1(d, r, desc, out), out);
+}
+
 void GroupSlices(ID3D11DeviceContext* c, ID3D11Resource* dst, ID3D11Resource* src, UINT& dsl, UINT& ssl);  // below
 UINT MipsOf(ID3D11Resource* r) {
     ID3D11Texture2D* t = nullptr;
@@ -3128,6 +3302,30 @@ void InstallD3DHooks(ID3D11DeviceContext* imm) {
         Log("Clones: D3D11 hooks %s (15 context methods: observation in learning and proof groups, bind fix in eye "
             "groups and the bound target and viewport while clones are in)",
             ok ? "installed" : "INCOMPLETE; no clones");
+        // The view cache needs to see every view made (a released view's address reused); without it the generation
+        // cache (kMapGen) takes its place.
+        ID3D11Device* dev = nullptr;
+        imm->GetDevice(&dev);
+        if (!dev) return;
+        void** dvt = *(void***)dev;
+        bool dok = hooks::CreateAt(dvt[7], (void*)D_CreateSrv, (void**)&o_createSrv, "CreateShaderResourceView") &&
+                   hooks::CreateAt(dvt[8], (void*)D_CreateUav, (void**)&o_createUav, "CreateUnorderedAccessView") &&
+                   hooks::CreateAt(dvt[9], (void*)D_CreateRtv, (void**)&o_createRtv, "CreateRenderTargetView") &&
+                   hooks::CreateAt(dvt[10], (void*)D_CreateDsv, (void**)&o_createDsv, "CreateDepthStencilView");
+        ID3D11Device3* d3 = nullptr;
+        if (dok && SUCCEEDED(dev->QueryInterface(__uuidof(ID3D11Device3), (void**)&d3)) && d3) {
+            void** vt3 = *(void***)d3;
+            dok = hooks::CreateAt(vt3[57], (void*)D_CreateSrv1, (void**)&o_createSrv1, "CreateShaderResourceView1") &&
+                  hooks::CreateAt(vt3[58], (void*)D_CreateUav1, (void**)&o_createUav1, "CreateUnorderedAccessView1") &&
+                  hooks::CreateAt(vt3[59], (void*)D_CreateRtv1, (void**)&o_createRtv1, "CreateRenderTargetView1");
+            d3->Release();
+        }
+        dev->Release();
+        g_devHooked = dok;
+        if (!dok && g_mapMode.load() >= kMapViews) g_mapMode = kMapGen;
+        Log("Clones: device view hooks %s (%s)", dok ? "installed" : "INCOMPLETE",
+            dok ? "the view cache drops a view's entry when a view is made at its address"
+                : "no view cache: clones_map_cache 2 and 3 work as 1");
     });
 }
 
@@ -3238,6 +3436,26 @@ void OnFrameStart(ID3D11DeviceContext* imm, bool enabled) {
         if (g_phase == Learning && g_set[Outer].learned >= kLearnGroups && focusDone && g_enabled && imm)
             BuildLocked(imm);
         if (g_phase == Ready && !g_dirty && g_twinPending && imm) BuildTwinsLocked(imm);
+        // The view cache outlives the groups: any change of the lists here starts a new generation, also one whose
+        // own steps missed it.
+        uint64_t sig = (uint64_t)g_phase * 0x9E3779B97F4A7C15ull;
+        auto mix = [&](size_t n) { sig = (sig ^ n) * 0x100000001B3ull; };
+        mix(g_tex.size());
+        mix(g_byRes.size());
+        mix(g_byClone.size());
+        mix(g_twin.size());
+        mix(g_arrs.size());
+        mix(g_arrView.size());
+        mix(g_lazyFailed.size());
+        for (const SetState& s : g_set) {
+            mix(s.fwd.size());
+            mix(s.back.size());
+            mix(s.entries.size());
+        }
+        if (sig != g_contentSig) {
+            g_contentSig = sig;
+            MapsChanged();
+        }
     });
 }
 
@@ -3261,7 +3479,7 @@ bool SwapInLocked(ID3D11DeviceContext* imm, Set set) {
     const bool fix = Cfg().clonesBindFix;
     g_cur = set;
     g_swapEye = SwapEyeOf(set);  // B20 K4: the focus scene set's twins too
-    MapsChanged();
+    StateChanged();
     for (const Entry& e : s.entries) WriteField(e, CloneValue(e, g_swapEye));
     g_swapped = true;
     ++g_c.swaps[set];
@@ -3305,7 +3523,7 @@ void BeginGroup(ID3D11DeviceContext* imm, Set set, bool viewSize) {
         ++g_groupNo;
         g_kind = KindOf(set);
         g_cur = g_kind;
-        MapsChanged();
+        StateChanged();
         if (g_phase == Learning) {
             g_watch = g_d3dHooked && g_set[g_kind].learned < kLearnGroups;
             return;
@@ -3869,24 +4087,40 @@ void LogStats(bool totals) {
                 (unsigned long long)c.fixFwd, (unsigned long long)c.lazy, (unsigned long long)c.fixBack,
                 (unsigned long long)c.sizeMismatch);
         const uint64_t hits = g_sameHits.exchange(0), miss = g_sameMiss.exchange(0);
-        g_sameHitsTot += hits;
-        g_sameMissTot += miss;
-        const uint64_t h = totals ? g_sameHitsTot : hits, m = totals ? g_sameMissTot : miss;
-        if (h || m)
-            Log("Clones map cache%s (O1, [debug] clones_map_cache %s): binds without the lock %llu, locked %llu (%.1f%% "
-                "without)",
-                totals ? " (session total)" : "", g_sameOn.load() ? "on" : "off", (unsigned long long)h,
-                (unsigned long long)m, 100.0 * h / (h + m));
+        const uint64_t vh = g_viewHits.exchange(0), vm = g_viewMiss.exchange(0);
+        const uint64_t vc = g_viewChecked.exchange(0), vx = g_viewMismatch.exchange(0);
+        g_sameHitsTot += hits + vh;
+        g_sameMissTot += miss + vm;
+        g_viewCheckedTot += vc;
+        g_viewMismatchTot += vx;
+        const uint64_t h = totals ? g_sameHitsTot : hits + vh, m = totals ? g_sameMissTot : miss + vm;
+        const uint64_t ck = totals ? g_viewCheckedTot : vc, mx = totals ? g_viewMismatchTot : vx;
+        if (h || m) {
+            char chk[96] = "";
+            if (ck || mx)
+                snprintf(chk, sizeof(chk), "; hits checked through the lock %llu, mismatches %llu",
+                         (unsigned long long)ck, (unsigned long long)mx);
+            Log("Clones map cache%s (O1, [debug] clones_map_cache %d): binds without the lock %llu, locked %llu (%.1f%% "
+                "without)%s; views made %llu",
+                totals ? " (session total)" : "", g_mapMode.load(), (unsigned long long)h, (unsigned long long)m,
+                100.0 * h / (h + m), chk, (unsigned long long)g_viewsMade.load());
+        }
         g_c = Counters{};
     });
 }
 
-void SetMapCache(bool on) {
-    if (on == g_sameOn.load()) return;
-    g_sameOn = on;
-    Log("Clones: map cache %s (O1: binds whose views all map to themselves skip the lock)", on ? "on" : "off");
+void SetMapCache(int mode) {
+    mode = std::clamp(mode, (int)kMapLocked, (int)kMapCheck);
+    if (mode >= kMapViews && !g_devHooked && g_d3dHooked) mode = kMapGen;
+    if (mode == g_mapMode.load()) return;
+    g_mapMode = mode;
+    static const char* const kNames[] = {"every bind through the lock", "one generation for the maps and the state",
+                                         "per view and state, across groups",
+                                         "per view and state, each hit checked through the lock"};
+    Log("Clones: map cache %d (%s)", mode, kNames[mode]);
 }
-bool GetMapCache() { return g_sameOn.load(); }
+int GetMapCache() { return g_mapMode.load(); }
+uint64_t MapMismatches() { return g_viewMismatchTot + g_viewMismatch.load(); }
 uint32_t PsHighSlotsGen() { return g_psHighGen.load(std::memory_order_relaxed); }
 void NewPsViewEpoch() { ++g_psEpoch; }
 ID3D11ShaderResourceView* PsView(ID3D11DeviceContext* c, UINT slot) {
@@ -3904,9 +4138,11 @@ ID3D11ShaderResourceView* PsView(ID3D11DeviceContext* c, UINT slot) {
     return v;
 }
 uint64_t PsViewReads() { return g_psViewReads; }
+void TestViewMade(void* v) { ViewMade(v); }
+uint64_t TestViewsMade() { return g_viewsMade.load(); }
 bool TestMapCache(uint64_t& hits, uint64_t& locked) {
-    hits = g_sameHits.load();
-    locked = g_sameMiss.load();
+    hits = g_sameHits.load() + g_viewHits.load();
+    locked = g_sameMiss.load() + g_viewMiss.load();
     return g_watch.load();
 }
 
