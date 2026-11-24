@@ -99,6 +99,7 @@ int RunMvrForward();  // mvr_forward_smoke.cpp
 int RunTaaFix();  // taa_fix_smoke.cpp
 int RunMvrMotion();  // mvr_motion_smoke.cpp
 int RunDlaaDisplays();  // dlaa_displays_smoke.cpp
+int RunSrCarry();       // sr_carry_smoke.cpp
 int RunNrBridge();   // nr_bridge_smoke.cpp
 int RunPanel();      // panel_smoke.cpp
 #include "focus_cull.h"
@@ -2183,6 +2184,20 @@ int RunClones() {
                    got[6], got[7]);
         if (fixBound) fixBound->Release();
     }
+    // At half the view size the render-size pairs are also the view size's own halves, quarters and reciprocals: the
+    // render size grows until none is. Other scales and the view size itself stay.
+    {
+        uint32_t w = 907, h = 760;
+        const bool half = qvfr::srcb::Ambiguous(w, h, 1814, 1520);
+        const bool grown = qvfr::srcb::AvoidAmbiguous(w, h, 1814, 1520);
+        uint32_t w67 = 1215, h67 = 1018, w33 = 798, h33 = 669, wo = 1814, ho = 1520;
+        const bool kept = !qvfr::srcb::AvoidAmbiguous(w67, h67, 1814, 1520) &&
+                          !qvfr::srcb::AvoidAmbiguous(w33, h33, 2419, 2027) &&
+                          !qvfr::srcb::AvoidAmbiguous(wo, ho, 1814, 1520) && w67 == 1215 && w33 == 798 && wo == 1814;
+        expect(half && grown && w > 907 && w - 907 == h - 760 && !qvfr::srcb::Ambiguous(w, h, 1814, 1520) && kept,
+               "SR constants fix: 907 x 760 of 1814 x 1520 is ambiguous and grows, 67%, 33% and 100% stay");
+        printf("SR constants fix: 907 x 760 of 1814 x 1520 grows to %u x %u\n", w, h);
+    }
     // Windows of a dynamic buffer share a block: two neighbours take one, a far one its own, and a Map of the buffer
     // drops them, so the next draw sees the new data.
     {
@@ -2487,6 +2502,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--taa-fix")) return RunTaaFix();
         else if (!strcmp(argv[i], "--mvr-motion")) return RunMvrMotion();
         else if (!strcmp(argv[i], "--dlaa-displays")) return RunDlaaDisplays();
+        else if (!strcmp(argv[i], "--sr-carry")) return RunSrCarry();
         else if (!strcmp(argv[i], "--nr-bridge")) return RunNrBridge();
         else if (!strcmp(argv[i], "--panel")) return RunPanel();
         else if (!strcmp(argv[i], "--mvr-vs")) mvrVsTest = true;

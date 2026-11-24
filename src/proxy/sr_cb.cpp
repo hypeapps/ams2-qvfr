@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <map>
 #include <tuple>
 #include <unordered_set>
@@ -136,8 +137,10 @@ bool EnsureShader(ID3D11Device* dev) {
     return true;
 }
 
-// The render-size pairs of this group and their view-size pairs.
-void BuildPairs(ID3D11DeviceContext* c, const clones::SrGroup& g) {
+uint32_t Frac(uint32_t s, uint32_t d, bool up) { return std::max(1u, up ? (s + d - 1) / d : s / d); }
+
+// The render-size pairs and their view-size pairs.
+FixPairs MakePairs(uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh) {
     FixPairs fp;
     auto add = [&](float fx, float fy, float tx, float ty) {
         if ((fx == tx && fy == ty) || (int)fp.count >= kMaxPairs) return;
@@ -152,11 +155,22 @@ void BuildPairs(ID3D11DeviceContext* c, const clones::SrGroup& g) {
     for (uint32_t d : {1u, 2u, 4u, 8u})
         for (int up = 0; up < 2; ++up) {
             if (d == 1 && up) continue;
-            auto fr = [&](uint32_t s) { return std::max(1u, up ? (s + d - 1) / d : s / d); };
-            const float rw = (float)fr(g.rw), rh = (float)fr(g.rh), ow = (float)fr(g.ow), oh = (float)fr(g.oh);
-            add(rw, rh, ow, oh);
-            for (float k : {1.0f, 0.5f, 2.0f}) add(k / rw, k / rh, k / ow, k / oh);
+            const float fw = (float)Frac(rw, d, up), fh = (float)Frac(rh, d, up);
+            const float tw = (float)Frac(ow, d, up), th = (float)Frac(oh, d, up);
+            add(fw, fh, tw, th);
+            for (float k : {1.0f, 0.5f, 2.0f}) add(k / fw, k / fh, k / tw, k / th);
         }
+    return fp;
+}
+
+// The pair (x, y) is the table entry e as CSFixSizes compares them.
+bool Matches(float x, float y, const float* e) {
+    return fabsf(x - e[0]) <= fabsf(e[0]) * 2e-6f && fabsf(y - e[1]) <= fabsf(e[1]) * 2e-6f;
+}
+
+// The render-size pairs of this group and their view-size pairs.
+void BuildPairs(ID3D11DeviceContext* c, const clones::SrGroup& g) {
+    const FixPairs fp = MakePairs(g.rw, g.rh, g.ow, g.oh);
     c->UpdateSubresource(g_pairsCb, 0, nullptr, &fp, 0, 0);
 }
 
@@ -322,6 +336,33 @@ HRESULT STDMETHODCALLTYPE D_Map(ID3D11DeviceContext* c, ID3D11Resource* r, UINT 
 }
 
 }  // namespace
+
+bool Ambiguous(uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh) {
+    const FixPairs fp = MakePairs(rw, rh, ow, oh);
+    for (uint32_t d = 1; d <= 64; d *= 2)
+        for (int up = 0; up < 4; ++up) {
+            const float w = (float)Frac(ow, d, up & 1), h = (float)Frac(oh, d, (up & 2) != 0);
+            for (uint32_t i = 0; i < fp.count; ++i) {
+                const float* e = fp.pairs[i];
+                if (Matches(w, h, e)) return true;
+                for (float k : {1.0f, 0.5f, 2.0f})
+                    if (Matches(k / w, k / h, e)) return true;
+            }
+        }
+    return false;
+}
+
+bool AvoidAmbiguous(uint32_t& rw, uint32_t& rh, uint32_t ow, uint32_t oh) {
+    uint32_t w = rw, h = rh;
+    for (int i = 0; i < 64 && w < ow && h < oh && Ambiguous(w, h, ow, oh); ++i) {
+        ++w;
+        ++h;
+    }
+    if ((w == rw && h == rh) || Ambiguous(w, h, ow, oh)) return false;
+    rw = w;
+    rh = h;
+    return true;
+}
 
 void Install(ID3D11DeviceContext* imm, bool hookDraws) {
     if (g_installed || !imm) return;

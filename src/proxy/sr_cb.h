@@ -33,6 +33,14 @@ void OnBufferWrite(ID3D11DeviceContext* c, ID3D11Resource* r);
 void OnFrameStart();
 void LogStats(bool totals);
 void Shutdown();
+// The passes after TAA also hold the view size's own fractions (targets without a scene clone keep the view size while
+// the scene set is in). Near half the view size some render-size pairs equal them (R = O / 2 is also O / 2 of the
+// view), and the fix would rewrite those too. Ambiguous: some pair of the table for these sizes equals a view-size
+// value (O / 1..64 rounded down or up per axis, and 0.5, 1 or 2 over it).
+bool Ambiguous(uint32_t rw, uint32_t rh, uint32_t ow, uint32_t oh);
+// The render size grown by whole pixels on both axes (up to 64, below the view size) until it is not ambiguous. False:
+// unchanged (not ambiguous, or no such size).
+bool AvoidAmbiguous(uint32_t& rw, uint32_t& rh, uint32_t ow, uint32_t oh);
 // Smoke test: the module on `c` without hooks; the blocks fixed since then.
 void TestInit(ID3D11DeviceContext* c);
 uint64_t TestBlocksFixed();

@@ -1046,7 +1046,10 @@ bool IsLinearColor(DXGI_FORMAT f) {
     }
 }
 
-CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes, UINT srcSlice, UINT dstSlice) {
+// `exactFmt` (unknown: none): the typed format the game reads `src` through, carried bit for bit in it from the nearest
+// texel (the TAA resolve's normal/stencil: a typeless texture the game views as UNORM, stencil bits in .w).
+CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes, UINT srcSlice, UINT dstSlice,
+                          DXGI_FORMAT exactFmt) {
     for (CarryViews& v : g_carry)
         if (v.src == src && v.dst == dstRes && v.srcSlice == srcSlice && v.dstSlice == dstSlice) return &v;
     if (g_carry.size() >= 64) return nullptr;
@@ -1060,12 +1063,15 @@ CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes, UINT src
     D3D11_TEXTURE2D_DESC sd{}, dd{};
     src->GetDesc(&sd);
     const char* why = nullptr;
+    bool exact = false;
     if (FAILED(dstRes->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&dst)) || !dst) {
         why = "not a 2D texture";
     } else {
         dst->GetDesc(&dd);
         const bool depth = (dd.BindFlags & D3D11_BIND_DEPTH_STENCIL) != 0;
-        const DXGI_FORMAT rf = ReadFormat(sd.Format);
+        exact = !depth && exactFmt != DXGI_FORMAT_UNKNOWN && sd.Format == dd.Format && IsTypeless(sd.Format) &&
+                !IsIntFormat(exactFmt);
+        const DXGI_FORMAT rf = exact ? exactFmt : ReadFormat(sd.Format);
         if (sd.SampleDesc.Count != 1 || dd.SampleDesc.Count != 1)
             why = "multisampled";
         // B20 K5b: a slice of a three-slice array (a focus scene clone of ours, focus's slice of an engine array)
@@ -1101,7 +1107,7 @@ CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes, UINT src
                 hr = g_dev->CreateDepthStencilView(dst, &d, &v.dsv);
             } else if (SUCCEEDED(hr)) {
                 D3D11_RENDER_TARGET_VIEW_DESC r{};
-                r.Format = ReadFormat(dd.Format);
+                r.Format = exact ? exactFmt : ReadFormat(dd.Format);
                 if (dd.ArraySize != 1) {
                     r.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
                     r.Texture2DArray = {0, dstSlice, 1};
@@ -1111,7 +1117,7 @@ CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes, UINT src
                 hr = g_dev->CreateRenderTargetView(dst, &r, &v.rtv);
             }
             if (FAILED(hr)) why = "its views could not be made";
-            v.linear = !depth && IsLinearColor(rf);
+            v.linear = !depth && !exact && IsLinearColor(rf);
             v.w = dd.Width;
             v.h = dd.Height;
         }
@@ -1122,10 +1128,11 @@ CarryViews* CarryViewsFor(ID3D11Texture2D* src, ID3D11Resource* dstRes, UINT src
         SafeRelease(v.rtv);
         SafeRelease(v.dsv);
     }
-    Log("DLAA: DLSS SR: carry %ux%u fmt %d%s -> %ux%u fmt %d%s (%s): %s", sd.Width, sd.Height, (int)sd.Format,
+    Log("DLAA: DLSS SR: carry %ux%u fmt %d%s -> %ux%u fmt %d%s (%s%s): %s", sd.Width, sd.Height, (int)sd.Format,
         sd.ArraySize != 1 ? (" slice " + std::to_string(srcSlice)).c_str() : "", dd.Width, dd.Height, (int)dd.Format,
         dd.ArraySize != 1 ? (" slice " + std::to_string(dstSlice)).c_str() : "",
-        v.dsv ? "depth" : v.linear ? "linear" : "nearest", why ? why : "ok");
+        v.dsv ? "depth" : v.linear ? "linear" : "nearest",
+        exact ? (", the TAA resolve's view format " + std::to_string((int)exactFmt)).c_str() : "", why ? why : "ok");
     if (!why && dd.MipLevels > 1) Log("DLAA: DLSS SR: only mip 0 of that texture is carried (%u mips)", dd.MipLevels);
     SafeRelease(dst);
     return &v;
@@ -1138,6 +1145,21 @@ void Carry(ID3D11DeviceContext* c) {
     UINT srcSlice[24] = {}, dstSlice[24] = {};
     const int n = clones::CarryList(clone, orig, 24, srcSlice, dstSlice);
     if (!n || !g_ctx1 || !EnsureCarry()) return;
+    // The TAA resolve's normal/stencil (t4) and the format the game reads it through (its bindings are still in).
+    ID3D11Resource* ns = nullptr;  // only compared
+    DXGI_FORMAT nsFmt = DXGI_FORMAT_UNKNOWN;
+    {
+        ID3D11ShaderResourceView* v = nullptr;
+        c->PSGetShaderResources(4, 1, &v);
+        if (v) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+            v->GetDesc(&vd);
+            nsFmt = vd.Format;
+            v->GetResource(&ns);
+            if (ns) ns->Release();
+            v->Release();
+        }
+    }
     const uint32_t gen = clones::Generation() * 977u + gpu::Generation();
     if (gen != g_carryGen) {
         DropCarryViews();
@@ -1154,7 +1176,8 @@ void Carry(ID3D11DeviceContext* c) {
         c->RSSetState(g_carryRs);
         c->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
         for (int i = 0; i < n; ++i) {
-            CarryViews* v = CarryViewsFor(clone[i], orig[i], srcSlice[i], dstSlice[i]);
+            CarryViews* v = CarryViewsFor(clone[i], orig[i], srcSlice[i], dstSlice[i],
+                                          (ID3D11Resource*)clone[i] == ns ? nsFmt : DXGI_FORMAT_UNKNOWN);
             if (!v || v->skip) continue;
             D3D11_VIEWPORT vp{0, 0, (float)v->w, (float)v->h, 0, 1};
             c->RSSetViewports(1, &vp);

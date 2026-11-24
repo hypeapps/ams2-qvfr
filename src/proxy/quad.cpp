@@ -2944,6 +2944,7 @@ uint32_t SizePx(double v) { return (uint32_t)std::clamp(std::lround(v), 16L, 163
 // DLSS SR (S2): the scene phase of each view at its render scale of the view's size. At the start, and at a frame start
 // after the scales changed in qvfr.ini (a DLSS mode picked while the game runs).
 uint32_t g_srSizes[4] = {};
+uint32_t g_srAsked[8] = {};  // the sizes at the scales asked for (before AvoidAmbiguous) and the view sizes
 int g_srScaleSwitch[2] = {-1, -1};  // benchmark sequence: outer's and focus's scale in percent over the ini's; -1 = not set
 float SrScale(int which, float ini) {
     return g_srScaleSwitch[which] > 0 ? std::clamp(g_srScaleSwitch[which], 33, 100) / 100.0f : ini;
@@ -2951,8 +2952,19 @@ float SrScale(int which, float ini) {
 void ApplySrScalesLocked() {
     const Config& c = Cfg();
     const float so = SrScale(0, c.dlaaOuterRenderScale), sf = SrScale(1, c.dlaaFocusRenderScale);
-    const uint32_t r[4] = {SizePx(g_focus.outerW * (double)so), SizePx(g_focus.outerH * (double)so),
-                           SizePx(g_focus.focusTexW * (double)sf), SizePx(g_focus.focusTexH * (double)sf)};
+    const uint32_t vw[2] = {g_focus.outerW, g_focus.focusTexW}, vh[2] = {g_focus.outerH, g_focus.focusTexH};
+    const uint32_t asked[8] = {SizePx(vw[0] * (double)so), SizePx(vh[0] * (double)so),
+                               SizePx(vw[1] * (double)sf), SizePx(vh[1] * (double)sf), vw[0], vh[0], vw[1], vh[1]};
+    if (std::equal(asked, asked + 8, g_srAsked) && g_srSizes[0]) return;
+    std::copy(asked, asked + 8, g_srAsked);
+    // The constants fix after TAA (sr_cb.h) tells render-size values from view-size ones by value alone.
+    uint32_t r[4];
+    std::copy(asked, asked + 4, r);
+    for (int k = 0; k < 2; ++k)
+        if (srcb::AvoidAmbiguous(r[k * 2], r[k * 2 + 1], vw[k], vh[k]))
+            Log("Quad: DLSS SR: %s's scene at %u x %u in place of %u x %u: at the scale asked for, size constants of the "
+                "passes after TAA would be taken for the render size",
+                k ? "focus" : "outer", r[k * 2], r[k * 2 + 1], asked[k * 2], asked[k * 2 + 1]);
     if (std::equal(r, r + 4, g_srSizes)) return;
     const bool live = g_srSizes[0] != 0;
     std::copy(r, r + 4, g_srSizes);
