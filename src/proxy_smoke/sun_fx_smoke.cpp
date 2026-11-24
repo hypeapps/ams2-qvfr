@@ -34,6 +34,15 @@ float4 Rays(float4 p : SV_Position) : SV_Target { return float4(0.1, 0.05, 0.02,
 float4 Anchor(float4 p : SV_Position) : SV_Target { return hdr.Load(int2(p.xy), 0); }
 )";
 
+// Car paint of the bonnet reflection as the game's shaders declare it (bonnetReflectionAndClamp of COMMON_BUFFER2 used,
+// motionBlurMap_tex), and a shader with the same declarations that does not use the constant.
+const char kPaintHlsl[] = R"(
+cbuffer COMMON_BUFFER2 : register(b12) { float4 pad0[43]; float4 bonnetReflectionAndClamp; };
+Texture2D<float4> motionBlurMap_tex : register(t1);
+float4 Paint(float4 p : SV_Position) : SV_Target { return motionBlurMap_tex.Load(int3(0, 0, 0)) * bonnetReflectionAndClamp.x; }
+float4 Decoy(float4 p : SV_Position) : SV_Target { return motionBlurMap_tex.Load(int3(0, 0, 0)) * pad0[0].x; }
+)";
+
 constexpr UINT kW = 64, kH = 48;
 constexpr float kBase = 0.2f;
 constexpr float kOrigin[2] = {0.25f, 0.3f}, kScale[2] = {0.5f, 0.4f};
@@ -280,6 +289,123 @@ int RunSunFx() {
     const bool insideOk = !check(out[0], zeroExpect, errInside) && s_replaceCalls == 1;
     qvfr::sunfx::SetDrawReplace(nullptr, nullptr, nullptr);
     const bool replaceOk = replaceSet && replacedOk && insideOk;
+
+    // Bonnet reflection: outer L and R read their own image (red, green), the focus groups their own (blue); the focus
+    // groups' car paint gets outer's image of the eye, and the game's view is back in the slot after the draw.
+    bool bonnetOk = false;
+    char bonnetText[256] = "not run";
+    {
+        auto paintBlob = [&](const char* entry) {
+            ID3DBlob *code = nullptr, *err = nullptr;
+            if (FAILED(D3DCompile(kPaintHlsl, sizeof(kPaintHlsl) - 1, "sun_fx_smoke_paint", nullptr, nullptr, entry,
+                                  "ps_5_0", 0, 0, &code, &err))) {
+                printf("D3DCompile %s: %s\n", entry, err ? (const char*)err->GetBufferPointer() : "?");
+                code = nullptr;
+            }
+            if (err) err->Release();
+            return code;
+        };
+        const unsigned long long madeBefore = qvfr::sunfx::TestGet().bonnetMade;
+        ID3DBlob* paintCode = paintBlob("Paint");
+        ID3DBlob* decoyCode = paintBlob("Decoy");
+        ID3D11PixelShader *paint = nullptr, *decoy = nullptr;
+        if (paintCode) dev->CreatePixelShader(paintCode->GetBufferPointer(), paintCode->GetBufferSize(), nullptr, &paint);
+        if (decoyCode) dev->CreatePixelShader(decoyCode->GetBufferPointer(), decoyCode->GetBufferSize(), nullptr, &decoy);
+        for (ID3DBlob* b : {paintCode, decoyCode})
+            if (b) b->Release();
+        const unsigned long long paintMade = qvfr::sunfx::TestGet().bonnetMade - madeBefore;
+        const float colors[3][4] = {{1, 0, 0, 1}, {0, 1, 0, 1}, {0, 0, 1, 1}};
+        ID3D11Texture2D* img[3] = {};
+        ID3D11ShaderResourceView* imgSrv[3] = {};
+        D3D11_TEXTURE2D_DESC id{};
+        id.Width = id.Height = 1;
+        id.MipLevels = id.ArraySize = 1;
+        id.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        id.SampleDesc = {1, 0};
+        id.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        bool ok2 = paint && decoy;
+        for (int i = 0; i < 3 && ok2; ++i) {
+            D3D11_SUBRESOURCE_DATA px{colors[i], sizeof(colors[i]), 0};
+            ok2 = SUCCEEDED(dev->CreateTexture2D(&id, &px, &img[i])) &&
+                  SUCCEEDED(dev->CreateShaderResourceView(img[i], nullptr, &imgSrv[i]));
+        }
+        float cb12[44][4] = {};
+        cb12[0][0] = 1;
+        cb12[43][0] = 1;
+        D3D11_BUFFER_DESC pb{};
+        pb.ByteWidth = sizeof(cb12);
+        pb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        D3D11_SUBRESOURCE_DATA pinit{cb12, 0, 0};
+        ID3D11Buffer* paintCb = nullptr;
+        ok2 = ok2 && SUCCEEDED(dev->CreateBuffer(&pb, &pinit, &paintCb));
+        bool restored = true;
+        auto paintGroup = [&](int g, int image, ID3D11PixelShader* ps) {
+            qvfr::sunfx::BeginGroup(g, g < 2 ? 0 : kOrigin[0], g < 2 ? 0 : kOrigin[1], g < 2 ? 1 : kScale[0],
+                                    g < 2 ? 1 : kScale[1]);
+            ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            ctx->VSSetShader(vs, nullptr, 0);
+            ctx->RSSetViewports(1, &vp);
+            ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+            bind(outRtv[g]);
+            ctx->PSSetShader(ps, nullptr, 0);
+            ctx->PSSetConstantBuffers(12, 1, &paintCb);
+            ctx->PSSetShaderResources(1, 1, &imgSrv[image]);
+            ctx->Draw(3, 0);
+            ID3D11ShaderResourceView* now = nullptr;
+            ctx->PSGetShaderResources(1, 1, &now);
+            if (now != imgSrv[image]) restored = false;
+            if (now) now->Release();
+            ID3D11ShaderResourceView* none = nullptr;
+            ctx->PSSetShaderResources(1, 1, &none);
+            qvfr::sunfx::EndGroup();
+        };
+        auto solid = [](const float* rgb) {
+            return [rgb](float, float, float e[3]) {
+                for (int c = 0; c < 3; ++c) e[c] = rgb[c];
+            };
+        };
+        float err[6] = {};
+        bool px[6] = {};
+        unsigned long long focusGiven = 0, missed = 0;
+        if (ok2) {
+            const qvfr::sunfx::TestState s0 = qvfr::sunfx::TestGet();
+            qvfr::sunfx::SetBonnetFromOuter(true);
+            qvfr::sunfx::OnFrameStart(ctx, true);
+            paintGroup(0, 0, paint);
+            paintGroup(1, 1, paint);
+            paintGroup(2, 2, paint);
+            px[0] = check(out[2], solid(colors[0]), err[0]);  // focus L: outer L's image
+            paintGroup(3, 2, paint);
+            px[1] = check(out[3], solid(colors[1]), err[1]);  // focus R: outer R's image
+            paintGroup(2, 2, decoy);
+            px[2] = check(out[2], solid(colors[2]), err[2]);  // not a car paint shader: its own image
+            qvfr::sunfx::OnFrameStart(ctx, true);  // a frame without outer's car paint: the game's image stays
+            paintGroup(2, 2, paint);
+            px[3] = check(out[2], solid(colors[2]), err[3]);
+            qvfr::sunfx::SetBonnetFromOuter(false);  // off: the game's image
+            qvfr::sunfx::OnFrameStart(ctx, true);
+            paintGroup(0, 0, paint);
+            paintGroup(2, 2, paint);
+            px[4] = check(out[2], solid(colors[2]), err[4]);
+            qvfr::sunfx::SetBonnetFromOuter(true);
+            const qvfr::sunfx::TestState s1 = qvfr::sunfx::TestGet();
+            focusGiven = s1.bonnetFocus - s0.bonnetFocus;
+            missed = s1.bonnetMissed - s0.bonnetMissed;
+            bonnetOk = paintMade == 1 && px[0] && px[1] && px[2] && px[3] && px[4] && restored && focusGiven == 2 &&
+                       missed == 1 && s1.bonnetOuter - s0.bonnetOuter == 2;
+        }
+        snprintf(bonnetText, sizeof(bonnetText),
+                 "car paint shaders recognised %llu of 1 (decoy not), focus L / R got outer L / R's image %d / %d "
+                 "(max %.4f / %.4f), decoy kept its own %d, frame without outer's kept the game's %d, off %d, game's "
+                 "view back %d, focus draws given %llu, missed %llu",
+                 paintMade, px[0], px[1], err[0], err[1], px[2], px[3], px[4], restored, focusGiven, missed);
+        for (IUnknown* u : {(IUnknown*)paint, (IUnknown*)decoy, (IUnknown*)paintCb})
+            if (u) u->Release();
+        for (int i = 0; i < 3; ++i) {
+            if (imgSrv[i]) imgSrv[i]->Release();
+            if (img[i]) img[i]->Release();
+        }
+    }
     qvfr::sunfx::Shutdown();
 
     int warnings = 0;
@@ -304,8 +430,9 @@ int RunSunFx() {
     }
     ctx->Release();
     dev->Release();
-    const bool ok =
-        outerOk && focusDrawOk && focusAnchorOk && countsOk && offOk && offCountsOk && replaceOk && !warnings;
+    const bool ok = outerOk && focusDrawOk && focusAnchorOk && countsOk && offOk && offCountsOk && replaceOk &&
+                    bonnetOk && !warnings;
+    printf("Bonnet reflection check %s: %s\n", bonnetOk ? "OK" : "FAILED", bonnetText);
     printf("Sun effects check %s: outer max error %.4f, focus with effect draws %.4f, focus at the anchor %.4f, module "
            "off %.4f; outer draws repeated %llu, focus draws skipped %llu, passes at an effect draw %llu, at the anchor "
            "%llu, missed %llu, faults %llu; module off counts unchanged %d; DLAA draw replace: replaced draw left the "

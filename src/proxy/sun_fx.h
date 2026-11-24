@@ -64,12 +64,22 @@ std::string Describe();      // one part of the summary line
 void LogStats(bool totals);  // a stats line, with the session totals at the end
 void Shutdown();             // VR_Shutdown: D3D11 objects released (hooks stay)
 
+// Bonnet reflection: the game's car paint pixel shaders map the reflected direction (in view space) onto
+// CCaptureBonnetReflection's half-size image of the eye's scene (motionBlurMap_tex, scaled and clamped by
+// bonnetReflectionAndClamp), drawn after each eye group's forward pass. A focus group's image is its own window, which
+// moves with the gaze, so its car paint reflects the wrong part of the scene. With this on, the focus groups' car
+// paint draws read the image outer of the same eye read in this frame (bound for the draw, the game's view back after
+// it). The shaders are recognised by their reflection data at CreatePixelShader. Quad sets it every frame from
+// [debug] bonnet_from_outer (live).
+void SetBonnetFromOuter(bool on);
+
 // qvfr_proxy_smoke --sun-fx: hooks on the test device and pixel shaders registered as effect shaders.
-enum Kind { KindNone = 0, KindRays = 1, KindFlare = 2 };
+enum Kind { KindNone = 0, KindRays = 1, KindFlare = 2, KindBonnet = 3 };
 bool TestInstall(ID3D11Device* dev, ID3D11DeviceContext* ctx);
 void TestRegister(ID3D11PixelShader* ps, Kind kind);
 struct TestState {
     unsigned long long replays = 0, skipped = 0, composites = 0, anchorComposites = 0, missed = 0, faults = 0;
+    unsigned long long bonnetMade = 0, bonnetOuter = 0, bonnetFocus = 0, bonnetMissed = 0;
 };
 TestState TestGet();
 
