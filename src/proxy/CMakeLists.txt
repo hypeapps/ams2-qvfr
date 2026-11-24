@@ -116,6 +116,15 @@ add_custom_command(
   DEPENDS ${QVFR_MVRMOTION_HLSL}
   COMMENT "fxc mvr_motion.hlsl"
   VERBATIM)
+set(QVFR_WINDSCREEN_HLSL ${CMAKE_CURRENT_SOURCE_DIR}/shaders/windscreen.hlsl)
+add_custom_command(
+  OUTPUT ${QVFR_SHADER_OUT}/windscreen_dilate_cs.h
+  COMMAND ${CMAKE_COMMAND} -E make_directory ${QVFR_SHADER_OUT}
+  COMMAND ${QVFR_FXC} /nologo /O3 /Qstrip_reflect /Qstrip_debug /T cs_5_0 /E CSDilate /Vn kWindscreenDilateCS
+          /Fh ${QVFR_SHADER_OUT}/windscreen_dilate_cs.h ${QVFR_WINDSCREEN_HLSL}
+  DEPENDS ${QVFR_WINDSCREEN_HLSL}
+  COMMENT "fxc windscreen.hlsl"
+  VERBATIM)
 # Linking this target gives the include directory and builds the headers first (proxy and smoke test).
 add_library(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT}/compose_vs.h ${QVFR_SHADER_OUT}/compose_ps.h
             ${QVFR_SHADER_OUT}/sun_fx_vs.h ${QVFR_SHADER_OUT}/sun_fx_ps.h ${QVFR_SHADER_OUT}/dlaa_mask_cs.h
@@ -128,7 +137,8 @@ add_library(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT}/compose_vs.h ${QVFR_SHADER
             ${QVFR_SHADER_OUT}/sr_vs.h ${QVFR_SHADER_OUT}/sr_color_ps.h ${QVFR_SHADER_OUT}/sr_depth_ps.h
             ${QVFR_SHADER_OUT}/sr_fix_cs.h ${QVFR_SHADER_OUT}/nr_pack_cs.h ${QVFR_SHADER_OUT}/nr_unpack_cs.h ${QVFR_SHADER_OUT}/nr_motion_cs.h
             ${QVFR_SHADER_OUT}/nr_depth_cs.h ${QVFR_SHADER_OUT}/nr_unpack4_cs.h ${QVFR_SHADER_OUT}/nr_pack_region_cs.h
-            ${QVFR_SHADER_OUT}/nr_unpack_region_cs.h ${QVFR_SHADER_OUT}/nr_upedit_cs.h)
+            ${QVFR_SHADER_OUT}/nr_unpack_region_cs.h ${QVFR_SHADER_OUT}/nr_upedit_cs.h
+            ${QVFR_SHADER_OUT}/windscreen_dilate_cs.h)
 target_include_directories(qvfr_shaders INTERFACE ${QVFR_SHADER_OUT})
 
 enable_language(ASM_MASM)  # export thunks (generated/thunks.asm)
@@ -178,6 +188,7 @@ add_library(qvfr_proxy SHARED
   mvr_pass.cpp
   mvr_motion.cpp
   taa_views.cpp
+  windscreen.cpp
   common.cpp
   panel.cpp
   panel_ui.cpp

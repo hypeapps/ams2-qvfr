@@ -4,8 +4,9 @@
 // one read, through a one-slice array view as dlaa.cpp makes it) has the displays class 0x88 in a rectangle, the other
 // slices have it everywhere (a wrong slice shows up). The current frame is 0.5 with a bright bar (4.0, a digit) inside
 // the display; DLSS's result is 2.0 everywhere (an old digit in its history). Checks against a CPU reference, with and
-// without a jitter:
+// without a jitter, with the outline edge 0, 1 and 2 render pixels:
 // - outside the display the output is DLSS's result;
+// - on the display's outline (edge > 0) DLSS's result, then a one-render-pixel blend into the current frame;
 // - inside, the current frame bilinear at the pixel's position minus the jitter (nothing of DLSS's 2.0 stays);
 // - the debug layer stays quiet.
 #include <windows.h>
@@ -55,18 +56,38 @@ float Cur(int x, int y) {
     return disp && x >= kBarX0 && x <= kBarX1 ? kBar : kBg;
 }
 bool Display(int x, int y) { return x >= kDispX0 && x <= kDispX1 && y >= kDispY0 && y <= kDispY1; }
+bool DisplayClamped(int x, int y) {
+    return Display(std::clamp(x, 0, (int)kRW - 1), std::clamp(y, 0, (int)kRH - 1));
+}
+float Inner(int x, int y, int edge) {
+    for (int dy = -edge; dy <= edge; ++dy)
+        for (int dx = -edge; dx <= edge; ++dx)
+            if (!DisplayClamped(x + dx, y + dy)) return 0.0f;
+    return 1.0f;
+}
 
 // The shader's rule for output pixel (x, y).
-float Expected(UINT x, UINT y, const float jitter[2]) {
+float Expected(UINT x, UINT y, const float jitter[2], int edge) {
     const float rx = ((float)x + 0.5f) * kRW / kOW, ry = ((float)y + 0.5f) * kRH / kOH;
     const int ix = std::min((int)rx, (int)kRW - 1), iy = std::min((int)ry, (int)kRH - 1);
     if (!Display(ix, iy)) return kDlss;
+    float k = 1.0f;
+    if (edge > 0) {
+        const float qx = rx - 0.5f, qy = ry - 0.5f;
+        const int ax = (int)std::floor(qx), ay = (int)std::floor(qy);
+        const float gx = qx - ax, gy = qy - ay;
+        const float top = Inner(ax, ay, edge) * (1 - gx) + Inner(ax + 1, ay, edge) * gx;
+        const float bot = Inner(ax, ay + 1, edge) * (1 - gx) + Inner(ax + 1, ay + 1, edge) * gx;
+        k = top * (1 - gy) + bot * gy;
+        if (k <= 0.0f) return kDlss;
+    }
     const float px = rx - jitter[0] - 0.5f, py = ry - jitter[1] - 0.5f;
     const int bx = (int)std::floor(px), by = (int)std::floor(py);
     const float fx = px - bx, fy = py - by;
     const float top = Cur(bx, by) * (1 - fx) + Cur(bx + 1, by) * fx;
     const float bot = Cur(bx, by + 1) * (1 - fx) + Cur(bx + 1, by + 1) * fx;
-    return top * (1 - fy) + bot * fy;
+    const float cur = top * (1 - fy) + bot * fy;
+    return kDlss + (cur - kDlss) * k;
 }
 
 template <class T>
@@ -168,15 +189,21 @@ int RunDlaaDisplays() {
     int failures = ok ? 0 : 1;
     struct Case {
         float jitter[2];
+        int edge;
         const char* name;
-    } cases[] = {{{0.0f, 0.0f}, "no jitter"}, {{0.3f, -0.2f}, "jitter (0.3, -0.2)"}, {{-0.45f, 0.4f}, "jitter (-0.45, 0.4)"}};
+    } cases[] = {{{0.0f, 0.0f}, 0, "edge 0, no jitter"},
+                 {{0.3f, -0.2f}, 0, "edge 0, jitter (0.3, -0.2)"},
+                 {{-0.45f, 0.4f}, 0, "edge 0, jitter (-0.45, 0.4)"},
+                 {{0.0f, 0.0f}, 1, "edge 1, no jitter"},
+                 {{0.3f, -0.2f}, 1, "edge 1, jitter (0.3, -0.2)"},
+                 {{-0.45f, 0.4f}, 2, "edge 2, jitter (-0.45, 0.4)"}};
     for (const Case& k : cases) {
         if (!ok) break;
         struct {
-            uint32_t bits, pad;
+            uint32_t bits, edge;
             float jitter[2], toRender[2];
             uint32_t renderSize[2];
-        } p{0x88, 0, {k.jitter[0], k.jitter[1]}, {(float)kRW / kOW, (float)kRH / kOH}, {kRW, kRH}};
+        } p{0x88, (uint32_t)k.edge, {k.jitter[0], k.jitter[1]}, {(float)kRW / kOW, (float)kRH / kOH}, {kRW, kRH}};
         ctx->UpdateSubresource(cb, 0, nullptr, &p, 0, 0);
         ctx->CSSetShader(cs, nullptr, 0);
         ctx->CSSetConstantBuffers(2, 1, &cb);
@@ -201,7 +228,7 @@ int RunDlaaDisplays() {
         for (UINT y = 0; y < kOH; ++y)
             for (UINT x = 0; x < kOW; ++x) {
                 const uint32_t v = ((const uint32_t*)((const uint8_t*)m.pData + (size_t)y * m.RowPitch))[x];
-                const float got = Unf11(v & 0x7FF), want = Expected(x, y, k.jitter);
+                const float got = Unf11(v & 0x7FF), want = Expected(x, y, k.jitter, k.edge);
                 const float err = std::fabs(got - want) / std::max(want, 0.01f);
                 worst = std::max(worst, err);
                 if (err > 0.04f) {  // R11G11B10 has 6 bits of mantissa: up to ~1.6% per value
@@ -217,8 +244,9 @@ int RunDlaaDisplays() {
                 }
             }
         ctx->Unmap(stgTex, 0);
-        // Sanity of the scene itself: most of the display away from the bar loses the old digit (0.5).
-        const bool sane = cleared * 2 > inside;
+        // Sanity of the scene itself: much of the display away from the bar and the outline loses the old digit (0.5);
+        // with an edge its outline keeps DLSS's result.
+        const bool sane = cleared * 3 > inside && (k.edge == 0 || kept > 0);
         printf("  %s: %d of %u pixels off (worst relative error %.3f); display pixels %d, cleared to the current frame "
                "%d, DLSS kept %d (%s)\n",
                k.name, bad, kOW * kOH, worst, inside, cleared, kept, bad == 0 && sane ? "OK" : "WRONG");

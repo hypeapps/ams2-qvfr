@@ -37,6 +37,7 @@
 #include "sr_probe.h"
 #include "sun_fx.h"
 #include "taa_views.h"
+#include "windscreen.h"
 
 namespace qvfr::quad {
 
@@ -1694,6 +1695,8 @@ bool Pressed(int mod, int key, bool& wasDown) {
     return pressed;
 }
 
+void TestSwitchesLocked();  // below, with the switches
+
 // Debug hotkeys and the outer-only decision for the frame that starts now.
 void HandleToolsLocked() {
     const Config& c = Cfg();
@@ -2337,6 +2340,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
             clones::BeginGroup(gpu::Context(), clones::Outer);
             sunfx::BeginGroup(g, 0, 0, 1, 1);
             taaviews::BeginGroup(g);  // outer: only the shot-frame dump
+            windscreen::BeginGroup();
             return;
         }
         if (g_firstFocusMs < 0) {
@@ -2352,6 +2356,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         clones::BeginGroup(gpu::Context(), clones::Focus);
         mvrpass::FocusGroupIn(g - FocusL);
         taaviews::BeginGroup(g);
+        windscreen::BeginGroup();
         // The focus window as a part of outer (which covers the whole grid); without the focus projection the
         // group renders outer's view.
         const focus::Geometry& geo = g_focus.geo;
@@ -2367,6 +2372,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
 void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
     mvrpass::EyeGroupEnd();  // B19: the group's draws are over
     sunfx::EndGroup();  // before CEndEye's copies and the desktop mirror
+    windscreen::EndGroup();
     dlaa::EndGroup();
     t_inEndEye = true;
     t_endRes = nullptr;
@@ -3210,12 +3216,14 @@ void OnFrameStart() {
             clones::OnFrameStart(gpu::Context(), false);  // a swap left over goes back
             sunfx::OnFrameStart(gpu::Context(), false);
             taaviews::OnFrameStart(false, false);
+            windscreen::OnFrameStart();
             return;
         }
         FinishFrameLocked();
         ++g_frameNo;
         g_frameT0 = NowMs();
         HandleToolsLocked();
+        TestSwitchesLocked();
         mvrpass::OnFrameStart(g_mvrOn);  // reports the comparison of the previous shot frame
         HandleShotLocked();
         // DLSS SR: the scene sets only while DLSS runs (setting, hotkey, no failure), else the views' own sizes.
@@ -3231,6 +3239,7 @@ void OnFrameStart() {
         mvrvs::OnFrameStart(gpu::Context());
         mvrps::OnFrameStart(gpu::Context());
         taaviews::OnFrameStart(g_taaOn && !g_frameSkip, g_shotFrame);
+        windscreen::OnFrameStart();
         dlaa::SetShotFrame(g_shotFrame);
     });
 }
@@ -3468,6 +3477,7 @@ void LogStats(bool totals) {
         mvrps::LogStats(totals);
         mvrpass::LogStats(totals);
         taaviews::LogStats(totals);
+        windscreen::LogStats();
     });
 }
 
@@ -3495,6 +3505,9 @@ const Switch kSwitches[] = {
     {"taa_views", false, 0, 1, [] { return (int)g_taaOn; }, [](int v) { g_taaOn = v != 0; }},
     {"taa_motion_fix", false, 0, 1, [] { return (int)taaviews::GetMotionFix(); },
      [](int v) { taaviews::SetMotionFix(v != 0); }},
+    {"windscreen", false, 0, 1, [] { return (int)windscreen::GetLayers(); },
+     [](int v) { windscreen::SetLayers(v != 0); }},
+    {"windscreen_depth", false, 0, 3, [] { return windscreen::GetDepth(); }, [](int v) { windscreen::SetDepth(v); }},
     {"outer_only", false, 0, 1, [] { return (int)g_userOuter; }, [](int v) { g_userOuter = v != 0; }},
     {"task_profile", false, 0, 1, [] { return (int)g_profOn.load(); }, [](int v) { g_profOn = v != 0; }},
     {"clones_map_cache", false, 0, 1, [] { return (int)clones::GetMapCache(); },
@@ -3585,6 +3598,39 @@ const Switch* FindSwitch(const std::string& name, std::string* why) {
         *why += ")";
     }
     return nullptr;
+}
+
+// Test scenarios ([debug] test_key, common.h TestScenarioSwitches): when the step changes, the switches the previous
+// step set get their earlier values back and the new step's are set.
+int g_testSwitchStep = 0;
+std::vector<std::pair<const Switch*, int>> g_testSaved;  // switch, its value before the step
+
+void TestSwitchesLocked() {
+    const int step = TestScenarioStep();
+    if (step == g_testSwitchStep) return;
+    g_testSwitchStep = step;
+    for (auto it = g_testSaved.rbegin(); it != g_testSaved.rend(); ++it) it->first->set(it->second);
+    g_testSaved.clear();
+    const std::string spec = TestScenarioSwitches();
+    for (size_t pos = 0; pos < spec.size();) {
+        size_t end = spec.find(',', pos);
+        if (end == std::string::npos) end = spec.size();
+        const std::string item = spec.substr(pos, end - pos);
+        pos = end + 1;
+        const size_t eq = item.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string name = item.substr(0, eq);
+        const int value = atoi(item.c_str() + eq + 1);
+        std::string why;
+        const Switch* s = FindSwitch(name, &why);
+        if (!s || value < s->lo || value > s->hi) {
+            Log("Quad: test scenario %d: %s not set (%s)", step, item.c_str(), s ? "out of range" : why.c_str());
+            continue;
+        }
+        g_testSaved.emplace_back(s, s->get());
+        s->set(value);
+        Log("Quad: test scenario %d: %s (was %d)", step, item.c_str(), g_testSaved.back().second);
+    }
 }
 
 }  // namespace
@@ -3685,6 +3731,7 @@ void Shutdown() {
         clones::Shutdown();
         sunfx::Shutdown();
         taaviews::Shutdown();
+        windscreen::Shutdown();
         mvrpass::Shutdown();
         shots::Cancel();
         g_shotFrame = false;
