@@ -192,6 +192,7 @@ void LogStats(bool totals);  // a stats line, with the session totals at the end
 void SetMapCache(int mode);
 int GetMapCache();
 uint64_t MapMismatches();  // mode 3's mismatches, so far
+uint64_t MapChecked();     // mode 3's hits checked through the lock, so far
 // O1: PSSetShaderResources calls on the immediate context that reach slot kPsWatchSlot or above (any caller, the
 // proxy's own too), counted: mvr_pass binds its t21..t26 (mvrps::kTexBase) again only when they may have changed.
 constexpr UINT kPsWatchSlot = 21;

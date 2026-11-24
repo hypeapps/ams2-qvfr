@@ -288,10 +288,11 @@ uint32_t g_viewVictim = 0;
 ViewSet& ViewSetOf(const void* v) {
     return g_views[((uintptr_t)v * 0x9E3779B97F4A7C15ull) >> (64 - kViewSetBits)];
 }
-// Render thread counters (no locked increments); read for the log.
+// Render thread counters (no locked increments, only that thread writes them); the log takes the difference to its
+// previous reading.
 std::atomic<uint64_t> g_viewHits{0}, g_viewMiss{0}, g_viewChecked{0}, g_viewMismatch{0};
-uint64_t g_viewHitsTot = 0, g_viewMissTot = 0, g_viewCheckedTot = 0, g_viewMismatchTot = 0;
-std::atomic<uint64_t> g_viewsMade{0};  // views the device hooks saw made
+uint64_t g_viewHitsLog = 0, g_viewMissLog = 0, g_viewCheckedLog = 0, g_viewMismatchLog = 0;
+std::atomic<uint64_t> g_viewsMade{0};  // views the device hooks saw made (any thread)
 bool g_devHooked = false;
 int g_mismatchLogs = 0;
 uint64_t g_contentSig = 0;  // OnFrameStart: the lists' sizes and the phase as of the latest frame start
@@ -304,7 +305,8 @@ uint32_t g_psViewEpoch[D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT] = {};
 uint32_t g_psEpoch = 1;
 uint64_t g_psViewReads = 0;  // PsView calls that read the slot back
 constexpr UINT kMapMax = 128;
-std::vector<IUnknown*> g_lazyRefs;          // originals of views cloned on the fly (referenced: their address stays theirs)
+// Originals of views cloned on the fly, and of those that could not be (referenced: their address stays theirs).
+std::vector<IUnknown*> g_lazyRefs;
 std::unordered_set<void*> g_lazyFailed;     // views that could not be cloned (logged once)
 std::vector<std::pair<void*, bool>> g_fixCallers;  // logged callers of the bind fix (caller, to the clone)
 
@@ -2204,7 +2206,10 @@ void* MapViewLocked(void* v, const char* method, void* caller) {
     void* cv = dev ? CloneViewLocked(s, dev, v, u, t) : nullptr;
     if (dev) dev->Release();
     if (!cv) {
-        g_lazyFailed.insert(v);
+        if (g_lazyFailed.insert(v).second) {  // referenced: no other view gets its address while it is listed
+            static_cast<IUnknown*>(v)->AddRef();
+            g_lazyRefs.push_back(static_cast<IUnknown*>(v));
+        }
         return v;
     }
     static_cast<IUnknown*>(v)->AddRef();
@@ -2315,7 +2320,7 @@ void ViewMade(void* v) {
     void* want = v;
     g_arrPlain[((uintptr_t)v >> 4) & (kPlainCache - 1)].compare_exchange_strong(want, nullptr,
                                                                                  std::memory_order_relaxed);
-    Bump(g_viewsMade);
+    g_viewsMade.fetch_add(1, std::memory_order_relaxed);
 }
 
 // The views to bind: `views` itself, or `tmp` (n entries) with translations.
@@ -3306,21 +3311,29 @@ void InstallD3DHooks(ID3D11DeviceContext* imm) {
         // cache (kMapGen) takes its place.
         ID3D11Device* dev = nullptr;
         imm->GetDevice(&dev);
-        if (!dev) return;
-        void** dvt = *(void***)dev;
-        bool dok = hooks::CreateAt(dvt[7], (void*)D_CreateSrv, (void**)&o_createSrv, "CreateShaderResourceView") &&
-                   hooks::CreateAt(dvt[8], (void*)D_CreateUav, (void**)&o_createUav, "CreateUnorderedAccessView") &&
-                   hooks::CreateAt(dvt[9], (void*)D_CreateRtv, (void**)&o_createRtv, "CreateRenderTargetView") &&
-                   hooks::CreateAt(dvt[10], (void*)D_CreateDsv, (void**)&o_createDsv, "CreateDepthStencilView");
-        ID3D11Device3* d3 = nullptr;
-        if (dok && SUCCEEDED(dev->QueryInterface(__uuidof(ID3D11Device3), (void**)&d3)) && d3) {
-            void** vt3 = *(void***)d3;
-            dok = hooks::CreateAt(vt3[57], (void*)D_CreateSrv1, (void**)&o_createSrv1, "CreateShaderResourceView1") &&
-                  hooks::CreateAt(vt3[58], (void*)D_CreateUav1, (void**)&o_createUav1, "CreateUnorderedAccessView1") &&
-                  hooks::CreateAt(vt3[59], (void*)D_CreateRtv1, (void**)&o_createRtv1, "CreateRenderTargetView1");
-            d3->Release();
+        bool dok = dev != nullptr;
+        if (dev) {
+            void** dvt = *(void***)dev;
+            void* const base[] = {dvt[7], dvt[8], dvt[9], dvt[10]};
+            dok = hooks::CreateAt(base[0], (void*)D_CreateSrv, (void**)&o_createSrv, "CreateShaderResourceView") &&
+                  hooks::CreateAt(base[1], (void*)D_CreateUav, (void**)&o_createUav, "CreateUnorderedAccessView") &&
+                  hooks::CreateAt(base[2], (void*)D_CreateRtv, (void**)&o_createRtv, "CreateRenderTargetView") &&
+                  hooks::CreateAt(base[3], (void*)D_CreateDsv, (void**)&o_createDsv, "CreateDepthStencilView");
+            // A slot whose code is one of the functions above is covered by that hook already.
+            auto hook1 = [&](void* t, void* detour, void** orig, const char* name) {
+                return std::find(std::begin(base), std::end(base), t) != std::end(base) ||
+                       hooks::CreateAt(t, detour, orig, name);
+            };
+            ID3D11Device3* d3 = nullptr;
+            if (dok && SUCCEEDED(dev->QueryInterface(__uuidof(ID3D11Device3), (void**)&d3)) && d3) {
+                void** vt3 = *(void***)d3;
+                dok = hook1(vt3[57], (void*)D_CreateSrv1, (void**)&o_createSrv1, "CreateShaderResourceView1") &&
+                      hook1(vt3[58], (void*)D_CreateUav1, (void**)&o_createUav1, "CreateUnorderedAccessView1") &&
+                      hook1(vt3[59], (void*)D_CreateRtv1, (void**)&o_createRtv1, "CreateRenderTargetView1");
+                d3->Release();
+            }
+            dev->Release();
         }
-        dev->Release();
         g_devHooked = dok;
         if (!dok && g_mapMode.load() >= kMapViews) g_mapMode = kMapGen;
         Log("Clones: device view hooks %s (%s)", dok ? "installed" : "INCOMPLETE",
@@ -4087,14 +4100,18 @@ void LogStats(bool totals) {
                 (unsigned long long)c.fixFwd, (unsigned long long)c.lazy, (unsigned long long)c.fixBack,
                 (unsigned long long)c.sizeMismatch);
         const uint64_t hits = g_sameHits.exchange(0), miss = g_sameMiss.exchange(0);
-        const uint64_t vh = g_viewHits.exchange(0), vm = g_viewMiss.exchange(0);
-        const uint64_t vc = g_viewChecked.exchange(0), vx = g_viewMismatch.exchange(0);
+        auto since = [](const std::atomic<uint64_t>& c, uint64_t& last) {
+            const uint64_t now = c.load(std::memory_order_relaxed);
+            const uint64_t d = now - last;
+            last = now;
+            return d;
+        };
+        const uint64_t vh = since(g_viewHits, g_viewHitsLog), vm = since(g_viewMiss, g_viewMissLog);
+        const uint64_t vc = since(g_viewChecked, g_viewCheckedLog), vx = since(g_viewMismatch, g_viewMismatchLog);
         g_sameHitsTot += hits + vh;
         g_sameMissTot += miss + vm;
-        g_viewCheckedTot += vc;
-        g_viewMismatchTot += vx;
         const uint64_t h = totals ? g_sameHitsTot : hits + vh, m = totals ? g_sameMissTot : miss + vm;
-        const uint64_t ck = totals ? g_viewCheckedTot : vc, mx = totals ? g_viewMismatchTot : vx;
+        const uint64_t ck = totals ? g_viewChecked.load() : vc, mx = totals ? g_viewMismatch.load() : vx;
         if (h || m) {
             char chk[96] = "";
             if (ck || mx)
@@ -4120,7 +4137,8 @@ void SetMapCache(int mode) {
     Log("Clones: map cache %d (%s)", mode, kNames[mode]);
 }
 int GetMapCache() { return g_mapMode.load(); }
-uint64_t MapMismatches() { return g_viewMismatchTot + g_viewMismatch.load(); }
+uint64_t MapMismatches() { return g_viewMismatch.load(); }
+uint64_t MapChecked() { return g_viewChecked.load(); }
 uint32_t PsHighSlotsGen() { return g_psHighGen.load(std::memory_order_relaxed); }
 void NewPsViewEpoch() { ++g_psEpoch; }
 ID3D11ShaderResourceView* PsView(ID3D11DeviceContext* c, UINT slot) {
