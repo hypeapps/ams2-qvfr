@@ -3226,6 +3226,7 @@ void OnFrameStart() {
         clones::SetSrActive(srNow);
         mvrpass::SetSrActive(srNow);
         clones::OnFrameStart(gpu::Context(), g_clonesOn && g_focus.on);
+        sunfx::SetBonnetFromOuter(Cfg().bonnetFromOuter);
         sunfx::OnFrameStart(gpu::Context(), g_sunOn && g_focus.on && !g_frameSkip);
         mvrvs::OnFrameStart(gpu::Context());
         mvrps::OnFrameStart(gpu::Context());

@@ -400,6 +400,7 @@ Config ReadConfig(const fs::path& ini) {
     c.sunEffects = IniInt(ini, L"debug", L"sun_effects", 1) != 0;
     c.sunKeyMod = IniInt(ini, L"debug", L"sun_effects_modifier", c.sunKeyMod);
     c.sunKey = IniInt(ini, L"debug", L"sun_effects_key", c.sunKey);
+    c.bonnetFromOuter = IniInt(ini, L"debug", L"bonnet_from_outer", 1) != 0;
     c.taaViews = IniInt(ini, L"debug", L"taa_views", 1) != 0;
     c.taaViewsKeyMod = IniInt(ini, L"debug", L"taa_views_modifier", c.taaViewsKeyMod);
     c.taaViewsKey = IniInt(ini, L"debug", L"taa_views_key", c.taaViewsKey);
@@ -834,6 +835,7 @@ bool ReloadConfig(bool force) {
     c.cullKeyMod = n.cullKeyMod;
     c.cullKey = n.cullKey;
     c.sunEffects = n.sunEffects;
+    c.bonnetFromOuter = n.bonnetFromOuter;
     c.sunKeyMod = n.sunKeyMod;
     c.sunKey = n.sunKey;
     c.taaViews = n.taaViews;

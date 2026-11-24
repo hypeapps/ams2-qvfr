@@ -133,6 +133,8 @@ struct Config {
     bool sunEffects = true;
     int sunKeyMod = VK_RCONTROL;
     int sunKey = 0;                   // testers: VK_F3
+    // Live: the focus views' car paint reflects outer's bonnet reflection image of the eye (sun_fx.h).
+    bool bonnetFromOuter = true;
     // Own TAA history of the focus views (taa_views.h, dlaa-plan D2); the hotkey switches.
     bool taaViews = true;
     int taaViewsKeyMod = VK_RCONTROL;
