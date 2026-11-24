@@ -49,7 +49,8 @@ void SetSizes(uint32_t gameW, uint32_t gameH, uint32_t outerW, uint32_t outerH, 
 // Frame start: a swap left over is put back, new objects are sorted, a changed list starts learning again, the clones
 // are made after learning. `enabled`: clones wanted now (setting, hotkey, focus window on).
 void OnFrameStart(ID3D11DeviceContext* imm, bool enabled);
-void BeginGroup(ID3D11DeviceContext* imm, Set set);  // eye group CBeginEye, before the engine's Execute
+// Eye group CBeginEye, before the engine's Execute. `viewSize`: the set itself even while DLSS SR wants its scene set.
+void BeginGroup(ID3D11DeviceContext* imm, Set set, bool viewSize = false);
 void EndGroup(ID3D11DeviceContext* imm);             // eye group CEndEye, after the engine's Execute (no-op without Begin)
 // DLSS SR (docs/dlaa-plan.md S1 in stereo, S2 in quad views; sr.h, dlaa.cpp): the scene phase of an eye group (until
 // the TAA resolve's draw) renders into the scene set of its kind at the render size. In the learning groups MarkTaa at

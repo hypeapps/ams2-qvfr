@@ -1841,21 +1841,34 @@ void EarlyMapMiss(const char* why) {
     AddReason(g_ltot.earlyMissed, why);
 }
 
+// What focus's early live track map draws into for the engine target behind `r`, at focus's view size also with DLSS
+// SR (EarlyMap in quad.cpp): its view-size clone, or with focus at the game's size the engine's texture itself.
+ID3D11Texture2D* FocusViewTarget(ID3D11Resource* r) {
+    if (!r) return nullptr;
+    if (g_cloneFn) return g_cloneFn(r);
+    ID3D11Resource* e = EngineOf(r);
+    if (ID3D11Texture2D* t = clones::CloneOf(e, clones::Focus)) return t;
+    if (!e || !g_sz.gw || g_sz.fw != g_sz.gw || g_sz.fh != g_sz.gh) return nullptr;
+    ComPtr<ID3D11Texture2D> t;
+    if (FAILED(e->QueryInterface(IID_PPV_ARGS(&t)))) return nullptr;
+    return t.Get();
+}
+
 // View 1's map from focus's early run in this frame (null: none, the reason counted when there was a run): a view of
-// focus's target behind outer's map `r` (its focus clone, or the engine's texture with focus at the game's size).
+// focus's view-size target behind outer's map `r` (FocusViewTarget). The PS reads it by UV, so with DLSS SR the map is
+// larger than view 1's slice.
 ID3D11ShaderResourceView* EarlyMapSrv(int eye, ID3D11Resource* r, DXGI_FORMAT fmt, ID3D11Texture2D** tex) {
     if (eye < 0 || eye > 1 || g_ltEarlyFrame[eye] != g_frame) return nullptr;
-    const Pass& p = g_p;
-    ID3D11Texture2D* t = FocusTarget(r);
+    ID3D11Texture2D* t = FocusViewTarget(r);
     if (!t) {
         EarlyMapMiss("no focus target of the map");
         return nullptr;
     }
     D3D11_TEXTURE2D_DESC d{};
     t->GetDesc(&d);
-    if (d.Width != p.fw || d.Height != p.fh || d.ArraySize != 1 || d.SampleDesc.Count != 1 ||
+    if (d.Width != g_sz.fw || d.Height != g_sz.fh || d.ArraySize != 1 || d.SampleDesc.Count != 1 ||
         !(d.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
-        EarlyMapMiss("focus's map is not a single texture at focus's size");
+        EarlyMapMiss("focus's map is not a single texture at focus's view size");
         return nullptr;
     }
     EarlyLiveTrack& m = g_ltEarly[eye];

@@ -2759,10 +2759,11 @@ void EarlyMap(int eye) {
     LARGE_INTEGER t0{}, t1{};
     QueryPerformanceCounter(&t0);
     ID3D11DeviceContext* imm = gpu::Context();
-    // Outer's set out, focus's in (its clones, its scene clones, or the engine's textures at the game's size), as in
-    // EarlyFocus; BeginGroup(Outer) below puts outer's back.
+    // Outer's set out, focus's in (its view-size clones, or the engine's textures at the game's size), as in EarlyFocus;
+    // BeginGroup(Outer) below puts outer's back. With DLSS SR not the scene clones: view 1 reads the map by UV, and at
+    // the render size the thin parts of its track mask come out of the upscale as white blocks.
     clones::EndGroup(imm);
-    clones::BeginGroup(imm, clones::Focus);
+    clones::BeginGroup(imm, clones::Focus, true);
     bool ok = ExecuteOnly(fBegin, o_beginExec) && RecordOnly(build) && ExecuteOnly(render, nullptr);
     clones::EndGroup(imm);
     clones::BeginGroup(imm, clones::Outer);

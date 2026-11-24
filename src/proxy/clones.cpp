@@ -3293,7 +3293,7 @@ void ProofGroupLocked(Set set) {
     if (--s.proofLeft == 0) LogProofLocked(set);
 }
 
-void BeginGroup(ID3D11DeviceContext* imm, Set set) {
+void BeginGroup(ID3D11DeviceContext* imm, Set set, bool viewSize) {
     Protect("BeginGroup", [&] {
         std::lock_guard lock(g_cm);
         if (g_failed || g_swapped) return;
@@ -3317,7 +3317,7 @@ void BeginGroup(ID3D11DeviceContext* imm, Set set) {
         if (g_phase != Ready || !g_enabled || g_dirty) return;
         // DLSS SR: the scene set first (SceneEnd puts the post set in at the TAA resolve).
         Set in = g_kind;
-        if (g_sr && g_srActive && !g_set[SceneOf(g_kind)].entries.empty()) in = SceneOf(g_kind);
+        if (!viewSize && g_sr && g_srActive && !g_set[SceneOf(g_kind)].entries.empty()) in = SceneOf(g_kind);
         if (g_set[in].entries.empty()) return;
         g_srGroup = SwapInLocked(imm, in) && in >= OuterScene;
     });
