@@ -62,7 +62,7 @@ std::atomic<bool> g_on{false};       // hooks in place and not failed
 std::atomic<bool> g_active{true};    // hotkey: DLAA (true) or the game's TAA
 std::atomic<int> g_gameTaaReq{-1};   // sequence switch dlss_game_taa for the next frame start (-1 = none)
 void** g_devGlobal = nullptr;        // address of the engine device pointer
-bool g_d3dHooked = false;
+std::atomic<bool> g_d3dHooked{false};  // D_Resolve may run on several recording threads
 bool g_external = false;             // quad mode: the draws come from sun_fx's DrawIndexed hook (Replace)
 // Quad eye group being replayed (-1 = none, stereo): its own DLSS feature. Index group + 1 in the per-view arrays.
 std::atomic<int> g_group{-1};
@@ -288,6 +288,7 @@ struct Scratch {
     UINT w = 0, h = 0, mips = 0, arr = 0;
     DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
     UINT bind = 0;
+    uint64_t used = 0;  // g_evalSeq of the evaluation that last asked for it
 };
 
 ID3D11Device* g_dev = nullptr;  // referenced; NGX lives on this device
@@ -299,6 +300,7 @@ NVSDK_NGX_Parameter* g_params = nullptr;
 std::vector<Feature> g_feat;
 std::atomic<size_t> g_featCount{0};  // g_feat.size() for the stats line (another thread)
 std::vector<Scratch> g_scratch;
+uint64_t g_evalSeq = 0;  // advanced at each Evaluate: scratch textures it asked for are not evicted during it
 int g_evalFails = 0;
 int g_sizeLogs = 0;
 std::atomic<int> g_ngxLogLines{0};
@@ -393,11 +395,13 @@ bool InitNgx(ID3D11DeviceContext* c) {
     g_gen = gpu::Generation();
     if (FAILED(c->QueryInterface(__uuidof(ID3D11DeviceContext1), (void**)&g_ctx1)) || !g_ctx1) {
         Log("DLAA: no ID3D11DeviceContext1; the game's TAA stays");
+        SetState("off: no ID3D11DeviceContext1");
         return false;
     }
     ID3D11Device1* dev1 = nullptr;
     if (FAILED(dev->QueryInterface(__uuidof(ID3D11Device1), (void**)&dev1)) || !dev1) {
         Log("DLAA: no ID3D11Device1; the game's TAA stays");
+        SetState("off: no ID3D11Device1");
         return false;
     }
     D3D_FEATURE_LEVEL fl = dev->GetFeatureLevel();
@@ -406,6 +410,7 @@ bool InitNgx(ID3D11DeviceContext* c) {
     dev1->Release();
     if (FAILED(hr) || !g_ctxState) {
         Log("DLAA: CreateDeviceContextState failed (0x%08lX); the game's TAA stays", (unsigned long)hr);
+        SetState("off: CreateDeviceContextState failed");
         return false;
     }
     const std::wstring dllDir = (ModuleDir() / L"qvfr").wstring();
@@ -442,7 +447,8 @@ bool InitNgx(ID3D11DeviceContext* c) {
     }
     r = NVSDK_NGX_D3D11_AllocateParameters(&g_params);
     if (NVSDK_NGX_FAILED(r) || !g_params) {
-        Log("DLAA: NGX parameters failed: %s", ResultText(r).c_str());
+        Log("DLAA: NGX parameters failed: %s; the game's TAA stays", ResultText(r).c_str());
+        SetState("off: NVIDIA NGX parameters failed (" + ResultText(r) + ")");
         return false;
     }
     SetState("on (DLSS ready)");
@@ -455,15 +461,22 @@ bool InitNgx(ID3D11DeviceContext* c) {
 ID3D11Texture2D* ScratchFor(const D3D11_TEXTURE2D_DESC& like, DXGI_FORMAT fmt, UINT bind) {
     for (Scratch& s : g_scratch)
         if (s.tex && s.w == like.Width && s.h == like.Height && s.mips == like.MipLevels && s.arr == 1 &&
-            s.fmt == fmt && s.bind == bind)
+            s.fmt == fmt && s.bind == bind) {
+            s.used = g_evalSeq;
             return s.tex;
-    // 11 in a DLSS SR session with the mask (2026-11-17): 4 at the eye size from the learning frames, 3-4 per view size.
-    // The oldest goes; one still used in this evaluation must not, so the cap stays well above that.
+        }
+    // A DLSS SR session with the mask holds about 11: 4 at the eye size from the learning frames, 3-4 per view size.
+    // Past the cap the least recently used goes, never one this evaluation already holds.
     if (g_scratch.size() >= 16) {
-        SafeRelease(g_scratch.front().srv);
-        SafeRelease(g_scratch.front().uav);
-        SafeRelease(g_scratch.front().tex);
-        g_scratch.erase(g_scratch.begin());
+        auto lru = g_scratch.end();
+        for (auto it = g_scratch.begin(); it != g_scratch.end(); ++it)
+            if (it->used != g_evalSeq && (lru == g_scratch.end() || it->used < lru->used)) lru = it;
+        if (lru != g_scratch.end()) {
+            SafeRelease(lru->srv);
+            SafeRelease(lru->uav);
+            SafeRelease(lru->tex);
+            g_scratch.erase(lru);
+        }
     }
     D3D11_TEXTURE2D_DESC d{};
     d.Width = like.Width;
@@ -487,6 +500,7 @@ ID3D11Texture2D* ScratchFor(const D3D11_TEXTURE2D_DESC& like, DXGI_FORMAT fmt, U
     s.arr = d.ArraySize;
     s.fmt = fmt;
     s.bind = bind;
+    s.used = g_evalSeq;
     g_scratch.push_back(s);
     Log("DLAA: texture %ux%u format %d bind 0x%X created", d.Width, d.Height, (int)fmt, bind);
     return s.tex;
@@ -1259,9 +1273,13 @@ Feature* FeatureFor(ID3D11DeviceContext* c, int view, uintptr_t key, UINT w, UIN
         if (x.view == view && x.key == key && x.w == w && x.h == h && x.ow == ow && x.oh == oh) f = &x;
     if (f && f->handle && f->flags == flags && f->preset == preset) return f;
     if (!f) {
-        if (g_feat.size() >= 8) {
-            if (g_feat.front().handle) NVSDK_NGX_D3D11_ReleaseFeature(g_feat.front().handle);
-            g_feat.erase(g_feat.begin());
+        if (g_feat.size() >= 8) {  // the one that ran longest ago goes, not one another view still runs
+            auto lru = std::min_element(g_feat.begin(), g_feat.end(),
+                                        [](const Feature& a, const Feature& b) { return a.lastFrame < b.lastFrame; });
+            Log("DLAA: DLSS feature for %s, motion vectors %p (%ux%u -> %ux%u) released: %zu features in use",
+                kViewName[lru->view], (void*)lru->key, lru->w, lru->h, lru->ow, lru->oh, g_feat.size());
+            if (lru->handle) NVSDK_NGX_D3D11_ReleaseFeature(lru->handle);
+            g_feat.erase(lru);
         }
         g_feat.push_back(Feature{});
         f = &g_feat.back();
@@ -1305,6 +1323,15 @@ Feature* FeatureFor(ID3D11DeviceContext* c, int view, uintptr_t key, UINT w, UIN
 
 void ResetAllLocked() {
     for (Feature& f : g_feat) f.fresh = true;
+}
+
+// A TAA resolve DLSS did not replace; after kMaxEvalFails in a row the game's TAA for the rest of the session.
+void CountFailedEvaluation() {
+    if (++g_evalFails < kMaxEvalFails) return;
+    Log("DLAA: %d failed evaluations in a row; the game's TAA for the rest of the session", g_evalFails);
+    SetState("off: DLSS evaluation keeps failing");
+    g_failed = true;
+    g_on = false;
 }
 
 DXGI_FORMAT ViewFormat(ID3D11ShaderResourceView* v) {
@@ -1367,8 +1394,11 @@ void ViewSpanEnd(gpu::Span first, int view) {
 // t3 motion vectors R16G16_FLOAT, t5 locks R8_UNORM. Returns kNotTaa, kDone (DLSS ran, skip the draw) or kFailed.
 // afterDraw: the game's TAA resolve already ran (cockpit_taa): DLSS runs after it and only the pixels outside the
 // player's car (stencil bit 0x200) take the DLSS result.
-int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
+// countEarly: a failure before DLSS's evaluation (sizes, textures) counts toward kMaxEvalFails too. DLSS SR's scene
+// phase needs that: without DLSS the game's TAA there reads the render-size clones and nothing is carried.
+int Evaluate(ID3D11DeviceContext* c, bool afterDraw, bool countEarly = false) {
     const int view = g_group.load(std::memory_order_relaxed) + 1;
+    ++g_evalSeq;
     ID3D11ShaderResourceView* srv[6] = {};
     c->PSGetShaderResources(0, 6, srv);
     ID3D11RenderTargetView* rtv = nullptr;
@@ -1376,11 +1406,14 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
     ID3D11Texture2D* tex[4] = {};  // depth, color, motion vectors, target
     int result = kNotTaa;
     ID3D11Texture2D* stencil = nullptr;  // t4: the game's normal/stencil (bias mask, shot statistics)
+    bool spanOpen = false;   // the view's DlssOuterL span
+    bool evaluated = false;  // DLSS's evaluation was called (its failure is counted there)
     [&] {
         if (!IsTaaResolve(rtv, srv)) return;
         result = kFailed;  // from here on it is the TAA resolve
         if (g_failed) return;
         ViewSpanBegin(gpu::DlssOuterL, view);
+        spanOpen = true;
         if (g_dev && g_gen != gpu::Generation()) {
             Log("DLAA: the device changed; NGX starts again");
             DropNgxLocked();
@@ -1406,13 +1439,21 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
         const DXGI_FORMAT vf[3] = {ViewFormat(srv[0]), ViewFormat(srv[1]), ViewFormat(srv[3])};
         const UINT w = d[3].Width, h = d[3].Height;  // the TAA target: DLSS's output size
         const UINT iw = d[0].Width, ih = d[0].Height;  // its inputs (DLSS SR: the clones at the render size)
+        // The target may be a slice of an array (MVR): DLSS's result goes into the slice the game's view writes.
+        D3D11_RENDER_TARGET_VIEW_DESC rd{};
+        rtv->GetDesc(&rd);
+        const UINT targetSlice =
+            rd.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY ? rd.Texture2DArray.FirstArraySlice : 0;
+        const UINT targetSub = D3D11CalcSubresource(0, targetSlice, d[3].MipLevels);
         if (!g_formatsLogged[view]) {
             g_formatsLogged[view] = true;
             Log("DLAA: TAA resolve found (%s): depth %ux%u fmt %d (view %d), color %ux%u fmt %d (view %d), motion %ux%u fmt "
-                "%d (view %d), target %ux%u fmt %d",
+                "%d (view %d), target %ux%u fmt %d, slice %u of %u",
                 kViewName[view], d[0].Width, d[0].Height, (int)d[0].Format, (int)vf[0], d[1].Width, d[1].Height, (int)d[1].Format,
-                (int)vf[1], d[2].Width, d[2].Height, (int)d[2].Format, (int)vf[2], w, h, (int)d[3].Format);
+                (int)vf[1], d[2].Width, d[2].Height, (int)d[2].Format, (int)vf[2], w, h, (int)d[3].Format, targetSlice,
+                d[3].ArraySize);
         }
+        if (targetSlice >= d[3].ArraySize) return;
         bool sizesOk = d[3].SampleDesc.Count == 1 && (g_sr ? iw <= w && ih <= h : iw == w && ih == h);
         for (int i = 0; i < 3; ++i) sizesOk &= d[i].Width == iw && d[i].Height == ih && d[i].SampleDesc.Count == 1;
         if (!sizesOk) {
@@ -1458,9 +1499,11 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
         ID3D11UnorderedAccessView* maskUav = nullptr;
         ID3D11ShaderResourceView* maskStencil = nullptr;  // ours (StencilViewFor), not referenced
         UINT stencilSlice = 0;
+        DXGI_FORMAT stencilFmt = DXGI_FORMAT_UNKNOWN;  // the format the game reads it through
         if (stencil) {
             D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
             srv[4]->GetDesc(&vd);
+            stencilFmt = vd.Format;
             if (vd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY) stencilSlice = vd.Texture2DArray.FirstArraySlice;
             D3D11_TEXTURE2D_DESC sd;
             stencil->GetDesc(&sd);
@@ -1527,15 +1570,22 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
         // Cockpit from the game's TAA: its result (now in the target) is copied aside before DLSS overwrites anything.
         ID3D11ShaderResourceView* taaSrv = nullptr;
         ID3D11UnorderedAccessView* outUav = nullptr;
+        ID3D11ShaderResourceView* cockpitStencil = nullptr;  // ours (StencilViewFor), not referenced
         if (afterDraw) {
             D3D11_TEXTURE2D_DESC sd{};
             if (stencil) stencil->GetDesc(&sd);
             ID3D11Texture2D* taaCopy = ScratchFor(d[3], d[3].Format, D3D11_BIND_SHADER_RESOURCE);
-            if (!stencil || sd.Width != w || sd.Height != h || !taaCopy || !EnsureCockpitShader()) return;
+            if (!stencil || sd.Width != w || sd.Height != h || sd.SampleDesc.Count != 1 || !taaCopy ||
+                !EnsureCockpitShader())
+                return;
             taaSrv = SrvFor(taaCopy);
             outUav = UavFor(out);
-            if (!taaSrv || !outUav) return;  // the game's TAA result stays everywhere
-            c->CopyResource(taaCopy, tex[3]);
+            cockpitStencil = StencilViewFor(stencil, stencilSlice, stencilFmt);
+            if (!taaSrv || !outUav || !cockpitStencil) return;  // the game's TAA result stays everywhere
+            if (d[3].ArraySize == 1)
+                c->CopyResource(taaCopy, tex[3]);
+            else
+                c->CopySubresourceRegion(taaCopy, 0, 0, 0, 0, tex[3], targetSub, nullptr);
             // Stencil high byte: 0x88 displays and mirrors, 0x86 the rest of the player's car (both 0x80). Testing any
             // single bit took more: 0x08 is also in the trees (0x1A) and the sky (0x28), whose soft leaf edges then came
             // from the game's TAA and thinned out while the head moved (docs/dlaa-trees.md).
@@ -1576,6 +1626,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
         t_inside = true;
         NVSDK_NGX_Result r = NVSDK_NGX_Result_Fail;
         Feature* f = nullptr;
+        evaluated = true;
         Protect("evaluate", [&] {
             f = FeatureFor(c, view, (uintptr_t)tex[2], iw, ih, w, h);
             if (!f) return;
@@ -1627,7 +1678,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             r = NGX_D3D11_EVALUATE_DLSS_EXT(c, f->handle, g_params, &e);
             ViewSpanEnd(gpu::DlssEvalOuterL, view);
             if (afterDraw && NVSDK_NGX_SUCCEED(r)) {
-                ID3D11ShaderResourceView* in2[2] = {srv[4], taaSrv};
+                ID3D11ShaderResourceView* in2[2] = {cockpitStencil, taaSrv};
                 c->CSSetShader(g_cockpitCs, nullptr, 0);
                 c->CSSetConstantBuffers(1, 1, &g_cockpitCb);
                 c->CSSetShaderResources(0, 2, in2);
@@ -1676,12 +1727,7 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
         SafeRelease(prev);
         if (!f || NVSDK_NGX_FAILED(r)) {
             if (f && g_evalFails < 5) Log("DLAA: DLSS evaluate failed: %s", ResultText(r).c_str());
-            if (++g_evalFails >= kMaxEvalFails) {
-                Log("DLAA: %d failed evaluations in a row; the game's TAA for the rest of the session", g_evalFails);
-                SetState("off: DLSS evaluation keeps failing");
-                g_failed = true;
-                g_on = false;
-            }
+            CountFailedEvaluation();
             return;
         }
         if (g_evalFails || !g_viewLogged[view]) {
@@ -1709,11 +1755,17 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw) {
             if (g_sr && view >= 1)
                 MeasureDisplays(c, view, stencil, stencilSlice, iw, ih, MaskBitsNow(), dispDone);
         }
-        c->CopyResource(tex[3], dispDone ? dispTex : out);
+        if (d[3].ArraySize == 1)
+            c->CopyResource(tex[3], dispDone ? dispTex : out);
+        else
+            c->CopySubresourceRegion(tex[3], targetSub, 0, 0, 0, dispDone ? dispTex : out, 0, nullptr);
         ViewSpanEnd(gpu::DlssOuterL, view);
+        spanOpen = false;
         if (g_sr) sr::ShotDlss(c, tex[1], tex[3]);  // shot frame only
         result = kDone;
     }();
+    if (spanOpen) ViewSpanEnd(gpu::DlssOuterL, view);
+    if (countEarly && result == kFailed && !evaluated && !g_failed) CountFailedEvaluation();
     for (auto*& t : tex) SafeRelease(t);
     SafeRelease(stencil);
     for (auto*& v : srv) SafeRelease(v);
@@ -1746,7 +1798,22 @@ bool Replace(ID3D11DeviceContext* c, UINT n) {
     if (n == 6 && !g_failed && g_on.load() && !g_active.load() && g_shot.load(std::memory_order_relaxed))
         Protect("shot", [&] { StartTaaShot(c); });
 #endif
-    if (n != 6 || !Wanted()) return false;
+    if (n != 6) return false;
+    if (!Wanted()) {
+#ifdef QVFR_HAVE_DLSS
+        // DLSS stopped earlier in this frame: a group already in its scene set still ends the scene phase at its TAA
+        // draw, so the game's TAA and the passes after it get the textures of the view size.
+        if (g_sr && clones::SceneIn()) {
+            bool taa = false;
+            Protect("draw", [&] { taa = BoundIsTaa(c); });
+            if (taa) {
+                clones::SceneEnd(c);
+                g_fallbacks.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+#endif
+        return false;
+    }
     int r = kNotTaa;
 #ifdef QVFR_HAVE_DLSS
     // DLSS SR (sr.h): with the clones in, DLSS scales the scene to the eye size, the textures the passes after TAA need
@@ -1759,7 +1826,7 @@ bool Replace(ID3D11DeviceContext* c, UINT n) {
         if (clones::SceneIn()) {
             {
                 clones::RawScope raw;  // our calls pass the clones' hooks as they are
-                Protect("draw", [&] { r = Evaluate(c, false); });
+                Protect("draw", [&] { r = Evaluate(c, false, true); });
                 if (r == kDone)
                     Protect("carry", [&] {
                         const int view = g_group.load(std::memory_order_relaxed) + 1;
@@ -1836,10 +1903,10 @@ void STDMETHODCALLTYPE D_DrawIndexed(ID3D11DeviceContext* c, UINT n, UINT start,
 bool Inside() { return t_inside; }
 
 void EnsureD3DHooks() {
-    if (g_d3dHooked) return;
+    if (g_d3dHooked.load()) return;
     ID3D11DeviceContext* imm = gpu::Context();
     if (!imm) return;  // before the first Submit: the game's TAA
-    g_d3dHooked = true;
+    if (g_d3dHooked.exchange(true)) return;  // another thread installs them
     // Quad mode: sun_fx owns the DrawIndexed hook (a second hook on the same function would fail).
     if (Cfg().quadMode == QuadMode::Quad && sunfx::SetDrawReplace(Replace, Inside, After)) {
         g_external = true;

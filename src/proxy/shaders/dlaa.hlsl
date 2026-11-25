@@ -22,7 +22,8 @@ void CSMask(uint3 id : SV_DispatchThreadID) {
     mask[id.xy] = (s & maskBits) == maskBits ? biasValue : 0.0;
 }
 
-Texture2D<float4> normalStencil : register(t0);
+// One slice of the game's normal/stencil, as a one-slice array view of ours like maskStencil.
+Texture2DArray<float4> normalStencil : register(t0);
 
 // Displays and mirrors from the game's TAA ([dlaa] cockpit_taa): after DLSS, the pixels whose stencil high byte has all of
 // `bits` take the game's TAA result, which handles changing digits without trails. Stencil high bytes seen in the game:
@@ -40,7 +41,7 @@ void CSCockpit(uint3 id : SV_DispatchThreadID) {
     uint w, h;
     outColor.GetDimensions(w, h);
     if (id.x >= w || id.y >= h) return;
-    uint s = (uint)(normalStencil.Load(int3(id.xy, 0)).w * 65535.0) >> 8;
+    uint s = (uint)(normalStencil.Load(int4(id.xy, 0, 0)).w * 65535.0) >> 8;
     if ((s & bits) == bits) outColor[id.xy] = taaColor.Load(int3(id.xy, 0)).rgb;
 }
 
