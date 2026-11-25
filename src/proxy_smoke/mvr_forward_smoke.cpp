@@ -18,7 +18,9 @@
 // - the clones are not changed by outer's pass; the comparison after focus's own pass runs;
 // - the module's counters and the debug layer (its linkage report for SV_RenderTargetArrayIndex is expected);
 // - B20 K4: the live pass in the corner layout (outer's clones smaller than focus at the game's size): outer's clones
-//   equal its own pass, focus's engine textures equal focus's own pass (view 1's screen UV in outer's units).
+//   equal its own pass, focus's engine textures equal focus's own pass (view 1's screen UV in outer's units);
+// - the live pass with a draw into the 1/2 size target by a PS without screen inputs (mvr_forward_other): outer's 1/2
+//   size target as without MVR, focus's 1/2 size clones as focus's own pass; with the setting off the pass falls back.
 #include <windows.h>
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
@@ -79,6 +81,8 @@ float4 VSOcc(uint id : SV_VertexID) : SV_Position {
     return float4(lerp(-1.0, 0.0, uv.x), lerp(1.0, 0.0, uv.y), 0.05, 1);
 }
 float4 Zero(float4 p : SV_Position) : SV_Target { return 0; }
+// A PS without screen inputs (the game's lit particles into the 1/2 size target): its colour from the view position.
+float4 Half(VsOut i) : SV_Target { return float4(frac(i.vp.x), frac(i.vp.y), i.vp.z * 0.1, 1); }
 // B13: a G-buffer PS like the game's (PS 82705): the live track map at SV_Position * ssd.zw, extrapolated by the
 // screen input.
 Texture2D GLOBAL_liveTrackTextureMap_tex : register(t7);
@@ -159,7 +163,7 @@ struct Scene {
     ID3D11Device* dev = nullptr;
     ID3D11DeviceContext* ctx = nullptr;
     ComPtr<ID3D11VertexShader> vs, vsOcc;
-    ComPtr<ID3D11PixelShader> fwd, zero, gbuf;
+    ComPtr<ID3D11PixelShader> fwd, zero, gbuf, half;
     ComPtr<ID3D11Texture2D> live;  // B13: outer's live track map, texel (x, y) = its UV
     ComPtr<ID3D11ShaderResourceView> liveSrv;
     ComPtr<ID3D11DepthStencilState> ds;
@@ -274,6 +278,7 @@ bool MakeSet(Set& s, UINT w, UINT h, int k, const float proj[16]) {
 }
 
 bool g_halfDraw = true;  // the live mode's pass draws nothing into the 1/2 size target (as the game's, B9c run 2)
+ID3D11PixelShader* g_halfPs = nullptr;  // the 1/2 size target's PS (null: the forward PS)
 
 // B11: the velocity fill source stands in for mvr_motion: it notes what it got and clears the target to a marker.
 const float kVelMark[4] = {0.25f, -0.5f, 0, 0};
@@ -326,8 +331,9 @@ void DrawForward(const Set& s) {
     c->PSSetShaderResources(kSlot2, 1, s.srv2.GetAddressOf());
     c->PSSetSamplers(0, 1, g_s.point.GetAddressOf());
     c->VSSetShader(g_s.vs.Get(), nullptr, 0);
+    c->PSSetShader(g_halfPs ? g_halfPs : g_s.fwd.Get(), nullptr, 0);
+    if (g_halfDraw) c->Draw(kQuads * 6, 0);  // the 1/2 size target
     c->PSSetShader(g_s.fwd.Get(), nullptr, 0);
-    if (g_halfDraw) c->Draw(kQuads * 6, 0);  // the 1/2 size target (one view)
     c->OMSetRenderTargets(1, &rtv, s.dsv.Get());
     D3D11_VIEWPORT vp{0, 0, (float)s.w, (float)s.h, 0, 1};
     c->RSSetViewports(1, &vp);
@@ -1157,10 +1163,11 @@ int RunMvrForward() {
     qvfr::mvrps::TestSetEnabled(true);
     ComPtr<ID3DBlob> vsCode = Compile("VS", "vs_5_0"), occCode = Compile("VSOcc", "vs_5_0"),
                      fwdCode = Compile("Fwd", "ps_5_0"), zeroCode = Compile("Zero", "ps_5_0"),
-                     gbufCode = Compile("Gbuf", "ps_5_0");
-    if (!vsCode || !occCode || !fwdCode || !zeroCode || !gbufCode) return 1;
+                     gbufCode = Compile("Gbuf", "ps_5_0"), halfCode = Compile("Half", "ps_5_0");
+    if (!vsCode || !occCode || !fwdCode || !zeroCode || !gbufCode || !halfCode) return 1;
     bool made =
         SUCCEEDED(dev->CreatePixelShader(zeroCode->GetBufferPointer(), zeroCode->GetBufferSize(), nullptr, &g_s.zero)) &&
+        SUCCEEDED(dev->CreatePixelShader(halfCode->GetBufferPointer(), halfCode->GetBufferSize(), nullptr, &g_s.half)) &&
         SUCCEEDED(dev->CreatePixelShader(gbufCode->GetBufferPointer(), gbufCode->GetBufferSize(), nullptr, &g_s.gbuf)) &&
         SUCCEEDED(dev->CreateVertexShader(vsCode->GetBufferPointer(), vsCode->GetBufferSize(), nullptr, &g_s.vs)) &&
         SUCCEEDED(dev->CreateVertexShader(occCode->GetBufferPointer(), occCode->GetBufferSize(), nullptr, &g_s.vsOcc)) &&
@@ -1250,6 +1257,13 @@ int RunMvrForward() {
                                 refH = Read(g_s.game.half.Get());
     DrawForward(g_s.focus);
     const std::vector<uint64_t> refFC = Read(g_s.focus.color.Get()), refFD = Read(g_s.focus.depth.Get());
+    // The 1/2 size target drawn by a PS without screen inputs (each run clears it first).
+    g_halfPs = g_s.half.Get();
+    DrawForward(g_s.game);
+    const std::vector<uint64_t> refHalf = Read(g_s.game.half.Get()), refHalfD = Read(g_s.game.halfDepth.Get());
+    DrawForward(g_s.focus);
+    const std::vector<uint64_t> refFHalf = Read(g_s.focus.half.Get()), refFHalfD = Read(g_s.focus.halfDepth.Get());
+    g_halfPs = nullptr;
     Restore();
 
     if (!HookContext(ctx.Get())) {
@@ -1527,12 +1541,63 @@ int RunMvrForward() {
         g_s.game.depth = plainDepth;
         g_s.game.dsv = plainDsv;
     }
+    // The live pass with a draw into the 1/2 size target by a PS without screen inputs (the game's lit particles in
+    // multiplayer): with mvr_forward_other view 1 draws it into the copy's slice 1 at the clone's share (32 x 24 of
+    // 48 x 40), which goes into focus's 1/2 size clones; without it the pass falls back to focus's own.
+    const qvfr::mvrps::Info halfInfo = qvfr::mvrps::InfoOf(g_s.half.Get());
+    struct HalfRun {
+        qvfr::mvrpass::TestLiveState lv;
+        std::vector<uint64_t> gC, gH, gHD, fH, fHD;
+    };
+    auto runHalf = [&](bool on) {
+        HalfRun r;
+        Restore();
+        ctx->ClearRenderTargetView(g_s.focus.halfRtv.Get(), mark);
+        ctx->ClearDepthStencilView(g_s.focus.halfDsv.Get(), D3D11_CLEAR_DEPTH, 0.25f, 0);
+        qvfr::mvrpass::TestSetForwardOther(on);
+        g_halfDraw = true;
+        g_halfPs = g_s.half.Get();
+        qvfr::mvrpass::OnFrameStart(true);
+        qvfr::mvrpass::SetWindow(0, true, sx, ox, sy, oy, kW, kH);
+        qvfr::mvrpass::TestForwardLive(g_vtPhase3);
+        FakeTask t{g_vtPhase3};
+        if (!qvfr::mvrpass::BeforeTask((uint8_t*)&t, 0)) RunTask(t);
+        qvfr::mvrpass::AfterTask((uint8_t*)&t);
+        r.lv = qvfr::mvrpass::TestLiveGet();
+        r.gC = Read(g_s.game.color.Get());
+        r.gH = Read(g_s.game.half.Get());
+        r.gHD = Read(g_s.game.halfDepth.Get());
+        r.fH = Read(g_s.focus.half.Get());
+        r.fHD = Read(g_s.focus.halfDepth.Get());
+        qvfr::mvrpass::TestEnd();
+        g_halfDraw = false;
+        g_halfPs = nullptr;
+        qvfr::mvrpass::TestSetForwardOther(true);
+        return r;
+    };
+    const HalfRun hOn = runHalf(true), hOff = runHalf(false);
     auto differ = [](const std::vector<uint64_t>& a, const std::vector<uint64_t>& b) {
         if (a.empty() || a.size() != b.size()) return 1 << 30;
         int d = 0;
         for (size_t i = 0; i < a.size(); ++i) d += a[i] != b[i];
         return d;
     };
+    const int hpx = (int)((kFW / 2) * (kFH / 2));
+    int hCovered = 0, hCBig = 0, hDOff = 0;
+    float hMax = 0;
+    for (size_t i = 0; i < hOn.fH.size() && i < refFHalf.size() && i < hOn.fHD.size() && i < refFHalfD.size(); ++i) {
+        hCovered += refFHalf[i] != 0;
+        const float d = MaxHalfDiff(hOn.fH[i], refFHalf[i]);
+        hCBig += d > 0.02f;
+        hMax = std::max(hMax, d);
+        hDOff += std::fabs(AsFloat(hOn.fHD[i]) - AsFloat(refFHalfD[i])) > 1e-5f;
+    }
+    const int hOuter = differ(hOn.gH, refHalf) + differ(hOn.gHD, refHalfD), hColor = differ(hOn.gC, lgC);
+    const bool halfOk = halfInfo.kind == qvfr::mvrps::Kind::NotNeeded && hOn.lv.passes == 1 && hOn.lv.ok == 1 &&
+                        hOn.lv.otherDraws == 1 && hOn.lv.otherTargets == 2 && hOn.fH.size() == (size_t)hpx &&
+                        hOuter == 0 && hColor == 0 && hCovered > hpx / 3 && hCBig * 100 <= hpx &&
+                        hDOff * 100 <= hpx && hOff.lv.ok == 0 && hOff.lv.otherDraws == 0 &&
+                        hOff.lv.why.find("mvr_forward_other off") != std::string::npos;
     const int nOuter = differ(ngC, lgC) + differ(ngD, lgD), nFocus = differ(nC, lC) + differ(nD, lD);
     const bool nativeOk = arrDsv && nlv.passes == 1 && nlv.ok == 1 && nlv.native == 1 && nlv.copiedBack == 1 &&
                           lv.native == 0 && lv.copiedBack == 2 && nOuter == 0 && nFocus == 0;
@@ -1882,7 +1947,15 @@ int RunMvrForward() {
     const unsigned long long psReads = qvfr::sunfx::PsReads();
     const bool trackOk = trkChecks > 0 && trkMis == 0;
     const bool ok = countsOk && outerOk && focusOk && liveOk && velSkipOk && gbufOk && nativeOk && msaa.ok && ltOk &&
-                    trackOk && cornerOk && k5bOk && !warnings;
+                    trackOk && cornerOk && k5bOk && halfOk && !warnings;
+    printf("  live pass with a draw into the 1/2 size target (PS %s): passes %u, ok %u (%s), draws there with two views "
+           "%u, targets into focus's clones %u; outer's 1/2 size target and depth vs without MVR %d px, its color vs the "
+           "live run %d px differ; focus's 1/2 size clone vs focus's own pass (%d covered): color %d px by > 0.02 (max "
+           "%.4f), depth %d px off; with mvr_forward_other off: ok %u (%s) (%s)\n",
+           halfInfo.kind == qvfr::mvrps::Kind::NotNeeded ? "without screen inputs" : "WITH SCREEN INPUTS",
+           hOn.lv.passes, hOn.lv.ok, hOn.lv.why.empty() ? "-" : hOn.lv.why.c_str(), hOn.lv.otherDraws,
+           hOn.lv.otherTargets, hOuter, hColor, hCovered, hCBig, hMax, hDOff, hOff.lv.ok,
+           hOff.lv.why.empty() ? "-" : hOff.lv.why.c_str(), halfOk ? "OK" : "WRONG");
     printf("  B20 K5b: the same with focus's screen texture as slice 1 of a three-slice array: passes %u, ok %u (%s); "
            "focus's color and depth vs the corner run %d px differ (%s)\n",
            klv.passes, klv.ok, klv.why.empty() ? "-" : klv.why.c_str(), k5bDiff, k5bOk ? "OK" : "WRONG");

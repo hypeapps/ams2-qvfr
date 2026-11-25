@@ -170,6 +170,11 @@ const char* ForwardDepthName(int mode);
 // depth first (a multisampled forward pass then shades its color from scratch; AMS2 draws the opaque sky dome first).
 void SetMsColorSkip(bool on);
 bool GetMsColorSkip();
+// [debug] mvr_forward_other (restart only, default on): the live forward pass draws into targets of another size than
+// outer's (AMS2: the 1/2 size lit particles, drawn in multiplayer) with two views when they are single-sample 2D
+// textures whose focus clones are the same fraction of focus's size and the PS reads no screen inputs: two-slice
+// copies like the pass's own targets, view 1's rows scaled to the clones' corner of slice 1, which goes into the clones
+// at the pass's end. Off (or a target that does not qualify): MVR pauses there and the focus group draws its own pass.
 // B12 step 5 (docs/mvr.md), [debug] mvr_ms_slices (restart only, default on): the multisampled forward targets become
 // three-slice arrays (clones::WantArray with 3), whose slices 1 and 2 are focus L's and focus R's clones of them
 // (clones.h). Outer L's live pass draws view 1 into slice 1, outer R's into slice 2 (renderTargetIndexOffset), each
@@ -378,9 +383,13 @@ struct TestLiveState {
     // B12, the last live pass: targets copied in from focus's clones, cleared first (no copy-in), multisampled.
     unsigned copyIns = 0, clearFills = 0, msTargets = 0, colorSkips = 0;  // colorSkips: mvr_ms_color_skip
     unsigned sliceTargets = 0, sliceClears = 0;  // B12 step 5, the last live pass: targets read in their slice, clears
+    // The last live pass: draws into targets of another size with two views, those targets put into focus's clones.
+    unsigned otherDraws = 0, otherTargets = 0;
     std::string why;  // the latest live pass's failure
 };
 TestLiveState TestLiveGet();
+// mvr_forward_other as the ini would set it.
+void TestSetForwardOther(bool on);
 // B19: the session's live track counters (per eye: renders and builds skipped, renders run) and the stop.
 struct TestLiveTrackState {
     unsigned long long skipped[2] = {}, builds[2] = {}, ran[2] = {}, checked = 0, reads = 0;
