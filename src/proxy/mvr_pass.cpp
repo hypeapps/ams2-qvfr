@@ -16,6 +16,7 @@
 
 #include "clones.h"
 #include "common.h"
+#include "fwd_diag.h"
 #include "gpu.h"
 #include "hook_prof.h"
 #include "hooks.h"
@@ -2140,6 +2141,7 @@ void ForwardDraw(ID3D11DeviceContext* c) {
         ++p.plainDraws;
         if (p.views != 1 && SetViews(c, 1)) p.views = 1;
         if (p.diag) DiagDraw(c, "forward (paused)", -1);
+        fwddiag::OnPausedDraw(c);
         return;
     }
     mvrps::Info info;
@@ -2837,6 +2839,7 @@ const char* StartMvr(ID3D11DeviceContext* c, ID3D11Resource* main, int e, uint8_
     p.t0 = t0;
     p.forward = forward;
     p.live = live;
+    if (forward) fwddiag::OnPassStart(e, g_frame, live, md.Width, md.Height, cd.Width, cd.Height);
     if (live) g_otherClears.clear();
     for (Copy& cp : g_copies) cp.used = cp.filled = cp.pending = false;
     {
@@ -3510,6 +3513,7 @@ void LiveEnd(ID3D11DeviceContext* c) {
                 kEye[e], (unsigned long long)g_frame, p.why.c_str(), p.draws, p.plainDraws, p.pauses, p.pausedDraws);
         }
     }
+    fwddiag::OnPassEnd(p.failed ? p.why.c_str() : nullptr);
     ReleasePassRefs(p);
     p = Pass{};
 }
@@ -4425,6 +4429,7 @@ void STDMETHODCALLTYPE D_DrawIndexedInstanced(ID3D11DeviceContext* c, UINT a, UI
     srcb::OnDraw(c);
     if (srprobe::Armed()) srprobe::OnDraw(c, _ReturnAddress(), "DrawIndexedInstanced");
     if (SkipDraw(c)) return;
+    fwddiag::NoteDrawCall("DrawIndexedInstanced", a, b, _ReturnAddress());
     BeforeDraw(c);
     hookprof::Orig orig;
     o_dii(c, a, b, d, e, f);
@@ -4434,6 +4439,7 @@ void STDMETHODCALLTYPE D_DrawInstanced(ID3D11DeviceContext* c, UINT a, UINT b, U
     srcb::OnDraw(c);  // S2.2
     if (srprobe::Armed()) srprobe::OnDraw(c, _ReturnAddress(), "DrawInstanced");
     if (SkipDraw(c)) return;
+    fwddiag::NoteDrawCall("DrawInstanced", a, b, _ReturnAddress());
     BeforeDraw(c);
     hookprof::Orig orig;
     o_di(c, a, b, d, e);
@@ -4441,6 +4447,7 @@ void STDMETHODCALLTYPE D_DrawInstanced(ID3D11DeviceContext* c, UINT a, UINT b, U
 void STDMETHODCALLTYPE D_DrawAuto(ID3D11DeviceContext* c) {
     hookprof::Scope prof(hookprof::KDraw);
     if (SkipDraw(c)) return;
+    fwddiag::NoteDrawCall("DrawAuto", 0, 1, _ReturnAddress());
     BeforeDraw(c);
     hookprof::Orig orig;
     o_da(c);
@@ -4448,6 +4455,7 @@ void STDMETHODCALLTYPE D_DrawAuto(ID3D11DeviceContext* c) {
 void STDMETHODCALLTYPE D_DrawIndexedInstancedIndirect(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT o) {
     hookprof::Scope prof(hookprof::KDraw);
     if (SkipDraw(c)) return;
+    fwddiag::NoteDrawCall("DrawIndexedInstancedIndirect", 0, 0, _ReturnAddress());
     BeforeDraw(c);
     hookprof::Orig orig;
     o_diii(c, b, o);
@@ -4455,6 +4463,7 @@ void STDMETHODCALLTYPE D_DrawIndexedInstancedIndirect(ID3D11DeviceContext* c, ID
 void STDMETHODCALLTYPE D_DrawInstancedIndirect(ID3D11DeviceContext* c, ID3D11Buffer* b, UINT o) {
     hookprof::Scope prof(hookprof::KDraw);
     if (SkipDraw(c)) return;
+    fwddiag::NoteDrawCall("DrawInstancedIndirect", 0, 0, _ReturnAddress());
     BeforeDraw(c);
     hookprof::Orig orig;
     o_dii2(c, b, o);
@@ -5441,6 +5450,7 @@ bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* r
             if (p.forward) {  // a target of another size: MVR pauses, the game's views go as they are
                 if (!p.paused) ++p.pauses;
                 p.paused = true;
+                fwddiag::OnPauseBind(c, n, rtv, dsv);
                 if (p.views != 1 && SetViews(c, 1)) p.views = 1;
                 return;
             }

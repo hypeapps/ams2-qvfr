@@ -12,6 +12,7 @@
 #include "clones.h"
 #include "common.h"
 #include "dxbc.h"
+#include "fwd_diag.h"
 #include "gpu.h"
 #include "hook_prof.h"
 #include "hooks.h"
@@ -682,6 +683,7 @@ HRESULT STDMETHODCALLTYPE D_CreatePixelShader(ID3D11Device* dev, const void* cod
     HRESULT hr = filter ? filter(dev, code, len, link, out, o_createPs, (uintptr_t)_ReturnAddress())
                         : o_createPs(dev, code, len, link, out);
     if (SUCCEEDED(hr) && out && *out) {
+        fwddiag::OnShaderMade(*out, 'P', code, len);
         Protect("CreatePixelShader", [&] {
             taaviews::OnPixelShaderMade(*out, code, len);  // the game's TAA resolve (focus motion fix)
             const int k = Classify(code, len);
@@ -736,6 +738,7 @@ void STDMETHODCALLTYPE D_DrawIndexed(ID3D11DeviceContext* c, UINT count, UINT st
         hookprof::SubScope sp(hookprof::STaaDraw);
         taaFix = taaviews::OnDraw(c, true, count);
     }
+    fwddiag::NoteDrawCall("DrawIndexed", count, 1, _ReturnAddress());
     const bool mvr = mvrpass::BeforeDraw(c);
     int g = -1;
     Action a = Forward;
@@ -776,6 +779,7 @@ void STDMETHODCALLTYPE D_Draw(ID3D11DeviceContext* c, UINT count, UINT start) {
         hookprof::SubScope sp(hookprof::STaaDraw);
         taaFix = taaviews::OnDraw(c, false, count);
     }
+    fwddiag::NoteDrawCall("Draw", count, 1, _ReturnAddress());
     const bool mvr = mvrpass::BeforeDraw(c);
     int g = -1;
     Action a = Forward;

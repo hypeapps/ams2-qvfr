@@ -33,6 +33,7 @@
 #include <string>
 #include <vector>
 
+#include "fwd_diag.h"
 #include "hooks.h"
 #include "mvr_pass.h"
 #include "mvr_ps.h"
@@ -1881,8 +1882,17 @@ int RunMvrForward() {
     qvfr::mvrpass::TestStateCheck(trkChecks, trkMis);
     const unsigned long long psReads = qvfr::sunfx::PsReads();
     const bool trackOk = trkChecks > 0 && trkMis == 0;
+    // Forward diagnostics: the draw into the 1/2 size target (MVR paused) described with its PS's reflection names.
+    const qvfr::fwddiag::TestState fd = qvfr::fwddiag::TestGet();
+    const bool fwdDiagOk = fd.pausedDraws >= 1 && fd.kinds >= 1 && fd.detailLines >= 1 &&
+                           fd.lastDraw.find("rt0 ") != std::string::npos &&
+                           fd.lastPs.find("globalTexture0@t3") != std::string::npos;
     const bool ok = countsOk && outerOk && focusOk && liveOk && velSkipOk && gbufOk && nativeOk && msaa.ok && ltOk &&
-                    trackOk && cornerOk && k5bOk && !warnings;
+                    trackOk && cornerOk && k5bOk && fwdDiagOk && !warnings;
+    printf("  forward diagnostics: shaders described %llu, draws while paused %llu, draw lines %llu, kinds %llu (%s)\n"
+           "    last draw: %s\n    its PS: %s\n",
+           (unsigned long long)fd.shaders, (unsigned long long)fd.pausedDraws, (unsigned long long)fd.detailLines,
+           (unsigned long long)fd.kinds, fwdDiagOk ? "OK" : "WRONG", fd.lastDraw.c_str(), fd.lastPs.c_str());
     printf("  B20 K5b: the same with focus's screen texture as slice 1 of a three-slice array: passes %u, ok %u (%s); "
            "focus's color and depth vs the corner run %d px differ (%s)\n",
            klv.passes, klv.ok, klv.why.empty() ? "-" : klv.why.c_str(), k5bDiff, k5bOk ? "OK" : "WRONG");

@@ -176,6 +176,7 @@ add_library(qvfr_proxy SHARED
   mvr_ps.cpp
   mvr_vs.cpp
   mvr_pass.cpp
+  fwd_diag.cpp
   mvr_motion.cpp
   taa_views.cpp
   common.cpp

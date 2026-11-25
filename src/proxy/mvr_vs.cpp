@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "common.h"
+#include "fwd_diag.h"
 #include "hooks.h"
 #include "dxbc.h"
 #include "mvr_patch.h"
@@ -267,9 +268,12 @@ HRESULT STDMETHODCALLTYPE D_CreateVertexShader(ID3D11Device* dev, const void* co
     if (SUCCEEDED(hr) && out && *out && code && len) {
         ShaderInfo info{patched, {}};
         SumText(code, len, info.sum);
-        std::unique_lock lock(g_sm);
-        g_shaders[*out] = info;
-        g_gen.fetch_add(1, std::memory_order_acq_rel);  // the render thread's memo (IsPatchedRt) looks again
+        {
+            std::unique_lock lock(g_sm);
+            g_shaders[*out] = info;
+            g_gen.fetch_add(1, std::memory_order_acq_rel);  // the render thread's memo (IsPatchedRt) looks again
+        }
+        fwddiag::OnShaderMade(*out, 'V', code, len);
     }
     return hr;
 }

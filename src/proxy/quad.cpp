@@ -23,6 +23,7 @@
 #include "focus_cull.h"
 #include "focus_geometry.h"
 #include "frame.h"
+#include "fwd_diag.h"
 #include "fwd_rec.h"
 #include "gpu.h"
 #include "hook_prof.h"
@@ -3467,6 +3468,7 @@ void LogStats(bool totals) {
         mvrvs::LogStats(totals);
         mvrps::LogStats(totals);
         mvrpass::LogStats(totals);
+        fwddiag::LogStats(totals);
         taaviews::LogStats(totals);
     });
 }
