@@ -21,6 +21,7 @@
 #include "sun_fx_ps.h"  // kSunFxPS (fxc from shaders/sun_fx.hlsl)
 #include "sun_fx_vs.h"  // kSunFxVS
 #include "taa_views.h"
+#include "windscreen.h"
 
 namespace qvfr::sunfx {
 
@@ -684,6 +685,7 @@ HRESULT STDMETHODCALLTYPE D_CreatePixelShader(ID3D11Device* dev, const void* cod
     if (SUCCEEDED(hr) && out && *out) {
         Protect("CreatePixelShader", [&] {
             taaviews::OnPixelShaderMade(*out, code, len);  // the game's TAA resolve (focus motion fix)
+            windscreen::OnPixelShaderMade(*out, code, len);  // the sharpen and the windscreen layers
             const int k = Classify(code, len);
             if (k >= 0) {
                 SetKind(*out, kKnown[k].kind);
@@ -711,10 +713,18 @@ void STDMETHODCALLTYPE D_PSSetShader(ID3D11DeviceContext* c, ID3D11PixelShader* 
         o_psSet(c, ps, ci, n);
     }
     if (c != g_imm.load(std::memory_order_relaxed)) return;
+    windscreen::OnPixelShaderSet(ps);
     g_curPs = ps;
     g_curKind = Lookup(ps, &g_curArg);
     g_curPsEpoch = g_psEpoch;
 }
+
+struct IndexedArgs {
+    ID3D11DeviceContext* c;
+    UINT count, start;
+    INT base;
+};
+void DrawIndexedTail(void* p);
 
 void STDMETHODCALLTYPE D_DrawIndexed(ID3D11DeviceContext* c, UINT count, UINT start, INT base) {
     hookprof::Scope prof(hookprof::KDraw);
@@ -727,6 +737,17 @@ void STDMETHODCALLTYPE D_DrawIndexed(ID3D11DeviceContext* c, UINT count, UINT st
     srcb::OnDraw(c);  // S2.1: after the TAA resolve of a DLSS SR group, the constants at the view size
     if (srprobe::Armed()) srprobe::OnDraw(c, _ReturnAddress(), "DrawIndexed");  // S2.1 probe frame only
     if (mvrpass::SkipDraw(c)) return;  // B11: a focus velocity pass whose target got outer's vectors
+    IndexedArgs args{c, count, start, base};
+    // The passes after TAA: the game's sharpen and the windscreen glass (windscreen.h; the rest of the detour as `draw`).
+    if (windscreen::OnDraw(c, DrawIndexedTail, &args)) return;
+    DrawIndexedTail(&args);
+}
+
+void DrawIndexedTail(void* p) {
+    const IndexedArgs& args = *static_cast<IndexedArgs*>(p);
+    ID3D11DeviceContext* c = args.c;
+    const UINT count = args.count, start = args.start;
+    const INT base = args.base;
     if (const DrawReplaceFn replace = g_drawReplace.load(std::memory_order_relaxed)) {
         hookprof::SubScope sp(hookprof::SDlss);
         if (replace(c, count)) return;  // DLSS replaced the game's TAA resolve
@@ -761,6 +782,12 @@ void STDMETHODCALLTYPE D_DrawIndexed(ID3D11DeviceContext* c, UINT count, UINT st
     if (const AfterFn after = g_drawAfter.load(std::memory_order_relaxed)) after(c);
 }
 
+struct PlainArgs {
+    ID3D11DeviceContext* c;
+    UINT count, start;
+};
+void DrawTail(void* p);
+
 void STDMETHODCALLTYPE D_Draw(ID3D11DeviceContext* c, UINT count, UINT start) {
     hookprof::Scope prof(hookprof::KDraw);
     if (const InsideFn inside = g_drawInside.load(std::memory_order_relaxed); inside && inside()) {
@@ -771,6 +798,16 @@ void STDMETHODCALLTYPE D_Draw(ID3D11DeviceContext* c, UINT count, UINT start) {
     if (mvrpass::SkipDraw(c)) return;  // B11
     srcb::OnDraw(c);  // S2.1
     if (srprobe::Armed()) srprobe::OnDraw(c, _ReturnAddress(), "Draw");  // S2.1 probe frame only
+    PlainArgs args{c, count, start};
+    // The passes after TAA: the game's sharpen and the windscreen glass (windscreen.h; the rest of the detour as `draw`).
+    if (windscreen::OnDraw(c, DrawTail, &args)) return;
+    DrawTail(&args);
+}
+
+void DrawTail(void* p) {
+    const PlainArgs& args = *static_cast<PlainArgs*>(p);
+    ID3D11DeviceContext* c = args.c;
+    const UINT count = args.count, start = args.start;
     bool taaFix;
     {
         hookprof::SubScope sp(hookprof::STaaDraw);

@@ -538,18 +538,23 @@ Config ReadConfig(const fs::path& ini) {
     c.dlaaOuterDisplayPass = IniInt(ini, L"dlaa", L"outer_display_pass", c.dlaaOuterDisplayPass ? 1 : 0) != 0;
     c.dlaaDisplayPassMinScale =
         std::clamp(IniFloat(ini, L"dlaa", L"display_pass_min_scale", c.dlaaDisplayPassMinScale), 0.0f, 1.0f);
+    c.dlaaDisplayEdge = std::clamp(IniInt(ini, L"dlaa", L"display_pass_edge", c.dlaaDisplayEdge), 0, 2);
+    c.gameSharpen = std::clamp(IniFloat(ini, L"dlaa", L"game_sharpen", c.gameSharpen), 0.0f, 1.0f);
+    c.windscreenDepth = std::clamp(IniInt(ini, L"dlaa", L"windscreen_depth", c.windscreenDepth), 0, 3);
+    Log("Settings: [dlaa] game_sharpen=%.2f windscreen_depth=%d", c.gameSharpen, c.windscreenDepth);
     if (c.dlaa)
         Log("Settings: [dlaa] mode=%s render_scale=%.3f outer_render_scale=%.3f focus_render_scale=%.3f preset=%s "
             "outer_preset=%s focus_preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d "
             "auto_exposure=%d exposure=%.4f exposure_scale=%.4f bias_mask=%.2f skip_locks=%d modifier=0x%X key=0x%X "
-            "exposure_key=0x%X cockpit_taa=%d display_pass=%d outer_display_pass=%d display_pass_min_scale=%.2f",
+            "exposure_key=0x%X cockpit_taa=%d display_pass=%d outer_display_pass=%d display_pass_min_scale=%.2f "
+            "display_pass_edge=%d",
             c.dlaaSr ? "dlss" : "dlaa", c.dlaaRenderScale, c.dlaaOuterRenderScale, c.dlaaFocusRenderScale,
             preset.c_str(), outerPreset.empty() ? preset.c_str() : outerPreset.c_str(),
             focusPreset.empty() ? preset.c_str() : focusPreset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY,
             c.dlaaMvJittered, c.dlaaAutoExposure,
             c.dlaaExposure, c.dlaaExposureScale, c.dlaaBiasMask, c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey,
             c.dlaaExpKey, c.dlaaCockpitTaa, c.dlaaDisplayPass ? 1 : 0, c.dlaaOuterDisplayPass ? 1 : 0,
-            c.dlaaDisplayPassMinScale);
+            c.dlaaDisplayPassMinScale, c.dlaaDisplayEdge);
     const std::string nr = IniString(ini, L"nr", L"mode", L"off");
     c.nrMode = nr == "focus" ? 1 : nr == "final" ? 2 : 0;
     if (nr != "off" && nr != "focus" && nr != "final") Log("Settings: unknown [nr] mode=\"%s\", using off", nr.c_str());
@@ -634,6 +639,7 @@ bool g_testKeyDown = false;
 struct TestScenario {
     const char* name;
     void (*apply)(Config&);
+    const char* switches = "";  // quad switches (TestScenarioSwitches)
 };
 const TestScenario kTestScenarios[] = {
     {"as in the ini", [](Config&) {}},
@@ -752,6 +758,9 @@ bool ReloadConfig(bool force) {
     c.dlaaDisplayPass = n.dlaaDisplayPass;
     c.dlaaOuterDisplayPass = n.dlaaOuterDisplayPass;
     c.dlaaDisplayPassMinScale = n.dlaaDisplayPassMinScale;
+    c.dlaaDisplayEdge = n.dlaaDisplayEdge;
+    c.gameSharpen = n.gameSharpen;
+    c.windscreenDepth = n.windscreenDepth;
     c.nrMode = n.nrMode;
     c.nrKeyMod = n.nrKeyMod;
     c.nrKey = n.nrKey;
@@ -909,6 +918,9 @@ bool ReloadConfig(bool force) {
     }
     return true;
 }
+
+int TestScenarioStep() { return g_testStep; }
+const char* TestScenarioSwitches() { return kTestScenarios[g_testStep].switches; }
 
 void TestScenarioFrame() {
     const Config& c = g_cfg;
