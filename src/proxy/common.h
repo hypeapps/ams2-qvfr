@@ -271,6 +271,9 @@ struct Config {
     // Restart only (mvr_pass.h): the live forward pass draws into targets of another size (the 1/2 size particles) with
     // two views when their focus clones allow it.
     bool mvrForwardOther = true;
+    // Restart only (mvr_pass.h): a focus group takes outer's G-buffer only in frames whose forward also comes from
+    // outer.
+    bool mvrGbufferWithForward = true;
     // Restart only (docs/mvr.md B20 K5b, mvr_pass.h): in the corner layout without DLSS SR (focus at the game's size) the
     // G-buffer pass's colors become three-slice arrays whose slices 1 and 2 are focus L's and focus R's clones of them
     // (no extract copy), and the pass's other copies get three slices (outer R draws view 1 into slice 2).

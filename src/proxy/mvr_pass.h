@@ -170,6 +170,11 @@ const char* ForwardDepthName(int mode);
 // depth first (a multisampled forward pass then shades its color from scratch; AMS2 draws the opaque sky dome first).
 void SetMsColorSkip(bool on);
 bool GetMsColorSkip();
+// [debug] mvr_gbuffer_with_forward (restart only, default on): a focus group takes outer's G-buffer (and the early SSAO
+// and lights) only in frames whose forward pass also comes from outer. When outer's live forward pass of the eye was
+// refused or failed (or the live forward is off), the focus group's first G-buffer task takes back the skip and the
+// group draws its whole image itself: its own forward geometry over outer's G-buffer shows the cockpit twice under
+// DLAA or the game's TAA far from the track's origin (float rounding moves the two up to about a millimetre apart).
 // [debug] mvr_forward_other (restart only, default on): the live forward pass draws into targets of another size than
 // outer's (AMS2: the 1/2 size lit particles, drawn in multiplayer) with two views when they are single-sample 2D
 // textures whose focus clones are the same fraction of focus's size and the PS reads no screen inputs: two-slice
@@ -388,8 +393,9 @@ struct TestLiveState {
     std::string why;  // the latest live pass's failure
 };
 TestLiveState TestLiveGet();
-// mvr_forward_other as the ini would set it.
+// mvr_forward_other and mvr_gbuffer_with_forward as the ini would set them.
 void TestSetForwardOther(bool on);
+void TestSetGbufferWithForward(bool on);
 // B19: the session's live track counters (per eye: renders and builds skipped, renders run) and the stop.
 struct TestLiveTrackState {
     unsigned long long skipped[2] = {}, builds[2] = {}, ran[2] = {}, checked = 0, reads = 0;

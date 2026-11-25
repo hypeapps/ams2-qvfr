@@ -1545,9 +1545,12 @@ int RunMvrForward() {
     // multiplayer): with mvr_forward_other view 1 draws it into the copy's slice 1 at the clone's share (32 x 24 of
     // 48 x 40), which goes into focus's 1/2 size clones; without it the pass falls back to focus's own.
     const qvfr::mvrps::Info halfInfo = qvfr::mvrps::InfoOf(g_s.half.Get());
+    // Then focus L's G-buffer task (mvr_gbuffer_with_forward): skipped after the pass from outer, drawn by the group
+    // after the fallen-back pass (its forward geometry would not match outer's G-buffer).
     struct HalfRun {
         qvfr::mvrpass::TestLiveState lv;
         std::vector<uint64_t> gC, gH, gHD, fH, fHD;
+        bool gbufSkipped = false;
     };
     auto runHalf = [&](bool on) {
         HalfRun r;
@@ -1569,6 +1572,9 @@ int RunMvrForward() {
         r.gHD = Read(g_s.game.halfDepth.Get());
         r.fH = Read(g_s.focus.half.Get());
         r.fHD = Read(g_s.focus.halfDepth.Get());
+        FakeTask g1{g_vtPhase1};
+        r.gbufSkipped = qvfr::mvrpass::BeforeTask((uint8_t*)&g1, 2);
+        qvfr::mvrpass::AfterTask((uint8_t*)&g1);
         qvfr::mvrpass::TestEnd();
         g_halfDraw = false;
         g_halfPs = nullptr;
@@ -1598,6 +1604,7 @@ int RunMvrForward() {
                         hOuter == 0 && hColor == 0 && hCovered > hpx / 3 && hCBig * 100 <= hpx &&
                         hDOff * 100 <= hpx && hOff.lv.ok == 0 && hOff.lv.otherDraws == 0 &&
                         hOff.lv.why.find("mvr_forward_other off") != std::string::npos;
+    const bool gbufFwdOk = hOn.gbufSkipped && !hOff.gbufSkipped;
     const int nOuter = differ(ngC, lgC) + differ(ngD, lgD), nFocus = differ(nC, lC) + differ(nD, lD);
     const bool nativeOk = arrDsv && nlv.passes == 1 && nlv.ok == 1 && nlv.native == 1 && nlv.copiedBack == 1 &&
                           lv.native == 0 && lv.copiedBack == 2 && nOuter == 0 && nFocus == 0;
@@ -1947,7 +1954,11 @@ int RunMvrForward() {
     const unsigned long long psReads = qvfr::sunfx::PsReads();
     const bool trackOk = trkChecks > 0 && trkMis == 0;
     const bool ok = countsOk && outerOk && focusOk && liveOk && velSkipOk && gbufOk && nativeOk && msaa.ok && ltOk &&
-                    trackOk && cornerOk && k5bOk && halfOk && !warnings;
+                    trackOk && cornerOk && k5bOk && halfOk && gbufFwdOk && !warnings;
+    printf("  focus L's G-buffer task after the pass (mvr_gbuffer_with_forward): from outer %s, after the fallen-back "
+           "pass %s (%s)\n",
+           hOn.gbufSkipped ? "skipped" : "DRAWN", hOff.gbufSkipped ? "SKIPPED" : "drawn by the group",
+           gbufFwdOk ? "OK" : "WRONG");
     printf("  live pass with a draw into the 1/2 size target (PS %s): passes %u, ok %u (%s), draws there with two views "
            "%u, targets into focus's clones %u; outer's 1/2 size target and depth vs without MVR %d px, its color vs the "
            "live run %d px differ; focus's 1/2 size clone vs focus's own pass (%d covered): color %d px by > 0.02 (max "

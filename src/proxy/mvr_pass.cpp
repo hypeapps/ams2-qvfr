@@ -705,6 +705,7 @@ struct FocusState {
     bool earlyLights = false;  // ... and its lights
     bool ssaoAgain = false;    // diagnosis (mode 4): the focus group runs its SSAO too
     bool refill = false;       // diagnosis (mode 5): the focus group gets the stash again at its G-buffer pass
+    bool gbufSeen = false;     // the focus group's first G-buffer task (build or render) of the frame ran
 };
 FocusState g_focus[2];
 
@@ -838,6 +839,14 @@ struct VelDepth {
     uint64_t frame = 0;
 };
 VelDepth g_vel[2];
+// A focus image takes outer's G-buffer only in frames whose forward pass also comes from outer: focus's own forward
+// geometry differs from outer's by float rounding far from the origin (up to about a millimetre), so its own forward pass
+// over outer's G-buffer shows the cockpit twice under DLAA or the game's TAA. When outer's live forward pass of the eye
+// was refused or failed in this frame (or is off), the focus group's first G-buffer task takes back the skip and the
+// group draws its own G-buffer, SSAO, lights and forward pass.
+bool g_gbufWithFwd = true;  // [debug] mvr_gbuffer_with_forward (restart only)
+uint64_t g_fwdDone[2] = {};  // the frame in which outer's live forward pass of the eye ended or was refused
+bool g_gbufEarlyLogged[2] = {};  // a focus G-buffer task ran before that (logged once per eye)
 // Mode 3 in the corner layout (B20): outer's forward depth goes back into outer's clone as view 0 drew it through M_0
 // (exact, for the crowd, K4), so outer's velocity pass (outer's own geometry, LESS_EQUAL) would miss it where M_0 rounds
 // nearer, as focus's did in mode 0: those pixels keep the camera motion of their linear depth (hundreds of pixels on the
@@ -3083,6 +3092,7 @@ void DiagDraw(ID3D11DeviceContext* c, const char* what, int psKind) {
 // A pass that runs plain: the G-buffer's focus group runs its own pass, the forward test has no comparison, the live
 // forward's focus group runs its own forward pass.
 void PassRefused(bool forward, bool live, int e, const char* why) {
+    if (live) g_fwdDone[e & 1] = g_frame;
     if (live)
         FwdReason(e, why);
     else if (forward)
@@ -3556,6 +3566,7 @@ void ForwardToClones(ID3D11DeviceContext* c) {
 void LiveEnd(ID3D11DeviceContext* c) {
     Pass& p = g_p;
     const int e = p.eye;
+    g_fwdDone[e & 1] = g_frame;
     if (p.part == PartWait) {
         p = Pass{};
         return FwdReason(e, "outer's forward pass bound no target at the game's size");
@@ -3692,6 +3703,7 @@ const char* Decide(int eye) {
     const Stash& s = g_stash[eye];
     const FocusState& f = g_focus[eye];
     if (g_shot.armed) return "shot frame (own pass for the comparison)";
+    if (g_gbufWithFwd && g_mode == Mode::Skip && !g_forwardOn) return "the live forward is off (mvr_gbuffer_with_forward)";
     if (!s.valid || s.frame != g_frame) return "no stash from outer's pass in this frame";
     if (!f.projected || f.frame != g_frame) return "the focus group renders without the focus projection";
     if (!FocusSwapped() && !FocusAtGame()) return "the focus clones are not in";
@@ -4633,6 +4645,7 @@ bool Install() {
         g_msSlices = Cfg().mvrMsSlices;
         g_gbufSlices = Cfg().mvrGbufferSlices;
         g_fwdOther = Cfg().mvrForwardOther;
+        g_gbufWithFwd = Cfg().mvrGbufferWithForward;
         g_ltOn = Cfg().mvrLiveTrackSkip;
         g_ltEarlyOn = Cfg().mvrLiveTrackEarly;
         g_installed = true;
@@ -4745,7 +4758,8 @@ void OnFrameStart(bool enabled) {
             Log("MVR G-buffer: %s (frame %llu)", on ? "ON" : "OFF (the focus groups run their own pass)",
                 (unsigned long long)g_frame);
         g_enabled = on;
-        for (FocusState& f : g_focus) f.decided = f.skip = f.early = f.earlyLights = f.ssaoAgain = f.refill = false;
+        for (FocusState& f : g_focus)
+            f.decided = f.skip = f.early = f.earlyLights = f.ssaoAgain = f.refill = f.gbufSeen = false;
         ++g_st.frames;
         ++g_tot.frames;
     });
@@ -5256,8 +5270,9 @@ bool Phase3Task(uint8_t* task, int group, bool build) {
         const char* why = LiveWanted(group);
         if (!why)
             PassBegin(task, group, true, true);
-        else if (*why)
-            FwdReason(group, why);
+        else
+            g_fwdDone[group & 1] = g_frame;
+        if (why && *why) FwdReason(group, why);
         return false;
     }
     const int eye = group - kFocusL;
@@ -5448,6 +5463,24 @@ bool BeforeTask(uint8_t* task, int group) {
                 ++g_tot.switches[eye];
             }
             g_lastSkip[eye] = f.skip;
+        }
+        // mvr_gbuffer_with_forward: outer's G-buffer only with outer's forward pass of this frame. The first of the
+        // pair decides (the build records what the render replays).
+        if (!f.gbufSeen) {
+            f.gbufSeen = true;
+            if (f.skip && g_gbufWithFwd && g_mode == Mode::Skip && g_forwardOn) {
+                if (g_fwdDone[eye] != g_frame) {
+                    if (!g_gbufEarlyLogged[eye]) {
+                        g_gbufEarlyLogged[eye] = true;
+                        Log("MVR G-buffer: focus %s's G-buffer task ran before outer's live forward pass of the eye ended "
+                            "(frame %llu): outer's G-buffer kept", kEye[eye], (unsigned long long)g_frame);
+                    }
+                } else if (g_fwdOk[eye] != g_frame) {
+                    f.skip = f.early = f.earlyLights = false;
+                    g_lastSkip[eye] = 0;
+                    Own(eye, "the live forward pass not from outer in this frame (mvr_gbuffer_with_forward)");
+                }
+            }
         }
         if (f.skip && g_mode != Mode::Skip && g_mode != Mode::SkipRaw) {  // the engine runs both tasks
             const bool fill = g_mode == Mode::Overwrite || g_mode == Mode::NoDepth;
@@ -6549,6 +6582,7 @@ TestLiveState TestLiveGet() {
 }
 
 void TestSetForwardOther(bool on) { g_fwdOther = on; }
+void TestSetGbufferWithForward(bool on) { g_gbufWithFwd = on; }
 
 void TestEnd() {
     const bool faulted = g_test.faulted;
