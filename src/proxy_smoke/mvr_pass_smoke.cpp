@@ -619,6 +619,8 @@ int RunMvrPass() {
         printf("MVR pass: context hooks could not be installed\n");
         return 1;
     }
+    // The G-buffer pass alone, without the live forward (mvr_gbuffer_with_forward would keep focus's own pass).
+    qvfr::mvrpass::TestSetGbufferWithForward(false);
     qvfr::mvrpass::TestSetup(ctx.Get(), g_vtOuter, g_vtBuild, &CloneOf, &JitterOf);
     qvfr::mvrpass::TestNative(&IsArrayTarget, &WantArrayTarget);
     qvfr::mvrpass::TestDepthBias(0, 0.0f, false);  // the depth as MVR draws it; the depth fix has its own frames
