@@ -646,6 +646,11 @@ struct TestScenario {
 };
 const TestScenario kTestScenarios[] = {
     {"as in the ini", [](Config&) {}},
+    // DLSS preset F for outer while driving. With the gaze the focus follows the eyes, so outer only (the whole image
+    // from outer) is the way to look at outer's model directly.
+    {"outer with DLSS preset F", [](Config&) {}, "dlss_preset_outer=6"},
+    {"outer only, DLSS preset K", [](Config&) {}, "outer_only=1, dlss_preset_outer=11"},
+    {"outer only, DLSS preset F", [](Config&) {}, "outer_only=1, dlss_preset_outer=6"},
 };
 constexpr int kTestScenarioCount = (int)(sizeof(kTestScenarios) / sizeof(kTestScenarios[0]));
 // The settings any scenario sets, back to the ini's before the next one applies (c.field = ini.field for each; none
