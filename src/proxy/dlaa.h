@@ -44,6 +44,11 @@ void SetPresetSwitch(int which, int preset);
 // frame start.
 int GetGameTaaSwitch();
 void SetGameTaaSwitch(int on);
+// Benchmark sequence switch dlss_exposure: the exposure hotkey's step, 0 = the ini's, 1 auto, 2 0.005, 3 0.002,
+// 4 0.001.
+constexpr int kExposureSteps = 5;
+int GetExposureSwitch();
+void SetExposureSwitch(int step);
 // DLSS replaces the game's TAA in this frame (setting, hotkey, no failure); its evaluation stores outer's motion
 // vectors for focus (mvr_motion.h StoreOuter), so without it focus's velocity pass gets none from outer.
 bool DlssNow();

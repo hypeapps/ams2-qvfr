@@ -2129,6 +2129,16 @@ int GetGameTaaSwitch() {
 
 void SetGameTaaSwitch(int on) { g_gameTaaReq = on ? 1 : 0; }
 
+static_assert(kExposureSteps == kExpStepCount);
+
+int GetExposureSwitch() { return g_expStep.load(); }
+
+void SetExposureSwitch(int step) {
+    if (step < 0 || step >= kExpStepCount || step == g_expStep.load()) return;
+    g_expStep = step;
+    Log("DLAA: sequence switch: %s%s", ExposureText().c_str(), step == 0 ? " (the ini settings)" : "");
+}
+
 bool DlssNow() { return g_installed && Wanted(); }
 
 void LogStats(bool totals) {
