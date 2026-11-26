@@ -550,6 +550,9 @@ struct Copy {
     // B20 K5: the size outer's work sees (an array whose outer clone is its slice 0: outer's corner; else desc's).
     UINT tw = 0, th = 0;
     uint64_t lastSeen = 0;  // the frame tw, th were read for an array
+    // A target of another size than outer's that the live forward pass draws into with two views in this pass (its
+    // focus clone is the same fraction of focus's size): view 1 in the corner of slice 1 at the clone's size.
+    bool other = false;
 };
 struct ViewMap {
     void* orig = nullptr;  // the game's view (only compared)
@@ -625,6 +628,17 @@ struct Pass {
     // an outer-size target.
     bool paused = false;
     unsigned pauses = 0, pausedDraws = 0, pausedClears = 0;
+    // The live pass draws into targets of another size with two views when their focus clones are the same fraction
+    // of focus's size (mvr_forward_other): a bind of them pauses as above (otherCand: they qualify; the views as the
+    // game bound them, alive while bound) and the first draw there maps them to copies (other: bound now, the VS rows
+    // scaled by otherA, otherB to the clones' corner). otherWhy: why the latest such bind did not qualify.
+    bool otherCand = false, other = false;
+    UINT otherN = 0;
+    ID3D11RenderTargetView* otherRtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* otherDsv = nullptr;
+    double otherA = 0, otherB = 0;
+    unsigned otherDraws = 0, otherMaps = 0, otherTargets = 0;
+    std::string otherWhy;
     // B9d: the live forward pass (every frame, either eye): its corners go into focus's clones at the end.
     bool live = false;
     // B9d run 5: the live track map of outer read in the focus window into a focus-size texture for view 1 (once per
@@ -691,6 +705,7 @@ struct FocusState {
     bool earlyLights = false;  // ... and its lights
     bool ssaoAgain = false;    // diagnosis (mode 4): the focus group runs its SSAO too
     bool refill = false;       // diagnosis (mode 5): the focus group gets the stash again at its G-buffer pass
+    bool gbufSeen = false;     // the focus group's first G-buffer task (build or render) of the frame ran
 };
 FocusState g_focus[2];
 
@@ -798,6 +813,7 @@ StashG g_fwd[kMaxTargets];  // the corners of slice 1 after the forward pass, in
 int g_fwdN = 0;
 ComPtr<ID3D11Texture2D> g_fwdDepthIn;  // focus's depth clone copied for a shader view (the copy-in)
 ComPtr<ID3D11Texture2D> g_fwdDepthIn0;  // B20 K4: outer's depth clone the same for slice 0 in the corner layout
+ComPtr<ID3D11Texture2D> g_fwdDepthInOther;  // the same for a depth of another size (Copy::other)
 struct SrvClone {
     ComPtr<ID3D11ShaderResourceView> game, clone;  // clone null: the texture has no focus clone
 };
@@ -813,6 +829,8 @@ int g_fwdDepth = 3;             // [debug] mvr_forward_depth and its hotkey (mvr
 bool g_msColorSkip = true;      // [debug] mvr_ms_color_skip and its hotkey (mvr_pass.h)
 bool g_msSlices = true;         // B12 step 5: [debug] mvr_ms_slices (restart only)
 bool g_gbufSlices = true;       // B20 K5b: [debug] mvr_gbuffer_slices (restart only)
+bool g_fwdOther = true;         // [debug] mvr_forward_other (restart only): Pass::otherCand
+bool g_fwdOtherLogged = false;  // the first pass that drew a target of another size with two views
 // Mode 3: per eye a conservative copy of the forward depth, bound in place of focus's depth clone while the focus
 // group's velocity pass (an R16G16 target at the focus size) draws.
 struct VelDepth {
@@ -821,6 +839,14 @@ struct VelDepth {
     uint64_t frame = 0;
 };
 VelDepth g_vel[2];
+// A focus image takes outer's G-buffer only in frames whose forward pass also comes from outer: focus's own forward
+// geometry differs from outer's by float rounding far from the origin (up to about a millimetre), so its own forward pass
+// over outer's G-buffer shows the cockpit twice under DLAA or the game's TAA. When outer's live forward pass of the eye
+// was refused or failed in this frame (or is off), the focus group's first G-buffer task takes back the skip and the
+// group draws its own G-buffer, SSAO, lights and forward pass.
+bool g_gbufWithFwd = true;  // [debug] mvr_gbuffer_with_forward (restart only)
+uint64_t g_fwdDone[2] = {};  // the frame in which outer's live forward pass of the eye ended or was refused
+bool g_gbufEarlyLogged[2] = {};  // a focus G-buffer task ran before that (logged once per eye)
 // Mode 3 in the corner layout (B20): outer's forward depth goes back into outer's clone as view 0 drew it through M_0
 // (exact, for the crowd, K4), so outer's velocity pass (outer's own geometry, LESS_EQUAL) would miss it where M_0 rounds
 // nearer, as focus's did in mode 0: those pixels keep the camera motion of their linear depth (hundreds of pixels on the
@@ -863,6 +889,7 @@ std::vector<ID3D11Resource*> g_twinOrigs;
 // A clear of a target of another size in the live forward pass (repeated on its focus clone at the end).
 struct OtherClear {
     ID3D11Resource* orig = nullptr;  // only compared
+    ID3D11Resource* res = nullptr;   // the texture as cleared (only compared with Copy::orig)
     bool depth = false;
     D3D11_RENDER_TARGET_VIEW_DESC rd{};
     D3D11_DEPTH_STENCIL_VIEW_DESC dd{};
@@ -892,6 +919,8 @@ struct FwdStats {
     uint64_t liveTracks = 0, liveTrackFails = 0;  // live track maps read in the focus window for view 1
     uint64_t copyIns = 0, clearFills = 0, msTargets = 0, colorSkips = 0;  // B12 (Pass)
     uint64_t sliceTargets[2] = {}, sliceClears = 0;  // B12 step 5 (Pass), per eye
+    // Targets of another size drawn with two views (Pass::other): passes per eye, draws, targets into focus's clones.
+    uint64_t otherPasses[2] = {}, otherDraws = 0, otherTargets = 0;
     double ms[2] = {};
     std::vector<Reason> reasons;
 };
@@ -903,6 +932,7 @@ struct TestLive {
     unsigned native = 0, copiedBack = 0;  // B17: the last live pass's targets that were the game's arrays, copied back
     unsigned copyIns = 0, clearFills = 0, msTargets = 0, colorSkips = 0;  // B12: the last live pass's
     unsigned sliceTargets = 0, sliceClears = 0;                           // B12 step 5: the last live pass's
+    unsigned otherDraws = 0, otherTargets = 0;  // the last live pass's (Pass::other)
     std::string why;
 };
 TestLive g_testLive;
@@ -1070,6 +1100,7 @@ void ReleaseAll() {
     g_fwdN = 0;
     g_fwdDepthIn.Reset();
     g_fwdDepthIn0.Reset();
+    g_fwdDepthInOther.Reset();
     ResetMsScratch();
     g_srvClones.clear();
     g_twinOrigs.clear();
@@ -1472,7 +1503,9 @@ void BuildRows(Pass& p, const Win& win) {
         ox += -win.sx * p.jit[0] / p.w + p.jit[0] / p.fw;
         oy += -win.sy * p.jit[1] / p.h + p.jit[1] / p.fh;
     }
-    const double a = (double)p.fw / p.sw, b = (double)p.fh / p.sh, sx = win.sx, sy = win.sy;
+    // A target of another size (Pass::other): view 1 fills its focus clone's corner of it.
+    const double a = p.otherA ? p.otherA : (double)p.fw / p.sw, b = p.otherB ? p.otherB : (double)p.fh / p.sh;
+    const double sx = win.sx, sy = win.sy;
     const float rows[8][4] = {
         {(float)(a * sx), 0, 0, (float)(a * ox + a - 1)},
         {0, (float)(b * sy), 0, (float)(b * oy + 1 - b)},
@@ -1703,6 +1736,61 @@ int CopyOfView(ID3D11View* v) {
     return k;
 }
 
+// A copy of another size (Copy::other): focus's clone (cw x ch, checked at the bind) or, when the pass cleared the
+// game's texture before the copy existed, those clears into the corner of slice 1. Null: done; else why not.
+const char* FillOtherSlice1(ID3D11DeviceContext* c, Copy& cp, bool skip) {
+    Pass& p = g_p;
+    ID3D11Texture2D* clone = FocusTarget(cp.orig);
+    if (!clone) return "a target of another size without a focus clone";
+    D3D11_TEXTURE2D_DESC cd{};
+    clone->GetDesc(&cd);
+    if (skip) {
+        ++p.clearFills;
+        return nullptr;
+    }
+    unsigned cleared = 0;
+    for (const OtherClear& oc : g_otherClears) {
+        if (oc.res != cp.orig || oc.depth != cp.depth) continue;
+        ID3D11View* v = nullptr;
+        if (oc.depth) {
+            D3D11_DEPTH_STENCIL_VIEW_DESC d = oc.dd;
+            if (d.ViewDimension != D3D11_DSV_DIMENSION_TEXTURE2D) return "a clear of another size not of a 2D view";
+            const UINT mip = d.Texture2D.MipSlice;
+            d.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
+            d.Texture2DArray = {mip, 1, 1};
+            v = CloneViewOf(cp.arr.Get(), 1, &d, sizeof(d));
+        } else {
+            D3D11_RENDER_TARGET_VIEW_DESC d = oc.rd;
+            if (d.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D) return "a clear of another size not of a 2D view";
+            const UINT mip = d.Texture2D.MipSlice;
+            d.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+            d.Texture2DArray = {mip, 1, 1};
+            v = CloneViewOf(cp.arr.Get(), 0, &d, sizeof(d));
+        }
+        if (!v) return "no view on slice 1 for a clear of another size";
+        Internal in;
+        if (oc.depth)
+            c->ClearDepthStencilView((ID3D11DepthStencilView*)v, oc.flags, oc.d, oc.s);
+        else
+            c->ClearRenderTargetView((ID3D11RenderTargetView*)v, oc.col);
+        ++cleared;
+    }
+    if (cleared) {
+        ++p.clearFills;
+        return nullptr;
+    }
+    if (cp.depth) {
+        if (!DepthIn(c, cp, clone, 1, cd.Width, cd.Height, g_fwdDepthInOther))
+            return "focus's depth of another size could not go into slice 1";
+    } else {
+        Internal in;
+        const D3D11_BOX box{0, 0, 0, cd.Width, cd.Height, 1};
+        c->CopySubresourceRegion(cp.arr.Get(), D3D11CalcSubresource(0, 1, cp.desc.MipLevels), 0, 0, 0, clone, 0, &box);
+    }
+    ++p.copyIns;
+    return nullptr;
+}
+
 // Copy k's content: slice 0 = the game's texture, the corner of slice 1 = focus's clone (once per copy and pass).
 // `cleared`: the game clears all of it now (B12: then neither slice needs its content first).
 void FillCopyAt(ID3D11DeviceContext* c, int k, bool cleared) {
@@ -1742,7 +1830,9 @@ void FillCopyAt(ID3D11DeviceContext* c, int k, bool cleared) {
     D3D11_TEXTURE2D_DESC cd{};
     if (clone) clone->GetDesc(&cd);
     const int fs = outerSize ? FocusSliceOfCopy(cp) : 0;
-    if (!outerSize) {
+    if (!outerSize && cp.other) {
+        if (const char* why = FillOtherSlice1(c, cp, skip)) PassFailed(p, why);
+    } else if (!outerSize) {
         PassFailed(p, "a forward target not at the outer size");
     } else if (fs) {
         // B12 step 5: focus's clone is this slice of the array, so focus's content is in its corner already.
@@ -2132,8 +2222,11 @@ ID3D11ShaderResourceView* CloneSrv(ID3D11ShaderResourceView* v, bool& held) {
 
 // Before each draw of the forward pass: two views when the VS and the PS are right for view 1 (VS patched; PS
 // patched or not needing it), else one; a patched PS gets the rows in slot 3 and focus's copies of its screen textures.
+bool SwitchOther(ID3D11DeviceContext* c);  // below
+
 void ForwardDraw(ID3D11DeviceContext* c) {
     Pass& p = g_p;
+    if (p.paused && p.otherCand && !p.failed) SwitchOther(c);
     if (p.paused) {
         ++p.pausedDraws;
         ++p.draws;
@@ -2149,6 +2242,11 @@ void ForwardDraw(ID3D11DeviceContext* c) {
         info = mvrps::InfoOfRt(ps);
     }
     const bool psOk = info.kind == mvrps::Kind::Patched || info.kind == mvrps::Kind::NotNeeded;
+    if (p.other) {
+        ++p.otherDraws;
+        // Its screen inputs would be mapped at outer's size (PsRows): only a PS that reads none draws there.
+        if (info.kind == mvrps::Kind::Patched) PassFailed(p, "a PS with screen inputs draws into a target of another size");
+    }
     if (info.kind == mvrps::Kind::Patched && p.vsPatched) {
         ++p.psPatchedDraws;
         ID3D11Buffer* mine = g_g.psRowsCb.Get();
@@ -2838,7 +2936,7 @@ const char* StartMvr(ID3D11DeviceContext* c, ID3D11Resource* main, int e, uint8_
     p.forward = forward;
     p.live = live;
     if (live) g_otherClears.clear();
-    for (Copy& cp : g_copies) cp.used = cp.filled = cp.pending = false;
+    for (Copy& cp : g_copies) cp.used = cp.filled = cp.pending = cp.other = false;
     {
         Internal in;
         if (g_g.c1)
@@ -2994,6 +3092,7 @@ void DiagDraw(ID3D11DeviceContext* c, const char* what, int psKind) {
 // A pass that runs plain: the G-buffer's focus group runs its own pass, the forward test has no comparison, the live
 // forward's focus group runs its own forward pass.
 void PassRefused(bool forward, bool live, int e, const char* why) {
+    if (live) g_fwdDone[e & 1] = g_frame;
     if (live)
         FwdReason(e, why);
     else if (forward)
@@ -3318,6 +3417,8 @@ void ForwardToClones(ID3D11DeviceContext* c) {
         ID3D11DepthStencilView* dsv;
         ID3D11RenderTargetView* rtv;  // B12: a multisampled color (the clone's view; the corner by PSColorOutMs)
         bool ms;
+        UINT w, h;    // the corner: focus's size, or the clone's for a target of another size
+        bool other;   // Copy::other
     };
     std::vector<Target> ts;
     std::vector<Copy*> sliced;  // B12 step 5: focus's clone is the slice view 1 drew into (nothing to copy)
@@ -3369,9 +3470,35 @@ void ForwardToClones(ID3D11DeviceContext* c) {
             rtv = (ID3D11RenderTargetView*)CloneViewOf(clone, 0, &rv, sizeof(rv));
             if (!rtv) return PassFailed(p, "no target view on a multisampled color clone");
         }
-        ts.push_back({&cp, clone, dsv, rtv, ms});
+        ts.push_back({&cp, clone, dsv, rtv, ms, p.fw, p.fh, false});
     }
     if (ts.empty() && sliced.empty()) return PassFailed(p, "no outer-size forward target");
+    // Targets of another size view 1 drew into (their clones and sizes checked at the bind).
+    std::vector<ID3D11Resource*> otherOrigs;
+    for (Copy& cp : g_copies) {
+        if (!cp.used || !cp.filled || !cp.other) continue;
+        ID3D11Texture2D* clone = FocusTarget(cp.orig);
+        if (!clone) return PassFailed(p, "a target of another size without a focus clone");
+        D3D11_TEXTURE2D_DESC cd{};
+        clone->GetDesc(&cd);
+        if (cd.Format != cp.desc.Format || cd.SampleDesc.Count != 1 || cd.ArraySize != 1 || cd.Width > cp.desc.Width ||
+            cd.Height > cp.desc.Height)
+            return PassFailed(p, "a target of another size whose focus clone changed");
+        ID3D11DepthStencilView* dsv = nullptr;
+        if (cp.depth) {
+            if (!cp.depthSrv) return PassFailed(p, "a depth of another size without a shader view");
+            DXGI_FORMAT dsvF, srvF;
+            DepthFormats(cd.Format, dsvF, srvF);
+            D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+            dv.Format = dsvF;
+            dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
+            dsv = dsvF == DXGI_FORMAT_UNKNOWN ? nullptr
+                                              : (ID3D11DepthStencilView*)CloneViewOf(clone, 1, &dv, sizeof(dv));
+            if (!dsv) return PassFailed(p, "no depth view on focus's depth clone of another size");
+        }
+        ts.push_back({&cp, clone, dsv, nullptr, false, cd.Width, cd.Height, true});
+        otherOrigs.push_back(cp.orig);
+    }
     struct Clear {
         const OtherClear* oc;
         ID3D11View* v;
@@ -3379,6 +3506,8 @@ void ForwardToClones(ID3D11DeviceContext* c) {
     std::vector<Clear> cs;
     unsigned misses = 0;
     for (const OtherClear& oc : g_otherClears) {
+        // A target view 1 drew into: slice 1 got the clear before its draws and goes into the clone below.
+        if (std::find(otherOrigs.begin(), otherOrigs.end(), oc.res) != otherOrigs.end()) continue;
         ID3D11Texture2D* clone = FocusTarget(oc.orig);  // B20 K4: at the game's size the engine's texture or its twin
         // A texture focus shares with outer: the game's clear went to it already (with outer cloned the engine's
         // texture is focus's own; a repeated clear of a shared one clears it the same way).
@@ -3394,7 +3523,9 @@ void ForwardToClones(ID3D11DeviceContext* c) {
     const gpu::Span span = p.eye ? gpu::FwdOutR : gpu::FwdOutL;
     gpu::SpanBegin(span);
     for (const Target& t : ts) {
-        if (t.dsv) {
+        if (t.dsv && t.other) {  // as drawn (the velocity pass reads the pass's own depth)
+            DepthPass(c, t.cp->depthSrv.Get(), t.dsv, t.w, t.h, 0u, 0.0f, false);
+        } else if (t.dsv) {
             const bool stash = g_fwdDepth == 2, bias = g_fwdDepth == 1 || stash;
             DepthPass(c, t.cp->depthSrv.Get(), t.dsv, p.fw, p.fh, bias ? DepthBias() : 0u,
                       stash ? DepthSlope() : 0.0f, stash && DepthDilate(), t.ms ? g_g.psDepthMs.Get() : nullptr);
@@ -3403,7 +3534,7 @@ void ForwardToClones(ID3D11DeviceContext* c) {
         } else if (t.ms) {
             ColorPassMs(c, t.cp->colorSrv.Get(), t.rtv, p.fw, p.fh, g_g.psColorOutMs.Get());
         } else {
-            const D3D11_BOX box{0, 0, 0, p.fw, p.fh, 1};
+            const D3D11_BOX box{0, 0, 0, t.w, t.h, 1};
             Internal in;
             c->CopySubresourceRegion(t.clone, 0, 0, 0, 0, t.cp->arr.Get(), D3D11CalcSubresource(0, 1, t.cp->desc.MipLevels),
                                      &box);
@@ -3428,12 +3559,14 @@ void ForwardToClones(ID3D11DeviceContext* c) {
     }
     g_testLive.otherClears += (unsigned)cs.size();
     g_testLive.otherClearMisses += misses;
+    p.otherTargets = (unsigned)otherOrigs.size();
 }
 
 // End of a live forward pass (B9d): view 1 into focus's clones, or the focus group runs its own pass.
 void LiveEnd(ID3D11DeviceContext* c) {
     Pass& p = g_p;
     const int e = p.eye;
+    g_fwdDone[e & 1] = g_frame;
     if (p.part == PartWait) {
         p = Pass{};
         return FwdReason(e, "outer's forward pass bound no target at the game's size");
@@ -3472,7 +3605,11 @@ void LiveEnd(ID3D11DeviceContext* c) {
     g_st.vpFixes[1] += p.vpFixes;  // B20 K5a
     g_tot.vpFixes[1] += p.vpFixes;
     if (p.lateDraws) PassFailed(p, "draws into an outer-size target after the MVR part");
-    if (p.pausedDraws) PassFailed(p, "draws into targets of other sizes (focus would miss them)");
+    if (p.pausedDraws) {
+        const std::string why = "draws into targets of other sizes (focus would miss them)" +
+                                (p.otherWhy.empty() ? std::string() : ": " + p.otherWhy);
+        PassFailed(p, why.c_str());
+    }
     if (p.plainDraws > p.pausedDraws) PassFailed(p, "draws with one view (VS or PS without the patch)");
     if (!p.failed) ForwardToClones(c);
     const double ms = NowMs() - p.t0;
@@ -3480,6 +3617,9 @@ void LiveEnd(ID3D11DeviceContext* c) {
         ++st->passes[e];
         st->ms[e] += ms;
         st->draws += p.draws;
+        if (p.otherMaps) ++st->otherPasses[e];
+        st->otherDraws += p.otherDraws;
+        if (!p.failed) st->otherTargets += p.otherTargets;
         st->copyIns += p.copyIns;
         st->clearFills += p.clearFills;
         st->msTargets += p.msTargets;
@@ -3497,6 +3637,8 @@ void LiveEnd(ID3D11DeviceContext* c) {
     g_testLive.colorSkips = p.colorSkips;
     g_testLive.sliceTargets = p.sliceTargets;
     g_testLive.sliceClears = p.sliceClears;
+    g_testLive.otherDraws = p.otherDraws;
+    g_testLive.otherTargets = p.failed ? 0 : p.otherTargets;
     if (!p.failed) {
         g_fwdOk[e] = g_frame;
         ++g_testLive.ok;
@@ -3561,6 +3703,7 @@ const char* Decide(int eye) {
     const Stash& s = g_stash[eye];
     const FocusState& f = g_focus[eye];
     if (g_shot.armed) return "shot frame (own pass for the comparison)";
+    if (g_gbufWithFwd && g_mode == Mode::Skip && !g_forwardOn) return "the live forward is off (mvr_gbuffer_with_forward)";
     if (!s.valid || s.frame != g_frame) return "no stash from outer's pass in this frame";
     if (!f.projected || f.frame != g_frame) return "the focus group renders without the focus projection";
     if (!FocusSwapped() && !FocusAtGame()) return "the focus clones are not in";
@@ -4501,6 +4644,8 @@ bool Install() {
         g_msColorSkip = Cfg().mvrMsColorSkip;
         g_msSlices = Cfg().mvrMsSlices;
         g_gbufSlices = Cfg().mvrGbufferSlices;
+        g_fwdOther = Cfg().mvrForwardOther;
+        g_gbufWithFwd = Cfg().mvrGbufferWithForward;
         g_ltOn = Cfg().mvrLiveTrackSkip;
         g_ltEarlyOn = Cfg().mvrLiveTrackEarly;
         g_installed = true;
@@ -4613,7 +4758,8 @@ void OnFrameStart(bool enabled) {
             Log("MVR G-buffer: %s (frame %llu)", on ? "ON" : "OFF (the focus groups run their own pass)",
                 (unsigned long long)g_frame);
         g_enabled = on;
-        for (FocusState& f : g_focus) f.decided = f.skip = f.early = f.earlyLights = f.ssaoAgain = f.refill = false;
+        for (FocusState& f : g_focus)
+            f.decided = f.skip = f.early = f.earlyLights = f.ssaoAgain = f.refill = f.gbufSeen = false;
         ++g_st.frames;
         ++g_tot.frames;
     });
@@ -5124,8 +5270,9 @@ bool Phase3Task(uint8_t* task, int group, bool build) {
         const char* why = LiveWanted(group);
         if (!why)
             PassBegin(task, group, true, true);
-        else if (*why)
-            FwdReason(group, why);
+        else
+            g_fwdDone[group & 1] = g_frame;
+        if (why && *why) FwdReason(group, why);
         return false;
     }
     const int eye = group - kFocusL;
@@ -5317,6 +5464,24 @@ bool BeforeTask(uint8_t* task, int group) {
             }
             g_lastSkip[eye] = f.skip;
         }
+        // mvr_gbuffer_with_forward: outer's G-buffer only with outer's forward pass of this frame. The first of the
+        // pair decides (the build records what the render replays).
+        if (!f.gbufSeen) {
+            f.gbufSeen = true;
+            if (f.skip && g_gbufWithFwd && g_mode == Mode::Skip && g_forwardOn) {
+                if (g_fwdDone[eye] != g_frame) {
+                    if (!g_gbufEarlyLogged[eye]) {
+                        g_gbufEarlyLogged[eye] = true;
+                        Log("MVR G-buffer: focus %s's G-buffer task ran before outer's live forward pass of the eye ended "
+                            "(frame %llu): outer's G-buffer kept", kEye[eye], (unsigned long long)g_frame);
+                    }
+                } else if (g_fwdOk[eye] != g_frame) {
+                    f.skip = f.early = f.earlyLights = false;
+                    g_lastSkip[eye] = 0;
+                    Own(eye, "the live forward pass not from outer in this frame (mvr_gbuffer_with_forward)");
+                }
+            }
+        }
         if (f.skip && g_mode != Mode::Skip && g_mode != Mode::SkipRaw) {  // the engine runs both tasks
             const bool fill = g_mode == Mode::Overwrite || g_mode == Mode::NoDepth;
             if (vt == g_phase1Vt && fill) {  // the stash goes on top after CPhase1Render
@@ -5379,6 +5544,147 @@ void AfterTask(uint8_t* task) {
     Protect("AfterTask", [&] { PassEnd(Imm()); });
 }
 
+namespace {
+
+// View 1's rows for a target of another size (a, b: its focus clone's share of it) or, with 0, for the pass's own
+// targets. The PS rows follow them (PsRows reads the VS rows).
+void SetRows(ID3D11DeviceContext* c, double a, double b) {
+    Pass& p = g_p;
+    if (p.otherA == a && p.otherB == b) return;
+    p.otherA = a;
+    p.otherB = b;
+    BuildRows(p, g_win[p.eye]);
+    Internal in;
+    c->UpdateSubresource(g_g.rowsCb.Get(), 0, nullptr, p.rows, 0, 0);
+    if (p.forward) {
+        float r[dxbc::kMvrPsRows][4];
+        PsRows(p, r);
+        c->UpdateSubresource(g_g.psRowsCb.Get(), 0, nullptr, r, 0, 0);
+    }
+}
+
+// A bind of targets of another size than outer's in the live forward pass: null when view 1 can draw them (all of one
+// size, single-sample 2D textures without mips whose focus clones of their own are the same fraction of focus's size
+// as they are of outer's, within a pixel of rounding; their size in tw, th, the clones' in cw, ch), else why not.
+const char* OtherWhy(UINT n, ID3D11RenderTargetView* const* rtv, ID3D11DepthStencilView* dsv, UINT& tw, UINT& th,
+                     UINT& cw, UINT& ch) {
+    Pass& p = g_p;
+    tw = th = cw = ch = 0;
+    if (!g_fwdOther) return "mvr_forward_other off";
+    if (!p.live) return "not the live pass";
+    if (p.corner) return "the corner layout";
+    auto one = [&](ID3D11View* v, bool twoD) -> const char* {
+        if (!v) return nullptr;
+        if (!twoD) return "not a 2D view";
+        ComPtr<ID3D11Resource> r;
+        v->GetResource(&r);
+        bool ok = false;
+        const D3D11_TEXTURE2D_DESC d = DescOf(r.Get(), &ok);
+        if (!ok) return "not a 2D texture";
+        if (d.ArraySize != 1 || IsNative(r.Get())) return "an array";
+        if (d.SampleDesc.Count != 1) return "multisampled";
+        if (d.MipLevels != 1) return "with mips";
+        if (tw && (d.Width != tw || d.Height != th)) return "targets of different sizes bound together";
+        tw = d.Width;
+        th = d.Height;
+        if (FocusSliceOf(r.Get(), p.eye)) return "focus's clone is a slice of an array";
+        ID3D11Texture2D* clone = FocusTarget(r.Get());
+        if (!clone || (ID3D11Resource*)clone == r.Get()) return "no focus clone of its own";
+        D3D11_TEXTURE2D_DESC fd{};
+        clone->GetDesc(&fd);
+        if (fd.Format != d.Format || fd.SampleDesc.Count != 1 || fd.ArraySize != 1) return "focus's clone of another format";
+        if (cw && (fd.Width != cw || fd.Height != ch)) return "focus's clones of different sizes";
+        cw = fd.Width;
+        ch = fd.Height;
+        const double ex = (double)tw * p.fw / p.w, ey = (double)th * p.fh / p.h;
+        if (cw > tw || ch > th || std::fabs(cw - ex) > 1.0 || std::fabs(ch - ey) > 1.0)
+            return "focus's clone not the same fraction of focus's size";
+        return nullptr;
+    };
+    for (UINT i = 0; i < n && rtv; ++i) {
+        if (!rtv[i]) continue;
+        D3D11_RENDER_TARGET_VIEW_DESC vd{};
+        rtv[i]->GetDesc(&vd);
+        if (const char* w = one(rtv[i], vd.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2D)) return w;
+    }
+    if (dsv) {
+        D3D11_DEPTH_STENCIL_VIEW_DESC vd{};
+        dsv->GetDesc(&vd);
+        if (const char* w = one(dsv, vd.ViewDimension == D3D11_DSV_DIMENSION_TEXTURE2D)) return w;
+    }
+    return tw ? nullptr : "no target";
+}
+
+// The bound views all have copies that view 1 drew into earlier in this pass.
+bool OtherMapped(UINT n, ID3D11RenderTargetView* const* rtv, ID3D11DepthStencilView* dsv) {
+    auto mapped = [](ID3D11View* v) {
+        int k = -1;
+        return !v || (FindView(v, &k) && k >= 0 && k < (int)g_copies.size() && g_copies[k].other);
+    };
+    for (UINT i = 0; i < n && rtv; ++i)
+        if (!mapped(rtv[i])) return false;
+    return mapped(dsv);
+}
+
+// A view of the game whose copy view 1 draws into as a target of another size in this pass (its clears go there).
+bool OtherCopyView(ID3D11View* v) {
+    int k = -1;
+    return v && FindView(v, &k) && k >= 0 && k < (int)g_copies.size() && g_copies[k].other;
+}
+
+// The copies behind the mapped views of a bind of another size become Copy::other.
+void MarkOther(UINT n, ID3D11RenderTargetView* const* rtv, ID3D11DepthStencilView* dsv) {
+    for (UINT i = 0; i < n && rtv; ++i)
+        if (const int k = CopyOfView(rtv[i]); k >= 0) g_copies[k].other = true;
+    if (const int k = CopyOfView(dsv); k >= 0) g_copies[k].other = true;
+}
+
+// The first draw into targets of another size that qualify (Pass::otherCand): their copies are bound in place of the
+// game's views, view 1's rows scaled to their clones' corner. False: they stay one view (the pass fails at its end).
+bool SwitchOther(ID3D11DeviceContext* c) {
+    Pass& p = g_p;
+    p.otherCand = false;
+    UINT tw = 0, th = 0, cw = 0, ch = 0;
+    if (const char* why = OtherWhy(p.otherN, p.otherRtv, p.otherDsv, tw, th, cw, ch)) {
+        p.otherWhy = why;
+        return false;
+    }
+    ID3D11RenderTargetView* ro[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+    ID3D11DepthStencilView* dout = nullptr;
+    for (UINT i = 0; i < p.otherN; ++i)
+        if (p.otherRtv[i] && !(ro[i] = ArrayRtv(c, p.otherRtv[i]))) {
+            p.otherWhy = "no copy of a target of another size";
+            return false;
+        }
+    if (p.otherDsv && !(dout = ArrayDsv(c, p.otherDsv))) {
+        p.otherWhy = "no copy of a target of another size";
+        return false;
+    }
+    MarkOther(p.otherN, ro, dout);
+    for (UINT i = 0; i < p.otherN; ++i) MarkPending(ro[i]);
+    MarkPending(dout);
+    p.viewSlice = 1;  // two-slice copies (SetViews below, at the draw)
+    {
+        Internal in;
+        c->OMSetRenderTargets(p.otherN, ro, dout);
+    }
+    p.paused = false;
+    p.other = true;
+    ++p.otherMaps;
+    SetRows(c, (double)cw / tw, (double)ch / th);
+    FlushPending(c);
+    if (!g_fwdOtherLogged) {
+        g_fwdOtherLogged = true;
+        Log("MVR forward: outer %s's live pass draws into targets of another size (%u x %u; focus's clones %u x %u): "
+            "view 1 into their corner of slice 1 (rows a %.5f, b %.5f), the pass's own targets a %.5f, b %.5f",
+            kEye[p.eye & 1], tw, th, cw, ch, (double)cw / tw, (double)ch / th, (double)p.fw / p.sw,
+            (double)p.fh / p.sh);
+    }
+    return true;
+}
+
+}  // namespace
+
 bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* rtv, ID3D11DepthStencilView* dsv,
                 ID3D11RenderTargetView** rtvOut, ID3D11DepthStencilView** dsvOut) {
     MapBind(c, n, rtv, dsv);
@@ -5427,6 +5733,7 @@ bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* r
         }
         if (!t_pass) return;
         ++p.binds;
+        p.otherCand = false;  // the views it held are no longer bound
         bool any = dsv != nullptr, outer = dsv && OuterSize(dsv);
         unsigned mixed = 0;
         for (UINT i = 0; i < n && rtv; ++i)
@@ -5437,16 +5744,40 @@ bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* r
                 else
                     ++mixed;
             }
+        bool other = false;
         if (any && !outer) {
-            if (p.forward) {  // a target of another size: MVR pauses, the game's views go as they are
+            if (!p.forward) {
+                EndMvr(c, false);  // the masks: the G-buffer is done
+                NoteTail(n, rtv, dsv);
+                return;
+            }
+            UINT tw = 0, th = 0, cw = 0, ch = 0;
+            const char* why = OtherWhy(n, rtv, dsv, tw, th, cw, ch);
+            if (!why && OtherMapped(n, rtv, dsv)) {  // view 1 drew them earlier in this pass: at once
+                p.paused = false;
+                p.other = other = true;
+                SetRows(c, (double)cw / tw, (double)ch / th);
+            } else {
+                // A target of another size: MVR pauses, the game's views go as they are; the first draw there maps them
+                // when they qualify (SwitchOther).
                 if (!p.paused) ++p.pauses;
                 p.paused = true;
+                p.otherCand = !why;
+                p.otherWhy = why ? why : "";
+                p.otherN = std::min<UINT>(n, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT);
+                for (UINT i = 0; i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
+                    p.otherRtv[i] = rtv && i < p.otherN ? rtv[i] : nullptr;
+                p.otherDsv = dsv;
+                if (p.other) {
+                    p.other = false;
+                    SetRows(c, 0, 0);
+                }
                 if (p.views != 1 && SetViews(c, 1)) p.views = 1;
                 return;
             }
-            EndMvr(c, false);  // the masks: the G-buffer is done
-            NoteTail(n, rtv, dsv);
-            return;
+        } else if (any && p.other) {  // outer's targets again
+            p.other = false;
+            SetRows(c, 0, 0);
         }
         if (any && p.paused) {
             p.paused = false;
@@ -5457,7 +5788,7 @@ bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* r
                 if (p.vsPatched) SetPassViewport(c, true);
             }
         }
-        p.mixed += mixed;
+        if (!other) p.mixed += mixed;
         for (UINT i = 0; i < n && i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
             rtvOut[i] = rtv && rtv[i] ? ArrayRtv(c, rtv[i]) : nullptr;
         *dsvOut = dsv ? ArrayDsv(c, dsv) : nullptr;
@@ -5467,6 +5798,7 @@ bool MapTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const* r
             EndMvr(c, false);
             return;
         }
+        if (other) MarkOther(n, rtvOut, *dsvOut);
         p.vpCheck = true;  // B20 K5a: the clones' viewport fix runs again at a bind
         if (p.forward) {  // their content goes in before the next draw (a clear first makes it unneeded)
             for (UINT i = 0; i < n && i < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) MarkPending(rtvOut[i]);
@@ -5515,6 +5847,7 @@ void RecordClear(ID3D11View* v, bool depth, const FLOAT* col, UINT flags, FLOAT 
     ComPtr<ID3D11Resource> r;
     v->GetResource(&r);
     oc.orig = g_cloneFn ? r.Get() : (ID3D11Resource*)clones::Original(r.Get());
+    oc.res = r.Get();
     oc.depth = depth;
     if (depth)
         static_cast<ID3D11DepthStencilView*>(v)->GetDesc(&oc.dd);
@@ -5609,7 +5942,7 @@ ID3D11RenderTargetView* MapClear(ID3D11DeviceContext* c, ID3D11RenderTargetView*
     if (g_track && !t_internal && c == Imm()) NoteWritten(v);
     StartAtClear(c, v);
     if (!InPass(c) || !v) return v;
-    if (g_p.forward && !OuterSize(v)) {
+    if (g_p.forward && !OuterSize(v) && !OtherCopyView(v)) {
         ++g_p.pausedClears;
         Protect("ClearRenderTargetView", [&] { RecordClear(v, false, col, 0, 0, 0); });
         return v;
@@ -5633,7 +5966,7 @@ ID3D11DepthStencilView* MapClear(ID3D11DeviceContext* c, ID3D11DepthStencilView*
     if (g_track && !t_internal && c == Imm()) NoteWritten(v);
     StartAtClear(c, v);
     if (!InPass(c) || !v) return v;
-    if (g_p.forward && !OuterSize(v)) {
+    if (g_p.forward && !OuterSize(v) && !OtherCopyView(v)) {
         ++g_p.pausedClears;
         Protect("ClearDepthStencilView", [&] { RecordClear(v, true, nullptr, flags, depth, stencil); });
         return v;
@@ -5960,7 +6293,8 @@ void LogStats(bool totals) {
             "maps from outer %llu (failed %llu); targets: copied in from focus's clones %llu, cleared first (no copy-in) "
             "%llu, multisampled (per-sample copies) %llu, multisampled colors without copy-in after a depth clear "
             "(mvr_ms_color_skip %s) %llu, read by focus in their slice (B12 step 5, mvr_ms_slices %s) L %llu / R %llu "
-            "with %llu clears of only their own slices%s%s",
+            "with %llu clears of only their own slices; targets of another size with two views (mvr_forward_other %s): "
+            "passes L %llu / R %llu, draws %llu, into focus's clones %llu%s%s",
             totals ? " (session)" : "", (unsigned long long)s.frames, g_forwardOn ? "on" : "off", g_fwdDepth,
             (unsigned long long)f.passes[0], (unsigned long long)f.passes[1], (unsigned long long)f.ok[0],
             (unsigned long long)f.ok[1], fms(0), fms(1),
@@ -5977,7 +6311,9 @@ void LogStats(bool totals) {
             (unsigned long long)f.liveTrackFails, (unsigned long long)f.copyIns, (unsigned long long)f.clearFills,
             (unsigned long long)f.msTargets, g_msColorSkip ? "on" : "off", (unsigned long long)f.colorSkips,
             g_msSlices ? "on" : "off", (unsigned long long)f.sliceTargets[0], (unsigned long long)f.sliceTargets[1],
-            (unsigned long long)f.sliceClears, fr.empty() ? "" : "; not from outer: ", fr.c_str());
+            (unsigned long long)f.sliceClears, g_fwdOther ? "on" : "off", (unsigned long long)f.otherPasses[0],
+            (unsigned long long)f.otherPasses[1], (unsigned long long)f.otherDraws,
+            (unsigned long long)f.otherTargets, fr.empty() ? "" : "; not from outer: ", fr.c_str());
     }
     LtStats& l = totals ? g_ltot : g_lts;
     if (g_ltRenderVt && (g_ltOn || l.skipped[0] || l.skipped[1] || l.reads)) {
@@ -6239,9 +6575,14 @@ TestLiveState TestLiveGet() {
     t.colorSkips = s.colorSkips;
     t.sliceTargets = s.sliceTargets;
     t.sliceClears = s.sliceClears;
+    t.otherDraws = s.otherDraws;
+    t.otherTargets = s.otherTargets;
     t.why = s.why;
     return t;
 }
+
+void TestSetForwardOther(bool on) { g_fwdOther = on; }
+void TestSetGbufferWithForward(bool on) { g_gbufWithFwd = on; }
 
 void TestEnd() {
     const bool faulted = g_test.faulted;

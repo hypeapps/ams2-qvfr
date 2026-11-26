@@ -1699,10 +1699,10 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw, bool countEarly = false) {
             if (NVSDK_NGX_SUCCEED(r) && dispTex) {
                 ViewSpanBegin(gpu::DlssDispOuterL, view);
                 struct {
-                    uint32_t bits, pad;
+                    uint32_t bits, edge;
                     float jitter[2], toRender[2];
                     uint32_t renderSize[2];
-                } cb{MaskBitsNow(), 0, {e.InJitterOffsetX, e.InJitterOffsetY},
+                } cb{MaskBitsNow(), (uint32_t)Cfg().dlaaDisplayEdge, {e.InJitterOffsetX, e.InJitterOffsetY},
                      {(float)iw / (float)w, (float)ih / (float)h}, {iw, ih}};
                 static_assert(sizeof(cb) == 32, "DisplayParams in shaders/dlaa.hlsl");
                 c->UpdateSubresource(g_dispCb, 0, nullptr, &cb, 0, 0);
@@ -1744,10 +1744,10 @@ int Evaluate(ID3D11DeviceContext* c, bool afterDraw, bool countEarly = false) {
             ID3D11Texture2D* sIn = StagingCopy(c, (ID3D11Texture2D*)in[1]);
             ID3D11Texture2D* sSt = StagingCopy(c, stencil);
             ID3D11Texture2D* sOut = StagingCopy(c, out);
-            char mode[192];
-            snprintf(mode, sizeof(mode), "%s, game's TAA for %s, %s, bias mask %.2f, displays pass: %s",
+            char mode[224];
+            snprintf(mode, sizeof(mode), "%s, game's TAA for %s, %s, bias mask %.2f, displays pass: %s, edge %d px",
                      iw != w ? "DLSS SR" : "DLAA", CockpitText(afterDraw ? CockpitTaaNow() : 0), ExposureText().c_str(),
-                     mask ? maskValue : 0.0f, dispDone ? "on" : "off");
+                     mask ? maskValue : 0.0f, dispDone ? "on" : "off", Cfg().dlaaDisplayEdge);
             MeasureShot(c, view, mode, sIn, sSt, sOut);
             SafeRelease(sIn);
             SafeRelease(sSt);

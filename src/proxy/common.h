@@ -268,6 +268,12 @@ struct Config {
     // outer R draws focus R into slice 2, and focus's clones of them are slices 1 (focus L) and 2 (focus R) of the
     // array itself (no copy out of the corner).
     bool mvrMsSlices = true;
+    // Restart only (mvr_pass.h): the live forward pass draws into targets of another size (the 1/2 size particles) with
+    // two views when their focus clones allow it.
+    bool mvrForwardOther = true;
+    // Restart only (mvr_pass.h): a focus group takes outer's G-buffer only in frames whose forward also comes from
+    // outer.
+    bool mvrGbufferWithForward = true;
     // Restart only (docs/mvr.md B20 K5b, mvr_pass.h): in the corner layout without DLSS SR (focus at the game's size) the
     // G-buffer pass's colors become three-slice arrays whose slices 1 and 2 are focus L's and focus R's clones of them
     // (no extract copy), and the pass's other copies get three slices (outer R draws view 1 into slice 2).
@@ -335,6 +341,17 @@ struct Config {
     // [dlaa] display_pass_min_scale (live): the displays pass only in views rendered at least at this fraction of their
     // size (DLSS SR); below it DLSS keeps the displays. 0.67 = from Quality up; 1 = only with DLAA; 0 = always.
     float dlaaDisplayPassMinScale = 0.67f;
+    // [dlaa] display_pass_edge (live, not in the default ini): render pixels at the outline of a display or mirror that
+    // keep DLSS's result in the displays pass, with a one-pixel blend into the current frame inside. The current frame
+    // has no anti-aliasing, so a hard switch at the stencil outline shows stair steps. 0 = the hard switch; 0..2.
+    int dlaaDisplayEdge = 1;
+    // [dlaa] game_sharpen (live; quad mode, also with the game's TAA): the game's luma sharpen after the TAA resolve at
+    // this fraction of its strength (windscreen.h); 1 = as the game draws it, 0 = off; 0..1.
+    float gameSharpen = 1.0f;
+    // [dlaa] windscreen_depth (live, not in the default ini; quad mode, also with the game's TAA): the windscreen glass
+    // tests a copy of the scene's depth made farther within this radius in render pixels (windscreen.h); 0 = the game's
+    // depth; 0..3.
+    int windscreenDepth = 1;
     // [nr] (prototype NR-P1, dlaa-plan D7; not in the default ini): 0 off, 1 focus = after DLAA the focus views go
     // through the NR bridge (nr.h; step 1: passthrough without a model); 2 final = the finished focus images at the
     // composition (motion vectors and depth from DLAA). Live, like its hotkey.
@@ -403,6 +420,10 @@ void LoadConfig();                    // creates a default qvfr.ini if it does n
 bool ReloadConfig(bool now = false);
 // Render thread, every frame after ReloadConfig: the test hotkey ([debug] test_key) steps the test scenario.
 void TestScenarioFrame();
+// The current test scenario's step and its quad switches ("name=value,..." with the names of the [benchmark] sequence
+// switches; "" none). quad.cpp sets them at the next frame and puts the previous values back when the step changes.
+int TestScenarioStep();
+const char* TestScenarioSwitches();
 
 fs::path ModuleDir();                 // folder of the proxy DLL (the game's x64\)
 fs::path BaseDir();                   // %QVFR_HOME% (tests) or x64\qvfr; %TEMP%\ams2-qvfr when x64\qvfr is not writable
