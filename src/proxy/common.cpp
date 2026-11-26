@@ -438,6 +438,8 @@ Config ReadConfig(const fs::path& ini) {
     if (c.srProbeKey || !c.srCbFix || c.srCbFixKey)
         Log("Settings: [debug] sr_probe_modifier=0x%X sr_probe_key=0x%X sr_cb_fix=%d sr_cb_fix_key=0x%X", c.srProbeKeyMod,
             c.srProbeKey, c.srCbFix, c.srCbFixKey);
+    c.samplerLog = IniInt(ini, L"debug", L"sampler_log", 1) != 0;
+    if (!c.samplerLog) Log("Settings: [debug] sampler_log=0");
     c.mvrShotCompare = IniInt(ini, L"debug", L"mvr_shot_compare", 0) != 0;
     c.mvrForwardTest = IniInt(ini, L"debug", L"mvr_forward_test", 0) != 0;
     c.mvrForward = IniInt(ini, L"debug", L"mvr_forward", 1) != 0;

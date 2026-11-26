@@ -29,6 +29,7 @@
 #include "probe.h"
 #include "quad.h"
 #include "runtime.h"
+#include "samplers.h"
 #include "sysinfo.h"
 #include "wrappers.h"
 
@@ -234,8 +235,9 @@ IVRSystem* VR_CALLTYPE VR_Init(EVRInitError* peError, EVRApplicationType eApplic
                 runtime::OpenXrPath() ? "through the OpenXR layer" : "unavailable");
     });
     Guarded("LogModules", [] { sysinfo::LogModules("after VR_Init"); });
+    samplers::Install();  // [debug] sampler_log; guards itself
     probe::Install();  // [quad] mode=probe; guards itself
-    quad::Install();   // [quad] mode=quad; guards itself
+    quad::Install();  // [quad] mode=quad; guards itself
     dlaa::Install();   // [dlaa] mode=dlaa; guards itself
     sr::Install();     // [dlaa] mode=dlss in stereo; guards itself
     return Wrap() ? wrap::System(real) : real;

@@ -129,6 +129,8 @@ struct Config {
     bool focusCull = true;
     int cullKeyMod = VK_RCONTROL;
     int cullKey = 0;                  // testers: VK_F4
+    // The game's sampler descriptions in the log (samplers.h). [debug] sampler_log; a change needs a restart.
+    bool samplerLog = true;
     // Crepuscular rays and lens flares of the focus views taken from outer (sun_fx.h); the hotkey switches.
     bool sunEffects = true;
     int sunKeyMod = VK_RCONTROL;
