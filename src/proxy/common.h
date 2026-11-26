@@ -345,9 +345,6 @@ struct Config {
     // keep DLSS's result in the displays pass, with a one-pixel blend into the current frame inside. The current frame
     // has no anti-aliasing, so a hard switch at the stencil outline shows stair steps. 0 = the hard switch; 0..2.
     int dlaaDisplayEdge = 1;
-    // [dlaa] game_sharpen (live; quad mode, also with the game's TAA): the game's luma sharpen after the TAA resolve at
-    // this fraction of its strength (windscreen.h); 1 = as the game draws it, 0 = off; 0..1.
-    float gameSharpen = 1.0f;
     // [dlaa] windscreen_depth (live, not in the default ini; quad mode, also with the game's TAA): the windscreen glass
     // tests a copy of the scene's depth made farther within this radius in render pixels (windscreen.h); 0 = the game's
     // depth; 0..3.
