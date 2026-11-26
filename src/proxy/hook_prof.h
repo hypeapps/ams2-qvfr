@@ -8,6 +8,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 
 #include <intrin.h>
@@ -54,6 +55,16 @@ enum Counter : uint8_t {
 
 extern std::atomic<bool> g_on;
 inline bool On() { return g_on.load(std::memory_order_relaxed); }
+// [debug] hook_fast (live): with the profile off, Orig skips the thread state and the shader memos (mvr_ps, mvr_vs)
+// spread addresses by a Fibonacci hash.
+extern std::atomic<bool> g_fast;
+inline bool Fast() { return g_fast.load(std::memory_order_relaxed); }
+void SetFast(bool on);
+// A memo slot of 2^bits for an object address: by its bits from 4 up, or (Fast) Fibonacci-hashed.
+inline size_t MemoSlot(const void* p, unsigned bits) {
+    if (Fast()) return (size_t)(((uintptr_t)p * 0x9E3779B97F4A7C15ull) >> (64 - bits));
+    return ((uintptr_t)p >> 4) & ((size_t(1) << bits) - 1);
+}
 
 struct Scope;
 struct ThreadState {
@@ -104,6 +115,7 @@ struct Orig {
     Scope* owner = nullptr;
     uint64_t t0 = 0;
     Orig() {
+        if (!On() && Fast()) return;
         ThreadState& t = t_state;
         if (!t.top || t.depth != 1) return;  // nested: the original call is part of the outer detour's work
         owner = t.top;
@@ -140,7 +152,10 @@ struct SubScope {
     SubScope& operator=(const SubScope&) = delete;
 };
 
-void Count(Counter c, uint32_t n = 1);
+void CountOn(Counter c, uint32_t n);
+inline void Count(Counter c, uint32_t n = 1) {
+    if (On()) CountOn(c, n);
+}
 
 // Render thread: an eye group begins (0..3: outer L, outer R, focus L, focus R) or ends (-1).
 void SetGroup(int group);

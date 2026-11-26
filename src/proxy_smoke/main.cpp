@@ -1293,6 +1293,7 @@ int RunClones() {
     ctx->PSSetShaderResources(0, 2, none);
     // O1 map cache (after the proof groups): in a focus group C's view (no clone) bound twice, the second time without the lock; then A's
     // original view with C's (translated: never from the cache) and C's again (from the cache).
+    cl::SetMapCache(1);
     {
         uint64_t h0 = 0, m0 = 0, h1 = 0, m1 = 0;
         bool watching = true;
@@ -1337,10 +1338,77 @@ int RunClones() {
         }
         cl::EndGroup(ctx);
         expect(translated, "map cache: A's original view still translated to its clone");
+        expect(cl::GetMapCache() == 1 || watching, "map cache mode 1 for this part");
         expect(watching || (h1 - h0 == 2 && m1 - m0 == 2),
                "map cache: C's view bound again without the lock (2 of 4 binds), A's through the lock");
         printf("Clones map cache: %s group, binds without the lock %llu, locked %llu\n", watching ? "watching" : "plain",
                (unsigned long long)(h1 - h0), (unsigned long long)(m1 - m0));
+    }
+    uint64_t mapMis0 = 0, mapChk0 = 0;  // scenarios 2 to 5 run with the view cache checked through the lock (mode 3)
+    // View cache (clones_map_cache 2): C's view, known to map to itself, binds without the lock in the next focus group
+    // and in a second outer group; A's original is translated; a view made at C's address takes the lock again; mode 3
+    // checks its hits through the lock without a mismatch; the device hooks see a view made.
+    {
+        cl::SetMapCache(2);
+        ID3D11ShaderResourceView* cv[1] = {srvC};
+        ID3D11ShaderResourceView* nil[2] = {};
+        uint64_t h0 = 0, m0 = 0, h1 = 0, m1 = 0, h2 = 0, m2 = 0, h3 = 0, m3 = 0;
+        bool watching = cl::TestMapCache(h0, m0);
+        cl::BeginGroup(ctx, cl::Focus);
+        ctx->PSSetShaderResources(1, 1, cv);
+        cl::EndGroup(ctx);
+        cl::BeginGroup(ctx, cl::Focus);
+        watching |= cl::TestMapCache(h0, m0);
+        ctx->PSSetShaderResources(1, 1, cv);
+        cl::TestMapCache(h1, m1);
+        ctx->PSSetShaderResources(0, 1, &srvA);
+        ID3D11ShaderResourceView* got = nullptr;
+        ctx->PSGetShaderResources(0, 1, &got);
+        const bool translated = got && got == A.at<ID3D11ShaderResourceView*>(0x70);
+        if (got) got->Release();
+        cl::TestMapCache(h2, m2);
+        cl::TestViewMade(srvC);
+        ctx->PSSetShaderResources(1, 1, cv);
+        ctx->PSSetShaderResources(1, 1, cv);
+        cl::TestMapCache(h3, m3);
+        cl::EndGroup(ctx);
+        expect(!watching, "view cache: no watching group");
+        expect(h1 - h0 == 1 && m1 == m0, "view cache: C's view in the next focus group without the lock");
+        expect(translated && m2 == m1 + 1, "view cache: A's original translated through the lock");
+        expect(m3 - m2 == 1 && h3 - h2 == 1, "view cache: a view made at C's address takes the lock once");
+        uint64_t o0 = 0, o1 = 0, l0 = 0, l1 = 0;
+        cl::BeginGroup(ctx, cl::Outer);
+        ctx->PSSetShaderResources(1, 1, cv);
+        cl::EndGroup(ctx);
+        cl::BeginGroup(ctx, cl::Outer);
+        cl::TestMapCache(o0, l0);
+        ctx->PSSetShaderResources(1, 1, cv);
+        cl::TestMapCache(o1, l1);
+        cl::EndGroup(ctx);
+        expect(o1 - o0 == 1 && l1 == l0, "view cache: C's view in the second outer group without the lock");
+        cl::SetMapCache(3);
+        const uint64_t x0 = cl::MapMismatches();
+        cl::BeginGroup(ctx, cl::Focus);
+        ctx->PSSetShaderResources(1, 1, cv);
+        ID3D11ShaderResourceView* ac[2] = {srvA, srvC};
+        ctx->PSSetShaderResources(0, 2, ac);
+        cl::EndGroup(ctx);
+        cl::BeginGroup(ctx, cl::Outer);
+        ctx->PSSetShaderResources(1, 1, cv);
+        cl::EndGroup(ctx);
+        expect(cl::MapMismatches() == x0, "view cache mode 3: no mismatch");
+        cl::SetMapCache(3);
+        mapMis0 = cl::MapMismatches();
+        mapChk0 = cl::MapChecked();
+        ctx->PSSetShaderResources(0, 2, nil);
+        const uint64_t made0 = cl::TestViewsMade();
+        ID3D11ShaderResourceView* extra = srv(texC);
+        expect(cl::TestViewsMade() == made0 + 1, "the device hooks see a view made");
+        if (extra) extra->Release();
+        printf("Clones view cache: next group %s, outer %s, after a view made at its address %s, mode 3 mismatches "
+               "%llu, views made seen %llu\n",
+               h1 - h0 == 1 ? "hit" : "MISS", o1 - o0 == 1 ? "hit" : "MISS", m3 - m2 == 1 ? "locked once" : "WRONG",
+               (unsigned long long)(cl::MapMismatches() - x0), (unsigned long long)(cl::TestViewsMade() - made0));
     }
     // An object destroyed inside a focus group gets its originals back at once; the list is watched again.
     cl::OnFrameStart(ctx, true);
@@ -1628,6 +1696,18 @@ int RunClones() {
     };
     cl::WantArray(texG);
     expect(!cl::IsArray(G.at<ID3D11Resource*>(0x58)), "B17: no array before the frame start");
+    // View cache: G's old SRV is noted as mapping to itself in an outer group before the array replaces G.
+    {
+        uint64_t h0 = 0, m0 = 0, h1 = 0, m1 = 0;
+        cl::BeginGroup(ctx, cl::Outer);
+        ctx->PSSetShaderResources(0, 1, &srvG);
+        cl::TestMapCache(h0, m0);
+        ctx->PSSetShaderResources(0, 1, &srvG);
+        cl::TestMapCache(h1, m1);
+        ctx->PSSetShaderResources(0, 2, none);
+        cl::EndGroup(ctx);
+        expect(h1 - h0 == 1 && m1 == m0, "B17 view cache: G's old SRV from the cache before the array");
+    }
     cl::OnFrameStart(ctx, true);
     ID3D11Texture2D* arrTex = G.at<ID3D11Texture2D*>(0x58);
     expect(arrTex != texG && cl::IsArray(arrTex) && arraySize(arrTex) == 2 && size(arrTex) == size(texG),
@@ -1646,6 +1726,16 @@ int RunClones() {
     expect(st.arrays == 1 && st.phase == 2 && st.clones[1] == 1 && cloneG && arraySize(cloneG) == 1 &&
                size(cloneG) == std::make_pair(32u, 24u),
            "B17: one array, focus's clone made again (single, 32 x 24)");
+    {
+        cl::BeginGroup(ctx, cl::Outer);
+        ctx->PSSetShaderResources(0, 1, &srvG);
+        ID3D11ShaderResourceView* outerG = nullptr;
+        ctx->PSGetShaderResources(0, 1, &outerG);
+        expect(outerG == srvArr, "B17 view cache: G's old SRV, known as itself before the array, bound as the array's");
+        if (outerG) outerG->Release();
+        ctx->PSSetShaderResources(0, 2, none);
+        cl::EndGroup(ctx);
+    }
     // Outside the groups: a clear through view X goes to slice 0 of the array; the old texture keeps red.
     ctx->ClearRenderTargetView(rtvGX, green);
     uint32_t oldPx = 0;
@@ -2121,9 +2211,28 @@ int RunClones() {
     expect(nc == 1 && carryC[0] == T.at<ID3D11Texture2D*>(0x58) && carryD[0] != texT &&
                size((ID3D11Texture2D*)carryD[0]) == std::make_pair(32u, 24u),
            "SR focus: T carried into focus's 32 x 24 clone");
+    // View cache: T's scene clone view maps to itself in the scene phase (from the cache the second time), and after
+    // the TAA draw (post phase) to focus's post clone view.
+    uint64_t srH0 = 0, srM0 = 0, srH1 = 0, srM1 = 0;
+    ctx->PSSetShaderResources(0, 1, &sceneSrvT);
+    const bool srWatching = cl::TestMapCache(srH0, srM0);
+    ctx->PSSetShaderResources(0, 1, &sceneSrvT);
+    cl::TestMapCache(srH1, srM1);
+    expect(srWatching || (srH1 - srH0 == 1 && srM1 == srM0), "SR view cache: the scene clone's view from the cache");
     expect(cl::SceneEnd(ctx) && T.at<void*>(0x58) == carryD[0] && Hst.at<void*>(0x58) == hstPost &&
                devSize(0)[0] == 32 && devSize(0)[1] == 24 && RS.at<uint16_t>(0x24) == 32,
            "SR focus after TAA: focus's clones and size");
+    {
+        ctx->PSSetShaderResources(0, 1, &sceneSrvT);
+        ID3D11ShaderResourceView* postT = nullptr;
+        ctx->PSGetShaderResources(0, 1, &postT);
+        expect(postT && postT != sceneSrvT && postT == T.at<ID3D11ShaderResourceView*>(0x70),
+               "SR view cache: after TAA the scene clone's view goes to focus's post clone view");
+        printf("Clones SR view cache: %s group, post phase %s\n", srWatching ? "watching" : "plain",
+               postT == T.at<ID3D11ShaderResourceView*>(0x70) ? "translated" : "WRONG");
+        if (postT) postT->Release();
+        ctx->PSSetShaderResources(0, 2, none);
+    }
     const UINT winFirst = 1008, winNum = 16;  // D3D11.1 takes multiples of 16 constants only
     if (ctx1) {
         ctx1->PSSetConstantBuffers1(2, 1, &cbFocus, &winFirst, &winNum);
@@ -2346,6 +2455,44 @@ int RunClones() {
         cl::SetFocusEye(0);
         expect(cl::CloneOf(texT, cl::FocusScene) == sceneT0, "K4 SR eye 0: T's shared scene clone");
     }
+    // View cache past the proof groups: in a focus group T's scene clone view maps to itself in the scene phase (from
+    // the cache the second time) and, after the TAA draw, to focus's post clone view (never from the cache).
+    {
+        bool watching = true;
+        for (int f = 0; f < 600 && watching; ++f) {
+            cl::OnFrameStart(ctx, true);
+            cl::BeginGroup(ctx, cl::Outer);
+            cl::SceneEnd(ctx);
+            cl::EndGroup(ctx);
+            cl::BeginGroup(ctx, cl::Focus);
+            uint64_t h = 0, m = 0;
+            watching = cl::TestMapCache(h, m);
+            if (watching) {
+                cl::SceneEnd(ctx);
+                cl::EndGroup(ctx);
+            }
+        }
+        expect(!watching && cl::SceneIn(), "SR view cache: a focus scene group past the proof");
+        ID3D11ShaderResourceView* sceneV = T.at<ID3D11ShaderResourceView*>(0x70);
+        uint64_t h0 = 0, m0 = 0, h1 = 0, m1 = 0;
+        ctx->PSSetShaderResources(0, 1, &sceneV);
+        cl::TestMapCache(h0, m0);
+        ctx->PSSetShaderResources(0, 1, &sceneV);
+        cl::TestMapCache(h1, m1);
+        cl::SceneEnd(ctx);
+        ID3D11ShaderResourceView* postV = T.at<ID3D11ShaderResourceView*>(0x70);
+        ctx->PSSetShaderResources(0, 1, &sceneV);
+        ID3D11ShaderResourceView* boundV = nullptr;
+        ctx->PSGetShaderResources(0, 1, &boundV);
+        const bool postOk = boundV && boundV == postV && postV != sceneV;
+        if (boundV) boundV->Release();
+        ctx->PSSetShaderResources(0, 2, none);
+        cl::EndGroup(ctx);
+        expect(h1 - h0 == 1 && m1 == m0, "SR view cache: the scene clone's view from the cache in the scene phase");
+        expect(postOk, "SR view cache: after TAA the scene clone's view goes to focus's post clone view");
+        printf("Clones SR view cache past the proof: scene phase %s, post phase %s\n",
+               h1 - h0 == 1 ? "hit" : "MISS", postOk ? "translated" : "WRONG");
+    }
     // B20 K5b with DLSS SR: T's focus scene clone as a three-slice array of ours (WantSceneSlices; the clones are made
     // again, learned stays). Focus L's field view draws into slice 1, focus R's twin (the same array) into slice 2;
     // CarryList gives each eye's slice; a focus scene group's copy of T goes to its slice.
@@ -2437,6 +2584,11 @@ int RunClones() {
     for (IUnknown* u : {(IUnknown*)texT, (IUnknown*)texU, (IUnknown*)texHst, (IUnknown*)texHo, (IUnknown*)rtvT,
                         (IUnknown*)rtvT2, (IUnknown*)rtvU, (IUnknown*)rtvHst, (IUnknown*)rtvHo, (IUnknown*)srvT})
         u->Release();
+    const uint64_t mapChecked = cl::MapChecked() - mapChk0, mapMis = cl::MapMismatches() - mapMis0;
+    expect(mapChecked > 0 && mapMis == 0, "view cache mode 3 in scenarios 2 to 5: hits checked, no mismatch");
+    printf("Clones view cache mode 3 (scenarios 2 to 5): hits checked through the lock %llu, mismatches %llu\n",
+           (unsigned long long)mapChecked, (unsigned long long)mapMis);
+    cl::SetMapCache(2);
     printf("Clones check %s: %d wrong (focus smaller %d, outer smaller %d, two-slice arrays %d, three-slice arrays %d, "
            "DLSS SR scene sets %d); %d translations, original pixel 0x%08X, clone pixel 0x%08X\n",
            bad ? "FAILED" : "OK", bad, bad1, bad2 - bad1, bad3 - bad2, bad4 - bad3, bad - bad4, translated1, pxA,

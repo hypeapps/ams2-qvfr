@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "common.h"
+#include "hook_prof.h"
 #include "hooks.h"
 #include "dxbc.h"
 #include "mvr_patch.h"
@@ -77,7 +78,8 @@ struct Memo {
     uint32_t gen = 0;
     bool patched = false;
 };
-constexpr size_t kMemo = 2048;
+constexpr unsigned kMemoBits = 11;
+constexpr size_t kMemo = size_t(1) << kMemoBits;
 Memo g_memo[kMemo];
 
 std::string NvErr(NvAPI_Status s) {
@@ -377,7 +379,7 @@ bool IsPatched(ID3D11VertexShader* vs, char* sum) {
 
 bool IsPatchedRt(ID3D11VertexShader* vs) {
     if (!vs) return false;
-    Memo& m = g_memo[((uintptr_t)vs >> 4) & (kMemo - 1)];
+    Memo& m = g_memo[hookprof::MemoSlot(vs, kMemoBits)];
     const uint32_t gen = g_gen.load(std::memory_order_acquire);  // before the lookup: a shader made meanwhile misses next
     if (m.vs == vs && m.gen == gen) return m.patched;
     const bool patched = IsPatched(vs);
