@@ -24,6 +24,7 @@
 #endif
 
 #include "common.h"
+#include "ngx_log.h"
 #include "nr_depth_cs.h"   // kNrDepthCS (fxc from shaders/nr.hlsl)
 #include "nr_motion_cs.h"  // kNrMotionCS
 #include "nr_pack_cs.h"    // kNrPackCS
@@ -284,12 +285,11 @@ void NVSDK_CONV NgxLog(const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_F
     while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
     if (s.empty()) return;
     // The core dumps its whole configuration at init; keep what can explain a failure (as nr-bridge).
-    std::string low = s;
-    for (char& ch : low) ch = (char)tolower((unsigned char)ch);
-    const bool keep = low.find("error") != std::string::npos || low.find("fail") != std::string::npos ||
-                      low.find("warn") != std::string::npos || low.find("not supported") != std::string::npos ||
-                      low.find("feature") != std::string::npos || low.find("snippet") != std::string::npos ||
-                      low.find("dlssnr") != std::string::npos || low.find("called from module") != std::string::npos;
+    const std::string low = ngxlog::Lower(s);
+    const bool keep = !ngxlog::Noise(low) &&
+                      (ngxlog::Problem(low) || low.find("not supported") != std::string::npos ||
+                       low.find("feature") != std::string::npos || low.find("snippet") != std::string::npos ||
+                       low.find("dlssnr") != std::string::npos || low.find("called from module") != std::string::npos);
     if (!keep || g_ngxLines.fetch_add(1) >= 200) return;
     Log("NR NGX: %s", s.c_str());
 }

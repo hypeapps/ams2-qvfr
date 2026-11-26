@@ -20,6 +20,7 @@
 #include "hooks.h"
 #include "mvr_motion.h"
 #include "mvr_pass.h"
+#include "ngx_log.h"
 #include "nr.h"
 #include "sr.h"
 #include "sun_fx.h"
@@ -304,6 +305,10 @@ uint64_t g_evalSeq = 0;  // advanced at each Evaluate: scratch textures it asked
 int g_evalFails = 0;
 int g_sizeLogs = 0;
 std::atomic<int> g_ngxLogLines{0};
+std::atomic<int> g_ngxPresetLines{0};
+// While FeatureFor creates a feature: NGX's tag of its quality mode and the view (the preset line to keep).
+std::atomic<const char*> g_ngxMode{nullptr};
+std::atomic<int> g_ngxView{-1};
 bool g_formatsLogged[kViews] = {};
 // Bias-current-color mask (shaders/dlaa.hlsl) and the fixed exposure texture ([dlaa] bias_mask, exposure).
 ID3D11ComputeShader* g_maskCs = nullptr;
@@ -336,10 +341,22 @@ float g_expValue = -1;
 uint64_t g_maskEvals = 0, g_expEvals = 0;
 
 void NVSDK_CONV NgxLog(const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature) {
-    if (!message || g_ngxLogLines.fetch_add(1) >= 300) return;
+    if (!message) return;
     std::string s(message);
     while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
-    Log("NGX: %s", s.c_str());
+    const char* mode = g_ngxMode.load();
+    switch (ngxlog::Classify(s, mode)) {
+        case ngxlog::Kind::Drop: return;
+        case ngxlog::Kind::Preset: {
+            if (g_ngxPresetLines.fetch_add(1) >= 100) return;
+            const int view = g_ngxView.load();
+            Log("NGX preset (%s %s): %s", view >= 0 && view < kViews ? kViewName[view] : "?", mode, s.c_str());
+            return;
+        }
+        default:
+            if (g_ngxLogLines.fetch_add(1) >= 200) return;
+            Log("NGX: %s", s.c_str());
+    }
 }
 
 void DropCarry();  // DLSS SR (below)
@@ -1305,7 +1322,10 @@ Feature* FeatureFor(ID3D11DeviceContext* c, int view, uintptr_t key, UINT w, UIN
     cp.Feature.InTargetHeight = oh;
     cp.Feature.InPerfQualityValue = quality;
     cp.InFeatureCreateFlags = flags;
+    g_ngxView = view;
+    g_ngxMode = ngxlog::ModeTag((int)quality);
     NVSDK_NGX_Result r = NGX_D3D11_CREATE_DLSS_EXT(c, &f->handle, g_params, &cp);
+    g_ngxMode = nullptr;
     if (NVSDK_NGX_FAILED(r) || !f->handle) {
         Log("DLAA: DLSS feature for %s, motion vectors %p (%ux%u -> %ux%u, %s, flags 0x%X, preset %d) failed: %s",
             kViewName[view], (void*)key, w, h, ow, oh, QualityName(quality), flags, preset, ResultText(r).c_str());
@@ -2206,6 +2226,7 @@ void Shutdown() {
         DropNgxLocked();
     });
     g_ngxLogLines = 0;
+    g_ngxPresetLines = 0;
 #endif
     hooks::DisableAll();
 }
