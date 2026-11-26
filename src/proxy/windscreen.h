@@ -1,12 +1,9 @@
 // The game's passes right after the TAA resolve, in each eye group (quad mode, through sun_fx's D3D11 hooks).
 //
 // After the resolve (the game's TAA or DLSS in its target) the game runs a luma sharpen (pixel shader with the constant
-// sharp_strength) into the scene color and then draws the windscreen layers (sun strip, frit, dirt, rain, scratches,
-// reflections) on it, one sample per pixel.
-//
-// The game's sharpen ([dlaa] game_sharpen = fraction of its strength): 1 = as the game draws it; 0 = off (the TAA
-// result copied into its target); in between the TAA result is copied and the game's draw blended over it with that
-// factor, which for this sharpen is the same as a lower sharp_strength.
+// sharp_strength, the game's Sharpening option / 100) into the scene color and then draws the windscreen layers (sun
+// strip, frit, dirt, rain, scratches, reflections) on it, one sample per pixel. The sharpen's draw marks where that
+// phase starts.
 //
 // The glass's depth ([dlaa] windscreen_depth = radius): TAA or DLSS anti-aliased the cockpit's outline against what is
 // behind the glass, but the glass's depth test sorts those mixed pixels to the cockpit, so they keep the bright

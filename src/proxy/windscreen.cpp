@@ -41,7 +41,7 @@ ID3D11PixelShader* g_curPs = nullptr;  // the bound pixel shader (compared only)
 bool g_afterSharpen = false;          // the group's sharpen drew
 ID3D11Resource* g_sharpTarget = nullptr;  // its render target (compared only, no reference)
 
-std::atomic<uint64_t> g_sharpCopied{0}, g_sharpBlended{0}, g_sharpKept{0}, g_layerSkipped{0}, g_depthBuilds{0},
+std::atomic<uint64_t> g_layerSkipped{0}, g_depthBuilds{0},
     g_depthFails{0}, g_depthDraws{0}, g_depthOther{0};
 bool g_scaleLogged[2] = {};  // the first glass's depth of each view kind with DLSS SR
 int g_logs = 0;
@@ -66,11 +66,6 @@ ID3D11DepthStencilView* g_dilDsv = nullptr;  // this group's (owned by a scratch
 ID3D11DepthStencilView* g_dilFor = nullptr;  // the game's view it was made from (compared only)
 bool g_dilTried = false;                     // this group: made or failed once
 
-// The sharpen at a fraction of its strength: drawn over the TAA result with this blend.
-ID3D11BlendState* g_sharpBlend = nullptr;
-bool g_sharpBlendFailed = false;
-bool g_sharpStateLogged = false;
-bool g_sharpOwnBlend = false;  // the game draws its sharpen with blending: only on or off then
 
 template <class T>
 void Rel(T*& p) {
@@ -115,8 +110,6 @@ bool Contains(const void* code, size_t len, const char* text) {
     return std::search(b, b + len, text, text + n) != b + len;
 }
 
-// The sharpen's strength as a fraction of the game's (0..1).
-float SharpenAmount() { return std::clamp(Cfg().gameSharpen, 0.0f, 1.0f); }
 
 int DepthRadius() {
     const int s = g_depthSwitch.load(std::memory_order_relaxed);
@@ -309,106 +302,6 @@ ID3D11DepthStencilView* MakeGlassDepth(ID3D11DeviceContext* c, ID3D11DepthStenci
     return out;
 }
 
-// The TAA result (t0) copied into the sharpen's target in the viewport, when both are 2D textures of one size and
-// format. False: not copied.
-bool CopySharpenSource(ID3D11DeviceContext* c) {
-    bool done = false;
-    ID3D11ShaderResourceView* srv = nullptr;
-    ID3D11RenderTargetView* rtv = nullptr;
-    c->PSGetShaderResources(0, 1, &srv);
-    c->OMGetRenderTargets(1, &rtv, nullptr);
-    D3D11_VIEWPORT vp{};
-    UINT nvp = 1;
-    c->RSGetViewports(&nvp, &vp);
-    ID3D11Resource *src = nullptr, *dst = nullptr;
-    if (srv) srv->GetResource(&src);
-    if (rtv) rtv->GetResource(&dst);
-    ID3D11Texture2D *st = nullptr, *dt = nullptr;
-    if (src) src->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&st);
-    if (dst) dst->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&dt);
-    D3D11_TEXTURE2D_DESC sd{}, dd{};
-    if (st) st->GetDesc(&sd);
-    if (dt) dt->GetDesc(&dd);
-    if (st && dt && nvp && sd.Width == dd.Width && sd.Height == dd.Height && sd.Format == dd.Format &&
-        sd.SampleDesc.Count == 1 && dd.SampleDesc.Count == 1) {
-        D3D11_SHADER_RESOURCE_VIEW_DESC svd{};
-        D3D11_RENDER_TARGET_VIEW_DESC rvd{};
-        srv->GetDesc(&svd);
-        rtv->GetDesc(&rvd);
-        const UINT ss = svd.ViewDimension == D3D11_SRV_DIMENSION_TEXTURE2DARRAY ? svd.Texture2DArray.FirstArraySlice : 0;
-        const UINT ds = rvd.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY ? rvd.Texture2DArray.FirstArraySlice : 0;
-        const UINT l = (UINT)std::max(0.0f, vp.TopLeftX), t = (UINT)std::max(0.0f, vp.TopLeftY);
-        const UINT r = std::min(dd.Width, (UINT)(vp.TopLeftX + vp.Width));
-        const UINT b = std::min(dd.Height, (UINT)(vp.TopLeftY + vp.Height));
-        if (r > l && b > t) {
-            const D3D11_BOX box{l, t, 0, r, b, 1};
-            c->CopySubresourceRegion(dt, D3D11CalcSubresource(0, ds, dd.MipLevels), l, t, 0, st,
-                                     D3D11CalcSubresource(0, ss, sd.MipLevels), &box);
-            done = true;
-        }
-    }
-    Rel(st);
-    Rel(dt);
-    Rel(src);
-    Rel(dst);
-    Rel(srv);
-    Rel(rtv);
-    return done;
-}
-
-// The game's sharpen draw at `amount` of its strength (0..1). The luma sharpen adds strength x the pixel's luma
-// detail (its clamp, sharp_clamp 100, is never reached), so the TAA result plus `amount` of the sharpen's change is
-// the sharpen at that strength: the result is copied into the target and the game's draw blended over it with
-// that factor. True: handled here.
-bool Sharpen(ID3D11DeviceContext* c, float amount, DrawFn draw, void* arg) {
-    ID3D11BlendState* gameBlend = nullptr;
-    float gameFactor[4] = {};
-    UINT gameMask = 0;
-    c->OMGetBlendState(&gameBlend, gameFactor, &gameMask);
-    if (!g_sharpStateLogged) {
-        g_sharpStateLogged = true;
-        D3D11_BLEND_DESC bd{};
-        if (gameBlend) gameBlend->GetDesc(&bd);
-        g_sharpOwnBlend = bd.RenderTarget[0].BlendEnable != FALSE;
-        Log("Windscreen: the game's sharpen draws %s; [dlaa] game_sharpen %s", g_sharpOwnBlend ? "with blending" : "opaque",
-            g_sharpOwnBlend ? "only turns it off (0) or leaves it (above 0)" : "scales it");
-    }
-    bool handled = false;
-    if (amount <= 0.001f) {
-        handled = CopySharpenSource(c);
-        (handled ? g_sharpCopied : g_sharpKept).fetch_add(1, std::memory_order_relaxed);
-    } else if (amount < 0.999f && !g_sharpOwnBlend) {
-        if (!g_sharpBlend && !g_sharpBlendFailed) {
-            ID3D11Device* dev = nullptr;
-            c->GetDevice(&dev);
-            D3D11_BLEND_DESC bd{};
-            D3D11_RENDER_TARGET_BLEND_DESC& rt = bd.RenderTarget[0];
-            rt.BlendEnable = TRUE;
-            rt.SrcBlend = rt.SrcBlendAlpha = D3D11_BLEND_BLEND_FACTOR;
-            rt.DestBlend = rt.DestBlendAlpha = D3D11_BLEND_INV_BLEND_FACTOR;
-            rt.BlendOp = rt.BlendOpAlpha = D3D11_BLEND_OP_ADD;
-            rt.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-            if (!dev || FAILED(dev->CreateBlendState(&bd, &g_sharpBlend))) {
-                g_sharpBlendFailed = true;
-                Log("Windscreen: the sharpen's blend state could not be made; [dlaa] game_sharpen below 1 is off or on");
-            }
-            Rel(dev);
-        }
-        if (g_sharpBlend && CopySharpenSource(c)) {
-            const float f[4] = {amount, amount, amount, amount};
-            c->OMSetBlendState(g_sharpBlend, f, 0xFFFFFFFF);
-            draw(arg);
-            c->OMSetBlendState(gameBlend, gameFactor, gameMask);
-            handled = true;
-            g_sharpBlended.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            g_sharpKept.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-    Rel(gameBlend);
-    return handled;
-}
-
 // The layer shaders that drew after the sharpen, once each: their checksums (x64\qvfr\ps_dump\<checksum>.dxbc).
 void NoteLayer(ID3D11PixelShader* ps, int index) {
     static ID3D11PixelShader* seen[32] = {};
@@ -498,8 +391,6 @@ bool OnDraw(ID3D11DeviceContext* c, DrawFn draw, void* arg) {
                 Rel(res);
                 Rel(rtv);
             }
-            const float amount = SharpenAmount();
-            if (amount < 0.999f) handled = Sharpen(c, amount, draw, arg);
             return;
         }
         if (!g_curLayer) return;
@@ -568,20 +459,16 @@ int GetDepth() { return DepthRadius(); }
 void LogStats() {
     if (g_dead.load()) return;
     Log("Windscreen: glass's depth radius %d render px: made %llu (not made %llu), glass draws on it %llu, other layer "
-        "draws on the game's %llu; layer shaders known %d (glass %d); layers %s (skipped %llu); the game's sharpen at "
-        "%.2f: copied (off) %llu, blended %llu, as drawn below 1 %llu",
+        "draws on the game's %llu; layer shaders known %d (glass %d); layers %s (skipped %llu)",
         DepthRadius(), (unsigned long long)g_depthBuilds.load(), (unsigned long long)g_depthFails.load(),
         (unsigned long long)g_depthDraws.load(), (unsigned long long)g_depthOther.load(), g_layerCount.load(),
-        g_glassCount.load(), g_layersOn.load() ? "on" : "OFF (switch)", (unsigned long long)g_layerSkipped.load(),
-        SharpenAmount(), (unsigned long long)g_sharpCopied.load(), (unsigned long long)g_sharpBlended.load(),
-        (unsigned long long)g_sharpKept.load());
+        g_glassCount.load(), g_layersOn.load() ? "on" : "OFF (switch)", (unsigned long long)g_layerSkipped.load());
 }
 
 void Shutdown() {
     for (DepthScratch& s : g_dep) ReleaseDepth(s);
     Rel(g_dilCs);
     Rel(g_dcb);
-    Rel(g_sharpBlend);
     ResetGroup();
 }
 

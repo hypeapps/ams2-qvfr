@@ -541,9 +541,8 @@ Config ReadConfig(const fs::path& ini) {
     c.dlaaDisplayPassMinScale =
         std::clamp(IniFloat(ini, L"dlaa", L"display_pass_min_scale", c.dlaaDisplayPassMinScale), 0.0f, 1.0f);
     c.dlaaDisplayEdge = std::clamp(IniInt(ini, L"dlaa", L"display_pass_edge", c.dlaaDisplayEdge), 0, 2);
-    c.gameSharpen = std::clamp(IniFloat(ini, L"dlaa", L"game_sharpen", c.gameSharpen), 0.0f, 1.0f);
     c.windscreenDepth = std::clamp(IniInt(ini, L"dlaa", L"windscreen_depth", c.windscreenDepth), 0, 3);
-    Log("Settings: [dlaa] game_sharpen=%.2f windscreen_depth=%d", c.gameSharpen, c.windscreenDepth);
+    Log("Settings: [dlaa] windscreen_depth=%d", c.windscreenDepth);
     if (c.dlaa)
         Log("Settings: [dlaa] mode=%s render_scale=%.3f outer_render_scale=%.3f focus_render_scale=%.3f preset=%s "
             "outer_preset=%s focus_preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d "
@@ -761,7 +760,6 @@ bool ReloadConfig(bool force) {
     c.dlaaOuterDisplayPass = n.dlaaOuterDisplayPass;
     c.dlaaDisplayPassMinScale = n.dlaaDisplayPassMinScale;
     c.dlaaDisplayEdge = n.dlaaDisplayEdge;
-    c.gameSharpen = n.gameSharpen;
     c.windscreenDepth = n.windscreenDepth;
     c.nrMode = n.nrMode;
     c.nrKeyMod = n.nrKeyMod;
