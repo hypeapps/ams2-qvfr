@@ -15,6 +15,15 @@ std::string StripTime(const std::string& line) {
     return close == std::string::npos ? line : line.substr(close + 2);
 }
 
+// qvfr_YYYYMMDD_HHMMSS_<exe>.log, the name the proxy gives its logs (a saved or renamed copy such as qvfr_mine.log
+// would sort after them and is not one).
+bool ProxyLogName(const std::wstring& name) {
+    if (name.size() < 21 || name.rfind(L"qvfr_", 0) != 0 || name[13] != L'_' || name[20] != L'_') return false;
+    for (size_t i = 5; i < 20; ++i)
+        if (i != 13 && (name[i] < L'0' || name[i] > L'9')) return false;
+    return true;
+}
+
 }  // namespace
 
 LogInfo ReadNewestLog(const std::filesystem::path& logDir) {
@@ -25,7 +34,7 @@ LogInfo ReadNewestLog(const std::filesystem::path& logDir) {
     for (const auto& e : std::filesystem::directory_iterator(logDir, ec)) {
         const std::wstring name = e.path().filename().wstring();
         // qvfr_YYYYMMDD_HHMMSS_<exe>.log sorts by time; the smoke test exe has its own name, the game is AMS2AVX.
-        if (name.rfind(L"qvfr_", 0) != 0 || e.path().extension() != L".log") continue;
+        if (!ProxyLogName(name) || e.path().extension() != L".log") continue;
         if (name > newestName) {
             newestName = name;
             newest = e.path();
