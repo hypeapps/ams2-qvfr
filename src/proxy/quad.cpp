@@ -3629,7 +3629,9 @@ void TestSwitchesLocked() {
         pos = end + 1;
         const size_t eq = item.find('=');
         if (eq == std::string::npos) continue;
-        const std::string name = item.substr(0, eq);
+        std::string name = item.substr(0, eq);
+        name.erase(0, name.find_first_not_of(' '));
+        name.erase(name.find_last_not_of(' ') + 1);
         const int value = atoi(item.c_str() + eq + 1);
         std::string why;
         const Switch* s = FindSwitch(name, &why);

@@ -148,16 +148,20 @@ const char* ComparisonText(D3D11_COMPARISON_FUNC c) {
 
 void LogEntry(size_t i, const Entry& e) {
     const D3D11_SAMPLER_DESC& d = e.d;
-    char maxLod[32];
+    char minLod[32], maxLod[32];
+    if (d.MinLOD <= -FLT_MAX)
+        snprintf(minLod, sizeof(minLod), "min");
+    else
+        snprintf(minLod, sizeof(minLod), "%.2f", d.MinLOD);
     if (d.MaxLOD >= FLT_MAX)
         snprintf(maxLod, sizeof(maxLod), "max");
     else
         snprintf(maxLod, sizeof(maxLod), "%.2f", d.MaxLOD);
     Log("Samplers: #%zu %s: filter 0x%X (%s), address %s/%s/%s, MipLODBias %.3f, MaxAnisotropy %u, comparison %s, "
-        "LOD %.2f..%s, border (%g, %g, %g, %g), created %llu from %zu%s call sites",
+        "LOD %s..%s, border (%g, %g, %g, %g), created %llu from %zu%s call sites",
         i + 1, e.where.c_str(), (unsigned)d.Filter, FilterText((unsigned)d.Filter).c_str(), AddressText(d.AddressU),
         AddressText(d.AddressV), AddressText(d.AddressW), d.MipLODBias, d.MaxAnisotropy, ComparisonText(d.ComparisonFunc),
-        d.MinLOD, maxLod, d.BorderColor[0], d.BorderColor[1], d.BorderColor[2], d.BorderColor[3],
+        minLod, maxLod, d.BorderColor[0], d.BorderColor[1], d.BorderColor[2], d.BorderColor[3],
         (unsigned long long)e.count, e.sites.size(), e.sites.size() >= kMaxSites ? "+" : "");
 }
 
