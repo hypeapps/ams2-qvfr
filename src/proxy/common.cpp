@@ -529,6 +529,8 @@ Config ReadConfig(const fs::path& ini) {
     c.dlaaJitterScaleX = IniFloat(ini, L"dlaa", L"jitter_scale_x", c.dlaaJitterScaleX);
     c.dlaaJitterScaleY = IniFloat(ini, L"dlaa", L"jitter_scale_y", c.dlaaJitterScaleY);
     c.dlaaMvJittered = IniInt(ini, L"dlaa", L"mv_jittered", 0) != 0;
+    c.dlaaMipBias = IniInt(ini, L"dlaa", L"mip_bias", 1) != 0;
+    c.dlaaMipBiasOffset = std::clamp(IniFloat(ini, L"dlaa", L"mip_bias_offset", 0.0f), -1.0f, 1.0f);
     c.dlaaAutoExposure = IniInt(ini, L"dlaa", L"auto_exposure", c.dlaaAutoExposure ? 1 : 0) != 0;
     c.dlaaSkipLocks = IniInt(ini, L"dlaa", L"skip_locks", 1) != 0;
     c.dlaaExposure = IniFloat(ini, L"dlaa", L"exposure", c.dlaaExposure);
@@ -552,14 +554,14 @@ Config ReadConfig(const fs::path& ini) {
             "outer_preset=%s focus_preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d "
             "auto_exposure=%d exposure=%.4f exposure_scale=%.4f bias_mask=%.2f skip_locks=%d modifier=0x%X key=0x%X "
             "exposure_key=0x%X cockpit_taa=%d display_pass=%d outer_display_pass=%d display_pass_min_scale=%.2f "
-            "display_pass_edge=%d",
+            "display_pass_edge=%d mip_bias=%d mip_bias_offset=%.3f",
             c.dlaaSr ? "dlss" : "dlaa", c.dlaaRenderScale, c.dlaaOuterRenderScale, c.dlaaFocusRenderScale,
             preset.c_str(), outerPreset.empty() ? "f" : outerPreset.c_str(),
             focusPreset.empty() ? preset.c_str() : focusPreset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY,
             c.dlaaMvJittered, c.dlaaAutoExposure,
             c.dlaaExposure, c.dlaaExposureScale, c.dlaaBiasMask, c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey,
             c.dlaaExpKey, c.dlaaCockpitTaa, c.dlaaDisplayPass ? 1 : 0, c.dlaaOuterDisplayPass ? 1 : 0,
-            c.dlaaDisplayPassMinScale, c.dlaaDisplayEdge);
+            c.dlaaDisplayPassMinScale, c.dlaaDisplayEdge, c.dlaaMipBias ? 1 : 0, c.dlaaMipBiasOffset);
     const std::string nr = IniString(ini, L"nr", L"mode", L"off");
     c.nrMode = nr == "focus" ? 1 : nr == "final" ? 2 : 0;
     if (nr != "off" && nr != "focus" && nr != "final") Log("Settings: unknown [nr] mode=\"%s\", using off", nr.c_str());
@@ -648,11 +650,9 @@ struct TestScenario {
 };
 const TestScenario kTestScenarios[] = {
     {"as in the ini", [](Config&) {}},
-    // DLSS preset F for outer while driving. With the gaze the focus follows the eyes, so outer only (the whole image
-    // from outer) is the way to look at outer's model directly.
-    {"outer with DLSS preset F", [](Config&) {}, "dlss_preset_outer=6"},
-    {"outer only, DLSS preset K", [](Config&) {}, "outer_only=1, dlss_preset_outer=11"},
-    {"outer only, DLSS preset F", [](Config&) {}, "outer_only=1, dlss_preset_outer=6"},
+    // Texture mip bias under DLSS (samplers.h, on by default): the game's textures as before, for shimmer on fences
+    // and foliage in the periphery.
+    {"texture mip bias off", [](Config&) {}, "dlss_mip_bias=0"},
 };
 constexpr int kTestScenarioCount = (int)(sizeof(kTestScenarios) / sizeof(kTestScenarios[0]));
 // The settings any scenario sets, back to the ini's before the next one applies (c.field = ini.field for each; none
@@ -755,6 +755,8 @@ bool ReloadConfig(bool force) {
     c.dlaaJitterScaleX = n.dlaaJitterScaleX;
     c.dlaaJitterScaleY = n.dlaaJitterScaleY;
     c.dlaaMvJittered = n.dlaaMvJittered;
+    c.dlaaMipBias = n.dlaaMipBias;
+    c.dlaaMipBiasOffset = n.dlaaMipBiasOffset;
     c.dlaaAutoExposure = n.dlaaAutoExposure;
     c.dlaaSkipLocks = n.dlaaSkipLocks;
     c.dlaaExposure = n.dlaaExposure;

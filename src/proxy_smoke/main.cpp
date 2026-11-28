@@ -55,6 +55,7 @@
 //                                     (CSDilate) against a CPU reference on a D3D11 device (windscreen_smoke.cpp)
 //   --samplers                        without SteamVR and without the proxy DLL: the sampler log's CreateSamplerState
 //                                     hook on a WARP device (distinct descriptions, negative bias; samplers_smoke.cpp)
+//                                     and the mip bias test's PSSetSamplers hook (variants per setting and eye group)
 //   --ngx-log                         without SteamVR: the NGX log filter on lines from a game session (ngx_log.h)
 //   --nr-bridge                       without SteamVR and without the proxy DLL: the NR bridge (D3D11 -> D3D12 -> D3D11
 //                                     passthrough) on two focus-sized images, bit for bit (nr_bridge_smoke.cpp)
