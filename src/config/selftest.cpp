@@ -198,6 +198,7 @@ int RunSelfTest(const fs::path& dir) {
     Expect(GetPrivateProfileIntW(L"quad", L"new_key", 0, iniPath.c_str()) == 1, "Windows profile API reads the saved file");
 
     Write(mod / L"logs" / L"qvfr_20261102_100000_AMS2AVX.log", "[ 1.0] old\n");
+    Write(mod / L"logs" / L"qvfr_sboys_driver.log", "[ 1.0] Note: No valid gaze in a saved copy.\n");
     Write(mod / L"logs" / L"qvfr_20261102_201721_AMS2AVX.log",
           "[       6.3] Settings C:\\x\\qvfr.ini: [runtime] path=openxr opencomposite=\"\" openxr_layer=1\n"
           "[     181.2] IVRSystem_026::GetRecommendedRenderTargetSize = 8192 x 6864\n"
