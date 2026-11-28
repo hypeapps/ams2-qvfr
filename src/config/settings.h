@@ -37,9 +37,9 @@ struct Settings {
     bool dlssUpscale = false;        // mode=dlss
     // The share of each axis the game renders, as the proxy uses it: 1 unless mode=dlss (restart).
     float dlssScale = 1.0f, dlssOuterScale = 1.0f, dlssFocusScale = 1.0f;
-    // j, k, l, m (no key: k as the proxy; "default" reads as k, NVIDIA's DLAA default). Live. The outer and focus ones
-    // follow dlssPreset when they have no key.
-    std::string dlssPreset = "k", dlssOuterPreset = "k", dlssFocusPreset = "k";
+    // f, j, k, l, m (no key: k as the proxy; "default" reads as k, NVIDIA's DLAA default). Live. Without its key the
+    // outer one is f and the focus one follows dlssPreset.
+    std::string dlssPreset = "k", dlssOuterPreset = "f", dlssFocusPreset = "k";
     bool dlaaAutoExposure = false;
     float dlaaExposure = 0.002f;     // fixed DLSS exposure with auto off
     // [nr] (dlaa-plan D7): DLSS 5 neural rendering on the finished image; runs on DLSS's motion vectors and depth, so
