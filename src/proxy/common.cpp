@@ -438,6 +438,8 @@ Config ReadConfig(const fs::path& ini) {
     if (c.srProbeKey || !c.srCbFix || c.srCbFixKey)
         Log("Settings: [debug] sr_probe_modifier=0x%X sr_probe_key=0x%X sr_cb_fix=%d sr_cb_fix_key=0x%X", c.srProbeKeyMod,
             c.srProbeKey, c.srCbFix, c.srCbFixKey);
+    c.samplerLog = IniInt(ini, L"debug", L"sampler_log", 1) != 0;
+    if (!c.samplerLog) Log("Settings: [debug] sampler_log=0");
     c.mvrShotCompare = IniInt(ini, L"debug", L"mvr_shot_compare", 0) != 0;
     c.mvrForwardTest = IniInt(ini, L"debug", L"mvr_forward_test", 0) != 0;
     c.mvrForward = IniInt(ini, L"debug", L"mvr_forward", 1) != 0;
@@ -506,9 +508,10 @@ Config ReadConfig(const fs::path& ini) {
         std::clamp(IniFloat(ini, L"dlaa", L"outer_render_scale", c.dlaaRenderScale), 0.33f, 1.0f);
     c.dlaaFocusRenderScale =
         std::clamp(IniFloat(ini, L"dlaa", L"focus_render_scale", c.dlaaRenderScale), 0.33f, 1.0f);
-    // K: NVIDIA's DLAA default and far cheaper than M in quad views (benchmark 2026-11-18: 9.7 against 17.1 ms of GPU
-    // time per frame). M has the least ghosting on thin parts but takes no fixed exposure (DLSS Programming Guide 3.9:
-    // only J and K do).
+    // K: NVIDIA's DLAA default and far cheaper than M in quad views (benchmark: 9.7 against 17.1 ms of GPU time per
+    // frame). M has the least ghosting on thin parts but takes no fixed exposure (DLSS Programming Guide 3.9: only J and
+    // K do; F takes it as well, measured in the game). F is outer's default: about half of K's evaluation time.
+    constexpr int kOuterDefaultPreset = 6;  // F
     const auto presetValue = [](const char* key, const std::string& v, int fallback) {
         if (v == "default") return 0;
         if (v.size() == 1 && v[0] >= 'a' && v[0] <= 'o') return v[0] - 'a' + 1;  // NVSDK_NGX_DLSS_Hint_Render_Preset: A = 1 ... K = 11
@@ -517,10 +520,11 @@ Config ReadConfig(const fs::path& ini) {
     };
     const std::string preset = IniString(ini, L"dlaa", L"preset", L"k");
     c.dlaaPreset = presetValue("preset", preset, c.dlaaPreset);
-    // Quad views: each kind of view can have its own model; an absent or empty key follows preset.
+    // Quad views: each kind of view can have its own model; an absent or empty key gives F for outer and follows preset
+    // for focus.
     const std::string outerPreset = IniString(ini, L"dlaa", L"outer_preset", L"");
     const std::string focusPreset = IniString(ini, L"dlaa", L"focus_preset", L"");
-    c.dlaaOuterPreset = outerPreset.empty() ? c.dlaaPreset : presetValue("outer_preset", outerPreset, c.dlaaPreset);
+    c.dlaaOuterPreset = outerPreset.empty() ? kOuterDefaultPreset : presetValue("outer_preset", outerPreset, kOuterDefaultPreset);
     c.dlaaFocusPreset = focusPreset.empty() ? c.dlaaPreset : presetValue("focus_preset", focusPreset, c.dlaaPreset);
     c.dlaaJitterScaleX = IniFloat(ini, L"dlaa", L"jitter_scale_x", c.dlaaJitterScaleX);
     c.dlaaJitterScaleY = IniFloat(ini, L"dlaa", L"jitter_scale_y", c.dlaaJitterScaleY);
@@ -550,7 +554,7 @@ Config ReadConfig(const fs::path& ini) {
             "exposure_key=0x%X cockpit_taa=%d display_pass=%d outer_display_pass=%d display_pass_min_scale=%.2f "
             "display_pass_edge=%d",
             c.dlaaSr ? "dlss" : "dlaa", c.dlaaRenderScale, c.dlaaOuterRenderScale, c.dlaaFocusRenderScale,
-            preset.c_str(), outerPreset.empty() ? preset.c_str() : outerPreset.c_str(),
+            preset.c_str(), outerPreset.empty() ? "f" : outerPreset.c_str(),
             focusPreset.empty() ? preset.c_str() : focusPreset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY,
             c.dlaaMvJittered, c.dlaaAutoExposure,
             c.dlaaExposure, c.dlaaExposureScale, c.dlaaBiasMask, c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey,
@@ -644,6 +648,11 @@ struct TestScenario {
 };
 const TestScenario kTestScenarios[] = {
     {"as in the ini", [](Config&) {}},
+    // DLSS preset F for outer while driving. With the gaze the focus follows the eyes, so outer only (the whole image
+    // from outer) is the way to look at outer's model directly.
+    {"outer with DLSS preset F", [](Config&) {}, "dlss_preset_outer=6"},
+    {"outer only, DLSS preset K", [](Config&) {}, "outer_only=1, dlss_preset_outer=11"},
+    {"outer only, DLSS preset F", [](Config&) {}, "outer_only=1, dlss_preset_outer=6"},
 };
 constexpr int kTestScenarioCount = (int)(sizeof(kTestScenarios) / sizeof(kTestScenarios[0]));
 // The settings any scenario sets, back to the ini's before the next one applies (c.field = ini.field for each; none

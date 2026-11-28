@@ -53,6 +53,9 @@
 //                                     (CSDisplays) against a CPU reference on a D3D11 device (dlaa_displays_smoke.cpp)
 //   --windscreen-depth                without SteamVR and without the proxy DLL: the windscreen glass's depth
 //                                     (CSDilate) against a CPU reference on a D3D11 device (windscreen_smoke.cpp)
+//   --samplers                        without SteamVR and without the proxy DLL: the sampler log's CreateSamplerState
+//                                     hook on a WARP device (distinct descriptions, negative bias; samplers_smoke.cpp)
+//   --ngx-log                         without SteamVR: the NGX log filter on lines from a game session (ngx_log.h)
 //   --nr-bridge                       without SteamVR and without the proxy DLL: the NR bridge (D3D11 -> D3D12 -> D3D11
 //                                     passthrough) on two focus-sized images, bit for bit (nr_bridge_smoke.cpp)
 //   --panel                           without SteamVR and without the proxy DLL: the tuning panel's picture (RmlUi on
@@ -104,6 +107,8 @@ int RunDlaaDisplays();  // dlaa_displays_smoke.cpp
 int RunWindscreenDepth();  // windscreen_smoke.cpp
 int RunSrCarry();       // sr_carry_smoke.cpp
 int RunNrBridge();   // nr_bridge_smoke.cpp
+int RunSamplers();   // samplers_smoke.cpp
+int RunNgxLog();     // samplers_smoke.cpp
 int RunPanel();      // panel_smoke.cpp
 #include "focus_cull.h"
 #include "focus_geometry.h"
@@ -2466,6 +2471,7 @@ int main(int argc, char** argv) {
     bool probe = false;
     bool quad = false;
     bool dlaa = false;
+    bool samplersTest = false;
     bool shotsTest = false;
     bool composeTest = false;
     bool clonesTest = false;
@@ -2508,6 +2514,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--windscreen-depth")) return RunWindscreenDepth();
         else if (!strcmp(argv[i], "--sr-carry")) return RunSrCarry();
         else if (!strcmp(argv[i], "--nr-bridge")) return RunNrBridge();
+        else if (!strcmp(argv[i], "--ngx-log")) return RunNgxLog();
+        else if (!strcmp(argv[i], "--samplers")) samplersTest = true;
         else if (!strcmp(argv[i], "--panel")) return RunPanel();
         else if (!strcmp(argv[i], "--mvr-vs")) mvrVsTest = true;
         else if (!strcmp(argv[i], "--ps-patch-dir") && i + 1 < argc) return RunPsPatchDir(argv[i + 1]);
@@ -2535,6 +2543,7 @@ int main(int argc, char** argv) {
     SetEnvironmentVariableW(L"QVFR_HOME", home.c_str());
     if (shotsTest) return RunShots(home);
     if (composeTest) return RunCompose();
+    if (samplersTest) return RunSamplers();
     // --hook-profile with one of the module tests below: the test runs with [debug] hook_profile on (this thread as outer
     // L's group); the detours must have counted and every scope must have closed.
     auto profiled = [&](int (*run)()) {

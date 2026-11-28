@@ -115,9 +115,9 @@ Settings Read(const IniFile& ini) {
         s.dlssOuterScale = StoredScale(ini, "outer_render_scale", true);
         s.dlssFocusScale = StoredScale(ini, "focus_render_scale", true);
     }
-    // The GUI offers j, k, l and m; without the key, or with an empty one, the proxy takes K.
+    // The GUI offers f, j, k, l and m; without the key, or with an empty one, the proxy takes K (outer: F).
     s.dlssPreset = PresetOf(ini, "preset", "k");
-    s.dlssOuterPreset = PresetOf(ini, "outer_preset", s.dlssPreset);
+    s.dlssOuterPreset = PresetOf(ini, "outer_preset", "f");
     s.dlssFocusPreset = PresetOf(ini, "focus_preset", s.dlssPreset);
     s.dlaaAutoExposure = ParseInt(ini.GetOr("dlaa", "auto_exposure", ""), 0) != 0;
     s.dlaaExposure = ParseFloat(ini.GetOr("dlaa", "exposure", ""), 0.002f);

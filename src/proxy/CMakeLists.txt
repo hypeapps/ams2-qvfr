@@ -183,6 +183,7 @@ add_library(qvfr_proxy SHARED
   fps_hud.cpp
   sysinfo.cpp
   sun_fx.cpp
+  samplers.cpp
   mvr_ps.cpp
   mvr_vs.cpp
   mvr_pass.cpp

@@ -129,6 +129,8 @@ struct Config {
     bool focusCull = true;
     int cullKeyMod = VK_RCONTROL;
     int cullKey = 0;                  // testers: VK_F4
+    // The game's sampler descriptions in the log (samplers.h). [debug] sampler_log; a change needs a restart.
+    bool samplerLog = true;
     // Crepuscular rays and lens flares of the focus views taken from outer (sun_fx.h); the hotkey switches.
     bool sunEffects = true;
     int sunKeyMod = VK_RCONTROL;
@@ -311,7 +313,7 @@ struct Config {
     float dlaaOuterRenderScale = 0.67f;
     float dlaaFocusRenderScale = 0.67f;
     int dlaaPreset = 0;               // DLSS render preset hint for DLAA: 0 = DLSS default, 10 = J, 11 = K, ...
-    int dlaaOuterPreset = 0;          // quad views: outer_preset and focus_preset, each preset when absent (live)
+    int dlaaOuterPreset = 6;          // quad views: outer_preset (F when absent) and focus_preset (preset when absent), live
     int dlaaFocusPreset = 0;
     float dlaaJitterScaleX = 0.5f;    // DLSS jitter in pixels = the engine's projection offset * scale
     float dlaaJitterScaleY = -0.5f;

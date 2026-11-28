@@ -18,6 +18,7 @@
 #include "panel.h"
 #include "generated/wrappers_0912.h"
 #include "probe.h"
+#include "samplers.h"
 #include "quad.h"
 
 namespace qvfr {
@@ -84,6 +85,7 @@ void LogCallStats(bool totals) {
     probe::LogStats(totals);
     quad::LogStats(totals);
     dlaa::LogStats(totals);
+    samplers::LogStats(totals);
 }
 
 namespace {

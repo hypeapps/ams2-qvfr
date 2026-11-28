@@ -201,7 +201,7 @@
                         <button class="primary" data-if="!nr_model" data-event-click="open_url('dlssnr')">Download</button>
                     </div>
                     <div class="dlss" data-if="dlss">
-                        <div class="dintro">Preset is the DLSS model. K (default) is light on the GPU. M shows less ghosting behind mirrors and cars, but costs much more.</div>
+                        <div class="dintro">Preset is the DLSS model. F (periphery default) costs about half of K. K (focus default) is light on the GPU. M shows less ghosting behind mirrors and cars, but costs much more.</div>
                         <div class="dview" data-for="v : dlss_views">
                             <div class="dhead">
                                 <div class="dtitle">
@@ -209,6 +209,7 @@
                                 </div>
                                 <span class="dlabel">Preset</span>
                                 <div class="seg small">
+                                    <button data-class-on="v.preset == 'f'" data-event-click="dlss_preset(v.id, 'f')">F</button>
                                     <button data-class-on="v.preset == 'j'" data-event-click="dlss_preset(v.id, 'j')">J</button>
                                     <button data-class-on="v.preset == 'k'" data-event-click="dlss_preset(v.id, 'k')">K</button>
                                     <button data-class-on="v.preset == 'l'" data-event-click="dlss_preset(v.id, 'l')">L</button>

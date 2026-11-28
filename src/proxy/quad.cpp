@@ -3574,6 +3574,8 @@ const Switch kSwitches[] = {
     // DLSS, over the ini (-1 = the ini's): presets as NVIDIA numbers them (10 J, 11 K, 12 L, 13 M), scales in percent.
     {"dlss_preset", false, -1, 15, [] { return dlaa::GetPresetSwitch(0); }, [](int v) { dlaa::SetPresetSwitch(0, v); }},
     {"dlss_game_taa", false, 0, 1, [] { return dlaa::GetGameTaaSwitch(); }, [](int v) { dlaa::SetGameTaaSwitch(v); }},
+    {"dlss_exposure", false, 0, dlaa::kExposureSteps - 1, [] { return dlaa::GetExposureSwitch(); },
+     [](int v) { dlaa::SetExposureSwitch(v); }},
     {"dlss_preset_outer", false, -1, 15, [] { return dlaa::GetPresetSwitch(1); },
      [](int v) { dlaa::SetPresetSwitch(1, v); }},
     {"dlss_preset_focus", false, -1, 15, [] { return dlaa::GetPresetSwitch(2); },
@@ -3627,7 +3629,9 @@ void TestSwitchesLocked() {
         pos = end + 1;
         const size_t eq = item.find('=');
         if (eq == std::string::npos) continue;
-        const std::string name = item.substr(0, eq);
+        std::string name = item.substr(0, eq);
+        name.erase(0, name.find_first_not_of(' '));
+        name.erase(name.find_last_not_of(' ') + 1);
         const int value = atoi(item.c_str() + eq + 1);
         std::string why;
         const Switch* s = FindSwitch(name, &why);
