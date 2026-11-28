@@ -1956,9 +1956,10 @@ ID3D11ShaderResourceView* EarlyMapSrv(int eye, ID3D11Resource* r, DXGI_FORMAT fm
     }
     D3D11_TEXTURE2D_DESC d{};
     t->GetDesc(&d);
-    if (d.Width != g_sz.fw || d.Height != g_sz.fh || d.ArraySize != 1 || d.SampleDesc.Count != 1 ||
-        !(d.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
-        EarlyMapMiss("focus's map is not a single texture at focus's view size");
+    // Focus's view size, or the game's (clones::SetLiveTrackFull: the map's clone at the game's size).
+    const bool sized = (d.Width == g_sz.fw && d.Height == g_sz.fh) || (d.Width == g_sz.gw && d.Height == g_sz.gh);
+    if (!sized || d.ArraySize != 1 || d.SampleDesc.Count != 1 || !(d.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+        EarlyMapMiss("focus's map is not a single texture at focus's view size or the game's");
         return nullptr;
     }
     EarlyLiveTrack& m = g_ltEarly[eye];

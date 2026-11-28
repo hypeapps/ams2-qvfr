@@ -106,6 +106,9 @@ struct Tex {
     // DLSS SR (SetStereoSr, SetSr): per kind, in the learning groups, written before the TAA resolve's draw (scene),
     // used after it (post), the target of that draw (taaOut: the TAA history, written in the output size).
     bool scene[2] = {}, post[2] = {}, taaOut[2] = {};
+    // Focus's live track map: written in a focus group's CLiveTrackRender (kept across lists) and nowhere else in focus
+    // groups but by clears. ltFull: focus's clones of it are at the game's size (built so in this list).
+    bool ltW = false, otherW = false, ltFull = false;
 };
 struct Rt {
     uint8_t* obj = nullptr;
@@ -125,7 +128,8 @@ struct Entry {
 // A render target or depth view of a clone: its size and the original's (at the view's mip).
 struct Target {
     uint32_t cw = 0, ch = 0, ow = 0, oh = 0;
-    char name[64] = "";  // the texture's
+    char name[64] = "";   // the texture's
+    bool ltFull = false;  // a focus clone of the live track map at the game's size
 };
 
 struct SetState {
@@ -215,6 +219,13 @@ std::unordered_set<ID3D11Resource*> g_otherWritten;  // written in learning grou
 std::vector<std::string> g_otherLines;
 int g_otherCount[2] = {};
 std::vector<void*> g_outsideCallers, g_mismatchCallers;
+// Focus's live track map at the game's size: the map is read by screen UV, and at a small size its thin parts (track
+// edges, fresh tyre marks) turn into flickering white blocks.
+bool g_ltFull = true;
+bool g_ltFullPending = false;  // changed: the clones are made again at the next frame start
+bool g_inLt = false;           // a focus group's CLiveTrackRender runs
+uint64_t g_ltVpScaled = 0;     // viewports of focus's size on a game-size map clone, scaled to it
+std::vector<std::pair<float, float>> g_ltVpSeen;  // viewports seen on such clones (logged once each)
 Counters g_c, g_ctot;
 // Issue #10 (the image broken from the second session on): the eye groups of loading frames draw little or nothing, so a
 // list learned on them gave outer clones of 3 small textures while its size went to the engine. A learning group counts
@@ -701,6 +712,7 @@ void ResetLocked(const char* why) {
     DropClonesLocked();
     for (auto& [obj, t] : g_tex) {
         for (int k = 0; k < 2; ++k) t.read[k] = t.written[k] = t.scene[k] = t.post[k] = t.taaOut[k] = false;
+        t.otherW = false;
     }
     for (SetState& s : g_set) {
         s.failed = false;
@@ -935,6 +947,7 @@ void NoteViewLocked(SetState& s, void* v, IUnknown* out, ID3D11Texture2D* clone,
         Target& tg = s.targets[out];
         tg = {MipSize(cd.Width, mip), MipSize(cd.Height, mip), MipSize(t.desc.Width, mip), MipSize(t.desc.Height, mip)};
         memcpy(tg.name, t.name, sizeof(tg.name));
+        tg.ltFull = t.ltFull && KindOf(SetOf(s)) == Focus;
     }
 }
 
@@ -971,6 +984,9 @@ uint64_t PackSize(uint32_t w, uint32_t h) { return (uint64_t)(w & 0xffff) | ((ui
 
 // Outer keeps a texture focus reads but does not write: focus needs outer's data in it.
 bool KeptForFocus(const Tex& t) { return t.read[Focus] && !t.written[Focus]; }
+
+// Focus's clone of t is at the game's size: t is a target of focus's live track map only.
+bool LtFullWanted(const Tex& t) { return g_ltFull && t.ltW && !t.otherW && t.desc.SampleDesc.Count == 1; }
 
 bool CloneWanted(const Tex& t, Set s) {
     const Set k = KindOf(s);
@@ -1039,7 +1055,7 @@ bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
     bool ok = true;
     Zeros zeros;
     int zeroed = 0, notZeroed = 0, sliced = 0, identical = 0, outerSliced = 0, sceneSliced = 0;
-    int sharedN = 0;
+    int sharedN = 0, ltFullN = 0;
     // B20 K4: focus at the game's size (wanted only for focus R's twins, UpdateWantedLocked): the identity set.
     const bool identity = si == Focus && s.w == g_gameW && s.h == g_gameH;
     // Issue #10: without a clone in the game's size the set's size would go to the engine while it draws into the
@@ -1065,6 +1081,13 @@ bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
         D3D11_TEXTURE2D_DESC d = t.desc;
         d.Width = Scaled(s.w, t.fr.d, t.fr.upW);
         d.Height = Scaled(s.h, t.fr.d, t.fr.upH);
+        const bool ltFull = !shared && !identity && KindOf(si) == Focus && LtFullWanted(t);
+        if (KindOf(si) == Focus) t.ltFull = ltFull;
+        if (ltFull) {
+            d.Width = t.desc.Width;
+            d.Height = t.desc.Height;
+            ++ltFullN;
+        }
         if (shared) {
             const D3D11_TEXTURE2D_DESC sd = DescOf(shared);
             const bool fs = KindOf(si) == Focus && t.slice, os = KindOf(si) == Outer && t.oslice;  // B20 K5
@@ -1085,7 +1108,7 @@ bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
         if (shared) {
             c = shared;
             ++sharedN;
-        } else if (ID3D11Texture2D* arr = si == Focus ? SliceArrayLocked(t, d) : nullptr) {
+        } else if (ID3D11Texture2D* arr = si == Focus && !ltFull ? SliceArrayLocked(t, d) : nullptr) {
             // B12 step 5: focus's clone is slice 1 of the array (the twin slice 2), its corner in focus's size. B20 K5:
             // also at the game's size (before the identity set: the slice, not slice 0).
             c = arr;
@@ -1164,11 +1187,12 @@ bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
         }
         if (!ok) break;
     }
-    int mixed = 0;
+    int mixed = 0, ltRts = 0, ltMixed = 0;
     for (auto& [obj, rt] : g_rt) {
         if (!ok) break;
         int other = 0;  // views of listed textures without a clone for this set
         int own = 0, sharedViews = 0;  // scene set: views of its own clones and of the kind's post clones
+        int full = 0;                  // views of game-size live track clones
         for (const RtArray& a : kRtArrays) {
             uint16_t count = 0;
             void** arr = nullptr;
@@ -1188,6 +1212,7 @@ bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
                     continue;
                 }
                 ++(u == t.clone[si] ? own : sharedViews);
+                if (u == t.clone[si] && t.ltFull && KindOf(si) == Focus) ++full;
                 void* cv = CloneViewLocked(s, dev, v, u, t);
                 if (!cv) {
                     ok = false;
@@ -1200,8 +1225,13 @@ bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
         if (rt.views[si]) {
             // A render target of shared post clones alone keeps the post set's size.
             const SetState& z = own || si < OuterScene ? s : g_set[KindOf(si)];
-            AddEntry(s, obj, obj + kRtSize, 4, PackSize(rt.w, rt.h),
-                     PackSize(Scaled(z.w, rt.fr.d, rt.fr.upW), Scaled(z.h, rt.fr.d, rt.fr.upH)));
+            // A target of the live track map alone keeps the game's size (all its views are of game-size clones).
+            if (full && full == own + sharedViews)
+                ++ltRts;
+            else
+                AddEntry(s, obj, obj + kRtSize, 4, PackSize(rt.w, rt.h),
+                         PackSize(Scaled(z.w, rt.fr.d, rt.fr.upW), Scaled(z.h, rt.fr.d, rt.fr.upH)));
+            if (full && full != own + sharedViews) ++ltMixed;
             if (other || (own && sharedViews)) ++mixed;
         }
     }
@@ -1209,6 +1239,17 @@ bool BuildSetLocked(ID3D11Device* dev, Set si, int& clones, double& mb) {
         Log("Clones: %d render targets have views of both cloned and shared textures for %s (sizes may not match)",
             mixed, kSetNames[si]);
     if (sharedN) Log("Clones: %s: %d textures use the %s clones", kSetNames[si], sharedN, kSetNames[KindOf(si)]);
+    if (KindOf(si) == Focus) {
+        int lt = 0, ltOther = 0;
+        for (auto& [o, t] : g_tex) {
+            lt += t.ltW ? 1 : 0;
+            ltOther += t.ltW && t.otherW ? 1 : 0;
+        }
+        Log("Clones: %s: live track map at the game's size %s: %d of %d textures written by CLiveTrackRender (%d also "
+            "written elsewhere in focus, kept at the set's size), %d render targets at the game's size, %d with other "
+            "views too",
+            kSetNames[si], g_ltFull ? "on" : "off", ltFullN, lt, ltOther, ltRts, ltMixed);
+    }
     if (identical)
         Log("Clones: %s at the game's size: %d of its textures are their own clones (B20 K4: focus L draws into the "
             "engine's textures, focus R into twins of those outer's groups write for it)",
@@ -1913,6 +1954,25 @@ void ApplyViewportsLocked(void* caller, bool force) {
         const bool fix = Cfg().clonesViewportFix;
         for (UINT i = 0; i < g_vpN; ++i) {
             D3D11_VIEWPORT& v = eff[i];
+            if (t.ltFull) {
+                // The map's clone at the game's size: a viewport of the set's size (the engine's size for the view)
+                // covers the whole clone.
+                const auto seen = std::make_pair(v.Width, v.Height);
+                if (g_ltVpSeen.size() < 8 && std::find(g_ltVpSeen.begin(), g_ltVpSeen.end(), seen) == g_ltVpSeen.end()) {
+                    g_ltVpSeen.push_back(seen);
+                    Log("Clones: viewport %.0f x %.0f at (%.0f, %.0f) on a game-size live track clone %u x %u in a %s "
+                        "group, from %s",
+                        v.Width, v.Height, v.TopLeftX, v.TopLeftY, t.cw, t.ch, kSetNames[g_cur],
+                        caller ? Where(caller).c_str() : "the state bound before the group");
+                }
+                if (s.w && s.h && v.TopLeftX == 0 && v.TopLeftY == 0 && std::abs(v.Width - (float)s.w) < 0.5f &&
+                    std::abs(v.Height - (float)s.h) < 0.5f && (s.w != t.cw || s.h != t.ch)) {
+                    v.Width = (float)t.cw;
+                    v.Height = (float)t.ch;
+                    ++g_ltVpScaled;
+                }
+                continue;
+            }
             if (v.Width <= t.cw + 0.5f && v.Height <= t.ch + 0.5f) continue;
             if (v.TopLeftX + v.Width > t.ow + 0.5f || v.TopLeftY + v.Height > t.oh + 0.5f) {
                 ++g_c.vpOutside;
@@ -2292,6 +2352,12 @@ void NoteLocked(ID3D11Resource* r, Use use, const char* method, void* caller) {
         if (auto it = g_byRes.find(r); it != g_byRes.end()) {
             Tex& t = g_tex[it->second];
             (use == Write ? t.written : t.read)[g_kind] = true;
+            if (use == Write && g_kind == Focus) {
+                if (g_inLt)
+                    t.ltW = true;
+                else if (strncmp(method, "Clear", 5) != 0)
+                    t.otherW = true;
+            }
             if (use == Write && t.fr.d == 1) g_groupFull = true;  // issue #10: the group counts
             if (g_sr && g_post)
                 t.post[g_kind] = true;
@@ -3233,6 +3299,12 @@ void OnFrameStart(ID3D11DeviceContext* imm, bool enabled) {
             Log("Clones: B20 K5b: clones made again with %d focus scene clones as three-slice arrays (DLSS SR)", n);
         }
         g_sceneWantPending = false;
+        if (g_ltFullPending && g_phase == Ready && !g_dirty) {
+            DropClonesLocked();
+            g_phase = Learning;
+            Log("Clones: clones made again with focus's live track map at %s", g_ltFull ? "the game's size" : "its size");
+        }
+        g_ltFullPending = false;
         // S1 (stereo): no focus groups; the focus set is not wanted there.
         const bool focusDone = g_set[Focus].learned >= kLearnGroups || g_stereo;  // stereo: no focus groups
         if (g_phase == Learning && g_set[Outer].learned >= kLearnGroups && focusDone && g_enabled && imm)
@@ -3887,6 +3959,24 @@ void SetMapCache(bool on) {
     Log("Clones: map cache %s (O1: binds whose views all map to themselves skip the lock)", on ? "on" : "off");
 }
 bool GetMapCache() { return g_sameOn.load(); }
+
+void SetLiveTrackFull(bool on) {
+    Protect("SetLiveTrackFull", [&] {
+        std::lock_guard lock(g_cm);
+        if (g_ltFull == on) return;
+        Log("Clones: focus's live track map at %s (%llu viewports scaled to its game-size clones so far)",
+            on ? "the game's size" : "its size", (unsigned long long)g_ltVpScaled);
+        g_ltFull = on;
+        g_ltFullPending = true;
+    });
+}
+bool GetLiveTrackFull() { return g_ltFull; }
+void LiveTrackTask(bool running) {
+    Protect("LiveTrackTask", [&] {
+        std::lock_guard lock(g_cm);
+        g_inLt = running;
+    });
+}
 uint32_t PsHighSlotsGen() { return g_psHighGen.load(std::memory_order_relaxed); }
 void NewPsViewEpoch() { ++g_psEpoch; }
 ID3D11ShaderResourceView* PsView(ID3D11DeviceContext* c, UINT slot) {

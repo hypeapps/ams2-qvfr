@@ -189,6 +189,12 @@ void LogStats(bool totals);  // a stats line, with the session totals at the end
 // skip the lock (a cache on the render thread).
 void SetMapCache(bool on);
 bool GetMapCache();
+// Focus's live track map (the targets only a focus group's CLiveTrackRender writes) in clones at the game's size, not
+// focus's: the map is read by screen UV. A change makes the clones again at the next frame start.
+void SetLiveTrackFull(bool on);
+bool GetLiveTrackFull();
+// A focus group's CLiveTrackRender starts (true) or ends: its writes are noted as the map's.
+void LiveTrackTask(bool running);
 // O1: PSSetShaderResources calls on the immediate context that reach slot kPsWatchSlot or above (any caller, the
 // proxy's own too), counted: mvr_pass binds its t21..t26 (mvrps::kTexBase) again only when they may have changed.
 constexpr UINT kPsWatchSlot = 21;

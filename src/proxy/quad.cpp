@@ -526,6 +526,7 @@ struct ProfTask {
     int order = 0;  // build order (its add-task call)
     bool begin = false;  // the group's CBeginEye: its calls are the group's frames
     bool fwdBuild = false;  // the group's CForwardBuildCommandThread (O2 steps 2 and 3)
+    bool liveTrack = false;  // a focus group's CLiveTrackRender (its writes are focus's live track map)
     char name[48] = "";
     mutable std::atomic<uint64_t> ticks{0}, calls{0};
     mutable std::atomic<uint64_t> gapTicks{0};  // render thread: from the end of its previous task to this one's start
@@ -846,10 +847,14 @@ void __fastcall RunTask(uint8_t* task) {
     if (map) mvrpass::TaskMapBegin(kGroupNames[prof->group], prof->name, g_mapFrame);
     LARGE_INTEGER t0{}, t1{};
     if (profOn) QueryPerformanceCounter(&t0);
+    const ProfTask* lt = prof ? prof : ProfFind(task);
+    const bool liveTrack = lt && lt->liveTrack;
+    if (liveTrack) clones::LiveTrackTask(true);
     {
         hookprof::Orig o;
         (*(ExecuteFn**)task)[kExecuteSlot](task);
     }
+    if (liveTrack) clones::LiveTrackTask(false);
     if (map) mvrpass::TaskMapEnd();
     if (mvr) mvrpass::AfterTask(task);
     if (spans.end >= 0) gpu::SpanEnd((gpu::Span)spans.end);
@@ -1065,6 +1070,7 @@ void BuildProfileLocked() {
         if (!TaskClassName(items[i].task, e.name, sizeof(e.name)))
             snprintf(e.name, sizeof(e.name), "task@%p", items[i].task);
         e.fwdBuild = !strcmp(e.name, "CForwardBuildCommandThread");
+        e.liveTrack = e.group >= FocusL && !strcmp(e.name, "CLiveTrackRender");
         ++count[e.group];
     }
     // MVR forward (B9d): the focus groups' CPhase3BuildCommandThread is skipped with their CPhase3Render (the pair
@@ -3512,6 +3518,8 @@ const Switch kSwitches[] = {
     {"task_profile", false, 0, 1, [] { return (int)g_profOn.load(); }, [](int v) { g_profOn = v != 0; }},
     {"clones_map_cache", false, 0, 1, [] { return (int)clones::GetMapCache(); },
      [](int v) { clones::SetMapCache(v != 0); }},
+    {"clones_lt_full", false, 0, 1, [] { return (int)clones::GetLiveTrackFull(); },
+     [](int v) { clones::SetLiveTrackFull(v != 0); }},
     {"hook_profile", false, 0, 1, [] { return (int)hookprof::On(); }, [](int v) { hookprof::SetOn(v != 0); }},
     {"mvr_early", true, 0, mvrpass::kEarlyModes - 1, [] { return mvrpass::GetEarly(); },
      [](int v) { mvrpass::SetEarly(v); }},
