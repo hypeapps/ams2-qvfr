@@ -3585,10 +3585,8 @@ const Switch kSwitches[] = {
      [](int v) { dlaa::SetPresetSwitch(2, v); }},
     {"dlss_scale_outer", false, -1, 100, [] { return g_srScaleSwitch[0]; }, [](int v) { g_srScaleSwitch[0] = v; }},
     {"dlss_scale_focus", false, -1, 100, [] { return g_srScaleSwitch[1]; }, [](int v) { g_srScaleSwitch[1] = v; }},
-    // Texture mip bias test (samplers.h): 0 off, 1 MipLODBias -1 in every view, 2 in the focus views only.
-    {"dlss_mip_bias", false, 0, samplers::kBiasModes - 1, [] { return samplers::GetBias(); },
-     [](int v) { samplers::SetBias(v); }},
-    {"sampler_aniso", false, 0, 1, [] { return (int)samplers::GetAniso(); }, [](int v) { samplers::SetAniso(v != 0); }},
+    // Texture mip bias under DLSS (samplers.h): -1 the ini's ([dlaa] mip_bias), 0 off, 1 on.
+    {"dlss_mip_bias", false, -1, 1, [] { return samplers::GetSwitch(); }, [](int v) { samplers::SetSwitch(v); }},
 };
 
 const Switch* FindSwitch(const std::string& name, std::string* why) {

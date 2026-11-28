@@ -5,6 +5,7 @@
 
 #include <d3d11.h>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 
@@ -37,13 +38,15 @@ bool Bound(ID3D11DeviceContext* c, UINT slot, ID3D11SamplerState* s, D3D11_SAMPL
     return b == s;
 }
 
-// The mip bias test: the game's scene samplers (the smoke exe counts as the game's exe) get variants; PSSetSamplers
-// binds the variant of the setting and eye group, the other samplers as they are; a group start rebinds.
+// The texture mip bias: the game's scene samplers (the smoke exe counts as the game's exe) get copies with the bias;
+// PSSetSamplers binds the copy of the current view's bias, the other samplers as they are. First as in stereo (no eye
+// groups: outer's bias everywhere), then with the quad eye groups (each view's own bias, the game's samplers from the
+// TAA resolve to the group's end, group starts rebinding).
 int RunMipBias(ID3D11Device* dev) {
     using namespace qvfr::samplers;
     ID3D11DeviceContext* c = nullptr;
     dev->GetImmediateContext(&c);
-    const size_t setsBefore = TestVariantSets();
+    const size_t setsBefore = TestSceneSamplers();
     const D3D11_SAMPLER_DESC want[] = {
         Desc(D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP),          // 0 scene, trilinear
         Desc(D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_WRAP),                   // 1 scene (MinLOD unlike --samplers)
@@ -53,9 +56,9 @@ int RunMipBias(ID3D11Device* dev) {
     };
     constexpr UINT kN = sizeof(want) / sizeof(want[0]);
     ID3D11SamplerState* s[kN] = {};
+    ID3D11SamplerState* late = nullptr;
     HRESULT hr = S_OK;
     for (UINT i = 0; i < kN && SUCCEEDED(hr); ++i) hr = dev->CreateSamplerState(&want[i], &s[i]);
-    const size_t sets = TestVariantSets() - setsBefore;
     int bad = 0;
     auto check = [&](const char* what, bool ok) {
         if (!ok) {
@@ -64,60 +67,78 @@ int RunMipBias(ID3D11Device* dev) {
         }
     };
     D3D11_SAMPLER_DESC d{};
+    auto all = [&](UINT from) {
+        bool same = true;
+        for (UINT i = from; i < kN; ++i) same &= Bound(c, i, s[i], &d);
+        return same;
+    };
     if (SUCCEEDED(hr)) {
         const uint64_t replaced0 = TestReplacedBinds();
         c->PSSetSamplers(0, kN, s);
-        bool same = true;
-        for (UINT i = 0; i < kN; ++i) same &= Bound(c, i, s[i], &d);
-        check("off: the game's samplers bound", same && TestReplacedBinds() == replaced0);
+        check("before any bias: the game's samplers bound", all(0) && TestReplacedBinds() == replaced0);
 
-        SetBias(1);
+        // Stereo DLAA: -1 everywhere.
+        SetViewBias(true, true, -1.0f, -1.0f);
         c->PSSetSamplers(0, kN, s);
-        check("bias in every view: trilinear sampler with MipLODBias -1",
+        check("stereo: trilinear sampler with MipLODBias -1",
               !Bound(c, 0, s[0], &d) && d.MipLODBias == -1.0f && d.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR);
-        check("bias in every view: anisotropic sampler with MipLODBias -1",
+        check("stereo: anisotropic sampler with MipLODBias -1",
               !Bound(c, 1, s[1], &d) && d.MipLODBias == -1.0f && d.Filter == D3D11_FILTER_ANISOTROPIC);
-        same = true;
-        for (UINT i = 2; i < kN; ++i) same &= Bound(c, i, s[i], &d);
-        check("bias in every view: mip point, LOD 0..0 and comparison samplers as they are", same);
-        check("bias in every view: two samplers replaced", TestReplacedBinds() == replaced0 + 2);
-
-        SetAniso(true);
+        check("stereo: mip point, LOD 0..0 and comparison samplers as they are", all(2));
+        check("stereo: two samplers replaced", TestReplacedBinds() == replaced0 + 2);
+        SceneEnd(c);  // no eye groups: the bias stays past the TAA resolve
         c->PSSetSamplers(0, 1, s);
-        check("bias and anisotropic: trilinear sampler anisotropic 16x with MipLODBias -1",
-              !Bound(c, 0, s[0], &d) && d.Filter == D3D11_FILTER_ANISOTROPIC && d.MaxAnisotropy == 16 &&
-                  d.MipLODBias == -1.0f);
-        SetBias(0);
-        c->PSSetSamplers(0, 1, s);
-        check("anisotropic only: trilinear sampler anisotropic 16x without bias",
-              !Bound(c, 0, s[0], &d) && d.Filter == D3D11_FILTER_ANISOTROPIC && d.MipLODBias == 0.0f);
-        SetAniso(false);
+        check("stereo: bias after the TAA resolve too", !Bound(c, 0, s[0], &d) && d.MipLODBias == -1.0f);
 
-        // Focus only: outer's group keeps the game's sampler; focus L's start rebinds the slots without a new bind
-        // from the game, and the next outer group's start puts the game's back.
-        SetBias(2);
-        BeginGroup(0, c);
+        SetViewBias(false, true, -1.0f, -1.0f);
         c->PSSetSamplers(0, kN, s);
-        check("focus only: outer L binds the game's sampler", Bound(c, 0, s[0], &d));
+        check("DLSS not running: the game's samplers", all(0));
+        SetSwitch(0);
+        SetViewBias(true, true, -1.0f, -1.0f);
+        c->PSSetSamplers(0, kN, s);
+        check("switch dlss_mip_bias=0: the game's samplers", all(0));
+        SetSwitch(1);
+        SetViewBias(true, false, -1.0f, -1.0f);
+        c->PSSetSamplers(0, 1, s);
+        check("switch dlss_mip_bias=1 over mip_bias=0: MipLODBias -1", !Bound(c, 0, s[0], &d) && d.MipLODBias == -1.0f);
+        SetSwitch(-1);
+
+        // Quad views with DLSS SR: outer at 50% (-2), focus at 77% (log2 0.77 - 1 = -1.377, step -1.375).
+        SetViewBias(true, true, std::log2(0.5f) - 1, std::log2(0.77f) - 1);
+        BeginGroup(0, c);
+        check("outer L's start rebinds with outer's bias -2", !Bound(c, 0, s[0], &d) && d.MipLODBias == -2.0f);
+        c->PSSetSamplers(0, kN, s);
+        check("outer L binds with -2", !Bound(c, 1, s[1], &d) && d.MipLODBias == -2.0f && all(2));
+        SceneEnd(c);
+        check("outer L's TAA resolve puts the game's samplers back", Bound(c, 0, s[0], &d) && Bound(c, 1, s[1], &d));
+        c->PSSetSamplers(0, kN, s);
+        check("outer L after its TAA resolve binds the game's samplers", all(0));
         EndGroup();
+        c->PSSetSamplers(0, kN, s);
+        check("between the eye groups: the game's samplers", all(0));
         BeginGroup(2, c);
-        check("focus only: focus L's start rebinds with MipLODBias -1", !Bound(c, 0, s[0], &d) && d.MipLODBias == -1.0f);
-        check("focus only: focus L's start rebinds the anisotropic one too",
-              !Bound(c, 1, s[1], &d) && d.MipLODBias == -1.0f && d.Filter == D3D11_FILTER_ANISOTROPIC);
-        check("focus only: comparison sampler as it is", Bound(c, 4, s[4], &d));
+        check("focus L's start rebinds with focus's bias -1.375", !Bound(c, 0, s[0], &d) && d.MipLODBias == -1.375f);
+        late = nullptr;
+        D3D11_SAMPLER_DESC w = Desc(D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_MIRROR);
+        hr = dev->CreateSamplerState(&w, &late);
+        if (SUCCEEDED(hr)) c->PSSetSamplers(5, 1, &late);
+        check("a scene sampler created while the bias runs: focus's bias -1.375",
+              SUCCEEDED(hr) && !Bound(c, 5, late, &d) && d.MipLODBias == -1.375f);
         EndGroup();
-        BeginGroup(1, c);
-        check("focus only: outer R's start puts the game's sampler back", Bound(c, 0, s[0], &d) && Bound(c, 1, s[1], &d));
+        SetViewBias(false, true, 0, 0);
+        BeginGroup(3, c);
+        check("DLSS off: focus R's start puts the game's samplers back", Bound(c, 0, s[0], &d) && Bound(c, 5, late, &d));
         EndGroup();
-        SetBias(0);
     }
+    const size_t sets = TestSceneSamplers() - setsBefore;
     for (auto*& x : s)
         if (x) x->Release();
+    if (late) late->Release();
     c->Release();
-    // Two new scene samplers here (want[0], want[1]); the others get no variants.
-    const bool ok = SUCCEEDED(hr) && sets == 2 && !bad;
-    printf("Mip bias check %s: created 0x%08lX, new game samplers with variants %zu (want 2), %d checks failed, "
-           "replaced at bind %llu; lines \"Samplers mip bias test\" in the proxy log\n",
+    // Three new scene samplers here (want[0], want[1], late); the others get no bias.
+    const bool ok = SUCCEEDED(hr) && sets == 3 && !bad;
+    printf("Mip bias check %s: created 0x%08lX, new game scene samplers %zu (want 3), %d checks failed, replaced at "
+           "bind %llu; lines \"Samplers: texture mip bias\" and \"Samplers mip bias\" in the proxy log\n",
            ok ? "OK" : "FAILED", (unsigned long)hr, sets, bad, (unsigned long long)TestReplacedBinds());
     return ok ? 0 : 5;
 }

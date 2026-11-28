@@ -22,6 +22,7 @@
 #include "mvr_pass.h"
 #include "ngx_log.h"
 #include "nr.h"
+#include "samplers.h"
 #include "sr.h"
 #include "sun_fx.h"
 #include "sysinfo.h"
@@ -1856,6 +1857,7 @@ bool Replace(ID3D11DeviceContext* c, UINT n) {
                     });
             }
             clones::SceneEnd(c);
+            samplers::SceneEnd(c);
             if (r == kDone) {
                 g_evals.fetch_add(1, std::memory_order_relaxed);
                 g_srEvals.fetch_add(1, std::memory_order_relaxed);
@@ -1881,9 +1883,11 @@ bool Replace(ID3D11DeviceContext* c, UINT n) {
             for (auto*& v : srv) SafeRelease(v);
             SafeRelease(rtv);
         });
+        if (t_after) samplers::SceneEnd(c);
         return false;
     }
     Protect("draw", [&] { r = Evaluate(c, false); });
+    if (r != kNotTaa) samplers::SceneEnd(c);
 #endif
     if (r == kDone) {
         g_evals.fetch_add(1, std::memory_order_relaxed);
@@ -2103,6 +2107,15 @@ void OnFrameStart() {
             g_expStep = (g_expStep.load() + 1) % kExpStepCount;
             Log("DLAA: exposure hotkey: %s%s", ExposureText().c_str(), g_expStep.load() == 0 ? " (the ini settings)" : "");
         }
+        // Texture mip bias (DLSS Programming Guide 3.5): log2(render / output) - 1, per view with DLSS SR.
+        const bool quad = c.quadMode == QuadMode::Quad;
+        float focus = 1, outer = 1;
+        if (g_sr) {
+            focus = g_scaleNow[0] >= 0 ? g_scaleNow[0] : quad ? c.dlaaFocusRenderScale : c.dlaaRenderScale;
+            outer = !quad ? focus : g_scaleNow[1] >= 0 ? g_scaleNow[1] : c.dlaaOuterRenderScale;
+        }
+        samplers::SetViewBias(Wanted(), c.dlaaMipBias, std::log2(outer) - 1 + c.dlaaMipBiasOffset,
+                              std::log2(focus) - 1 + c.dlaaMipBiasOffset);
     });
     nr::OnFrameStart();
 }

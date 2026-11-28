@@ -318,6 +318,9 @@ struct Config {
     float dlaaJitterScaleX = 0.5f;    // DLSS jitter in pixels = the engine's projection offset * scale
     float dlaaJitterScaleY = -0.5f;
     bool dlaaMvJittered = false;      // the engine's motion vectors include the jitter
+    // Texture mip bias while DLSS runs (samplers.h), live: log2(view's render scale) - 1 + offset over the game's.
+    bool dlaaMipBias = true;
+    float dlaaMipBiasOffset = 0.0f;
     // DLSS exposure: auto dims the lights (dlaa-plan D4, tests 3-5); a fixed 0.002 keeps them (the game's TAA also
     // scales its color by 0.002).
     bool dlaaAutoExposure = false;    // DLSS auto exposure (0 = dlaaExposure)
