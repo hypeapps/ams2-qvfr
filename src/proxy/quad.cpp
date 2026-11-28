@@ -32,6 +32,7 @@
 #include "mvr_ps.h"
 #include "mvr_vs.h"
 #include "nr.h"
+#include "samplers.h"
 #include "shots.h"
 #include "sr_cb.h"
 #include "sr_probe.h"
@@ -2333,6 +2334,7 @@ void* __fastcall D_BeginExec(void* task, void* b, void* c, void* d) {
         g_began |= 1u << g;
         gpu::Begin((gpu::Phase)g);  // the groups and the GPU phases have the same order
         dlaa::BeginGroup(g);        // its own DLSS history per eye group
+        samplers::BeginGroup(g, gpu::Context());
         // The eye of this group's focus work (outer R's group runs focus R's early tasks and forward pass): focus R's
         // clones are its twins (B9d).
         clones::SetFocusEye(g == OuterR || g == FocusR ? 1 : 0);
@@ -2380,6 +2382,7 @@ void* __fastcall D_EndExec(void* task, void* b, void* c, void* d) {
     sunfx::EndGroup();  // before CEndEye's copies and the desktop mirror
     windscreen::EndGroup();
     dlaa::EndGroup();
+    samplers::EndGroup();
     t_inEndEye = true;
     t_endRes = nullptr;
     void* r = o_endExec(task, b, c, d);
@@ -3582,6 +3585,10 @@ const Switch kSwitches[] = {
      [](int v) { dlaa::SetPresetSwitch(2, v); }},
     {"dlss_scale_outer", false, -1, 100, [] { return g_srScaleSwitch[0]; }, [](int v) { g_srScaleSwitch[0] = v; }},
     {"dlss_scale_focus", false, -1, 100, [] { return g_srScaleSwitch[1]; }, [](int v) { g_srScaleSwitch[1] = v; }},
+    // Texture mip bias test (samplers.h): 0 off, 1 MipLODBias -1 in every view, 2 in the focus views only.
+    {"dlss_mip_bias", false, 0, samplers::kBiasModes - 1, [] { return samplers::GetBias(); },
+     [](int v) { samplers::SetBias(v); }},
+    {"sampler_aniso", false, 0, 1, [] { return (int)samplers::GetAniso(); }, [](int v) { samplers::SetAniso(v != 0); }},
 };
 
 const Switch* FindSwitch(const std::string& name, std::string* why) {

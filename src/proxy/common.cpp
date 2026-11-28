@@ -648,11 +648,12 @@ struct TestScenario {
 };
 const TestScenario kTestScenarios[] = {
     {"as in the ini", [](Config&) {}},
-    // DLSS preset F for outer while driving. With the gaze the focus follows the eyes, so outer only (the whole image
-    // from outer) is the way to look at outer's model directly.
-    {"outer with DLSS preset F", [](Config&) {}, "dlss_preset_outer=6"},
-    {"outer only, DLSS preset K", [](Config&) {}, "outer_only=1, dlss_preset_outer=11"},
-    {"outer only, DLSS preset F", [](Config&) {}, "outer_only=1, dlss_preset_outer=6"},
+    // Texture mip bias under DLSS (samplers.h): the game's scene samplers with MipLODBias -1, then the anisotropic 16x
+    // filter in place of the game's trilinear one, to tell a mip blur from a missing anisotropic filter.
+    {"mip bias -1 in every view", [](Config&) {}, "dlss_mip_bias=1"},
+    {"mip bias -1 in the focus views only", [](Config&) {}, "dlss_mip_bias=2"},
+    {"anisotropic 16x, no mip bias", [](Config&) {}, "sampler_aniso=1"},
+    {"mip bias -1 and anisotropic 16x in every view", [](Config&) {}, "dlss_mip_bias=1, sampler_aniso=1"},
 };
 constexpr int kTestScenarioCount = (int)(sizeof(kTestScenarios) / sizeof(kTestScenarios[0]));
 // The settings any scenario sets, back to the ini's before the next one applies (c.field = ini.field for each; none

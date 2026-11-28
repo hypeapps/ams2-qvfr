@@ -11,6 +11,119 @@
 #include "ngx_log.h"
 #include "samplers.h"
 
+namespace {
+
+D3D11_SAMPLER_DESC Desc(D3D11_FILTER f, D3D11_TEXTURE_ADDRESS_MODE a, float maxLod = D3D11_FLOAT32_MAX) {
+    D3D11_SAMPLER_DESC d{};
+    d.Filter = f;
+    d.AddressU = d.AddressV = d.AddressW = a;
+    d.MaxAnisotropy = 16;
+    d.ComparisonFunc = D3D11_COMPARISON_NEVER;
+    d.MinLOD = -D3D11_FLOAT32_MAX;
+    d.MaxLOD = maxLod;
+    return d;
+}
+
+// What slot `slot` holds now: its description, and whether it is `s` itself.
+bool Bound(ID3D11DeviceContext* c, UINT slot, ID3D11SamplerState* s, D3D11_SAMPLER_DESC* d) {
+    ID3D11SamplerState* b = nullptr;
+    c->PSGetSamplers(slot, 1, &b);
+    if (!b) {
+        *d = {};
+        return !s;
+    }
+    b->GetDesc(d);
+    b->Release();
+    return b == s;
+}
+
+// The mip bias test: the game's scene samplers (the smoke exe counts as the game's exe) get variants; PSSetSamplers
+// binds the variant of the setting and eye group, the other samplers as they are; a group start rebinds.
+int RunMipBias(ID3D11Device* dev) {
+    using namespace qvfr::samplers;
+    ID3D11DeviceContext* c = nullptr;
+    dev->GetImmediateContext(&c);
+    const size_t setsBefore = TestVariantSets();
+    const D3D11_SAMPLER_DESC want[] = {
+        Desc(D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP),          // 0 scene, trilinear
+        Desc(D3D11_FILTER_ANISOTROPIC, D3D11_TEXTURE_ADDRESS_WRAP),                   // 1 scene (MinLOD unlike --samplers)
+        Desc(D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT, D3D11_TEXTURE_ADDRESS_CLAMP),     // 2 no linear mips: as it is
+        Desc(D3D11_FILTER_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_CLAMP, 0.0f),     // 3 LOD 0..0: as it is
+        Desc(D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR, D3D11_TEXTURE_ADDRESS_BORDER),  // 4 shadow: as it is
+    };
+    constexpr UINT kN = sizeof(want) / sizeof(want[0]);
+    ID3D11SamplerState* s[kN] = {};
+    HRESULT hr = S_OK;
+    for (UINT i = 0; i < kN && SUCCEEDED(hr); ++i) hr = dev->CreateSamplerState(&want[i], &s[i]);
+    const size_t sets = TestVariantSets() - setsBefore;
+    int bad = 0;
+    auto check = [&](const char* what, bool ok) {
+        if (!ok) {
+            ++bad;
+            printf("  mip bias: %s FAILED\n", what);
+        }
+    };
+    D3D11_SAMPLER_DESC d{};
+    if (SUCCEEDED(hr)) {
+        const uint64_t replaced0 = TestReplacedBinds();
+        c->PSSetSamplers(0, kN, s);
+        bool same = true;
+        for (UINT i = 0; i < kN; ++i) same &= Bound(c, i, s[i], &d);
+        check("off: the game's samplers bound", same && TestReplacedBinds() == replaced0);
+
+        SetBias(1);
+        c->PSSetSamplers(0, kN, s);
+        check("bias in every view: trilinear sampler with MipLODBias -1",
+              !Bound(c, 0, s[0], &d) && d.MipLODBias == -1.0f && d.Filter == D3D11_FILTER_MIN_MAG_MIP_LINEAR);
+        check("bias in every view: anisotropic sampler with MipLODBias -1",
+              !Bound(c, 1, s[1], &d) && d.MipLODBias == -1.0f && d.Filter == D3D11_FILTER_ANISOTROPIC);
+        same = true;
+        for (UINT i = 2; i < kN; ++i) same &= Bound(c, i, s[i], &d);
+        check("bias in every view: mip point, LOD 0..0 and comparison samplers as they are", same);
+        check("bias in every view: two samplers replaced", TestReplacedBinds() == replaced0 + 2);
+
+        SetAniso(true);
+        c->PSSetSamplers(0, 1, s);
+        check("bias and anisotropic: trilinear sampler anisotropic 16x with MipLODBias -1",
+              !Bound(c, 0, s[0], &d) && d.Filter == D3D11_FILTER_ANISOTROPIC && d.MaxAnisotropy == 16 &&
+                  d.MipLODBias == -1.0f);
+        SetBias(0);
+        c->PSSetSamplers(0, 1, s);
+        check("anisotropic only: trilinear sampler anisotropic 16x without bias",
+              !Bound(c, 0, s[0], &d) && d.Filter == D3D11_FILTER_ANISOTROPIC && d.MipLODBias == 0.0f);
+        SetAniso(false);
+
+        // Focus only: outer's group keeps the game's sampler; focus L's start rebinds the slots without a new bind
+        // from the game, and the next outer group's start puts the game's back.
+        SetBias(2);
+        BeginGroup(0, c);
+        c->PSSetSamplers(0, kN, s);
+        check("focus only: outer L binds the game's sampler", Bound(c, 0, s[0], &d));
+        EndGroup();
+        BeginGroup(2, c);
+        check("focus only: focus L's start rebinds with MipLODBias -1", !Bound(c, 0, s[0], &d) && d.MipLODBias == -1.0f);
+        check("focus only: focus L's start rebinds the anisotropic one too",
+              !Bound(c, 1, s[1], &d) && d.MipLODBias == -1.0f && d.Filter == D3D11_FILTER_ANISOTROPIC);
+        check("focus only: comparison sampler as it is", Bound(c, 4, s[4], &d));
+        EndGroup();
+        BeginGroup(1, c);
+        check("focus only: outer R's start puts the game's sampler back", Bound(c, 0, s[0], &d) && Bound(c, 1, s[1], &d));
+        EndGroup();
+        SetBias(0);
+    }
+    for (auto*& x : s)
+        if (x) x->Release();
+    c->Release();
+    // Two new scene samplers here (want[0], want[1]); the others get no variants.
+    const bool ok = SUCCEEDED(hr) && sets == 2 && !bad;
+    printf("Mip bias check %s: created 0x%08lX, new game samplers with variants %zu (want 2), %d checks failed, "
+           "replaced at bind %llu; lines \"Samplers mip bias test\" in the proxy log\n",
+           ok ? "OK" : "FAILED", (unsigned long)hr, sets, bad, (unsigned long long)TestReplacedBinds());
+    return ok ? 0 : 5;
+}
+
+}  // namespace
+
 int RunSamplers() {
     ID3D11Device* dev = nullptr;
     if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &dev,
@@ -45,15 +158,16 @@ int RunSamplers() {
     qvfr::samplers::LogStats(false);
     const size_t distinct = qvfr::samplers::TestDistinct(), negative = qvfr::samplers::TestNegativeBias();
     const unsigned long long creations = qvfr::samplers::TestCreations();
+    const bool logOk = SUCCEEDED(hr) && distinct == 3 && negative == 1 && creations == 4;
+    printf("Samplers check %s: created 0x%08lX, distinct %zu (want 3), negative MipLODBias %zu (want 1), creations %llu "
+           "(want 4); lines \"Samplers:\" in the proxy log\n",
+           logOk ? "OK" : "FAILED", (unsigned long)hr, distinct, negative, creations);
+    const int bias = RunMipBias(dev);
     qvfr::samplers::LogStats(true);
     for (auto*& x : s)
         if (x) x->Release();
     dev->Release();
-    const bool ok = SUCCEEDED(hr) && distinct == 3 && negative == 1 && creations == 4;
-    printf("Samplers check %s: created 0x%08lX, distinct %zu (want 3), negative MipLODBias %zu (want 1), creations %llu "
-           "(want 4); lines \"Samplers:\" in the proxy log\n",
-           ok ? "OK" : "FAILED", (unsigned long)hr, distinct, negative, creations);
-    return ok ? 0 : 4;
+    return !logOk ? 4 : bias;
 }
 
 int RunNgxLog() {
