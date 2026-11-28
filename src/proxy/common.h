@@ -318,6 +318,7 @@ struct Config {
     float dlaaJitterScaleX = 0.5f;    // DLSS jitter in pixels = the engine's projection offset * scale
     float dlaaJitterScaleY = -0.5f;
     bool dlaaMvJittered = false;      // the engine's motion vectors include the jitter
+    int dlaaJitter = 2;               // jitter sequence while DLSS runs (jitter_seq.h): 0 game, 1 full 8, 2 NVIDIA's phases
     // DLSS exposure: auto dims the lights (dlaa-plan D4, tests 3-5); a fixed 0.002 keeps them (the game's TAA also
     // scales its color by 0.002).
     bool dlaaAutoExposure = false;    // DLSS auto exposure (0 = dlaaExposure)

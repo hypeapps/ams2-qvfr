@@ -18,6 +18,7 @@
 #include "gpu.h"
 #include "hook_prof.h"
 #include "hooks.h"
+#include "jitter_seq.h"
 #include "mvr_motion.h"
 #include "mvr_pass.h"
 #include "ngx_log.h"
@@ -175,6 +176,23 @@ uint32_t g_jitCtx = 0;
 uint64_t g_setCalls = 0, g_setNonzero = 0, g_lastSetCalls = 0, g_lastSetNonzero = 0;
 int g_setLogs = 0;
 std::atomic<int> g_traceLeft{0};  // TraceJitter: further SetJitter calls to log
+
+// GetJitter (device vtable +0x2f8, jitter_seq.h): the engine asks it for the frame's projection offset in the 4 render
+// tasks before SetJitter, and for the frame before in COMMON_BUFFER2 (cameraJitter.zw). While DLSS replaces the game's
+// TAA the offset may come from another sequence ([dlaa] jitter). The mode and phase count are latched per engine frame
+// counter, so every view and both constant buffer fields of one frame agree even if the mode changes in between.
+using GetJitterFn = float*(__fastcall*)(void* dev, float* out, uint32_t frame);
+GetJitterFn o_getJitter = nullptr;
+std::atomic<int> g_jitterSwitch{-1};  // benchmark sequence switch dlss_jitter, -1 = the ini's
+constexpr uint32_t kLatchValid = 1u << 31;
+// Low 32 bits of a latch: mode (bits 0-7), phases (8-23), kLatchValid; high 32 bits: the engine frame counter.
+std::atomic<uint32_t> g_jitterNow{0};  // render thread at frame start: what new frames take
+std::atomic<uint64_t> g_jitterLatch{0}, g_jitterPrevLatch{0};
+std::atomic<uint64_t> g_jitterReplaced{0};
+uint64_t g_lastJitterReplaced = 0;
+uint32_t g_jitterLogged = ~0u;  // render thread: g_jitterNow last logged
+bool g_getJitterHooked = false;
+
 bool g_faultLogged = false;
 thread_local bool t_inside = false;  // inside our evaluation
 
@@ -1987,6 +2005,80 @@ void __fastcall D_SetJitter(void* dev, const float* offset, uint32_t ctx) {
     });
 }
 
+// The jitter mode and phases of an engine frame (low 32 bits of a latch). The first call of a newer frame latches
+// g_jitterNow; an older frame that is no longer latched takes g_jitterNow too.
+uint32_t JitterFor(uint32_t frame) {
+    for (;;) {
+        uint64_t cur = g_jitterLatch.load();
+        if ((cur & kLatchValid) && (uint32_t)(cur >> 32) == frame) return (uint32_t)cur;
+        const uint64_t prev = g_jitterPrevLatch.load();
+        if ((prev & kLatchValid) && (uint32_t)(prev >> 32) == frame) return (uint32_t)prev;
+        const uint32_t now = g_jitterNow.load() | kLatchValid;
+        if ((cur & kLatchValid) && (int32_t)(frame - (uint32_t)(cur >> 32)) < 0) return now;
+        const uint64_t next = ((uint64_t)frame << 32) | now;
+        if (g_jitterLatch.compare_exchange_weak(cur, next)) {
+            if (cur & kLatchValid) g_jitterPrevLatch.store(cur);
+            return now;
+        }
+    }
+}
+
+float* __fastcall D_GetJitter(void* dev, float* out, uint32_t frame) {
+    float* r = o_getJitter(dev, out, frame);
+    if (!r || (r[0] == 0.0f && r[1] == 0.0f)) return r;  // no TAA object: the engine's (0, 0)
+    const uint32_t j = JitterFor(frame);
+    const int mode = (int)(j & 0xFF);
+    if (mode != jitter::kGame) {
+        jitter::Apply(mode, (int)((j >> 8) & 0xFFFF), frame, r);
+        g_jitterReplaced.fetch_add(1, std::memory_order_relaxed);
+    }
+    return r;
+}
+
+int JitterModeWanted() {
+    const int s = g_jitterSwitch.load();
+    return s >= 0 ? s : Cfg().dlaaJitter;
+}
+
+// The smallest render scale of the views DLSS computes (1 without SR): it sets NVIDIA's phase count, one sequence
+// for all views (MVR's view 1 takes outer's jitter with a single correction).
+float JitterScaleNow() {
+    if (!g_sr) return 1.0f;
+    const Config& c = Cfg();
+    const bool quad = c.quadMode == QuadMode::Quad;
+    const float focus = g_scaleNow[0] >= 0 ? g_scaleNow[0] : quad ? c.dlaaFocusRenderScale : c.dlaaRenderScale;
+    if (!quad) return focus;
+    return std::min(focus, g_scaleNow[1] >= 0 ? g_scaleNow[1] : c.dlaaOuterRenderScale);
+}
+
+std::string JitterText(uint32_t j) {
+    const int mode = (int)(j & 0xFF), phases = (int)((j >> 8) & 0xFFFF);
+    char buf[160];
+    if (mode == jitter::kFull8)
+        snprintf(buf, sizeof(buf), "the game's %d phases scaled to the full range (up to +-0.42 px)",
+                 jitter::kGamePhases);
+    else if (mode == jitter::kNvidia)
+        snprintf(buf, sizeof(buf), "full range (up to +-0.50 px), %d phases of Halton (2, 3) for render scale %.2f",
+                 phases, JitterScaleNow());
+    else
+        snprintf(buf, sizeof(buf), "the game's (up to +-0.25 px, %d phases)", jitter::kGamePhases);
+    return buf;
+}
+
+// Render thread, frame start: what the next engine frames take. Another sequence only while DLSS replaces the TAA.
+void UpdateJitterNow() {
+    if (!g_getJitterHooked) return;
+    const int want = std::clamp(JitterModeWanted(), 0, jitter::kModeCount - 1);
+    const int mode = Wanted() ? want : jitter::kGame;
+    const int phases = mode == jitter::kNvidia ? jitter::NvidiaPhases(JitterScaleNow()) : jitter::kGamePhases;
+    const uint32_t now = (uint32_t)mode | ((uint32_t)phases << 8);
+    g_jitterNow = now;
+    if (now == g_jitterLogged) return;
+    g_jitterLogged = now;
+    Log("DLAA: jitter: %s%s", JitterText(now).c_str(),
+        mode != want ? " (DLSS is off now; [dlaa] jitter applies while DLSS runs)" : "");
+}
+
 bool FrameJitterRead(float out[2]) {
     void* dev = nullptr;
     uint32_t counter = 0;
@@ -2066,6 +2158,9 @@ void Install() {
         bool ok = hooks::Create(Anchor::TaaResolve, (void*)D_Resolve, (void**)&o_resolve);
         ok &= hooks::Create(Anchor::TaaLocks, (void*)D_Locks, (void**)&o_locks);
         ok &= hooks::Create(Anchor::SetJitter, (void*)D_SetJitter, (void**)&o_setJitter);
+        // Optional: without it the game's jitter stays and DLSS still runs.
+        g_getJitterHooked = ok && hooks::Create(Anchor::GetJitter, (void*)D_GetJitter, (void**)&o_getJitter);
+        if (ok && !g_getJitterHooked) Log("DLAA: GetJitter hook failed; the game's jitter stays ([dlaa] jitter ignored)");
         g_installed = ok;
         g_on = ok;
         Log("DLAA: engine hooks %s (CTAAControl resolve and locks; device pointer at AMS2AVX.exe+0x%llX)",
@@ -2103,6 +2198,7 @@ void OnFrameStart() {
             g_expStep = (g_expStep.load() + 1) % kExpStepCount;
             Log("DLAA: exposure hotkey: %s%s", ExposureText().c_str(), g_expStep.load() == 0 ? " (the ini settings)" : "");
         }
+        UpdateJitterNow();
     });
     nr::OnFrameStart();
 }
@@ -2139,6 +2235,14 @@ void SetExposureSwitch(int step) {
     Log("DLAA: sequence switch: %s%s", ExposureText().c_str(), step == 0 ? " (the ini settings)" : "");
 }
 
+int GetJitterSwitch() { return g_jitterSwitch.load(); }
+
+void SetJitterSwitch(int mode) {
+    if (mode == g_jitterSwitch.load()) return;
+    g_jitterSwitch = std::clamp(mode, -1, jitter::kModeCount - 1);
+    Log("DLAA: sequence switch: jitter %d%s", mode, mode < 0 ? " (the ini's)" : "");
+}
+
 bool DlssNow() { return g_installed && Wanted(); }
 
 void LogStats(bool totals) {
@@ -2172,6 +2276,12 @@ void LogStats(bool totals) {
     g_lastResolves = r;
     g_lastSetCalls = sc;
     g_lastSetNonzero = sn;
+    if (g_getJitterHooked) {
+        const uint64_t jr = g_jitterReplaced.load();
+        Log("DLAA%s: jitter now %s; %llu GetJitter offsets replaced", totals ? " (session total)" : "",
+            JitterText(g_jitterNow.load()).c_str(), (unsigned long long)(totals ? jr : jr - g_lastJitterReplaced));
+        g_lastJitterReplaced = jr;
+    }
 #ifdef QVFR_HAVE_DLSS
     if (g_maskEvals || g_expEvals || g_cockpitEvals || g_dispEvals)
         Log("DLAA: evaluations with the bias mask %llu, with the fixed exposure %llu, with the cockpit from the game's "

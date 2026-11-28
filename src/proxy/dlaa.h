@@ -49,6 +49,10 @@ void SetGameTaaSwitch(int on);
 constexpr int kExposureSteps = 5;
 int GetExposureSwitch();
 void SetExposureSwitch(int step);
+// Benchmark sequence switch dlss_jitter: the jitter sequence while DLSS runs (jitter_seq.h: 0 the game's, 1 full range
+// with the game's 8 phases, 2 full range with NVIDIA's phase count); -1 = [dlaa] jitter. Latched per engine frame.
+int GetJitterSwitch();
+void SetJitterSwitch(int mode);
 // DLSS replaces the game's TAA in this frame (setting, hotkey, no failure); its evaluation stores outer's motion
 // vectors for focus (mvr_motion.h StoreOuter), so without it focus's velocity pass gets none from outer.
 bool DlssNow();

@@ -196,9 +196,11 @@ int RunTaaFix() {
     c2[51 * 4] = 0.5f;
     c2[56 * 4 + 1] = 0.25f;
     ctx->Unmap(big, 0);
-    ID3D11Texture2D *velRt[2] = {};
-    ID3D11RenderTargetView* velRtv[2] = {};
-    for (int i = 0; i < 2; ++i)
+    // Target 0: focus without a known jitter; 1: no focus (the game's matrices); 2: focus with this frame's jitter,
+    // which the previous matrices take as the engine's own previous projection does.
+    ID3D11Texture2D *velRt[3] = {};
+    ID3D11RenderTargetView* velRtv[3] = {};
+    for (int i = 0; i < 3; ++i)
         made = made && tex(DXGI_FORMAT_R16G16_FLOAT, D3D11_BIND_RENDER_TARGET, &velRt[i]) &&
                SUCCEEDED(dev->CreateRenderTargetView(velRt[i], nullptr, &velRtv[i]));
     if (!made) {
@@ -211,12 +213,22 @@ int RunTaaFix() {
     ctx->PSSetShader(velPs, nullptr, 0);
     ID3D11ShaderResourceView* noViews[6] = {};
     ctx->PSSetShaderResources(0, 6, noViews);
+    // m[0][3] = m[1][3] = 1: an NDC jitter t adds t.x to m[0][0] and t.y to m[1][1].
     float focusProj[16] = {}, focusViewProj[16] = {};
     focusProj[0] = 2.0f;
+    focusProj[3] = 1.0f;
     focusViewProj[5] = 3.0f;
+    focusViewProj[7] = 1.0f;
+    // Projection offset (kW / 4, kH / 2) over the target size: t = (0.25, 0.5).
+    const qvfr::taaviews::JitterFn testJitter = [](float o[2]) {
+        o[0] = kW * 0.25f;
+        o[1] = kH * 0.5f;
+        return true;
+    };
     int velRestored = 0;
-    for (int i = 0; i < 2; ++i) {
-        qvfr::taaviews::TestSetPrevFocus(i == 0 ? focusProj : nullptr, focusViewProj);
+    for (int i = 0; i < 3; ++i) {
+        qvfr::taaviews::SetJitterSource(i == 2 ? testJitter : nullptr);
+        qvfr::taaviews::TestSetPrevFocus(i != 1 ? focusProj : nullptr, focusViewProj);
         ctx->OMSetRenderTargets(1, &velRtv[i], nullptr);
         qvfr::taaviews::OnSetTargets(ctx, 1, &velRtv[i]);  // as quad's OMSetRenderTargets detour does
         ctx->DrawIndexed(9, 0, 0);
@@ -227,6 +239,7 @@ int RunTaaFix() {
         if (b) b->Release();
     }
     qvfr::taaviews::TestSetPrevFocus(nullptr, nullptr);
+    qvfr::taaviews::SetJitterSource(nullptr);
     ctx->OMSetRenderTargets(1, &none, nullptr);
 
     // Read back the center pixel of both targets.
@@ -252,17 +265,18 @@ int RunTaaFix() {
         s->Release();
         return ok;
     };
-    uint32_t lp = 0, rp = 0, vp0 = 0, vp1 = 0;
-    const bool readOk = read(locksRt, lp) && read(resolveRt, rp) && read(velRt[0], vp0) && read(velRt[1], vp1);
+    uint32_t lp = 0, rp = 0, vp0 = 0, vp1 = 0, vp2 = 0;
+    const bool readOk = read(locksRt, lp) && read(resolveRt, rp) && read(velRt[0], vp0) && read(velRt[1], vp1) &&
+                        read(velRt[2], vp2);
     auto half = [](uint32_t h) {
         const uint32_t e = (h >> 10) & 31, mm = h & 1023;
         const float v = e ? std::ldexp(1.0f + mm / 1024.0f, (int)e - 15) : std::ldexp(mm / 1024.0f, -14);
         return (h >> 15) & 1 ? -v : v;
     };
     const float focusX = half(vp0 & 0xFFFF), focusY = half(vp0 >> 16), gameX = half(vp1 & 0xFFFF),
-                gameY = half(vp1 >> 16);
-    const bool velOk = focusX == 2.0f && focusY == 3.0f && gameX == 0.5f && gameY == 0.25f && velRestored == 2 &&
-                       qvfr::taaviews::TestObjectDraws() == 1;
+                gameY = half(vp1 >> 16), jitX = half(vp2 & 0xFFFF), jitY = half(vp2 >> 16);
+    const bool velOk = focusX == 2.0f && focusY == 3.0f && gameX == 0.5f && gameY == 0.25f && jitX == 2.25f &&
+                       jitY == 3.5f && velRestored == 3 && qvfr::taaviews::TestObjectDraws() == 2;
     const float locksW = lp / 255.0f * 4096;
     const float resolveW = Small(rp & 0x7FF, 6) * 4096, resolveInvH = Small((rp >> 11) & 0x7FF, 6) / 16,
                 resolveRate = Small(rp >> 22, 5);
@@ -349,9 +363,10 @@ int RunTaaFix() {
     printf("TAA fix check %s: locks read width %.0f (target %u, the game's cb0 1814), resolve width %.1f, 1/height "
            "%.5f, constant rate %.3f (0.95 in the game's cb0); game binding back after %d of 2 draws; %llu draws "
            "fixed; object velocity in a focus group (%.2f, %.2f) (focus 2, 3), outside (%.2f, %.2f) (game 0.5, 0.25), "
-           "game binding back after %d of 2, %llu draws fixed; debug layer %s, %llu warnings\n",
+           "in a focus group with a jitter (%.2f, %.2f) (2.25, 3.5); game binding back after %d of 3, %llu draws "
+           "fixed; debug layer %s, %llu warnings\n",
            ok ? "OK" : "FAILED", locksW, kW, resolveW, resolveInvH, resolveRate, restored,
-           (unsigned long long)fixed, focusX, focusY, gameX, gameY, velRestored,
+           (unsigned long long)fixed, focusX, focusY, gameX, gameY, jitX, jitY, velRestored,
            (unsigned long long)qvfr::taaviews::TestObjectDraws(), info ? "on" : "off", (unsigned long long)warnings);
     qvfr::taaviews::TestEnableFix(nullptr, false);
     return ok ? 0 : 1;

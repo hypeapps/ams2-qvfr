@@ -115,6 +115,11 @@ struct PrevFocus {
 };
 PrevFocus g_pf;
 bool g_velBound = false;  // render thread: render target 0 is a velocity buffer (R16G16_FLOAT)
+UINT g_velSize[2] = {};   // render thread: its size
+// The previous matrices get this frame's jitter (FixObjectVelocity); switch taa_mv_jitter.
+std::atomic<bool> g_velJitter{true};
+std::atomic<uint64_t> g_velJittered{0};  // patched COMMON_BUFFER2 copies with the jitter added
+JitterFn g_jitterFn = nullptr;            // this frame's projection offset (dlaa::FrameJitter)
 std::atomic<uint64_t> g_objFixed{0};
 int g_dumpCount = 0;
 int g_dumpVelocity = 0;  // object velocity draws dumped in this group
@@ -580,6 +585,7 @@ struct Fix {
     const void* madeFrom = nullptr;  // engine buffer, first constant and group the cb12 was made from (compared only)
     UINT madeFirst = 0;
     uint32_t madeSerial = 0;
+    float madeJitter[2] = {};  // NDC offset added to the previous matrices (see FixObjectVelocity)
 };
 Fix g_fx;  // render thread
 ID3D11DeviceContext* g_testCtx = nullptr;  // smoke test: the context in place of the game's
@@ -783,6 +789,26 @@ void FixDraw(ID3D11DeviceContext* c) {
 // test 8). In a focus group each draw into the velocity buffer gets a copy of the engine's COMMON_BUFFER2 with
 // prevProjMatrix and prevViewProj replaced by this focus view's of the last frame (the same matrices the camera
 // velocity pass gets from the TAA state). The copy is made once per engine buffer place and group.
+// The NDC offset of this frame's jitter in the bound velocity buffer: the engine's projection offset over the target
+// size (as in its camera setup), 0 without a known jitter or with taa_mv_jitter=0.
+void FrameNdcJitter(float out[2]) {
+    out[0] = out[1] = 0.0f;
+    if (!g_velJitter.load() || !g_velSize[0] || !g_velSize[1]) return;
+    float o[2] = {};
+    if (!g_jitterFn || !g_jitterFn(o)) return;
+    out[0] = o[0] / (float)g_velSize[0];
+    out[1] = o[1] / (float)g_velSize[1];
+}
+
+// The engine moves its projection by an NDC offset t (camera setup 0x15dafa0): with row vectors
+// clip.x += t.x * clip.w, so each row gets m[r][0] += m[r][3] * t.x (and y in column 1). The same on viewProj.
+void AddNdcOffset(float m[16], const float t[2]) {
+    for (int r = 0; r < 4; ++r) {
+        m[r * 4 + 0] += m[r * 4 + 3] * t[0];
+        m[r * 4 + 1] += m[r * 4 + 3] * t[1];
+    }
+}
+
 void FixObjectVelocity(ID3D11DeviceContext* c) {
     if (!EnsureFix(c)) return;
     ID3D11Buffer* eb = nullptr;
@@ -796,12 +822,22 @@ void FixObjectVelocity(ID3D11DeviceContext* c) {
         eb->Release();
         return;
     }
-    if (eb != g_fx.madeFrom || first != g_fx.madeFirst || g_pf.serial != g_fx.madeSerial) {
+    float jit[2] = {};
+    FrameNdcJitter(jit);
+    if (eb != g_fx.madeFrom || first != g_fx.madeFirst || g_pf.serial != g_fx.madeSerial ||
+        jit[0] != g_fx.madeJitter[0] || jit[1] != g_fx.madeJitter[1]) {
         const D3D11_BOX src{start, 0, 0, start + kCommon2Size, 1, 1};
         c->CopySubresourceRegion(g_fx.scratch12, 0, 0, 0, 0, eb, 0, &src);
         float m[32];
         memcpy(m, g_pf.proj, sizeof(g_pf.proj));
         memcpy(m + 16, g_pf.viewProj, sizeof(g_pf.viewProj));
+        if (jit[0] != 0.0f || jit[1] != 0.0f) {
+            AddNdcOffset(m, jit);
+            AddNdcOffset(m + 16, jit);
+            g_velJittered.fetch_add(1, std::memory_order_relaxed);
+        }
+        g_fx.madeJitter[0] = jit[0];
+        g_fx.madeJitter[1] = jit[1];
         const D3D11_BOX part{kPrevProjOffset, 0, 0, kPrevProjOffset + sizeof(m), 1, 1};
         c->UpdateSubresource(g_fx.scratch12, 0, &part, m, 0, 0);
         c->CopyResource(g_fx.cb12, g_fx.scratch12);
@@ -885,9 +921,27 @@ void OnSetTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const*
         D3D11_RENDER_TARGET_VIEW_DESC d{};
         rtv[0]->GetDesc(&d);
         vel = d.Format == DXGI_FORMAT_R16G16_FLOAT;
+        if (vel) {
+            ID3D11Resource* res = nullptr;
+            rtv[0]->GetResource(&res);
+            ID3D11Texture2D* tex = nullptr;
+            if (res && SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex))) {
+                D3D11_TEXTURE2D_DESC td{};
+                tex->GetDesc(&td);
+                g_velSize[0] = td.Width;
+                g_velSize[1] = td.Height;
+                tex->Release();
+            }
+            if (res) res->Release();
+        }
     }
     g_velBound = vel;
 }
+
+void SetVelocityJitter(bool on) { g_velJitter = on; }
+bool GetVelocityJitter() { return g_velJitter.load(); }
+
+void SetJitterSource(JitterFn fn) { g_jitterFn = fn; }
 
 void TestSetPrevFocus(const float proj[16], const float viewProj[16]) {
     g_pf.on = proj != nullptr;
@@ -965,10 +1019,11 @@ void LogStats(bool totals) {
     g_tot.late += g_st.late;
     const Stats& s = totals ? g_tot : g_st;
     Log("TAA views%s: viewportScale fix: %llu resolve and %llu locks draws so far; focus object velocity draws with "
-        "the focus view's previous matrices %llu; focus resolves keeping the history while the image moves %llu (%s)",
+        "the focus view's previous matrices %llu (with this frame's jitter in %llu copies, %s); focus resolves keeping "
+        "the history while the image moves %llu (%s)",
         totals ? " (session total)" : "", (unsigned long long)g_fixed[0].load(), (unsigned long long)g_fixed[1].load(),
-        (unsigned long long)g_objFixed.load(), (unsigned long long)g_motionFixed.load(),
-        g_motionFix.load() ? "on" : "off");
+        (unsigned long long)g_objFixed.load(), (unsigned long long)g_velJittered.load(),
+        g_velJitter.load() ? "on" : "off", (unsigned long long)g_motionFixed.load(), g_motionFix.load() ? "on" : "off");
     if (s.swaps[0] || s.swaps[1] || s.noCopies || s.changed || s.late)
         Log("TAA views stats%s: own TAA state in focus L/R groups %llu/%llu (slot 2 matrices updated in %llu/%llu), "
             "groups without copies %llu, fields changed by the engine %llu, late restores %llu",

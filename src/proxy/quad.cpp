@@ -3154,7 +3154,10 @@ void Install() {
                 Log("MVR PS patch: off (needs [debug] mvr_vs_patch=1)");
         }
         // TAA views: the target helper hook must be in place before the game makes its TAA (track load).
-        if (g_patched) taaviews::Install();
+        if (g_patched) {
+            taaviews::SetJitterSource(&dlaa::FrameJitter);
+            taaviews::Install();
+        }
         // Quad <-> outer only needs the focus tasks from the builder's "add task" calls and the executor patch.
         if (g_patched && hooks::Create(Anchor::TaskGroupAddTask, (void*)D_AddTask, (void**)&o_addTask))
             g_execPatched = PatchExecutor();
@@ -3511,6 +3514,8 @@ const Switch kSwitches[] = {
     {"taa_views", false, 0, 1, [] { return (int)g_taaOn; }, [](int v) { g_taaOn = v != 0; }},
     {"taa_motion_fix", false, 0, 1, [] { return (int)taaviews::GetMotionFix(); },
      [](int v) { taaviews::SetMotionFix(v != 0); }},
+    {"taa_mv_jitter", false, 0, 1, [] { return (int)taaviews::GetVelocityJitter(); },
+     [](int v) { taaviews::SetVelocityJitter(v != 0); }},
     {"windscreen", false, 0, 1, [] { return (int)windscreen::GetLayers(); },
      [](int v) { windscreen::SetLayers(v != 0); }},
     {"windscreen_depth", false, 0, 3, [] { return windscreen::GetDepth(); }, [](int v) { windscreen::SetDepth(v); }},
@@ -3576,6 +3581,7 @@ const Switch kSwitches[] = {
     {"dlss_game_taa", false, 0, 1, [] { return dlaa::GetGameTaaSwitch(); }, [](int v) { dlaa::SetGameTaaSwitch(v); }},
     {"dlss_exposure", false, 0, dlaa::kExposureSteps - 1, [] { return dlaa::GetExposureSwitch(); },
      [](int v) { dlaa::SetExposureSwitch(v); }},
+    {"dlss_jitter", false, -1, 2, [] { return dlaa::GetJitterSwitch(); }, [](int v) { dlaa::SetJitterSwitch(v); }},
     {"dlss_preset_outer", false, -1, 15, [] { return dlaa::GetPresetSwitch(1); },
      [](int v) { dlaa::SetPresetSwitch(1, v); }},
     {"dlss_preset_focus", false, -1, 15, [] { return dlaa::GetPresetSwitch(2); },

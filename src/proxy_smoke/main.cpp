@@ -56,6 +56,8 @@
 //   --samplers                        without SteamVR and without the proxy DLL: the sampler log's CreateSamplerState
 //                                     hook on a WARP device (distinct descriptions, negative bias; samplers_smoke.cpp)
 //   --ngx-log                         without SteamVR: the NGX log filter on lines from a game session (ngx_log.h)
+//   --jitter-seq                      without SteamVR: the DLSS jitter sequences (jitter_seq.h) against the engine's
+//                                     table and NVIDIA's phase counts (jitter_seq_smoke.cpp)
 //   --nr-bridge                       without SteamVR and without the proxy DLL: the NR bridge (D3D11 -> D3D12 -> D3D11
 //                                     passthrough) on two focus-sized images, bit for bit (nr_bridge_smoke.cpp)
 //   --panel                           without SteamVR and without the proxy DLL: the tuning panel's picture (RmlUi on
@@ -102,6 +104,7 @@ int RunPsPatchDir(const char* dir);  // mvr_ps_smoke.cpp (B20 K4)
 int RunMvrPass();  // mvr_pass_smoke.cpp
 int RunMvrForward();  // mvr_forward_smoke.cpp
 int RunTaaFix();  // taa_fix_smoke.cpp
+int RunJitterSeq();  // jitter_seq_smoke.cpp
 int RunMvrMotion();  // mvr_motion_smoke.cpp
 int RunDlaaDisplays();  // dlaa_displays_smoke.cpp
 int RunWindscreenDepth();  // windscreen_smoke.cpp
@@ -2509,6 +2512,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--clones")) clonesTest = true;
         else if (!strcmp(argv[i], "--sun-fx")) sunFxTest = true;
         else if (!strcmp(argv[i], "--taa-fix")) return RunTaaFix();
+        else if (!strcmp(argv[i], "--jitter-seq")) return RunJitterSeq();
         else if (!strcmp(argv[i], "--mvr-motion")) return RunMvrMotion();
         else if (!strcmp(argv[i], "--dlaa-displays")) return RunDlaaDisplays();
         else if (!strcmp(argv[i], "--windscreen-depth")) return RunWindscreenDepth();
