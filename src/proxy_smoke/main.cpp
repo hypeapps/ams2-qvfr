@@ -55,6 +55,7 @@
 //                                     (CSDilate) against a CPU reference on a D3D11 device (windscreen_smoke.cpp)
 //   --samplers                        without SteamVR and without the proxy DLL: the sampler log's CreateSamplerState
 //                                     hook on a WARP device (distinct descriptions, negative bias; samplers_smoke.cpp)
+//                                     and the mip bias test's PSSetSamplers hook (variants per setting and eye group)
 //   --ngx-log                         without SteamVR: the NGX log filter on lines from a game session (ngx_log.h)
 //   --jitter-seq                      without SteamVR: the DLSS jitter sequences (jitter_seq.h) against the engine's
 //                                     table and NVIDIA's phase counts (jitter_seq_smoke.cpp)
