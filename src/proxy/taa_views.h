@@ -49,6 +49,15 @@ void OnSetTargets(ID3D11DeviceContext* c, UINT n, ID3D11RenderTargetView* const*
 void OnPixelShaderMade(ID3D11PixelShader* ps, const void* code, size_t len);
 void SetMotionFix(bool on);
 bool GetMotionFix();
+// The focus groups' object motion vectors take the previous matrices from the TAA state, which have no jitter, while
+// the engine's own previous projection carries this frame's jitter (it cancels out in the vectors). With this on (the
+// default, switch taa_mv_jitter) the previous matrices get this frame's jitter too.
+void SetVelocityJitter(bool on);
+bool GetVelocityJitter();
+// Where this frame's engine projection offset comes from (quad: dlaa::FrameJitter; the smoke test: its own); without
+// one the previous matrices stay without jitter.
+using JitterFn = bool (*)(float out[2]);
+void SetJitterSource(JitterFn fn);
 // qvfr_proxy_smoke --taa-fix: as in eye group `group` (-1: none); resolves drawn with the copy so far.
 void TestSetGroup(int group);
 uint64_t TestMotionFixed();

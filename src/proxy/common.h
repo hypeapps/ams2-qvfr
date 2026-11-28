@@ -318,6 +318,7 @@ struct Config {
     float dlaaJitterScaleX = 0.5f;    // DLSS jitter in pixels = the engine's projection offset * scale
     float dlaaJitterScaleY = -0.5f;
     bool dlaaMvJittered = false;      // the engine's motion vectors include the jitter
+    int dlaaJitter = 2;               // jitter sequence while DLSS runs (jitter_seq.h): 0 game, 1 full 8, 2 NVIDIA's phases
     // Texture mip bias while DLSS runs (samplers.h), live: log2(view's render scale) - 1 + offset over the game's.
     bool dlaaMipBias = true;
     float dlaaMipBiasOffset = 0.0f;

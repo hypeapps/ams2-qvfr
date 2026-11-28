@@ -529,6 +529,7 @@ Config ReadConfig(const fs::path& ini) {
     c.dlaaJitterScaleX = IniFloat(ini, L"dlaa", L"jitter_scale_x", c.dlaaJitterScaleX);
     c.dlaaJitterScaleY = IniFloat(ini, L"dlaa", L"jitter_scale_y", c.dlaaJitterScaleY);
     c.dlaaMvJittered = IniInt(ini, L"dlaa", L"mv_jittered", 0) != 0;
+    c.dlaaJitter = std::clamp(IniInt(ini, L"dlaa", L"jitter", c.dlaaJitter), 0, 2);
     c.dlaaMipBias = IniInt(ini, L"dlaa", L"mip_bias", 1) != 0;
     c.dlaaMipBiasOffset = std::clamp(IniFloat(ini, L"dlaa", L"mip_bias_offset", 0.0f), -1.0f, 1.0f);
     c.dlaaAutoExposure = IniInt(ini, L"dlaa", L"auto_exposure", c.dlaaAutoExposure ? 1 : 0) != 0;
@@ -551,14 +552,14 @@ Config ReadConfig(const fs::path& ini) {
     Log("Settings: [dlaa] windscreen_depth=%d", c.windscreenDepth);
     if (c.dlaa)
         Log("Settings: [dlaa] mode=%s render_scale=%.3f outer_render_scale=%.3f focus_render_scale=%.3f preset=%s "
-            "outer_preset=%s focus_preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d "
+            "outer_preset=%s focus_preset=%s jitter_scale=(%.3f, %.3f) mv_jittered=%d jitter=%d "
             "auto_exposure=%d exposure=%.4f exposure_scale=%.4f bias_mask=%.2f skip_locks=%d modifier=0x%X key=0x%X "
             "exposure_key=0x%X cockpit_taa=%d display_pass=%d outer_display_pass=%d display_pass_min_scale=%.2f "
             "display_pass_edge=%d mip_bias=%d mip_bias_offset=%.3f",
             c.dlaaSr ? "dlss" : "dlaa", c.dlaaRenderScale, c.dlaaOuterRenderScale, c.dlaaFocusRenderScale,
             preset.c_str(), outerPreset.empty() ? "f" : outerPreset.c_str(),
             focusPreset.empty() ? preset.c_str() : focusPreset.c_str(), c.dlaaJitterScaleX, c.dlaaJitterScaleY,
-            c.dlaaMvJittered, c.dlaaAutoExposure,
+            c.dlaaMvJittered, c.dlaaJitter, c.dlaaAutoExposure,
             c.dlaaExposure, c.dlaaExposureScale, c.dlaaBiasMask, c.dlaaSkipLocks, c.dlaaKeyMod, c.dlaaKey,
             c.dlaaExpKey, c.dlaaCockpitTaa, c.dlaaDisplayPass ? 1 : 0, c.dlaaOuterDisplayPass ? 1 : 0,
             c.dlaaDisplayPassMinScale, c.dlaaDisplayEdge, c.dlaaMipBias ? 1 : 0, c.dlaaMipBiasOffset);
@@ -755,6 +756,7 @@ bool ReloadConfig(bool force) {
     c.dlaaJitterScaleX = n.dlaaJitterScaleX;
     c.dlaaJitterScaleY = n.dlaaJitterScaleY;
     c.dlaaMvJittered = n.dlaaMvJittered;
+    c.dlaaJitter = n.dlaaJitter;
     c.dlaaMipBias = n.dlaaMipBias;
     c.dlaaMipBiasOffset = n.dlaaMipBiasOffset;
     c.dlaaAutoExposure = n.dlaaAutoExposure;
